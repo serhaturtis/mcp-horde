@@ -4,7 +4,7 @@
  *
  * usage: node supervisor.js <parentPid> <bin> ...args
  */
-import { spawn } from "node:child_process"
+import { spawn, spawnSync } from "node:child_process"
 
 const [parentArg, bin, ...args] = process.argv.slice(2)
 const parent = Number(parentArg)
@@ -20,7 +20,10 @@ const child = spawn(bin, args, {
   shell: process.platform === "win32",
 })
 const stop = () => {
-  if (child.exitCode === null) child.kill("SIGTERM")
+  if (child.exitCode !== null) return
+  // On Windows the binary runs behind a .cmd shim: kill the whole tree.
+  if (process.platform === "win32") spawnSync("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true })
+  else child.kill("SIGTERM")
 }
 child.on("exit", (code) => process.exit(code ?? 0))
 child.on("error", (err) => {

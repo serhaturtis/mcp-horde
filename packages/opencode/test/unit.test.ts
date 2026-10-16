@@ -1,4 +1,5 @@
 import assert from "node:assert/strict"
+import path from "node:path"
 import { describe, test } from "node:test"
 import { loadConfig } from "../src/config.js"
 import { defaultQuestionPolicy, formatModel, parseModel } from "../src/fleet.js"
@@ -120,7 +121,7 @@ describe("helpers", () => {
     assert.equal(c.defaultPermissions, "user")
     assert.equal(c.maxRunning, 8)
     assert.equal(c.channel, false)
-    assert.equal(c.directory, "/work")
+    assert.equal(c.directory, path.resolve("/work"))
     assert.throws(() => loadConfig({ HORDE_OPENCODE_PERMISSIONS: "maybe" } as NodeJS.ProcessEnv), /must be one of/)
     assert.throws(() => loadConfig({ HORDE_OPENCODE_SERVER: "cloud" } as NodeJS.ProcessEnv), /shared or private/)
     assert.throws(() => loadConfig({ HORDE_OPENCODE_MAX_RUNNING: "-1" } as NodeJS.ProcessEnv), /non-negative integer/)

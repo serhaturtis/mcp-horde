@@ -1,4 +1,4 @@
-import { type ChildProcess, spawn } from "node:child_process"
+import { type ChildProcess, spawn, spawnSync } from "node:child_process"
 import { randomBytes } from "node:crypto"
 import { EventEmitter } from "node:events"
 import fs from "node:fs"
@@ -127,18 +127,14 @@ export class Backend {
   close() {
     this.closed = true
     this.abort.abort()
-    if (this.proc && this.proc.exitCode === null) this.proc.kill("SIGTERM")
+    if (this.proc && this.proc.exitCode === null) killTree(this.proc.pid!)
   }
 }
 
 export async function stopSharedServer(store: Store): Promise<string> {
   const known = store.server
   if (!known) return "No shared OpenCode server is recorded."
-  try {
-    process.kill(known.pid, "SIGTERM")
-  } catch {
-    // Already gone.
-  }
+  killTree(known.pid)
   store.setServer(undefined)
   return `Stopped the shared OpenCode server (pid ${known.pid}, ${known.url}). Running agents were stopped with it.`
 }
@@ -190,6 +186,16 @@ async function freePort(): Promise<number> {
 const LISTENING = /opencode server listening on\s+(https?:\/\/\S+)/
 const isWindows = process.platform === "win32"
 
+/** Stop a process and everything it started (on Windows the binary runs behind a .cmd shim). */
+export function killTree(pid: number) {
+  try {
+    if (isWindows) spawnSync("taskkill", ["/pid", String(pid), "/T", "/F"], { stdio: "ignore", windowsHide: true })
+    else process.kill(pid, "SIGTERM")
+  } catch {
+    // Already gone.
+  }
+}
+
 function serveArgs(port: number) {
   return ["serve", "--hostname", "127.0.0.1", "--port", String(port)]
 }
@@ -214,17 +220,22 @@ async function spawnShared(config: Config, stateDir: string, password: string) {
     ),
   )
   proc.unref()
-  const url = await Promise.race([
+  // We chose the port, so poll it instead of parsing output (a detached
+  // process on Windows does not reliably write to the redirected log).
+  const url = `http://127.0.0.1:${port}`
+  await Promise.race([
     launchError,
     (async () => {
-      const deadline = Date.now() + 30_000
+      const deadline = Date.now() + 60_000
       while (Date.now() < deadline) {
-        const out = fs.readFileSync(logPath, "utf8")
-        const match = out.match(LISTENING)
-        if (match?.[1]) return match[1]
-        if (proc.exitCode !== null) throw new Error(`\`${config.bin} serve\` exited with code ${proc.exitCode}.\n${out}`)
-        await new Promise((r) => setTimeout(r, 100))
+        const res = await fetch(`${url}/global/health`, { signal: AbortSignal.timeout(2000) }).catch(() => undefined)
+        if (res) return
+        if (proc.exitCode !== null) {
+          throw new Error(`\`${config.bin} serve\` exited with code ${proc.exitCode}.\n${fs.readFileSync(logPath, "utf8")}`)
+        }
+        await new Promise((r) => setTimeout(r, 200))
       }
+      killTree(proc.pid!)
       throw new Error(`Timed out waiting for \`${config.bin} serve\`; see ${logPath}`)
     })(),
   ])
@@ -245,7 +256,7 @@ async function spawnPrivate(config: Config, password: string) {
     windowsHide: true,
   })
   const killChild = () => {
-    if (proc.exitCode === null) proc.kill("SIGTERM")
+    if (proc.exitCode === null) killTree(proc.pid!)
   }
   process.once("exit", killChild)
 
