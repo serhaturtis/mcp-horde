@@ -673,6 +673,18 @@ export class Fleet {
       await this.interruptNow(live, "disposed")
       notes.push("interrupted the running turn")
     }
+    // Commit a worktree's leftovers before anything is deleted (throws if that is not safe).
+    if (live.record.worktree && opts.worktree === "remove") {
+      const committed = await commitAll(live.record.worktree, `horde: uncommitted work from ${name}`)
+      if (committed) notes.push(committed)
+    }
+    if (opts.deleteSession) {
+      // First, while its directory still exists: OpenCode opens the session's
+      // directory to serve the request. v2 has no delete yet; the legacy
+      // endpoint removes the session and its children.
+      const res = await this.backend.client.session.delete({ sessionID: id, directory: live.session?.location.directory ?? live.record.directory })
+      notes.push(res.response?.ok ? `deleted session ${id}` : `could not delete session ${id} (HTTP ${res.response?.status})`)
+    }
     const wt = live.record.worktree
     if (wt) {
       const mode = opts.worktree ?? "keep"
@@ -688,11 +700,7 @@ export class Fleet {
       }
     }
     if (live.record.agentFile) await fs.rm(live.record.agentFile, { force: true })
-    if (opts.deleteSession) {
-      // v2 has no delete yet; the legacy endpoint removes the session and its children.
-      const res = await this.backend.client.session.delete({ sessionID: id, directory: live.session?.location.directory ?? live.record.directory })
-      notes.push(res.response?.ok ? `deleted session ${id}` : `could not delete session ${id} (HTTP ${res.response?.status})`)
-    } else notes.push(`the session ${id} stays in OpenCode history`)
+    if (!opts.deleteSession) notes.push(`the session ${id} stays in OpenCode history`)
     this.forget(id)
     notes.push(`stopped tracking ${name}`)
     return notes.join("\n")
@@ -1101,12 +1109,22 @@ export class Fleet {
     })
     let untracked: SessionV2Info[] = []
     if (opts.includeUntracked) {
-      const res = unwrap(
-        await this.api.session.list({ directory: this.resolveDir(opts.directory), limit: opts.limit ?? 20, order: "desc" }),
-        "listing sessions",
+      // OpenCode may record the real path (macOS /private/var, Windows long names): ask for both.
+      const dir = this.resolveDir(opts.directory)
+      const real = await fs.realpath(dir).catch(() => dir)
+      const lists = await Promise.all(
+        [...new Set([dir, real])].map(async (directory) =>
+          unwrap(await this.api.session.list({ directory, limit: opts.limit ?? 20, order: "desc" }), "listing sessions"),
+        ),
       )
       const owned = new Set(this.store.agents(this.serverKey).map((r) => r.id))
-      untracked = res.data.filter((s) => !s.parentID && !this.live.has(s.id) && !owned.has(s.id) && !this.childToRoot.has(s.id))
+      const seen = new Set<string>()
+      untracked = lists
+        .flatMap((l) => l.data)
+        .filter((s) => !seen.has(s.id) && seen.add(s.id))
+        .filter((s) => !s.parentID && !this.live.has(s.id) && !owned.has(s.id) && !this.childToRoot.has(s.id))
+        .sort((a, b) => b.time.updated - a.time.updated)
+        .slice(0, opts.limit ?? 20)
     }
     return { snapshots, errors, untracked }
   }

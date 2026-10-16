@@ -511,11 +511,12 @@ export async function removeWorktree(wt: Worktree, name: string, discard: boolea
       await git(wt.repo, "worktree", "remove", "--force", wt.root)
     } catch {
       // Something may still be writing into it (e.g. OpenCode); delete it outright.
-      await fs.rm(wt.root, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 })
-      await git(wt.repo, "worktree", "prune")
+      await fs.rm(wt.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 }).catch(() => undefined)
+      await git(wt.repo, "worktree", "prune").catch(() => undefined)
     }
   }
-  notes.push(`removed worktree ${wt.root}`)
+  if (await exists(wt.root)) notes.push(`could not fully remove worktree ${wt.root} (files still in use?); delete it by hand`)
+  else notes.push(`removed worktree ${wt.root}`)
   let ahead: number
   try {
     ahead = Number(await git(wt.repo, "rev-list", "--count", `${wt.baseline ?? wt.base}..${wt.branch}`))

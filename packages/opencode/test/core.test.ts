@@ -85,7 +85,9 @@ describe("opencode MCP server: core behaviour (real opencode, mock LLM)", { time
   test("a relative directory is resolved against the configured directory", async () => {
     fs.mkdirSync(path.join(repo, "sub"), { recursive: true })
     const out = await h.call("opencode_spawn", { prompt: "where", name: "rel", directory: "sub", wait: true, timeout_seconds: 60 })
-    assert.match(out, new RegExp(`dir: ${fs.realpathSync(path.join(repo, "sub")).replace(/[\\^$.*+?()[\]{}|]/g, "\\$&")}`))
+    // Either the configured or the real path (macOS /var → /private/var).
+    const dir = out.match(/dir: (\S+)/)![1]!
+    assert.equal(fs.realpathSync(dir), fs.realpathSync(path.join(repo, "sub")))
   })
 
   test("limits merge on message instead of replacing each other", async () => {
