@@ -41,6 +41,8 @@ export function makeRepo(mockUrl: string, extra: Record<string, unknown> = {}) {
           models: {
             mock: { name: "Mock", tool_call: true, reasoning: true, variants: { high: { reasoningEffort: "high" }, low: { reasoningEffort: "low" } } },
             other: { name: "Other mock", tool_call: true },
+            // $1.50 per mock step (10 input + 5 output tokens), for cost limits.
+            pricey: { name: "Pricey mock", tool_call: true, cost: { input: 100_000, output: 100_000 } },
           },
         },
         // A provider OpenCode accepts but cannot run: turns are admitted and then silently dropped.
@@ -70,12 +72,12 @@ export interface Harness {
   client: Client
   call(name: string, args?: Record<string, unknown>): Promise<string>
   /** What the next elicitation dialog answers; undefined = decline support. */
-  elicit: { answer: (req: { message: string; requestedSchema: unknown }) => ElicitResult; seen: string[] }
+  elicit: { answer: (req: { message: string; requestedSchema: unknown }) => ElicitResult | Promise<ElicitResult>; seen: string[] }
   channel: { content: string; meta: Record<string, string> }[]
   close(): Promise<void>
 }
 
-export async function connect(env: Record<string, string>, opts: { elicitation?: boolean } = {}): Promise<Harness> {
+export async function connect(env: Record<string, string>, opts: { elicitation?: boolean; built?: boolean } = {}): Promise<Harness> {
   const client = new Client({ name: "test", version: "0" }, { capabilities: opts.elicitation ? { elicitation: { form: {} } } : {} })
   const elicit: Harness["elicit"] = { answer: () => ({ action: "cancel" }), seen: [] }
   const channel: Harness["channel"] = []
@@ -95,7 +97,8 @@ export async function connect(env: Record<string, string>, opts: { elicitation?:
   await client.connect(
     new StdioClientTransport({
       command: process.execPath,
-      args: ["--import", "tsx", path.join(pkg, "src/index.ts")],
+      // `built` runs the compiled package exactly as npm installs it.
+      args: opts.built ? [path.join(pkg, "dist/index.js")] : ["--import", "tsx", path.join(pkg, "src/index.ts")],
       cwd: pkg,
       env: { ...(process.env as Record<string, string>), HORDE_OPENCODE_BIN: opencodeBin, ...env },
       stderr: "inherit",

@@ -13,20 +13,34 @@ if (!parent || !bin) {
   process.exit(2)
 }
 
+const isWindows = process.platform === "win32"
 const child = spawn(bin, args, {
   cwd: process.env.HORDE_SUPERVISED_CWD || process.cwd(),
   stdio: ["ignore", "inherit", "inherit"],
   windowsHide: true,
   // A resolved .exe needs no shell; only fall back to one for .cmd/.bat shims.
-  shell: process.platform === "win32" && /\.(cmd|bat)$/i.test(bin),
+  shell: isWindows && /\.(cmd|bat)$/i.test(bin),
 })
+
+let stopping = false
 const stop = () => {
-  if (child.exitCode !== null) return
-  // On Windows the binary runs behind a .cmd shim: kill the whole tree.
-  if (process.platform === "win32") spawnSync("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true })
-  else child.kill("SIGTERM")
+  if (stopping || child.exitCode !== null) return
+  stopping = true
+  if (isWindows) {
+    spawnSync("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true })
+    return
+  }
+  child.kill("SIGTERM")
+  // Escalate if it does not shut down.
+  setTimeout(() => {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL")
+  }, 5_000).unref()
 }
-child.on("exit", (code) => process.exit(code ?? 0))
+
+child.on("exit", (code, signal) => {
+  const signals: Record<string, number> = { SIGHUP: 1, SIGINT: 2, SIGKILL: 9, SIGTERM: 15 }
+  process.exit(code ?? (signal ? 128 + (signals[signal] ?? 1) : 1))
+})
 child.on("error", (err) => {
   console.error(`failed to launch ${bin}: ${err.message}`)
   process.exit(1)
@@ -43,7 +57,7 @@ process.stdin.resume()
 setInterval(() => {
   try {
     process.kill(parent, 0)
-  } catch {
-    stop()
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "EPERM") stop()
   }
 }, 1000).unref()

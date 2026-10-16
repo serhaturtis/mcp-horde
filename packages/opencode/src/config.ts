@@ -36,6 +36,8 @@ export interface Config {
   worktreeDir: string
   /** Push a Claude Code channel notification whenever an agent settles. */
   channel: boolean
+  /** How long a permission/question dialog may stay open before the request goes to the calling model. */
+  elicitTimeoutMs: number
 }
 
 function policy(value: string | undefined): PermissionPolicy {
@@ -57,8 +59,12 @@ function int(value: string | undefined, fallback: number, name: string): number 
   return n
 }
 
-function bool(value: string | undefined): boolean {
-  return value === "1" || value === "true" || value === "yes"
+function bool(value: string | undefined, name: string): boolean {
+  const v = value?.trim().toLowerCase()
+  if (!v) return false
+  if (["1", "true", "yes", "on"].includes(v)) return true
+  if (["0", "false", "no", "off"].includes(v)) return false
+  throw new Error(`${name} must be a boolean (1/0, true/false, yes/no, on/off), got "${value}"`)
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
@@ -69,7 +75,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     url: env.HORDE_OPENCODE_URL || undefined,
     username: env.OPENCODE_SERVER_USERNAME || "opencode",
     password: env.OPENCODE_SERVER_PASSWORD || undefined,
-    allowInsecure: bool(env.HORDE_OPENCODE_ALLOW_INSECURE),
+    allowInsecure: bool(env.HORDE_OPENCODE_ALLOW_INSECURE, "HORDE_OPENCODE_ALLOW_INSECURE"),
     serverMode: mode(env.HORDE_OPENCODE_SERVER),
     bin: env.HORDE_OPENCODE_BIN || "opencode",
     directory: path.resolve(env.HORDE_OPENCODE_DIRECTORY || process.cwd()),
@@ -77,6 +83,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     maxRunning: int(env.HORDE_OPENCODE_MAX_RUNNING, 8, "HORDE_OPENCODE_MAX_RUNNING"),
     stateDir: path.resolve(env.HORDE_OPENCODE_STATE_DIR || path.join(stateHome, "mcp-horde", "opencode")),
     worktreeDir: path.resolve(env.HORDE_OPENCODE_WORKTREE_DIR || path.join(dataHome, "mcp-horde", "worktrees")),
-    channel: bool(env.HORDE_OPENCODE_CHANNEL),
+    channel: bool(env.HORDE_OPENCODE_CHANNEL, "HORDE_OPENCODE_CHANNEL"),
+    elicitTimeoutMs: int(env.HORDE_OPENCODE_DIALOG_TIMEOUT, 600, "HORDE_OPENCODE_DIALOG_TIMEOUT") * 1000,
   }
 }

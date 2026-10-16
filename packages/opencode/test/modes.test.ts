@@ -112,12 +112,18 @@ ${output}`)
       const base = isolatedEnv(tmp, repo)
 
       const wrong = await connect({ ...base, HORDE_OPENCODE_URL: url, OPENCODE_SERVER_PASSWORD: "nope" })
-      await assert.rejects(wrong.call("opencode_models"), /unauthorized \(wrong OPENCODE_SERVER_PASSWORD\?\)/)
-      await wrong.close()
+      try {
+        await assert.rejects(wrong.call("opencode_models"), /unauthorized \(wrong OPENCODE_SERVER_PASSWORD/)
+      } finally {
+        await wrong.close()
+      }
 
       const remote = await connect({ ...base, HORDE_OPENCODE_URL: "http://example.invalid:4096" })
-      await assert.rejects(remote.call("opencode_models"), /Refusing to use .* without OPENCODE_SERVER_PASSWORD/)
-      await remote.close()
+      try {
+        await assert.rejects(remote.call("opencode_models"), /Refusing to use .* without OPENCODE_SERVER_PASSWORD/)
+      } finally {
+        await remote.close()
+      }
 
       const h = await connect({ ...base, HORDE_OPENCODE_URL: url, OPENCODE_SERVER_PASSWORD: password })
       try {

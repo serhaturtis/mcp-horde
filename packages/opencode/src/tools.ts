@@ -1,12 +1,11 @@
 import { type McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js"
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js"
 import { z } from "zod"
-import { type Backend, stopSharedServer } from "./backend.js"
+import type { Backend } from "./backend.js"
 import { POLICIES } from "./config.js"
 import type { Fleet, Snapshot } from "./fleet.js"
-import { formatModel, SETTLED, unsupportedReason } from "./fleet.js"
+import { defined, formatModel, SETTLED, unsupportedReason } from "./fleet.js"
 import { formatTokens, formatUsd, indent, oneLine, truncate, truncateHead } from "./render.js"
-import type { Store } from "./state.js"
 import type { Turn } from "./tracker.js"
 
 type Extra = {
@@ -18,7 +17,12 @@ type Extra = {
 export interface Context {
   fleet: () => Promise<Fleet>
   backend: () => Promise<Backend>
-  store: Store
+  /** The fleet if it is already running (never starts a server). */
+  peekFleet: () => Promise<Fleet> | undefined
+  /** Stop the server for the current mode and drop the cached connection. */
+  stop: () => Promise<string>
+  /** Name of the connected MCP client, to pick sensible defaults. */
+  clientName: () => string | undefined
 }
 
 const ok = (text: string): CallToolResult => ({ content: [{ type: "text", text }] })
@@ -27,7 +31,13 @@ const fail = (err: unknown): CallToolResult => ({
   isError: true,
 })
 
-const DEFAULT_WAIT_S = 1800
+/**
+ * Claude Code keeps long tool calls alive (and backgrounds them after 2 min);
+ * most other clients time out after 60 s, so default to less there.
+ */
+function defaultWait(ctx: Context): number {
+  return /claude/i.test(ctx.clientName() ?? "") ? 1800 : 50
+}
 
 const id = z.string().describe("Agent name (given at spawn) or session id (ses_…).")
 const permissions = z
@@ -53,17 +63,21 @@ const timeout = z
   .min(1)
   .max(86_400)
   .describe(
-    `Max seconds to block (default ${DEFAULT_WAIT_S}). Claude Code moves long calls to the background automatically. On timeout the agents keep working.`,
+    "Max seconds to block (default 1800 in Claude Code, which backgrounds long calls; 50 elsewhere, to stay under the usual 60 s client timeout). Agents keep working after a timeout.",
   )
 const files = z.array(z.string()).describe("Files to attach (paths relative to the agent's directory, or absolute).")
 
+/** Only the keys the caller set: an omitted limit must not erase an existing one. */
 function limitsIn(l?: { max_steps?: number; max_cost_usd?: number; timeout_minutes?: number }) {
   if (!l) return undefined
-  return { maxSteps: l.max_steps, maxCostUsd: l.max_cost_usd, timeoutMinutes: l.timeout_minutes }
+  return defined({ maxSteps: l.max_steps, maxCostUsd: l.max_cost_usd, timeoutMinutes: l.timeout_minutes })
 }
 
+/** Strip only the blocks this server injects into prompts, not the user's own markup. */
+const INJECTED = /<(instructions|workspace|file)\b[^>]*>[\s\S]*?<\/\1>/g
+
 function renderTurn(t: Turn, chars: number, label: boolean): string {
-  const head = label ? `turn "${truncate(oneLine(t.prompt.replace(/<[^>]+>[\s\S]*?<\/[^>]+>/g, "")), 60)}":\n` : ""
+  const head = label ? `turn "${truncate(oneLine(t.prompt.replace(INJECTED, "")), 60)}":\n` : ""
   const body = t.finalText.trim() || (t.failure ? `(no answer: ${t.failure})` : "(no text answer)")
   return indent(`${head}${truncateHead(body, chars)}`)
 }
@@ -101,9 +115,23 @@ export function renderSnapshot(s: Snapshot, opts: { resultChars?: number; mode?:
   const chars = opts.resultChars ?? 0
   if (chars > 0 && SETTLED.has(s.state) && s.state !== "needs_input") {
     const turns = opts.mode === "news" && s.unreported.length ? s.unreported : s.lastTurn?.endedAt ? [s.lastTurn] : []
-    if (turns.length) lines.push(`  result:\n${turns.map((t) => renderTurn(t, Math.max(500, Math.floor(chars / turns.length)), turns.length > 1)).join("\n")}`)
+    // `chars` caps the total; the latest turns matter most.
+    if (turns.length) {
+      const per = Math.max(1, Math.floor(chars / turns.length))
+      lines.push(`  result:\n${turns.map((t) => renderTurn(t, per, turns.length > 1)).join("\n")}`)
+    }
   }
   return lines.join("\n")
+}
+
+/** Progress notifications for long single operations (e.g. worktree setup). */
+function progressMessage(extra: Extra) {
+  const token = extra._meta?.progressToken
+  if (token === undefined) return undefined
+  let n = 0
+  return (message: string) => {
+    void extra.sendNotification({ method: "notifications/progress", params: { progressToken: token, progress: ++n, message } }).catch(() => undefined)
+  }
 }
 
 function progress(extra: Extra) {
@@ -145,17 +173,19 @@ export function registerTools(server: McpServer, ctx: Context) {
   }
 
   const waitAndRender = async (fleet: Fleet, ids: string[], mode: "any" | "all", seconds: number | undefined, extra: Extra, chars: number) => {
-    const r = await fleet.waitFor(ids, mode, (seconds ?? DEFAULT_WAIT_S) * 1000, { signal: extra.signal, onTick: progress(extra) })
+    const secs = seconds ?? defaultWait(ctx)
+    const r = await fleet.waitFor(ids, mode, secs * 1000, { signal: extra.signal, onTick: progress(extra) })
     const news = r.snapshots.filter((s) => r.news.has(s.id))
     const running = r.snapshots.filter((s) => !SETTLED.has(s.state))
     const quiet = r.snapshots.filter((s) => SETTLED.has(s.state) && !r.news.has(s.id))
     const head = r.timedOut
-      ? `Timed out after ${seconds ?? DEFAULT_WAIT_S}s with no news; ${running.length} still running.`
+      ? `Timed out after ${secs}s: ${news.length} with news, ${running.length} still running (they keep working; wait again).`
       : r.nothingToWaitFor
         ? "Nothing new: no listed agent is running, and their results were already reported."
         : `${news.length} with news, ${running.length} still running.`
     const parts = [head, ...news.map((s) => renderSnapshot(s, { resultChars: chars, mode: "news" })), ...running.map((s) => renderSnapshot(s))]
     if (quiet.length) parts.push(`Already reported: ${quiet.map((s) => `${s.name ?? s.id} (${s.state})`).join(", ")}`)
+    if (r.errors.length) parts.push(`Could not read: ${r.errors.join("; ")}`)
     return parts.join("\n\n")
   }
 
@@ -195,14 +225,15 @@ export function registerTools(server: McpServer, ctx: Context) {
     "opencode_agents",
     'List OpenCode agent profiles usable with opencode_spawn agent (e.g. "build" edits and runs commands, "plan" is read-only, plus custom ones from the project config).',
     { directory: z.string().optional().describe("Project directory whose opencode config applies.") },
-    async (a, fleet) =>
-      (await fleet.agents(a.directory))
+    async (a, fleet) => {
+      const lines = (await fleet.agents(a.directory))
         .filter((x) => !x.hidden && x.mode !== "subagent")
         .map(
           (x) =>
             `${x.id}${x.model ? ` · ${formatModel(x.model)}` : ""}${x.steps ? ` · max ${x.steps} steps` : ""}${x.description ? ` — ${truncate(x.description, 200)}` : ""}`,
         )
-        .join("\n"),
+      return lines.length ? lines.join("\n") : "No agent profiles found (is OpenCode configured?)."
+    },
     { readOnlyHint: true },
   )
 
@@ -214,7 +245,10 @@ export function registerTools(server: McpServer, ctx: Context) {
       name: z.string().optional().describe("Unique short name to address it by (letters, digits, . _ -)."),
       model: z.string().optional().describe('"provider/model" from opencode_models, chosen for this task. Omitted = OpenCode\'s configured default.'),
       variant: z.string().optional().describe('Effort level / model variant, e.g. "low", "high", "max" (see opencode_models; requires model).'),
-      agent: z.string().optional().describe('Existing agent profile (opencode_agents), e.g. "build" (default) or "plan" (read-only).'),
+      agent: z
+        .string()
+        .optional()
+        .describe('Existing agent profile (opencode_agents), e.g. "build" or "plan" (read-only). Omitted = OpenCode\'s default profile.'),
       instructions: z.string().optional().describe("Role, constraints and context for the agent, prepended to the prompt (like a subagent system prompt)."),
       profile: z
         .object({
@@ -224,7 +258,7 @@ export function registerTools(server: McpServer, ctx: Context) {
         })
         .optional()
         .describe('A custom agent profile created for this agent. Requires isolation "worktree" unless OpenCode has not opened the directory yet.'),
-      directory: z.string().optional().describe("Working directory (absolute). Defaults to the server's directory."),
+      directory: z.string().optional().describe("Working directory (absolute, or relative to the server's default directory, which is used when omitted)."),
       isolation: z
         .enum(["none", "worktree"])
         .optional()
@@ -233,7 +267,8 @@ export function registerTools(server: McpServer, ctx: Context) {
         .object({
           include_uncommitted: z.boolean().optional().describe("Copy your uncommitted and untracked changes into the worktree (default true)."),
           link: z.array(z.string()).optional().describe('Paths to symlink from the main checkout, e.g. ["node_modules", ".env"].'),
-          setup: z.string().optional().describe('Shell command to run in the worktree before the agent starts, e.g. "npm ci".'),
+          setup: z.string().optional().describe('Shell command to run in the worktree before the agent starts, e.g. "npm ci" (killed after 15 min).'),
+          submodules: z.boolean().optional().describe("Initialize submodules in the worktree (default: when the repo has any)."),
         })
         .optional(),
       permissions: permissions.optional(),
@@ -254,11 +289,18 @@ export function registerTools(server: McpServer, ctx: Context) {
         profile: a.profile,
         directory: a.directory,
         isolation: a.isolation,
-        worktree: a.worktree && { includeUncommitted: a.worktree.include_uncommitted, link: a.worktree.link, setup: a.worktree.setup },
+        worktree: a.worktree && {
+          includeUncommitted: a.worktree.include_uncommitted,
+          link: a.worktree.link,
+          setup: a.worktree.setup,
+          submodules: a.worktree.submodules,
+        },
         permissions: a.permissions as never,
         questions: a.questions,
         limits: limitsIn(a.limits),
         files: a.files,
+        signal: extra.signal,
+        onProgress: progressMessage(extra),
       })
       const noteText = notes.length ? `\n${notes.map((n) => `  · ${n}`).join("\n")}` : ""
       if (a.wait) return `Spawned.${noteText}\n${await waitAndRender(fleet, [snapshot.id], "all", a.timeout_seconds, extra, 8000)}`
@@ -306,7 +348,13 @@ export function registerTools(server: McpServer, ctx: Context) {
       ids: z.array(z.string()).optional().describe("Agents to wait on. Default: all tracked agents."),
       mode: z.enum(["any", "all"]).optional(),
       timeout_seconds: timeout.optional(),
-      result_chars: z.number().int().min(0).max(100_000).optional().describe("Max chars of final answers per agent (default 6000)."),
+      result_chars: z
+        .number()
+        .int()
+        .min(0)
+        .max(100_000)
+        .optional()
+        .describe("Max chars of final answers per agent (default 6000; 0 = states only, read answers with opencode_output)."),
     },
     async (a, fleet, extra) => {
       const ids = a.ids?.length ? a.ids : fleet.ids()
@@ -317,20 +365,38 @@ export function registerTools(server: McpServer, ctx: Context) {
 
   tool(
     "opencode_status",
-    "Peek at agents without blocking: state, what they are doing right now, pending requests, cost, last answer. With no ids: every agent tracked by this server.",
+    "Peek at agents without blocking: state, what they are doing right now, pending requests, cost, last answer. With no ids: every agent this MCP session drives.",
     {
-      ids: z.array(z.string()).optional(),
-      include_untracked: z.boolean().optional().describe("Also adopt recent OpenCode sessions in `directory` that were not spawned here."),
+      ids: z
+        .array(z.string())
+        .optional()
+        .describe('Agents to show. A session id this server does not track yet is adopted (with permissions/questions "ask").'),
+      include_untracked: z
+        .boolean()
+        .optional()
+        .describe("Also list recent OpenCode sessions in `directory` that are not tracked (pass their id to adopt one)."),
       directory: z.string().optional(),
     },
     async (a, fleet) => {
-      const snaps = a.ids?.length
-        ? await Promise.all(a.ids.map((i) => fleet.snapshot(i)))
-        : await fleet.list({ includeUntracked: a.include_untracked, directory: a.directory })
-      if (!snaps.length) return "No agents yet. Start one with opencode_spawn."
-      return snaps.map((s) => renderSnapshot(s, { resultChars: 800, mode: "last" })).join("\n\n")
+      if (a.ids?.length) {
+        const ids = a.ids
+        const results = await Promise.allSettled(ids.map((i) => fleet.snapshot(i)))
+        return results
+          .map((r, i) =>
+            r.status === "fulfilled" ? renderSnapshot(r.value, { resultChars: 800, mode: "last" }) : `✗ ${ids[i]}: ${(r.reason as Error).message}`,
+          )
+          .join("\n\n")
+      }
+      const { snapshots, errors, untracked } = await fleet.list({ includeUntracked: a.include_untracked, directory: a.directory })
+      const parts = snapshots.map((s) => renderSnapshot(s, { resultChars: 800, mode: "last" }))
+      if (errors.length) parts.push(`Could not read: ${errors.join("; ")}`)
+      if (untracked.length) {
+        parts.push(
+          `Untracked sessions (pass an id to adopt):\n${untracked.map((s) => `  ${s.id} — ${s.title} (${new Date(s.time.updated).toISOString()})`).join("\n")}`,
+        )
+      }
+      return parts.length ? parts.join("\n\n") : "No agents yet. Start one with opencode_spawn."
     },
-    { readOnlyHint: true },
   )
 
   tool(
@@ -356,10 +422,20 @@ export function registerTools(server: McpServer, ctx: Context) {
 
   tool(
     "opencode_resume",
-    "Resume an interrupted, failed or idle agent. Without a message it is told to continue where it left off.",
+    "Resume an interrupted, failed or idle agent. Without a message it is told to continue (interrupted), retry (failed) or carry on (idle).",
     { id, message: z.string().optional(), wait: z.boolean().optional(), timeout_seconds: timeout.optional() },
     async (a, fleet, extra) => {
-      const snap = await fleet.message(a.id, a.message ?? "You were interrupted. Continue the task from where you left off.")
+      const current = await fleet.snapshot(a.id)
+      if (current.state === "running" || current.state === "needs_input") {
+        throw new Error(`${current.name ?? current.id} is ${current.state}; use opencode_message to steer it or opencode_respond to answer it`)
+      }
+      const fallback =
+        current.state === "interrupted"
+          ? "You were interrupted. Continue the task from where you left off."
+          : current.state === "error"
+            ? `Your last turn failed (${current.error ?? "error"}). Retry and continue the task.`
+            : "Continue."
+      const snap = await fleet.message(a.id, a.message ?? fallback)
       if (a.wait) return waitAndRender(fleet, [snap.id], "all", a.timeout_seconds, extra, 8000)
       return `Resumed.\n${renderSnapshot(snap)}`
     },
@@ -411,16 +487,21 @@ export function registerTools(server: McpServer, ctx: Context) {
     "opencode_server",
     {
       description:
-        'The OpenCode server behind the agents: "info" shows its URL, version and the command to watch agents live in the OpenCode TUI; "stop" stops the shared server (and every agent on it).',
+        'The OpenCode server behind the agents: "info" shows its URL, version and the command to watch agents live in the OpenCode TUI; "stop" stops the server this MCP server manages (and every agent on it); the next call starts a fresh one.',
       inputSchema: { action: z.enum(["info", "stop"]) },
       annotations: { openWorldHint: false },
     },
     (async (a: { action: "info" | "stop" }) => {
       try {
-        if (a.action === "stop") return ok(await stopSharedServer(ctx.store))
+        if (a.action === "stop") return ok(await ctx.stop())
         const b = await ctx.backend()
         const i = b.info
-        const attach = i.password ? `OPENCODE_SERVER_PASSWORD=${i.password} opencode attach ${i.url}` : `opencode attach ${i.url}`
+        // Never echo the password into the conversation: point at where it is.
+        const attach = i.passwordFile
+          ? `OPENCODE_SERVER_PASSWORD="$(cat ${i.passwordFile})" opencode attach ${i.url}`
+          : i.password
+            ? `opencode attach ${i.url}  (with your OPENCODE_SERVER_PASSWORD set)`
+            : `opencode attach ${i.url}`
         return ok(
           [
             `${i.mode} server ${i.url} (opencode ${i.version}${i.pid ? `, pid ${i.pid}` : ""})`,
@@ -441,8 +522,10 @@ export function registerTools(server: McpServer, ctx: Context) {
   server.registerResource(
     "agent-transcript",
     new ResourceTemplate("opencode://agents/{id}/transcript", {
+      // Listing must never start a server: only list when one is already running.
       list: async () => {
-        const fleet = await ctx.fleet()
+        const fleet = await ctx.peekFleet()?.catch(() => undefined)
+        if (!fleet) return { resources: [] }
         return { resources: fleet.ids().map((i) => ({ uri: `opencode://agents/${i}/transcript`, name: `transcript ${i}`, mimeType: "text/markdown" })) }
       },
     }),

@@ -67,10 +67,59 @@ describe("opencode MCP server: core behaviour (real opencode, mock LLM)", { time
     const full = await h.call("opencode_output", { id: "greeter", scope: "all" })
     assert.match(full, /hello there[\s\S]*second[\s\S]*switched model → mock\/other[\s\S]*third/)
     assert.match(await h.call("opencode_output", { id: "greeter", detail: "final" }), /^Echo\[none\]: third$/)
+    // Token usage is tracked.
+    assert.match(await h.call("opencode_status", { ids: ["greeter"] }), /3 steps · \$0 · 45 tok/)
   })
 
-  test("token usage is tracked", async () => {
-    assert.match(await h.call("opencode_status", { ids: ["greeter"] }), /3 steps · \$0 · 45 tok/)
+  test("agent names are unique; a failed spawn leaves nothing behind", async () => {
+    await h.call("opencode_spawn", { prompt: "first", name: "uniq", wait: true, timeout_seconds: 60 })
+    await assert.rejects(h.call("opencode_spawn", { prompt: "again", name: "uniq" }), /already exists/)
+    // Worktree isolation outside a git repository fails after the session was created: it must be rolled back.
+    const plain = fs.mkdtempSync(path.join(tmp, "plain-"))
+    await assert.rejects(h.call("opencode_spawn", { prompt: "x", name: "failed", directory: plain, isolation: "worktree" }), /needs a git repository/)
+    assert.doesNotMatch(await h.call("opencode_status"), /failed \(ses_/)
+    const reused = await h.call("opencode_spawn", { prompt: "reuse", name: "failed", wait: true, timeout_seconds: 60 })
+    assert.match(reused, /failed \(ses_\w+\) — IDLE/)
+  })
+
+  test("a relative directory is resolved against the configured directory", async () => {
+    fs.mkdirSync(path.join(repo, "sub"), { recursive: true })
+    const out = await h.call("opencode_spawn", { prompt: "where", name: "rel", directory: "sub", wait: true, timeout_seconds: 60 })
+    assert.match(out, new RegExp(`dir: ${fs.realpathSync(path.join(repo, "sub")).replace(/[\\^$.*+?()[\]{}|]/g, "\\$&")}`))
+  })
+
+  test("limits merge on message instead of replacing each other", async () => {
+    await h.call("opencode_spawn", { prompt: "hi", name: "limited", limits: { max_steps: 9 }, wait: true, timeout_seconds: 60 })
+    const out = await h.call("opencode_message", { id: "limited", message: "again", limits: { max_cost_usd: 5 }, wait: true, timeout_seconds: 60 })
+    assert.match(out, /limits: 9 steps, \$5/)
+  })
+
+  test("cost and time limits interrupt the turn; a later turn is not killed by the old one", async () => {
+    const pricey = await h.call("opencode_spawn", {
+      prompt: "STEPS: 6",
+      name: "spender",
+      model: "mock/pricey",
+      permissions: "allow",
+      limits: { max_cost_usd: 2 },
+      wait: true,
+      timeout_seconds: 60,
+    })
+    assert.match(pricey, /INTERRUPTED[\s\S]*reason: cost limit reached/)
+    // The cost of the previous turn does not count against a new one.
+    const next = await h.call("opencode_message", { id: "spender", message: "cheap", limits: { max_cost_usd: 2 }, wait: true, timeout_seconds: 60 })
+    assert.match(next, /IDLE[\s\S]*Echo\[none\]: cheap/)
+
+    const slow = await h.call("opencode_spawn", { prompt: "SLOW timed", name: "timed", limits: { timeout_minutes: 0.05 }, wait: true, timeout_seconds: 60 })
+    assert.match(slow, /INTERRUPTED[\s\S]*reason: time limit reached/)
+  })
+
+  test("queued messages run after the current turn", async () => {
+    await h.call("opencode_spawn", { prompt: "SLOW first", name: "queuer" })
+    await h.call("opencode_message", { id: "queuer", message: "queued second", delivery: "queue" })
+    const out = await h.call("opencode_wait", { ids: ["queuer"], timeout_seconds: 60 })
+    assert.match(out, /IDLE/)
+    const all = await h.call("opencode_output", { id: "queuer", scope: "all" })
+    assert.match(all, /SLOW first[\s\S]*Working[\s\S]*queued second[\s\S]*Echo\[none\]: queued second/)
   })
 
   test("parallel agents: wait any reports each one once, then the next", async () => {
@@ -95,15 +144,17 @@ describe("opencode MCP server: core behaviour (real opencode, mock LLM)", { time
     assert.match(resumed, /IDLE/)
     assert.match(resumed, /Echo\[none\]: finish up/)
     assert.match(await h.call("opencode_output", { id: "slow", scope: "all" }), /SLOW task[\s\S]*interrupted[\s\S]*please also say hi[\s\S]*finish up/)
-  })
-
-  test("interrupting an idle agent is a no-op", async () => {
+    // Interrupting an idle agent is a no-op.
     assert.match(await h.call("opencode_interrupt", { id: "fast" }), /— IDLE/)
+    // Resuming a running agent is refused instead of sending "you were interrupted".
+    await h.call("opencode_spawn", { prompt: "SLOW busy", name: "busy" })
+    await assert.rejects(h.call("opencode_resume", { id: "busy" }), /running/i)
+    await h.call("opencode_interrupt", { id: "busy" })
   })
 
   test("graceful pause lets the running tool finish", async () => {
     const marker = path.join(repo, "paused.txt")
-    await h.call("opencode_spawn", { prompt: `TOOL: sleep 2 && echo done > ${marker}`, name: "pauser", permissions: "allow" })
+    await h.call("opencode_spawn", { prompt: `TOOL: sleep 4 && echo done > ${marker}`, name: "pauser", permissions: "allow" })
     await until(async () => /doing: bash/.test(await h.call("opencode_status", { ids: ["pauser"] })))
     const pausing = await h.call("opencode_interrupt", { id: "pauser", when: "after_step" })
     assert.match(pausing, /RUNNING[\s\S]*pausing after the current step/)
@@ -207,7 +258,10 @@ describe("opencode MCP server: core behaviour (real opencode, mock LLM)", { time
     const parentOut = await h.call("opencode_spawn", { prompt: "parent", name: "parent", permissions: "ask", wait: true, timeout_seconds: 60 })
     const parent = idOf(parentOut)
     // OpenCode's v2 runner has no subagent tool yet; create the child the way the legacy task tool does.
-    const [, password, url] = (await h.call("opencode_server", { action: "info" })).match(/OPENCODE_SERVER_PASSWORD=(\S+) opencode attach (\S+)/)!
+    const info = await h.call("opencode_server", { action: "info" })
+    const [, file, url] = info.match(/OPENCODE_SERVER_PASSWORD="\$\(cat (\S+)\)" opencode attach (\S+)/)!
+    const password = fs.readFileSync(file!, "utf8")
+    assert.doesNotMatch(info, new RegExp(password), "the password itself is never printed")
     const oc = createOpencodeClient({ baseUrl: url, headers: { Authorization: `Basic ${Buffer.from(`opencode:${password}`).toString("base64")}` } })
     const child = (await oc.session.create({ directory: repo, parentID: parent, title: "child" })).data!.id
     await oc.v2.session.prompt({ sessionID: child, prompt: { text: "TOOL: echo child > child.txt" } })
@@ -217,6 +271,17 @@ describe("opencode MCP server: core behaviour (real opencode, mock LLM)", { time
     const req = blocked.match(/needs permission (per_\w+)/)![1]!
     await h.call("opencode_respond", { id: "parent", request_id: req })
     await until(async () => fs.existsSync(path.join(repo, "child.txt")))
+
+    // Sessions started outside this server are listed on request and adopted
+    // with the cautious "ask" policy, never auto-approved by our defaults.
+    const outside = (await oc.session.create({ directory: repo, title: "outside" })).data!.id
+    const listed = await h.call("opencode_status", { include_untracked: true })
+    assert.match(listed, new RegExp(outside))
+    assert.doesNotMatch(await h.call("opencode_status"), new RegExp(`${outside}\\) —`))
+    const adopted = await h.call("opencode_status", { ids: [outside] })
+    assert.match(adopted, /permissions: ask\/ask/)
+    // A child id resolves to its root agent instead of being adopted on its own.
+    assert.match(await h.call("opencode_status", { ids: [child] }), new RegExp(`parent \\(${parent}\\)`))
   })
 
   test("worktree isolation: uncommitted changes, link, setup, profile, diff, merge, dispose", async () => {
@@ -265,6 +330,17 @@ describe("opencode MCP server: core behaviour (real opencode, mock LLM)", { time
     assert.match(git(repo, "status", "--porcelain"), /^\s?M README\.md/m)
     assert.doesNotMatch(git(repo, "show", "--stat", "HEAD"), /node_modules|scratch|setup/)
 
+    // A second merge only brings the new commit, not the first batch again.
+    await h.call("opencode_message", {
+      id: "iso",
+      message: 'TOOL: echo more > more.txt && git add more.txt && git commit -qm "add more"',
+      wait: true,
+      timeout_seconds: 60,
+    })
+    assert.match(await h.call("opencode_worktree", { id: "iso", action: "merge" }), /merged 1 commit\(s\)/)
+    assert.equal(git(repo, "log", "-2", "--format=%s"), "add more\nadd feature")
+    assert.match(await h.call("opencode_worktree", { id: "iso", action: "merge" }), /nothing to merge|no new commits/i)
+
     const disposed = await h.call("opencode_dispose", { id: "iso", worktree: "remove", delete_session: true })
     assert.match(disposed, /removed worktree/)
     assert.match(disposed, /kept branch horde\/iso/)
@@ -303,15 +379,6 @@ describe("opencode MCP server: core behaviour (real opencode, mock LLM)", { time
     await h.call("opencode_dispose", { id: "clash", worktree: "discard" })
   })
 
-  test("many agents in parallel and the running limit", async () => {
-    const names = ["p1", "p2", "p3", "p4", "p5", "p6"]
-    await Promise.all(names.map((n) => h.call("opencode_spawn", { prompt: `SLOW ${n}`, name: n })))
-    await assert.rejects(h.call("opencode_spawn", { prompt: "one too many" }), /6 agents are already working/)
-    await Promise.all(names.map((n) => h.call("opencode_interrupt", { id: n })))
-    const all = await h.call("opencode_wait", { ids: names, mode: "all", timeout_seconds: 60 })
-    assert.equal(all.match(/INTERRUPTED/g)?.length, 6)
-  })
-
   test("channel notifications are pushed when agents settle", async () => {
     const before = h.channel.length
     await h.call("opencode_spawn", { prompt: "ping", name: "pinger" })
@@ -323,9 +390,60 @@ describe("opencode MCP server: core behaviour (real opencode, mock LLM)", { time
   })
 
   test("transcripts are exposed as resources", async () => {
+    await h.call("opencode_spawn", { prompt: "for the record", name: "recorded", wait: true, timeout_seconds: 60 })
     const list = await h.client.listResources()
     const uri = list.resources.find((r) => r.uri.includes("/transcript"))!.uri
     const res = await h.client.readResource({ uri })
     assert.match(String((res.contents[0] as { text: string }).text), /## user/)
+  })
+})
+
+// A separate MCP server (and OpenCode server) with a small running limit and a
+// short dialog timeout, so these tests do not depend on what the suite above left running.
+describe("capacity, dialog timeouts and server restarts", { timeout: 600_000 }, () => {
+  let g: Harness
+  let gmock: Mock
+  let groot: { tmp: string; repo: string }
+
+  before(async () => {
+    gmock = await startMockLlm()
+    groot = makeRepo(gmock.url)
+    g = await connect({ ...isolatedEnv(groot.tmp, groot.repo), HORDE_OPENCODE_MAX_RUNNING: "3", HORDE_OPENCODE_DIALOG_TIMEOUT: "2" }, { elicitation: true })
+  })
+
+  after(async () => {
+    await g?.call("opencode_server", { action: "stop" }).catch(() => undefined)
+    await g?.close()
+    gmock?.close()
+  })
+
+  test("concurrent spawns never exceed the running limit", async () => {
+    const names = ["c1", "c2", "c3", "c4", "c5"]
+    const results = await Promise.allSettled(names.map((n) => g.call("opencode_spawn", { prompt: `SLOW ${n}`, name: n })))
+    const ok = results.filter((r) => r.status === "fulfilled").length
+    assert.equal(ok, 3, results.map((r) => (r.status === "rejected" ? String(r.reason) : "ok")).join("\n"))
+    for (const r of results) if (r.status === "rejected") assert.match(String(r.reason), /3 agents are already working or starting/)
+    const started = names.filter((_, i) => results[i]!.status === "fulfilled")
+    await Promise.all(started.map((n) => g.call("opencode_interrupt", { id: n })))
+    const all = await g.call("opencode_wait", { ids: started, mode: "all", timeout_seconds: 60 })
+    assert.equal(all.match(/INTERRUPTED/g)?.length, 3, all)
+    // The slots are free again.
+    assert.match(await g.call("opencode_spawn", { prompt: "after", name: "after", wait: true, timeout_seconds: 60 }), /IDLE/)
+  })
+
+  test("a dialog the human never answers falls back to the caller", async () => {
+    g.elicit.answer = () => new Promise(() => undefined)
+    const out = await g.call("opencode_spawn", { prompt: "TOOL: echo late > late.txt", name: "unanswered", wait: true, timeout_seconds: 60 })
+    assert.match(out, /NEEDS_INPUT[\s\S]*needs permission (per_\w+)/)
+    const req = out.match(/needs permission (per_\w+)/)![1]!
+    await g.call("opencode_respond", { id: "unanswered", request_id: req, decision: "once" })
+    assert.match(await g.call("opencode_wait", { ids: ["unanswered"], timeout_seconds: 60 }), /IDLE[\s\S]*DONE/)
+  })
+
+  test("stopping the server does not break later calls", async () => {
+    const stopped = await g.call("opencode_server", { action: "stop" })
+    assert.match(stopped, /Stopped/)
+    const out = await g.call("opencode_spawn", { prompt: "back again", name: "again", wait: true, timeout_seconds: 60 })
+    assert.match(out, /again .*— IDLE[\s\S]*Echo\[none\]: back again/)
   })
 })

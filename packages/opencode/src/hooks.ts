@@ -5,29 +5,75 @@ import type { Hooks, Snapshot } from "./fleet.js"
 import { truncate } from "./render.js"
 import { renderSnapshot } from "./tools.js"
 
+type Schema = Record<string, unknown>
+
+/** The dialog schema for a question request; exported for tests. */
+export function questionSchema(req: QuestionV2Request): { properties: Record<string, Schema>; required: string[] } {
+  const properties: Record<string, Schema> = {}
+  const required: string[] = []
+  req.questions.forEach((q, i) => {
+    const options = q.options.map((o) => ({ const: o.label, title: o.description ? `${o.label} — ${o.description}` : o.label }))
+    const custom = q.custom !== false
+    if (options.length && q.multiple) {
+      properties[`q${i}`] = { type: "array", title: q.question, items: { anyOf: options } }
+    } else if (options.length) {
+      properties[`q${i}`] = { type: "string", title: q.question, oneOf: options }
+      if (!custom) required.push(`q${i}`)
+    }
+    if (custom || !options.length) {
+      properties[`q${i}_text`] = { type: "string", title: options.length ? `${q.question} — or your own answer` : q.question }
+      if (!options.length) required.push(`q${i}_text`)
+    }
+  })
+  return { properties, required }
+}
+
+/** Turn dialog content back into OpenCode answers (one list of labels/text per question). */
+export function questionAnswers(req: QuestionV2Request, content: Record<string, unknown> | undefined): string[][] {
+  return req.questions.map((_, i) => {
+    const text = content?.[`q${i}_text`]
+    if (typeof text === "string" && text.trim()) return [text.trim()]
+    const choice = content?.[`q${i}`]
+    if (Array.isArray(choice)) return choice.filter((c): c is string => typeof c === "string")
+    return typeof choice === "string" ? [choice] : []
+  })
+}
+
 /** Bridges fleet events to the MCP client: elicitation dialogs and channel pushes. */
 export function makeHooks(server: McpServer, config: Config): Hooks {
   const label = (s: Snapshot) => s.name ?? s.id
   return {
-    canElicit: () => !!server.server.getClientCapabilities()?.elicitation,
+    // Only form dialogs can carry these requests. Per the MCP spec an empty
+    // `elicitation: {}` means form support; a URL-only client cannot show them.
+    canElicit: () => {
+      const caps = server.server.getClientCapabilities()?.elicitation
+      if (!caps) return false
+      return caps.form !== undefined || caps.url === undefined
+    },
 
-    async askPermission(snap: Snapshot, req: PermissionV2Request) {
-      const res = await server.server.elicitInput({
-        message: `OpenCode agent "${label(snap)}" wants permission: ${req.action}\n${truncate(req.resources.join("\n"), 1500)}\n(in ${snap.directory})`,
-        requestedSchema: {
-          type: "object",
-          properties: {
-            decision: {
-              type: "string",
-              title: "Allow?",
-              enum: ["once", "always", "reject"],
-              enumNames: ["Allow once", "Always allow this pattern", "Reject"],
+    async askPermission(snap: Snapshot, req: PermissionV2Request, signal: AbortSignal) {
+      const res = await server.server.elicitInput(
+        {
+          message: `OpenCode agent "${label(snap)}" wants permission: ${req.action}\n${truncate(req.resources.join("\n"), 1500)}\n(in ${snap.directory})`,
+          requestedSchema: {
+            type: "object",
+            properties: {
+              decision: {
+                type: "string",
+                title: "Allow?",
+                oneOf: [
+                  { const: "once", title: "Allow once" },
+                  { const: "always", title: "Always allow this pattern" },
+                  { const: "reject", title: "Reject" },
+                ],
+              },
+              message: { type: "string", title: "Note to the agent (optional, used when rejecting)" },
             },
-            message: { type: "string", title: "Note to the agent (optional, used when rejecting)" },
+            required: ["decision"],
           },
-          required: ["decision"],
         },
-      })
+        { signal, timeout: config.elicitTimeoutMs },
+      )
       if (res.action === "accept") {
         const decision = res.content?.decision
         const reply = decision === "always" || decision === "reject" ? decision : "once"
@@ -38,38 +84,18 @@ export function makeHooks(server: McpServer, config: Config): Hooks {
       return undefined // dismissed: leave it for the orchestrating model
     },
 
-    async askQuestion(snap: Snapshot, req: QuestionV2Request) {
-      const properties: Record<string, object> = {}
-      req.questions.forEach((q, i) => {
-        const labels = q.options.map((o) => o.label)
-        if (labels.length && !q.multiple) {
-          properties[`q${i}`] = { type: "string", title: q.question, enum: labels, enumNames: q.options.map((o) => `${o.label} — ${o.description}`) }
-        }
-        if (q.custom !== false || !labels.length || q.multiple) {
-          properties[`q${i}_text`] = {
-            type: "string",
-            title: labels.length ? `${q.question} — or your own answer${q.multiple ? " (comma-separated options)" : ""}` : q.question,
-          }
-        }
-      })
-      const res = await server.server.elicitInput({
-        message: `OpenCode agent "${label(snap)}" asks:`,
-        requestedSchema: { type: "object", properties: properties as never },
-      })
+    async askQuestion(snap: Snapshot, req: QuestionV2Request, signal: AbortSignal) {
+      const { properties, required } = questionSchema(req)
+      const res = await server.server.elicitInput(
+        {
+          message: `OpenCode agent "${label(snap)}" asks:`,
+          requestedSchema: { type: "object", properties: properties as never, ...(required.length ? { required } : {}) },
+        },
+        { signal, timeout: config.elicitTimeoutMs },
+      )
       if (res.action === "decline") return "dismiss" as const
       if (res.action !== "accept") return undefined
-      return req.questions.map((q, i) => {
-        const text = res.content?.[`q${i}_text`]
-        if (typeof text === "string" && text.trim())
-          return q.multiple
-            ? text
-                .split(",")
-                .map((t) => t.trim())
-                .filter(Boolean)
-            : [text.trim()]
-        const choice = res.content?.[`q${i}`]
-        return typeof choice === "string" ? [choice] : []
-      })
+      return questionAnswers(req, res.content as Record<string, unknown> | undefined)
     },
 
     settled(snap: Snapshot) {

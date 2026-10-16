@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto"
 import fs from "node:fs/promises"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
@@ -5,8 +6,8 @@ import type { AgentV2Info, ModelRef, ModelV2Info, PermissionV2Request, QuestionV
 import type { Backend } from "./backend.js"
 import type { Config, PermissionPolicy } from "./config.js"
 import { type Detail, inputSummary, oneLine, renderTranscript } from "./render.js"
-import type { AgentRecord, Limits, Store } from "./state.js"
-import { apply, currentTurn, type DurableEvent, emptyTrack, type Track, type Turn, turnsSince } from "./tracker.js"
+import { type AgentRecord, type Limits, ownerAlive, SELF, type Store } from "./state.js"
+import { apply, type CostEstimator, costSince, currentTurn, type DurableEvent, emptyTrack, latestTool, type Track, type Turn, turnsSince } from "./tracker.js"
 import { commitAll, createWorktree, excludeFromGit, mergeWorktree, removeWorktree, type Worktree, worktreeDiff } from "./worktree.js"
 
 /**
@@ -20,11 +21,18 @@ export type AgentState = "running" | "needs_input" | "idle" | "interrupted" | "e
 export const SETTLED: ReadonlySet<AgentState> = new Set(["needs_input", "idle", "interrupted", "error"])
 export type QuestionPolicy = AgentRecord["questions"]
 
-/** A freshly prompted or quiet turn gets this long before we call it stuck. */
+/** A quiet open turn gets this long before we call it stuck. */
 const GRACE_MS = 10_000
+/** An admitted prompt gets this long to start (a fresh directory needs time to load). */
+const START_GRACE_MS = 30_000
+const FIRST_START_GRACE_MS = 60_000
 const POLL_MS = 1_000
-const IDLE_REFRESH_MS = 15_000
+/** Settled agents are mostly kept current by events; poll them slowly as a safety net. */
+const SETTLED_REFRESH_MS = 60_000
+const DORMANT_REFRESH_MS = 10 * 60_000
 const CHILD_SCAN_MS = 30_000
+/** A child session with no activity for this long is no longer polled. */
+const CHILD_COOL_MS = 60_000
 
 export interface Pending {
   permissions: PermissionV2Request[]
@@ -74,19 +82,21 @@ export interface SpawnInput {
   profile?: Profile
   directory?: string
   isolation?: "none" | "worktree"
-  worktree?: { includeUncommitted?: boolean; link?: string[]; setup?: string }
+  worktree?: { includeUncommitted?: boolean; link?: string[]; setup?: string; submodules?: boolean }
   permissions?: PermissionPolicy
   questions?: QuestionPolicy
   limits?: Limits
   files?: string[]
+  signal?: AbortSignal
+  onProgress?: (message: string) => void
 }
 
 export interface Hooks {
-  /** True when the client can show elicitation dialogs to the human. */
+  /** True when the client can show form dialogs to the human. */
   canElicit(): boolean
-  askPermission(snap: Snapshot, req: PermissionV2Request): Promise<{ reply: "once" | "always" | "reject"; message?: string } | undefined>
-  askQuestion(snap: Snapshot, req: QuestionV2Request): Promise<string[][] | "dismiss" | undefined>
-  /** Called once each time an agent settles (channel push). */
+  askPermission(snap: Snapshot, req: PermissionV2Request, signal: AbortSignal): Promise<{ reply: "once" | "always" | "reject"; message?: string } | undefined>
+  askQuestion(snap: Snapshot, req: QuestionV2Request, signal: AbortSignal): Promise<string[][] | "dismiss" | undefined>
+  /** Called when an agent settles or newly needs input (channel push). */
   settled(snap: Snapshot): void
 }
 
@@ -99,19 +109,36 @@ interface Live {
   error?: string
   pending: Pending
   children: Set<string>
+  childTracks: Map<string, Track>
+  /** Children with recent activity: only these are polled. */
+  hotChildren: Map<string, number>
   liveText: string
   retry?: { attempt: number; message: string }
   lastRefresh: number
   lastChildScan: number
-  /** Request ids we already handled automatically or are asking the human about. */
+  /** Request ids answered automatically or currently shown to the human. */
   handled: Set<string>
+  /** Open dialogs, so a caller's answer can close them. */
+  dialogs: Map<string, AbortController>
   /** Request ids already shown to the caller by opencode_wait. */
   reportedRequests: Set<string>
-  /** Requests the human dismissed: they go to the calling model instead. */
+  /** Requests the human dismissed (or a dialog failed): they go to the calling model. */
   handedToCaller: Set<string>
   /** When the agent last went from running to settled. */
   settledAt: number
-  lock: Promise<unknown>
+  /** Bumped on every prompt we send; refreshes started before it do not publish state. */
+  gen: number
+  /**
+   * A prompt we sent that history does not show yet. OpenCode can answer the
+   * prompt call before the admission is readable, and until then the previous
+   * (settled) turn would look current.
+   */
+  sent?: { at: number; seq: number }
+  /** Local time a turn was first seen live, for time limits that do not depend on server clocks. */
+  turnSeen: Map<number, number>
+  lastPushKey?: string
+  running?: Promise<void>
+  queued?: Promise<void>
 }
 
 type Res<T> = { data?: T; error?: unknown; response?: Response }
@@ -152,14 +179,24 @@ export function defaultQuestionPolicy(p: PermissionPolicy): QuestionPolicy {
   return p === "user" ? "user" : p === "ask" ? "ask" : "dismiss"
 }
 
+/** Drop undefined values, so a partial update never erases other fields. */
+export function defined<T extends object>(o: T): Partial<T> {
+  return Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined)) as Partial<T>
+}
+
 /** Orchestrates OpenCode sessions ("agents") through the OpenCode v2 API. */
 export class Fleet {
   private readonly live = new Map<string, Live>()
   private readonly childToRoot = new Map<string, string>()
+  /** Sessions disposed or found missing in this process: never re-adopt them implicitly. */
+  private readonly gone = new Set<string>()
   private readonly modelCache = new Map<string, { at: number; models: ModelV2Info[] }>()
   private readonly wakeups = new Set<() => void>()
+  /** Spawns in progress, counted against the running limit. */
+  private reserved = 0
   private monitor?: NodeJS.Timeout
   private monitoring = false
+  private closed = false
 
   constructor(
     private readonly backend: Backend,
@@ -167,18 +204,38 @@ export class Fleet {
     private readonly store: Store,
     private readonly hooks: Hooks,
   ) {
-    for (const record of store.agents(this.serverKey)) this.adoptRecord(record)
-    backend.events.on("event", (e: V2Event) => this.onEvent(e))
+    this.syncStore()
+    backend.events.on("event", (e: V2Event) => {
+      try {
+        this.onEvent(e)
+      } catch {
+        // Never let a bug here break the event stream.
+      }
+    })
     this.monitor = setInterval(() => void this.tick(), POLL_MS)
     this.monitor.unref()
   }
 
+  /** Stop monitoring and hand our agents over: another MCP process may claim them at once. */
   close() {
+    this.closed = true
     if (this.monitor) clearInterval(this.monitor)
+    for (const d of this.liveDialogs()) d.abort()
+    for (const l of this.live.values()) {
+      try {
+        this.store.update(l.record.id, { owner: undefined })
+      } catch {
+        // best effort
+      }
+    }
+  }
+
+  private *liveDialogs() {
+    for (const l of this.live.values()) yield* l.dialogs.values()
   }
 
   private get serverKey() {
-    return this.backend.info.url
+    return this.backend.info.key
   }
 
   private get api() {
@@ -198,8 +255,23 @@ export class Fleet {
       if (models.length) break
       await sleep(250)
     }
-    this.modelCache.set(dir, { at: Date.now(), models })
+    if (models.length) this.modelCache.set(dir, { at: Date.now(), models })
     return models
+  }
+
+  /**
+   * OpenCode 1.19's v2 runner reports every step as free, so price steps from
+   * the catalog (USD per million tokens; reasoning is billed as output).
+   */
+  private estimator(directory: string): CostEstimator {
+    return (model, tok) => {
+      const info = this.modelCache.get(directory)?.models.find((m) => m.providerID === model.providerID && m.id === model.id)
+      if (!info?.cost?.length) return undefined
+      const context = tok.input + tok.cacheRead + tok.cacheWrite
+      const tiers = info.cost.filter((c) => !c.tier || c.tier.size <= context).sort((a, b) => (a.tier?.size ?? 0) - (b.tier?.size ?? 0))
+      const p = tiers[tiers.length - 1] ?? info.cost[0]!
+      return (tok.input * p.input + (tok.output + tok.reasoning) * p.output + tok.cacheRead * p.cache.read + tok.cacheWrite * p.cache.write) / 1_000_000
+    }
   }
 
   async agents(directory?: string): Promise<AgentV2Info[]> {
@@ -215,6 +287,7 @@ export class Fleet {
 
   private async validateModel(ref: ModelRef, directory: string) {
     const models = await this.models(directory)
+    if (!models.length) throw new Error("OpenCode reports no models at all. Configure a provider (opencode auth login, or opencode.json) and retry.")
     const found = models.find((m) => m.providerID === ref.providerID && m.id === ref.id)
     if (!found) {
       const needle = ref.id.toLowerCase()
@@ -249,54 +322,92 @@ export class Fleet {
 
   // ------------------------------------------------------------ lifecycle
 
-  private runningCount(): number {
-    let n = 0
-    for (const l of this.live.values()) if (l.state === "running" || l.state === "needs_input") n++
-    return n
+  private working(l: Live) {
+    return l.state === undefined || l.state === "running" || l.state === "needs_input"
   }
 
-  private checkCapacity() {
-    if (this.config.maxRunning > 0 && this.runningCount() >= this.config.maxRunning) {
-      const busy = [...this.live.values()].filter((l) => l.state === "running" || l.state === "needs_input").map((l) => l.record.name ?? l.record.id)
-      throw new Error(
-        `${busy.length} agents are already working (limit HORDE_OPENCODE_MAX_RUNNING=${this.config.maxRunning}): ${busy.join(", ")}. Wait for one with opencode_wait, or stop one.`,
-      )
+  /** Reserve a running slot synchronously, so concurrent calls cannot exceed the limit. */
+  private reserve(): () => void {
+    if (this.config.maxRunning > 0) {
+      const busy = [...this.live.values()].filter((l) => this.working(l)).map((l) => l.record.name ?? l.record.id)
+      if (busy.length + this.reserved >= this.config.maxRunning) {
+        throw new Error(
+          `${busy.length + this.reserved} agents are already working or starting (limit HORDE_OPENCODE_MAX_RUNNING=${this.config.maxRunning})${busy.length ? `: ${busy.join(", ")}` : ""}. Wait for one with opencode_wait, or stop one.`,
+        )
+      }
+    }
+    this.reserved++
+    let released = false
+    return () => {
+      if (!released) this.reserved--
+      released = true
     }
   }
 
+  private resolveDir(dir?: string): string {
+    return path.resolve(this.config.directory, dir ?? ".")
+  }
+
+  /** Agents not refreshed yet (e.g. after a restart) count as working; find out first. */
+  private async refreshUnknown() {
+    const unknown = [...this.live.values()].filter((l) => l.state === undefined)
+    if (!unknown.length) return
+    const active = await this.activeSet().catch(() => undefined)
+    await Promise.allSettled(unknown.map((l) => this.refresh(l, active)))
+  }
+
   async spawn(input: SpawnInput): Promise<{ snapshot: Snapshot; notes: string[] }> {
-    this.checkCapacity()
-    let directory = path.resolve(input.directory ?? this.config.directory)
+    if (this.config.maxRunning > 0) await this.refreshUnknown()
+    const release = this.reserve()
+    try {
+      return await this.spawnReserved(input)
+    } finally {
+      release()
+    }
+  }
+
+  private async spawnReserved(input: SpawnInput): Promise<{ snapshot: Snapshot; notes: string[] }> {
+    let directory = this.resolveDir(input.directory)
     const stat = await fs.stat(directory).catch(() => undefined)
     if (!stat?.isDirectory()) throw new Error(`directory does not exist: ${directory}`)
     if (input.name) {
       if (!/^[A-Za-z0-9._-]{1,64}$/.test(input.name)) throw new Error("name may only contain letters, digits, '.', '_' and '-' (max 64)")
-      if (this.findByName(input.name)) throw new Error(`an agent named "${input.name}" already exists; pick another name or dispose it`)
+      this.syncStore()
+      const taken = this.findByName(input.name) ?? this.store.agents(this.serverKey).find((r) => r.name === input.name)
+      if (taken) throw new Error(`an agent named "${input.name}" already exists; pick another name or dispose it`)
     }
+    if (input.profile && input.agent) throw new Error("pass either agent (an existing profile) or profile (a custom one), not both")
     const model = input.model ? parseModel(input.model, input.variant) : undefined
     if (!model && input.variant) throw new Error("variant requires model (pick one with opencode_models)")
     if (model) await this.validateModel(model, directory)
     if (input.agent) await this.validateAgent(input.agent, directory)
-    if (input.profile && input.agent) throw new Error("pass either agent (an existing profile) or profile (a custom one), not both")
+    // Read attachments before anything is created, so a typo fails cleanly.
+    const prepared = await prepareFiles(input.files ?? [], directory)
 
     const notes: string[] = []
-    const name = input.name ?? `agent-${Date.now().toString(36)}`
+    const name = input.name ?? `agent-${Date.now().toString(36)}${randomBytes(2).toString("hex")}`
     let worktree: Worktree | undefined
-    if (input.isolation === "worktree") {
-      const made = await createWorktree(directory, name, {
-        rootDir: this.config.worktreeDir,
-        includeUncommitted: input.worktree?.includeUncommitted ?? true,
-        link: input.worktree?.link ?? [],
-        setup: input.worktree?.setup,
-      })
-      worktree = made.worktree
-      notes.push(...made.notes)
-      directory = worktree.path
-    }
-
-    let agent = input.agent
     let agentFile: string | undefined
+    let sessionId: string | undefined
+    let prompted = false
     try {
+      if (input.isolation === "worktree") {
+        const made = await createWorktree(directory, name, {
+          rootDir: this.config.worktreeDir,
+          includeUncommitted: input.worktree?.includeUncommitted ?? true,
+          link: input.worktree?.link ?? [],
+          setup: input.worktree?.setup,
+          submodules: input.worktree?.submodules,
+          signal: input.signal,
+          onProgress: input.onProgress,
+        })
+        worktree = made.worktree
+        notes.push(...made.notes)
+        directory = worktree.path
+        // Re-resolve attachments relative to the worktree (they were checked in the original directory).
+      }
+      if (input.signal?.aborted) throw new Error("cancelled")
+      let agent = input.agent
       if (input.profile) {
         const made = await this.writeProfile(directory, name, input.profile)
         agent = made.agent
@@ -306,24 +417,27 @@ export class Fleet {
         await this.api.session.create({ location: { directory }, ...(model ? { model } : {}), ...(agent ? { agent } : {}) }),
         "creating session",
       ).data
+      sessionId = session.id
       // v2 cannot set titles; the legacy endpoint can, and it makes agents recognisable in the TUI.
       await this.backend.client.session.update({ sessionID: session.id, directory, title: `horde: ${name}` }).catch(() => undefined)
       const policy = input.permissions ?? this.config.defaultPermissions
       const record: AgentRecord = {
         id: session.id,
-        name: input.name,
+        name: input.name ?? name,
         server: this.serverKey,
         directory,
         policy,
         questions: input.questions ?? defaultQuestionPolicy(policy),
         worktree,
-        limits: input.limits ?? {},
+        limits: defined(input.limits ?? {}),
         agentFile,
         createdAt: Date.now(),
+        owner: SELF,
         reportedSeq: 0,
       }
       this.store.put(record)
-      this.adoptRecord(record)
+      const live = this.adoptRecord(record)
+      live.loaded = true // a brand-new session has no history to replay
       const preamble: string[] = []
       if (input.instructions) preamble.push(`<instructions>\n${input.instructions}\n</instructions>`)
       if (worktree) {
@@ -332,12 +446,27 @@ export class Fleet {
         )
       }
       const text = preamble.length ? `${preamble.join("\n\n")}\n\n${input.prompt}` : input.prompt
-      await this.prompt(session.id, text, { files: input.files, directory })
-      return { snapshot: await this.snapshot(session.id), notes }
+      await this.sendPrompt(live, text, prepared)
+      prompted = true
     } catch (err) {
-      if (agentFile) await fs.rm(agentFile, { force: true })
-      if (worktree) await removeWorktree(worktree, name, true).catch(() => undefined)
+      // Nothing is running yet: undo everything.
+      if (!prompted) {
+        if (sessionId) {
+          this.forget(sessionId)
+          await this.backend.client.session.delete({ sessionID: sessionId, directory }).catch(() => undefined)
+        }
+        if (agentFile) await fs.rm(agentFile, { force: true })
+        if (worktree) await removeWorktree(worktree, name, true).catch(() => undefined)
+      }
       throw err
+    }
+    // The agent is running now; a failing status read must not undo or duplicate it.
+    const live = this.live.get(sessionId!)!
+    try {
+      return { snapshot: await this.snapshot(sessionId!), notes }
+    } catch (err) {
+      notes.push(`(status unavailable right now: ${(err as Error).message})`)
+      return { snapshot: this.build(live), notes }
     }
   }
 
@@ -389,107 +518,119 @@ export class Fleet {
       limits?: Limits
     } = {},
   ): Promise<Snapshot> {
-    const live = this.get(ref)
+    const live = await this.get(ref)
     const id = live.record.id
-    await this.refresh(id)
-    if (live.state && SETTLED.has(live.state) && live.state !== "needs_input") this.checkCapacity()
-    const session = await this.session(id)
-    if (opts.model || opts.variant) {
-      const current = session.model
-      const model = opts.model
-        ? parseModel(opts.model, opts.variant)
-        : current
-          ? { providerID: current.providerID, id: current.id, variant: opts.variant }
-          : undefined
-      if (!model) throw new Error("variant requires model: the agent has no explicit model yet")
-      await this.validateModel(model, session.location.directory)
-      unwrap(await this.api.session.switchModel({ sessionID: id, model }), "switching model")
+    await this.refresh(live)
+    if (this.config.maxRunning > 0) await this.refreshUnknown()
+    // Waking a settled agent takes a running slot.
+    const release = live.state && SETTLED.has(live.state) && live.state !== "needs_input" ? this.reserve() : () => undefined
+    try {
+      const session = await this.session(id)
+      const directory = session.location.directory
+      const prepared = await prepareFiles(opts.files ?? [], directory)
+      if (opts.model || opts.variant) {
+        const current = session.model ?? live.track.model
+        const model = opts.model
+          ? parseModel(opts.model, opts.variant)
+          : current
+            ? { providerID: current.providerID, id: current.id, variant: opts.variant }
+            : undefined
+        if (!model) throw new Error("variant requires model: the agent's model is not known yet; pass model too")
+        await this.validateModel(model, directory)
+        unwrap(await this.api.session.switchModel({ sessionID: id, model }), "switching model")
+      }
+      if (opts.agent) {
+        await this.validateAgent(opts.agent, directory)
+        unwrap(await this.api.session.switchAgent({ sessionID: id, agent: opts.agent }), "switching agent")
+      }
+      const patch: Partial<AgentRecord> = {}
+      if (opts.permissions) {
+        patch.policy = opts.permissions
+        if (!opts.questions) patch.questions = defaultQuestionPolicy(opts.permissions)
+      }
+      if (opts.questions) patch.questions = opts.questions
+      if (opts.limits) patch.limits = { ...live.record.limits, ...defined(opts.limits) }
+      if (Object.keys(patch).length) this.updateRecord(id, patch)
+      await this.sendPrompt(live, text, prepared, opts.delivery)
+    } finally {
+      release()
     }
-    if (opts.agent) {
-      await this.validateAgent(opts.agent, session.location.directory)
-      unwrap(await this.api.session.switchAgent({ sessionID: id, agent: opts.agent }), "switching agent")
-    }
-    const patch: Partial<AgentRecord> = {}
-    if (opts.permissions) {
-      patch.policy = opts.permissions
-      if (!opts.questions) patch.questions = defaultQuestionPolicy(opts.permissions)
-    }
-    if (opts.questions) patch.questions = opts.questions
-    if (opts.limits) patch.limits = { ...live.record.limits, ...opts.limits }
-    if (Object.keys(patch).length) this.updateRecord(id, patch)
-    await this.prompt(id, text, { delivery: opts.delivery, files: opts.files, directory: session.location.directory })
     return this.snapshot(id)
   }
 
-  private async prompt(id: string, text: string, opts: { delivery?: "steer" | "queue"; files?: string[]; directory: string }) {
-    // Text files are inlined: many providers reject text/plain file parts.
-    // Binary files (images, PDFs) are attached for models that accept them.
-    const files: { uri: string; name: string }[] = []
-    const inlined: string[] = []
-    for (const f of opts.files ?? []) {
-      const abs = path.resolve(opts.directory, f)
-      const buf = await fs.readFile(abs).catch(() => {
-        throw new Error(`attachment not found: ${abs}`)
-      })
-      const isText = !buf.subarray(0, 8192).includes(0)
-      if (isText && buf.length <= 256 * 1024) inlined.push(`<file path="${path.relative(opts.directory, abs) || abs}">\n${buf.toString("utf8")}\n</file>`)
-      else files.push({ uri: pathToFileURL(abs).href, name: path.basename(abs) })
-    }
-    const body = inlined.length ? `${text}\n\n${inlined.join("\n\n")}` : text
+  private async sendPrompt(live: Live, text: string, prepared: Prepared, delivery?: "steer" | "queue") {
+    const body = prepared.inlined.length ? `${text}\n\n${prepared.inlined.join("\n\n")}` : text
     unwrap(
       await this.api.session.prompt({
-        sessionID: id,
-        prompt: { text: body, ...(files.length ? { files } : {}) },
-        delivery: opts.delivery ?? "steer",
+        sessionID: live.record.id,
+        prompt: { text: body, ...(prepared.files.length ? { files: prepared.files } : {}) },
+        delivery: delivery ?? "steer",
       }),
       "sending prompt",
     )
-    this.updateRecord(id, { interruptedAt: undefined, stopReason: undefined, pauseAfterStep: undefined })
-    const live = this.live.get(id)
-    if (live) {
-      live.state = "running"
-      live.liveText = ""
-    }
+    // Any refresh that started before this point must not publish its (now stale) state.
+    live.gen++
+    live.state = "running"
+    live.liveText = ""
+    live.sent = { at: Date.now(), seq: live.track.seq }
+    this.updateRecord(live.record.id, { interruptedSeq: undefined, stopReason: undefined, pauseAfterStep: undefined })
   }
 
   async interrupt(ref: string, when: "now" | "after_step" = "now", reason?: string): Promise<Snapshot> {
-    const live = this.get(ref)
+    const live = await this.get(ref)
     const id = live.record.id
-    await this.refresh(id)
+    await this.refresh(live)
     if (live.state !== "running" && live.state !== "needs_input") return this.snapshot(id)
-    if (when === "after_step" && live.track.stepOpen) {
+    if (when === "after_step" && (live.track.stepOpen || live.track.openTools.size)) {
       this.updateRecord(id, { pauseAfterStep: true, stopReason: reason ?? "paused after step" })
       return this.snapshot(id)
     }
-    await this.interruptNow(id, reason)
+    await this.interruptNow(live, reason ?? "interrupted by the orchestrator")
     await this.waitFor([id], "all", 5_000, { markReported: false })
     return this.snapshot(id)
   }
 
-  private async interruptNow(id: string, reason?: string) {
-    const tree = [id, ...(this.live.get(id)?.children ?? [])]
-    await Promise.all(tree.map((sid) => this.api.session.interrupt({ sessionID: sid })))
-    this.updateRecord(id, { interruptedAt: Date.now(), pauseAfterStep: undefined, ...(reason ? { stopReason: reason } : {}) })
+  private async interruptNow(live: Live, reason: string) {
+    const tree = [live.record.id, ...live.children]
+    await Promise.all(tree.map((sid) => this.api.session.interrupt({ sessionID: sid }).catch(() => undefined)))
+    this.updateRecord(live.record.id, { interruptedSeq: live.track.seq, pauseAfterStep: undefined, stopReason: reason })
+    live.sent = undefined
+    // Settled by us, not by a refresh: record it as news for the next wait.
+    if (!live.state || !SETTLED.has(live.state)) {
+      live.liveText = ""
+      live.settledAt = Date.now()
+    }
+    live.state = "interrupted"
+    live.error = reason
   }
 
   async respond(ref: string, requestID: string, reply: { decision?: "once" | "always" | "reject"; message?: string; answers?: string[][] }): Promise<Snapshot> {
-    const live = this.get(ref)
+    const live = await this.get(ref)
     const id = live.record.id
-    await this.refresh(id)
-    if (live.handled.has(`asking:${requestID}`)) throw new Error(`${requestID} is currently being shown to the user; their answer will be applied`)
+    await this.refresh(live)
     const perm = live.pending.permissions.find((p) => p.id === requestID)
     const question = live.pending.questions.find((q) => q.id === requestID)
-    if (perm) {
-      await this.replyPermission(perm, reply.decision ?? "once", reply.message)
-    } else if (question) {
-      if (reply.decision === "reject") await this.rejectQuestion(question)
-      else if (reply.answers) await this.answerQuestion(question, reply.answers)
-      else await this.dismissQuestion(question)
-    } else {
+    if (!perm && !question) {
       const known = [...live.pending.permissions, ...live.pending.questions].map((r) => r.id)
       throw new Error(`no pending request ${requestID} on ${live.record.name ?? id}.${known.length ? ` Pending: ${known.join(", ")}` : " Nothing is pending."}`)
     }
+    // The caller's answer wins over a dialog that is still open (removed first,
+    // so its abort is not mistaken for a dismissal).
+    const dialog = live.dialogs.get(requestID)
+    live.dialogs.delete(requestID)
+    dialog?.abort()
     live.handled.add(requestID)
+    try {
+      if (perm) await this.replyPermission(perm, reply.decision ?? "once", reply.message)
+      else if (question) {
+        if (reply.decision === "reject") await this.rejectQuestion(question)
+        else if (reply.answers) await this.answerQuestion(question, reply.answers)
+        else await this.dismissQuestion(question)
+      }
+    } catch (err) {
+      live.handled.delete(requestID)
+      throw err
+    }
     return this.snapshot(id)
   }
 
@@ -517,25 +658,28 @@ export class Fleet {
   }
 
   async dispose(ref: string, opts: { worktree?: "keep" | "remove" | "discard"; deleteSession?: boolean }): Promise<string> {
-    const live = this.get(ref)
+    const live = await this.get(ref)
     const id = live.record.id
     const name = live.record.name ?? id
     const notes: string[] = []
-    await this.refresh(id).catch(() => undefined)
+    await this.refresh(live).catch(() => undefined)
     if (live.state === "running" || live.state === "needs_input") {
-      await this.interruptNow(id, "disposed")
+      await this.interruptNow(live, "disposed")
       notes.push("interrupted the running turn")
     }
     const wt = live.record.worktree
     if (wt) {
       const mode = opts.worktree ?? "keep"
-      // Let OpenCode release the directory before it disappears.
-      if (mode !== "keep") await this.backend.client.instance.dispose({ directory: wt.path }).catch(() => undefined)
       if (mode === "keep") {
-        const committed = await commitAll(wt, `horde: uncommitted work from ${name}`).catch(() => undefined)
+        const committed = await commitAll(wt, `horde: uncommitted work from ${name}`).catch((e: Error) => `could not commit leftovers: ${e.message}`)
         if (committed) notes.push(committed)
         notes.push(`kept worktree ${wt.root} (branch ${wt.branch})`)
-      } else notes.push(await removeWorktree(wt, name, mode === "discard"))
+      } else {
+        // Let OpenCode release the directory before it disappears.
+        await this.backend.client.instance.dispose({ directory: wt.path }).catch(() => undefined)
+        // Throws without removing anything if leftover work cannot be committed safely.
+        notes.push(await removeWorktree(wt, name, mode === "discard"))
+      }
     }
     if (live.record.agentFile) await fs.rm(live.record.agentFile, { force: true })
     if (opts.deleteSession) {
@@ -543,23 +687,23 @@ export class Fleet {
       const res = await this.backend.client.session.delete({ sessionID: id, directory: live.session?.location.directory ?? live.record.directory })
       notes.push(res.response?.ok ? `deleted session ${id}` : `could not delete session ${id} (HTTP ${res.response?.status})`)
     } else notes.push(`the session ${id} stays in OpenCode history`)
-    this.live.delete(id)
-    for (const c of live.children) this.childToRoot.delete(c)
-    this.store.remove(id)
+    this.forget(id)
     notes.push(`stopped tracking ${name}`)
     return notes.join("\n")
   }
 
   async worktree(ref: string, action: "diff" | "commit" | "merge", opts: { strategy?: "merge" | "squash"; maxChars?: number }): Promise<string> {
-    const live = this.get(ref)
+    const live = await this.get(ref)
     const wt = live.record.worktree
     const name = live.record.name ?? live.record.id
     if (!wt) throw new Error(`${name} does not run in a worktree (spawn with isolation "worktree")`)
     if (action === "diff") return worktreeDiff(wt, opts.maxChars ?? 20_000)
-    await this.refresh(live.record.id)
-    if (live.state === "running") throw new Error(`${name} is still running; wait for it or interrupt it first`)
+    await this.refresh(live)
+    if (this.working(live) && live.state !== "needs_input") throw new Error(`${name} is still running; wait for it or interrupt it first`)
     if (action === "commit") return (await commitAll(wt, `horde: work from ${name}`)) ?? "nothing to commit"
-    return mergeWorktree(wt, name, opts.strategy ?? "merge")
+    const result = await mergeWorktree(wt, name, opts.strategy ?? "merge")
+    if (result.merged && result.merged !== wt.merged) this.updateRecord(live.record.id, { worktree: { ...wt, merged: result.merged } })
+    return result.text
   }
 
   // --------------------------------------------------------------- reading
@@ -573,76 +717,157 @@ export class Fleet {
     return new Set(Object.keys(res.data))
   }
 
-  /** Refresh one agent: new history, children, pending requests, derived state, policies, limits. */
-  refresh(id: string, active?: Set<string>): Promise<void> {
-    const live = this.live.get(id)
-    if (!live) return Promise.reject(new Error(`unknown agent ${id}`))
-    const run = live.lock.then(() => this.doRefresh(live, active))
-    live.lock = run.catch(() => undefined)
+  /**
+   * Refresh one agent. Concurrent requests are coalesced: at most one refresh
+   * runs and one more is queued, and every caller sees a refresh that started
+   * after its call.
+   */
+  private refresh(live: Live, active?: Set<string>): Promise<void> {
+    if (live.queued) return live.queued
+    if (live.running) {
+      live.queued = live.running
+        .catch(() => undefined)
+        .then(() => {
+          live.queued = undefined
+          return this.runRefresh(live)
+        })
+      return live.queued
+    }
+    return this.runRefresh(live, active)
+  }
+
+  private runRefresh(live: Live, active?: Set<string>): Promise<void> {
+    const run = this.doRefresh(live, active).finally(() => {
+      if (live.running === run) live.running = undefined
+    })
+    live.running = run
     return run
   }
 
   private async doRefresh(live: Live, activeIn?: Set<string>) {
     const id = live.record.id
+    const gen = live.gen
+    const before = live.state
     const sessionRes = await this.api.session.get({ sessionID: id })
     if (sessionRes.response?.status === 404) {
-      this.live.delete(id)
-      this.store.remove(id)
-      throw new Error(`session ${id} does not exist on this OpenCode server (deleted, or from another server); stopped tracking it`)
+      this.forget(id)
+      throw new Error(`session ${id} no longer exists on the OpenCode server (deleted?); stopped tracking it`)
     }
     live.session = unwrap(sessionRes, `loading session ${id}`).data
 
     // Durable history since the last seq we applied.
-    for (let page = 0; page < 1000; page++) {
-      const res = unwrap(await this.api.session.history({ sessionID: id, after: live.track.seq, limit: 100 }), "reading session history")
-      for (const e of res.data as DurableEvent[]) apply(live.track, e)
-      if (res.data.length < 100) break
-    }
+    const replaying = !live.loaded
+    const turnsBefore = live.track.turns.length ? currentTurn(live.track)!.startSeq : -1
+    await this.readHistory(id, live.track, live.session.location.directory)
+    const sent = live.sent
+    if (sent && (live.track.lastPromptedSeq > sent.seq || [...live.track.admitted.values()].some((a) => a.seq > sent.seq))) live.sent = undefined
+    const turn = currentTurn(live.track)
+    if (!replaying && turn && turn.startSeq !== turnsBefore) live.turnSeen.set(turn.startSeq, Date.now())
     live.loaded = true
+    if (live.record.adoptPending) this.finishAdoption(live)
+    if (live.record.directory !== live.session.location.directory) this.updateRecord(id, { directory: live.session.location.directory })
 
-    if (Date.now() - live.lastChildScan > CHILD_SCAN_MS) await this.scanChildren(live).catch(() => undefined)
-
-    const tree = [id, ...live.children]
+    const active = activeIn ?? (await this.activeSet())
+    const now = Date.now()
+    for (const c of live.children) if (active.has(c)) live.hotChildren.set(c, now)
+    if (now - live.lastChildScan > CHILD_SCAN_MS && this.working(live)) await this.scanChildren(live).catch(() => undefined)
+    for (const [c, at] of live.hotChildren) if (now - at > CHILD_COOL_MS && !active.has(c)) live.hotChildren.delete(c)
+    // Child histories (for cost limits) and requests, only for children with recent activity.
+    const hot = [...live.hotChildren.keys()]
+    for (const c of hot) {
+      let t = live.childTracks.get(c)
+      if (!t) {
+        t = emptyTrack()
+        live.childTracks.set(c, t)
+      }
+      await this.readHistory(c, t, live.session.location.directory).catch(() => undefined)
+    }
+    const tree = [id, ...hot]
     const [perms, questions] = await Promise.all([
       Promise.all(tree.map(async (sid) => unwrap(await this.api.session.permission.list({ sessionID: sid }), "listing permissions").data)),
       Promise.all(tree.map(async (sid) => unwrap(await this.api.session.question.list({ sessionID: sid }), "listing questions").data)),
     ])
     live.pending = { permissions: perms.flat(), questions: questions.flat() }
-    const active = activeIn ?? (await this.activeSet())
-    const before = live.state
+    this.pruneRequestSets(live)
+
+    if (live.record.pauseAfterStep && !live.track.inLoop) this.updateRecord(id, { pauseAfterStep: undefined })
+    // Interrupting before the loop picked up the prompt is a no-op in OpenCode, so
+    // the turn may start afterwards: stop it again once it does.
+    const marker = live.record.interruptedSeq
+    const cur = currentTurn(live.track)
+    if (marker !== undefined && cur && live.track.inLoop && cur.startSeq > marker && cur.admittedSeq <= marker && live.gen === gen) {
+      await Promise.all([id, ...live.hotChildren.keys()].map((sid) => this.api.session.interrupt({ sessionID: sid }).catch(() => undefined)))
+    }
+    live.lastRefresh = Date.now()
+    // A prompt was sent while we were reading: our view predates it.
+    if (live.gen !== gen) return
+
     const { state, error } = this.derive(live, active)
     live.state = state
     live.error = error
-    live.lastRefresh = Date.now()
-
     await this.applyPolicies(live)
-    if (live.state === "running") await this.enforceLimits(live)
+    if (live.state === "running" && live.gen === gen) await this.enforceLimits(live)
 
-    if (before !== undefined && !SETTLED.has(before) && SETTLED.has(live.state)) {
+    if (SETTLED.has(live.state) && before !== undefined && !SETTLED.has(before)) {
       live.liveText = ""
       live.settledAt = Date.now()
-      // Pushes do not count as reported: if the client drops them (channels
-      // not enabled), opencode_wait must still deliver the result.
-      this.hooks.settled(this.build(live))
     }
+    this.maybePush(live)
+  }
+
+  private async readHistory(sessionID: string, track: Track, directory: string) {
+    // Pricing comes from the catalog; load it once per directory.
+    if (!this.modelCache.has(directory)) await this.models(directory).catch(() => undefined)
+    const estimate = this.estimator(directory)
+    for (let page = 0; page < 1000; page++) {
+      const res = unwrap(await this.api.session.history({ sessionID, after: track.seq, limit: 100 }), "reading session history")
+      for (const e of res.data as DurableEvent[]) apply(track, e, estimate)
+      if (res.data.length < 100) break
+    }
+  }
+
+  /** Push once per distinct settled outcome (and per new request). */
+  private maybePush(live: Live) {
+    if (!live.state || !SETTLED.has(live.state)) {
+      live.lastPushKey = undefined
+      return
+    }
+    const ids = [...live.pending.permissions, ...live.pending.questions]
+      .filter((r) => !live.handled.has(r.id))
+      .map((r) => r.id)
+      .sort()
+    const key = `${live.state}:${currentTurn(live.track)?.startSeq ?? 0}:${ids.join(",")}`
+    if (key === live.lastPushKey) return
+    const first = live.lastPushKey === undefined && live.settledAt === 0
+    live.lastPushKey = key
+    // Agents found already settled at startup are not news.
+    if (!first) this.hooks.settled(this.build(live))
   }
 
   private derive(live: Live, active: Set<string>): { state: AgentState; error?: string } {
     const { record, track: t } = live
     const unhandled = [...live.pending.permissions, ...live.pending.questions].filter((r) => !live.handled.has(r.id))
     if (unhandled.length) return { state: "needs_input" }
-    const tree = [record.id, ...live.children]
+    // We interrupted it, and nothing new was prompted since (a turn that started
+    // from input admitted before the interrupt is being interrupted again).
+    if (record.interruptedSeq !== undefined && (t.lastPromptedSeq <= record.interruptedSeq || (currentTurn(t)?.admittedSeq ?? 0) <= record.interruptedSeq)) {
+      return { state: "interrupted", error: record.stopReason }
+    }
+    const tree = [record.id, ...live.hotChildren.keys()]
     if (tree.some((sid) => active.has(sid))) return { state: "running" }
     const now = Date.now()
-    if (record.interruptedAt && record.interruptedAt >= t.lastPromptedAt) return { state: "interrupted", error: record.stopReason }
+    if (live.sent) {
+      if (now - live.sent.at < START_GRACE_MS) return { state: "running" }
+      return { state: "error", error: "the prompt was sent but OpenCode never recorded it; check the OpenCode server log" }
+    }
     if (t.admitted.size) {
       const newest = Math.max(...[...t.admitted.values()].map((a) => a.at))
-      if (now - newest < GRACE_MS) return { state: "running" }
+      if (now - newest < (t.totalSteps ? START_GRACE_MS : FIRST_START_GRACE_MS)) return { state: "running" }
       return { state: "error", error: "the prompt was accepted but the agent never started on it; check the OpenCode server log" }
     }
     const turn = currentTurn(t)
-    // e.g. a rejected question: OpenCode interrupts the tool and halts the loop without ending the step.
-    if (turn?.interrupted) return { state: "interrupted", error: record.stopReason ?? turn.failure }
+    // e.g. a rejected question: OpenCode interrupts the tool and halts the loop.
+    if (turn?.interrupted) return { state: "interrupted", error: turn.failure }
     if (t.inLoop) {
       if (now - t.lastEventAt < GRACE_MS) return { state: "running" }
       return {
@@ -657,6 +882,27 @@ export class Fleet {
 
   private async applyPolicies(live: Live) {
     const { record } = live
+    const timeout = this.config.elicitTimeoutMs
+    const ask = <T>(id: string, show: (signal: AbortSignal) => Promise<T>, onAnswer: (answer: T) => Promise<void>) => {
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), timeout)
+      live.handled.add(id)
+      live.dialogs.set(id, controller)
+      void show(controller.signal)
+        .then(async (answer) => {
+          if (controller.signal.aborted && live.handled.has(id)) return // the caller answered meanwhile
+          await onAnswer(answer)
+        })
+        .catch(() => {
+          // Timed out, failed, or the client cannot show it: the calling model decides.
+          if (live.dialogs.get(id) === controller) this.handToCaller(live, id)
+        })
+        .finally(() => {
+          clearTimeout(timer)
+          if (live.dialogs.get(id) === controller) live.dialogs.delete(id)
+          this.wake()
+        })
+    }
     for (const p of live.pending.permissions) {
       if (live.handled.has(p.id) || live.handedToCaller.has(p.id)) continue
       if (record.policy === "allow" || record.policy === "deny") {
@@ -667,19 +913,14 @@ export class Fleet {
           record.policy === "deny" ? "Denied by the orchestrator's permission policy. Find another way, or explain what you need and stop." : undefined,
         ).catch(() => live.handled.delete(p.id))
       } else if (record.policy === "user" && this.hooks.canElicit()) {
-        live.handled.add(p.id)
-        live.handled.add(`asking:${p.id}`)
-        void this.hooks
-          .askPermission(this.build(live), p)
-          .then(async (answer) => {
+        ask(
+          p.id,
+          (signal) => this.hooks.askPermission(this.build(live), p, signal),
+          async (answer) => {
             if (answer) await this.replyPermission(p, answer.reply, answer.message)
             else this.handToCaller(live, p.id)
-          })
-          .catch(() => live.handled.delete(p.id))
-          .finally(() => {
-            live.handled.delete(`asking:${p.id}`)
-            this.wake()
-          })
+          },
+        )
       }
     }
     for (const q of live.pending.questions) {
@@ -688,20 +929,15 @@ export class Fleet {
         live.handled.add(q.id)
         await this.dismissQuestion(q).catch(() => live.handled.delete(q.id))
       } else if (record.questions === "user" && this.hooks.canElicit()) {
-        live.handled.add(q.id)
-        live.handled.add(`asking:${q.id}`)
-        void this.hooks
-          .askQuestion(this.build(live), q)
-          .then(async (answer) => {
+        ask(
+          q.id,
+          (signal) => this.hooks.askQuestion(this.build(live), q, signal),
+          async (answer) => {
             if (answer === "dismiss") await this.dismissQuestion(q)
             else if (answer) await this.answerQuestion(q, answer)
             else this.handToCaller(live, q.id)
-          })
-          .catch(() => live.handled.delete(q.id))
-          .finally(() => {
-            live.handled.delete(`asking:${q.id}`)
-            this.wake()
-          })
+          },
+        )
       }
     }
     // Requests handled automatically or shown to the human do not block on the caller.
@@ -715,26 +951,35 @@ export class Fleet {
     live.handedToCaller.add(requestId)
   }
 
+  /** Forget request ids that are no longer pending (except open dialogs). */
+  private pruneRequestSets(live: Live) {
+    const pending = new Set([...live.pending.permissions, ...live.pending.questions].map((r) => r.id))
+    for (const set of [live.handled, live.reportedRequests, live.handedToCaller]) {
+      for (const id of set) if (!pending.has(id) && !live.dialogs.has(id)) set.delete(id)
+    }
+  }
+
   private async enforceLimits(live: Live) {
     const { record, track } = live
     const turn = currentTurn(track)
-    if (!turn) return
+    // Only the turn that is running now: an ended turn's totals must not stop a new prompt.
+    if (!turn || turn.endedAt !== undefined || !track.inLoop) return
     const { maxSteps, maxCostUsd, timeoutMinutes } = record.limits
+    const started = live.turnSeen.get(turn.startSeq) ?? turn.startedAt
+    let childCost = 0
+    for (const t of live.childTracks.values()) childCost += costSince(t, turn.startedAt)
+    const cost = turn.cost + childCost
     let reason: string | undefined
     if (maxSteps && (turn.steps > maxSteps || (turn.steps >= maxSteps && !track.stepOpen))) reason = `step limit reached (${maxSteps} steps this turn)`
-    else if (maxCostUsd && turn.cost >= maxCostUsd) reason = `cost limit reached ($${turn.cost.toFixed(4)} ≥ $${maxCostUsd} this turn)`
-    else if (timeoutMinutes && Date.now() - turn.startedAt > timeoutMinutes * 60_000) reason = `time limit reached (${timeoutMinutes} min this turn)`
-    else if (record.pauseAfterStep && !track.stepOpen) reason = record.stopReason ?? "paused after step"
-    if (reason) {
-      await this.interruptNow(record.id, reason)
-      live.state = "interrupted"
-      live.error = reason
-    }
+    else if (maxCostUsd && cost >= maxCostUsd) reason = `cost limit reached ($${cost.toFixed(4)} ≥ $${maxCostUsd} this turn)`
+    else if (timeoutMinutes && Date.now() - started > timeoutMinutes * 60_000) reason = `time limit reached (${timeoutMinutes} min this turn)`
+    if (reason) await this.interruptNow(live, reason)
   }
 
   private async scanChildren(live: Live) {
     live.lastChildScan = Date.now()
-    const res = unwrap(await this.api.session.list({ directory: live.record.directory, limit: 100, order: "desc" }), "listing sessions")
+    const directory = live.session?.location.directory ?? live.record.directory
+    const res = unwrap(await this.api.session.list({ directory, limit: 100, order: "desc" }), "listing sessions")
     const tree = new Set([live.record.id, ...live.children])
     // Parents are listed after children in desc order; loop until no new descendants appear.
     let grew = true
@@ -752,6 +997,7 @@ export class Fleet {
 
   private addChild(live: Live, child: string) {
     live.children.add(child)
+    live.hotChildren.set(child, Date.now())
     this.childToRoot.set(child, live.record.id)
   }
 
@@ -762,16 +1008,25 @@ export class Fleet {
     const turn = currentTurn(track)
     let activity: string | undefined
     if (state === "running") {
-      const asking = [...live.pending.permissions, ...live.pending.questions].filter((r) => live.handled.has(`asking:${r.id}`))
+      const asking = [...live.pending.permissions, ...live.pending.questions].filter((r) => live.dialogs.has(r.id))
+      const tool = latestTool(track)
       if (asking.length) {
         activity = `waiting for the user to answer: ${asking
           .map((r) => ("action" in r ? `${r.action} ${JSON.stringify(r.resources)}` : (r.questions[0]?.question ?? "a question")))
           .join("; ")}`
       } else if (record.pauseAfterStep) activity = "pausing after the current step"
-      else if (track.openTool) activity = `${track.openTool.tool}: ${inputSummary(track.openTool.input)}`
+      else if (tool) activity = `${tool.tool}: ${inputSummary(tool.input)}${track.openTools.size > 1 ? ` (+${track.openTools.size - 1} more)` : ""}`
       else if (live.liveText) activity = `writing: …${oneLine(live.liveText).slice(-160)}`
       else if (track.stepOpen) activity = "thinking"
       else activity = "starting"
+    }
+    let cost = track.cost
+    let steps = track.totalSteps
+    const tokens = { ...track.tokens }
+    for (const t of live.childTracks.values()) {
+      cost += t.cost
+      steps += t.totalSteps
+      for (const k of Object.keys(tokens) as (keyof typeof tokens)[]) tokens[k] += t.tokens[k]
     }
     return {
       id: record.id,
@@ -792,38 +1047,53 @@ export class Fleet {
         permissions: live.pending.permissions.filter((p) => !live.handled.has(p.id)),
         questions: live.pending.questions.filter((q) => !live.handled.has(q.id)),
       },
-      unreported: turnsSince(track, record.reportedSeq).filter((x) => x.endedAt !== undefined),
+      unreported: record.adoptPending ? [] : turnsSince(track, record.reportedSeq).filter((x) => x.endedAt !== undefined),
       lastTurn: turn,
-      steps: track.totalSteps,
-      cost: track.cost,
-      tokens: track.tokens,
+      steps,
+      cost,
+      tokens,
       children: [...live.children],
     }
   }
 
   async snapshot(ref: string, active?: Set<string>): Promise<Snapshot> {
-    const live = this.get(ref)
-    await this.refresh(live.record.id, active)
+    const live = await this.get(ref)
+    await this.refresh(live, active)
     return this.build(live)
   }
 
-  async list(opts: { includeUntracked?: boolean; directory?: string; limit?: number }): Promise<Snapshot[]> {
+  /** Tracked agents (with per-agent errors), plus untracked root sessions in a directory if asked. */
+  async list(opts: { includeUntracked?: boolean; directory?: string; limit?: number }): Promise<{
+    snapshots: Snapshot[]
+    errors: string[]
+    untracked: SessionV2Info[]
+  }> {
     this.syncStore()
+    const active = await this.activeSet()
+    const ids = [...this.live.keys()]
+    const results = await Promise.allSettled(ids.map((id) => this.snapshot(id, active)))
+    const snapshots: Snapshot[] = []
+    const errors: string[] = []
+    results.forEach((r, i) => {
+      if (r.status === "fulfilled") snapshots.push(r.value)
+      else errors.push(`${ids[i]}: ${(r.reason as Error).message}`)
+    })
+    let untracked: SessionV2Info[] = []
     if (opts.includeUntracked) {
       const res = unwrap(
-        await this.api.session.list({ directory: opts.directory ?? this.config.directory, limit: opts.limit ?? 20, order: "desc" }),
+        await this.api.session.list({ directory: this.resolveDir(opts.directory), limit: opts.limit ?? 20, order: "desc" }),
         "listing sessions",
       )
-      for (const s of res.data) if (!s.parentID && !this.live.has(s.id) && !this.childToRoot.has(s.id)) this.adopt(s.id)
+      const owned = new Set(this.store.agents(this.serverKey).map((r) => r.id))
+      untracked = res.data.filter((s) => !s.parentID && !this.live.has(s.id) && !owned.has(s.id) && !this.childToRoot.has(s.id))
     }
-    const active = await this.activeSet()
-    return Promise.all([...this.live.keys()].map((id) => this.snapshot(id, active)))
+    return { snapshots, errors, untracked }
   }
 
   async transcript(ref: string, opts: { scope: "turn" | "all"; detail: Detail }): Promise<string> {
-    const live = this.get(ref)
-    await this.refresh(live.record.id)
-    const since = opts.scope === "turn" ? currentTurn(live.track)?.startedAt : undefined
+    const live = await this.get(ref)
+    await this.refresh(live)
+    const since = opts.scope === "turn" ? currentTurn(live.track)?.admittedAt : undefined
     const messages = await this.messages(live.record.id, since)
     return renderTranscript(messages, opts.detail)
   }
@@ -860,39 +1130,45 @@ export class Fleet {
     return s.state !== "idle" && live.settledAt > (live.record.reportedAt ?? 0)
   }
 
-  /** Remember what the caller has seen: pending requests, and turns that have finished. */
-  private markReported(live: Live) {
-    for (const r of [...live.pending.permissions, ...live.pending.questions]) live.reportedRequests.add(r.id)
-    if (live.state === "needs_input") return
-    const ended = live.track.turns.filter((t) => t.endedAt !== undefined)
-    const seq = ended.length ? ended[ended.length - 1]!.startSeq : live.record.reportedSeq
-    this.updateRecord(live.record.id, { reportedSeq: Math.max(seq, live.record.reportedSeq), reportedAt: Date.now() })
+  /** Remember what the caller was shown: exactly the requests and turns in this snapshot. */
+  private markReported(s: Snapshot) {
+    const live = this.live.get(s.id)
+    if (!live) return
+    for (const r of [...s.pending.permissions, ...s.pending.questions]) live.reportedRequests.add(r.id)
+    if (s.state === "needs_input") return
+    const seq = Math.max(live.record.reportedSeq, ...s.unreported.map((t) => t.startSeq))
+    this.updateRecord(s.id, { reportedSeq: seq, reportedAt: Date.now() })
   }
 
   /**
    * Block until agents have news. mode "any": until one of them settled with
-   * something not yet reported; "all": until every one is settled. Results are
-   * marked as reported, so the next "any" wait returns the next agent.
+   * something not yet reported; "all": until every one is settled. What is
+   * returned is marked as reported, so the next "any" wait returns the next agent.
    */
   async waitFor(
     refs: string[],
     mode: "any" | "all",
     timeoutMs: number,
     opts: { signal?: AbortSignal; onTick?: (snaps: Snapshot[], elapsedMs: number) => void; markReported?: boolean } = {},
-  ): Promise<{ snapshots: Snapshot[]; news: Set<string>; timedOut: boolean; nothingToWaitFor: boolean }> {
-    const ids = refs.map((r) => this.get(r).record.id)
+  ): Promise<{ snapshots: Snapshot[]; news: Set<string>; errors: string[]; timedOut: boolean; nothingToWaitFor: boolean }> {
+    const lives = await Promise.all(refs.map((r) => this.get(r)))
+    const ids = [...new Set(lives.map((l) => l.record.id))]
     const start = Date.now()
     const deadline = start + timeoutMs
     for (;;) {
       const active = await this.activeSet()
-      const snaps = await Promise.all(ids.map((id) => this.snapshot(id, active)))
+      const results = await Promise.allSettled(ids.map((id) => this.snapshot(id, active)))
+      const snaps = results.filter((r): r is PromiseFulfilledResult<Snapshot> => r.status === "fulfilled").map((r) => r.value)
+      const errors = results.flatMap((r, i) => (r.status === "rejected" ? [`${ids[i]}: ${(r.reason as Error).message}`] : []))
       const settled = snaps.filter((s) => SETTLED.has(s.state))
       const news = settled.filter((s) => this.hasNews(s))
       const allSettled = settled.length === snaps.length
       const done = mode === "any" ? news.length > 0 || allSettled : allSettled
-      if (done || Date.now() >= deadline || opts.signal?.aborted) {
-        if (done && opts.markReported !== false) for (const s of snaps) if (SETTLED.has(s.state)) this.markReported(this.live.get(s.id)!)
-        return { snapshots: snaps, news: new Set(news.map((s) => s.id)), timedOut: !done, nothingToWaitFor: done && news.length === 0 && mode === "any" }
+      const timedOut = !done && (Date.now() >= deadline || !!opts.signal?.aborted)
+      if (done || timedOut) {
+        // Mark what the caller is about to see (news only: a timeout shows no other results).
+        if (opts.markReported !== false) for (const s of done ? settled : news) this.markReported(s)
+        return { snapshots: snaps, news: new Set(news.map((s) => s.id)), errors, timedOut, nothingToWaitFor: done && news.length === 0 && mode === "any" }
       }
       opts.onTick?.(snaps, Date.now() - start)
       await this.sleepUntilWoken(Math.min(this.backend.streaming ? 2_000 : 1_000, deadline - Date.now()), opts.signal)
@@ -907,7 +1183,7 @@ export class Fleet {
         signal?.removeEventListener("abort", done)
         resolve()
       }
-      const timer = setTimeout(done, ms)
+      const timer = setTimeout(done, Math.max(0, ms))
       this.wakeups.add(done)
       signal?.addEventListener("abort", done)
     })
@@ -924,8 +1200,9 @@ export class Fleet {
     const d = raw.data ?? raw.properties ?? {}
     if (raw.type === "session.created") {
       const info = d.info as { id?: string; parentID?: string } | undefined
-      const root = info?.parentID ? (this.live.has(info.parentID) ? info.parentID : this.childToRoot.get(info.parentID)) : undefined
-      if (root && info?.id) this.addChild(this.live.get(root)!, info.id)
+      const rootId = info?.parentID ? (this.live.has(info.parentID) ? info.parentID : this.childToRoot.get(info.parentID)) : undefined
+      const root = rootId ? this.live.get(rootId) : undefined
+      if (root && info?.id) this.addChild(root, info.id)
       return
     }
     const sid = typeof d.sessionID === "string" ? d.sessionID : undefined
@@ -933,14 +1210,17 @@ export class Fleet {
     const rootId = this.live.has(sid) ? sid : this.childToRoot.get(sid)
     const live = rootId ? this.live.get(rootId) : undefined
     if (!live) return
+    if (sid !== rootId) live.hotChildren.set(sid, Date.now())
     switch (raw.type) {
       case "session.next.text.delta":
         if (sid === rootId) live.liveText = `${live.liveText}${String(d.delta ?? "")}`.slice(-400)
         return
       case "session.next.text.started":
       case "session.next.step.started":
-        live.liveText = ""
-        live.retry = undefined
+        if (sid === rootId) {
+          live.liveText = ""
+          live.retry = undefined
+        }
         break
       case "session.next.retried": {
         const err = d.error as { message?: string } | undefined
@@ -948,13 +1228,21 @@ export class Fleet {
         break
       }
       case "session.next.step.ended":
+        if (sid !== rootId) break
         live.retry = undefined
-        // Pause requested: stop now, between steps, so no tool gets killed mid-run.
-        if (live.record.pauseAfterStep) void this.interruptNow(live.record.id, live.record.stopReason).then(() => this.wake())
+        // Pause requested: stop now, between steps of the root, so no tool gets killed mid-run.
+        // A final step ends the turn by itself; then there is nothing to pause.
+        if (live.record.pauseAfterStep) {
+          if (d.finish === "tool-calls") {
+            void this.interruptNow(live, live.record.stopReason ?? "paused after step")
+              .catch(() => undefined)
+              .then(() => this.wake())
+          } else this.updateRecord(live.record.id, { pauseAfterStep: undefined })
+        }
         break
     }
     if (/session\.next\.(prompted|step\.|tool\.(success|failed))|asked|replied|rejected|session\.idle|session\.status/.test(raw.type)) {
-      void this.refresh(live.record.id)
+      void this.refresh(live)
         .catch(() => undefined)
         .then(() => this.wake())
     }
@@ -962,15 +1250,19 @@ export class Fleet {
 
   /** Background refresh so policies, limits and channel pushes work without a caller waiting. */
   private async tick() {
-    if (this.monitoring) return
+    if (this.monitoring || this.closed) return
     this.monitoring = true
     try {
-      const due = [...this.live.values()].filter(
-        (l) => !l.loaded || l.state === undefined || !SETTLED.has(l.state) || l.state === "needs_input" || Date.now() - l.lastRefresh > IDLE_REFRESH_MS,
-      )
+      if (this.backend.dead) return
+      const now = Date.now()
+      const due = [...this.live.values()].filter((l) => {
+        if (!l.loaded || this.working(l)) return true
+        const recent = now - l.track.lastEventAt < 60 * 60_000
+        return now - l.lastRefresh > (recent ? SETTLED_REFRESH_MS : DORMANT_REFRESH_MS)
+      })
       if (!due.length) return
       const active = await this.activeSet()
-      await Promise.all(due.map((l) => this.refresh(l.record.id, active).catch(() => undefined)))
+      await Promise.all(due.map((l) => this.refresh(l, active).catch(() => undefined)))
       this.wake()
     } catch {
       // Server unreachable; try again next tick.
@@ -988,51 +1280,96 @@ export class Fleet {
       loaded: false,
       pending: { permissions: [], questions: [] },
       children: new Set(),
+      childTracks: new Map(),
+      hotChildren: new Map(),
       liveText: "",
       lastRefresh: 0,
       lastChildScan: 0,
       handled: new Set(),
+      dialogs: new Map(),
       reportedRequests: new Set(),
       handedToCaller: new Set(),
       settledAt: 0,
-      lock: Promise.resolve(),
+      gen: 0,
+      turnSeen: new Map(),
     }
     this.live.set(record.id, live)
     return live
   }
 
-  /** Track a session this server did not spawn (e.g. from before a restart). */
-  private adopt(id: string): Live {
-    const policy = this.config.defaultPermissions
+  /**
+   * Track a session this server did not spawn (e.g. one started in the TUI).
+   * Adopted agents get the "ask" policy: nothing is answered on a human's behalf.
+   */
+  private adopt(session: SessionV2Info): Live {
     const record: AgentRecord = {
-      id,
+      id: session.id,
       server: this.serverKey,
-      directory: this.config.directory,
-      policy,
-      questions: defaultQuestionPolicy(policy),
+      directory: session.location.directory,
+      policy: "ask",
+      questions: "ask",
       limits: {},
       createdAt: Date.now(),
-      reportedSeq: Number.MAX_SAFE_INTEGER,
+      owner: SELF,
+      reportedSeq: 0,
+      adoptPending: true,
     }
     this.store.put(record)
-    const live = this.adoptRecord(record)
-    // Do not report history from before adoption as news.
-    void this.refresh(id)
-      .then(() => this.updateRecord(id, { reportedSeq: live.track.seq, reportedAt: Date.now() }))
-      .catch(() => undefined)
-    return live
+    return this.adoptRecord(record)
   }
 
-  /** Pick up agents another MCP process (sharing the server) created. */
+  /** History before adoption is not news, except a turn that is still running. */
+  private finishAdoption(live: Live) {
+    const t = live.track
+    const open = t.inLoop ? currentTurn(t) : undefined
+    const ended = t.turns.filter((x) => x.endedAt !== undefined && x !== open)
+    const reportedSeq = open ? open.startSeq - 1 : (ended[ended.length - 1]?.startSeq ?? 0)
+    this.updateRecord(live.record.id, { reportedSeq, reportedAt: Date.now(), adoptPending: undefined })
+  }
+
+  /**
+   * Load records for this server: ours, plus orphaned ones whose owner process
+   * is gone (claimed). Drop agents whose record disappeared (disposed elsewhere).
+   */
   private syncStore() {
-    this.store.reload()
-    for (const r of this.store.agents(this.serverKey)) if (!this.live.has(r.id)) this.adoptRecord(r)
+    const records = this.store.agents(this.serverKey)
+    const ids = new Set(records.map((r) => r.id))
+    for (const id of [...this.live.keys()]) if (!ids.has(id)) this.dropLive(id)
+    for (const r of records) {
+      if (this.live.has(r.id) || this.gone.has(r.id)) continue
+      if (r.owner?.token !== SELF.token && ownerAlive(r.owner)) continue // another MCP session drives it
+      const claimed = { ...r, owner: SELF }
+      this.store.put(claimed)
+      this.adoptRecord(claimed)
+    }
+  }
+
+  private dropLive(id: string) {
+    const live = this.live.get(id)
+    if (!live) return
+    for (const d of live.dialogs.values()) d.abort()
+    for (const c of live.children) this.childToRoot.delete(c)
+    this.live.delete(id)
+  }
+
+  /** Stop tracking an agent for good (disposed, failed spawn, or deleted). */
+  private forget(id: string) {
+    this.dropLive(id)
+    this.gone.add(id)
+    this.store.remove(id)
   }
 
   private updateRecord(id: string, patch: Partial<AgentRecord>) {
     const live = this.live.get(id)
-    if (live) Object.assign(live.record, patch)
-    this.store.update(id, patch)
+    if (live) {
+      Object.assign(live.record, patch)
+      for (const [k, v] of Object.entries(patch)) if (v === undefined) delete (live.record as unknown as Record<string, unknown>)[k]
+    }
+    try {
+      this.store.update(id, patch)
+    } catch {
+      // Persistence is best effort; in-memory state stays authoritative.
+    }
   }
 
   private findByName(name: string): Live | undefined {
@@ -1040,33 +1377,57 @@ export class Fleet {
     return undefined
   }
 
-  /** Resolve a session id or agent name. Unknown session ids are adopted. */
-  get(ref: string): Live {
+  /** Resolve a session id or agent name. Unknown root sessions are adopted; child ids resolve to their root. */
+  async get(ref: string): Promise<Live> {
     let live = this.findByName(ref) ?? this.live.get(ref)
-    if (!live) {
-      this.syncStore()
-      live = this.findByName(ref) ?? this.live.get(ref)
-    }
     if (live) return live
-    if (ref.startsWith("ses_")) {
-      const root = this.childToRoot.get(ref)
-      if (root) return this.live.get(root)!
-      return this.adopt(ref)
+    this.syncStore()
+    live = this.findByName(ref) ?? this.live.get(ref)
+    if (live) return live
+    const foreign = this.store.agents(this.serverKey).find((r) => r.id === ref || r.name === ref)
+    if (foreign) throw new Error(`agent "${ref}" is driven by another MCP session (pid ${foreign.owner?.pid}); use that session, or close it first`)
+    if (!ref.startsWith("ses_")) throw new Error(`unknown agent "${ref}". Pass a session id (ses_…) or the name given at spawn; opencode_status lists them.`)
+    const root = this.childToRoot.get(ref)
+    if (root && this.live.has(root)) return this.live.get(root)!
+    if (this.gone.has(ref)) throw new Error(`session ${ref} was disposed or deleted; it is no longer tracked`)
+    const res = await this.api.session.get({ sessionID: ref })
+    if (res.response?.status === 404) throw new Error(`session ${ref} does not exist on this OpenCode server`)
+    const session = unwrap(res, `loading session ${ref}`).data
+    // A subagent's session belongs to its root agent.
+    if (session.parentID) {
+      const rootLive = await this.get(session.parentID)
+      this.addChild(rootLive, ref)
+      return rootLive
     }
-    throw new Error(`unknown agent "${ref}". Pass a session id (ses_…) or the name given at spawn; opencode_status lists them.`)
-  }
-
-  resolveId(ref: string): string {
-    return this.get(ref).record.id
-  }
-
-  runningIds(): string[] {
-    return [...this.live.values()].filter((l) => l.state === undefined || !SETTLED.has(l.state)).map((l) => l.record.id)
+    return this.adopt(session)
   }
 
   ids(): string[] {
     return [...this.live.keys()]
   }
+}
+
+interface Prepared {
+  files: { uri: string; name: string }[]
+  inlined: string[]
+}
+
+/**
+ * Text files are inlined (many providers reject text/plain file parts);
+ * binary files (images, PDFs) are attached for models that accept them.
+ */
+async function prepareFiles(paths: string[], directory: string): Promise<Prepared> {
+  const out: Prepared = { files: [], inlined: [] }
+  for (const f of paths) {
+    const abs = path.resolve(directory, f)
+    const buf = await fs.readFile(abs).catch(() => {
+      throw new Error(`attachment not found: ${abs}`)
+    })
+    const isText = !buf.subarray(0, 8192).includes(0)
+    if (isText && buf.length <= 256 * 1024) out.inlined.push(`<file path="${path.relative(directory, abs) || abs}">\n${buf.toString("utf8")}\n</file>`)
+    else out.files.push({ uri: pathToFileURL(abs).href, name: path.basename(abs) })
+  }
+  return out
 }
 
 function sleep(ms: number) {

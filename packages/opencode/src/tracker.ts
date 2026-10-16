@@ -17,6 +17,10 @@ export interface Turn {
   /** Seq of the `prompted` event that started this turn. */
   startSeq: number
   startedAt: number
+  /** When the opening prompt was admitted (queued prompts are admitted before they start). */
+  admittedAt: number
+  /** History seq at which the opening prompt was admitted. */
+  admittedSeq: number
   prompt: string
   /** Text of the latest assistant message that produced text. */
   finalText: string
@@ -32,25 +36,28 @@ export interface Track {
   /** Last durable sequence number applied. */
   seq: number
   /** Prompts admitted but not yet picked up by the agent loop. */
-  admitted: Map<string, { at: number; text: string }>
-  /** A turn is open from `prompted` until a final step end or a failure. */
+  admitted: Map<string, { at: number; seq: number; text: string }>
+  /** A turn is open from `prompted` until a final step end, a failure or an interrupt. */
   inLoop: boolean
   stepOpen: boolean
-  openTool?: { callID: string; tool: string; input: Record<string, unknown> }
+  /** Tool calls in flight, by call id (models can call several in parallel). */
+  openTools: Map<string, { tool: string; input: Record<string, unknown> }>
   turns: Turn[]
   totalSteps: number
   cost: number
   tokens: Tokens
+  /** Recent step costs with their time, so limits can include child sessions. */
+  stepCosts: { at: number; cost: number }[]
   lastEventAt: number
   lastPromptedAt: number
+  lastPromptedSeq: number
   /** Model and agent profile of the latest step (the session may not record them). */
   model?: { id: string; providerID: string; variant?: string }
   agent?: string
 }
 
-export function isInterrupted(message: string): boolean {
-  return INTERRUPTED.test(message)
-}
+/** Prices a step from its token usage when OpenCode reports no cost (its v2 runner reports 0). */
+export type CostEstimator = (model: { id: string; providerID: string }, tokens: Tokens) => number | undefined
 
 export interface DurableEvent {
   type: string
@@ -64,17 +71,26 @@ export function emptyTrack(): Track {
     admitted: new Map(),
     inLoop: false,
     stepOpen: false,
+    openTools: new Map(),
     turns: [],
     totalSteps: 0,
     cost: 0,
     tokens: { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
+    stepCosts: [],
     lastEventAt: 0,
     lastPromptedAt: 0,
+    lastPromptedSeq: 0,
   }
 }
 
 const MAX_TURNS = 50
-const INTERRUPTED = /interrupt|abort/i
+const MAX_STEP_COSTS = 500
+/** OpenCode's own interrupt messages ("Tool execution interrupted", "Provider turn interrupted"). */
+const INTERRUPTED = /\b(execution|turn) interrupted\b/i
+
+export function isInterruptMessage(message: string): boolean {
+  return INTERRUPTED.test(message)
+}
 
 function str(v: unknown): string {
   return typeof v === "string" ? v : ""
@@ -88,7 +104,17 @@ export function currentTurn(t: Track): Turn | undefined {
   return t.turns[t.turns.length - 1]
 }
 
-export function apply(t: Track, e: DurableEvent): void {
+/** The tool call that started most recently, if any are running. */
+export function latestTool(t: Track): { tool: string; input: Record<string, unknown> } | undefined {
+  return [...t.openTools.values()].pop()
+}
+
+/** Cost of steps that ended at or after `since`. */
+export function costSince(t: Track, since: number): number {
+  return t.stepCosts.filter((s) => s.at >= since).reduce((a, s) => a + s.cost, 0)
+}
+
+export function apply(t: Track, e: DurableEvent, estimate?: CostEstimator): void {
   const seq = e.durable?.seq ?? t.seq
   if (seq <= t.seq && e.durable) return
   t.seq = Math.max(t.seq, seq)
@@ -99,17 +125,24 @@ export function apply(t: Track, e: DurableEvent): void {
 
   switch (e.type) {
     case "session.next.prompt.admitted":
-      t.admitted.set(str(d.messageID), { at, text: str((d.prompt as { text?: unknown } | undefined)?.text) })
+      t.admitted.set(str(d.messageID), { at, seq, text: str((d.prompt as { text?: unknown } | undefined)?.text) })
       break
     case "session.next.prompted": {
-      t.admitted.delete(str(d.messageID))
+      const id = str(d.messageID)
+      const admittedAt = t.admitted.get(id)?.at ?? at
+      const admittedSeq = t.admitted.get(id)?.seq ?? seq
+      t.admitted.delete(id)
+      // Anything admitted before this prompt and still not picked up was superseded.
+      for (const [k, v] of t.admitted) if (v.at < admittedAt) t.admitted.delete(k)
       t.lastPromptedAt = at
+      t.lastPromptedSeq = seq
       const text = str((d.prompt as { text?: unknown } | undefined)?.text)
-      if (t.inLoop && turn && !turn.endedAt) {
+      const steering = t.inLoop && turn && !turn.endedAt && !turn.interrupted && !turn.failure
+      if (steering) {
         // Steered into a running turn: same turn, remember the extra instruction.
         turn.prompt = `${turn.prompt}\n[steer] ${text}`
       } else {
-        t.turns.push({ startSeq: seq, startedAt: at, prompt: text, finalText: "", steps: 0, cost: 0 })
+        t.turns.push({ startSeq: seq, startedAt: at, admittedAt, admittedSeq, prompt: text, finalText: "", steps: 0, cost: 0 })
         if (t.turns.length > MAX_TURNS) t.turns.shift()
       }
       t.inLoop = true
@@ -124,43 +157,55 @@ export function apply(t: Track, e: DurableEvent): void {
       break
     case "session.next.step.ended": {
       t.stepOpen = false
-      t.openTool = undefined
-      const cost = num(d.cost)
+      t.openTools.clear()
+      const tok = (d.tokens ?? {}) as { input?: number; output?: number; reasoning?: number; cache?: { read?: number; write?: number } }
+      const step: Tokens = {
+        input: num(tok.input),
+        output: num(tok.output),
+        reasoning: num(tok.reasoning),
+        cacheRead: num(tok.cache?.read),
+        cacheWrite: num(tok.cache?.write),
+      }
+      let cost = num(d.cost)
+      if (!cost && estimate && t.model) cost = estimate(t.model, step) ?? 0
       t.cost += cost
       if (turn) turn.cost += cost
-      const tok = (d.tokens ?? {}) as { input?: number; output?: number; reasoning?: number; cache?: { read?: number; write?: number } }
-      t.tokens.input += num(tok.input)
-      t.tokens.output += num(tok.output)
-      t.tokens.reasoning += num(tok.reasoning)
-      t.tokens.cacheRead += num(tok.cache?.read)
-      t.tokens.cacheWrite += num(tok.cache?.write)
+      t.stepCosts.push({ at, cost })
+      if (t.stepCosts.length > MAX_STEP_COSTS) t.stepCosts.shift()
+      for (const k of Object.keys(step) as (keyof Tokens)[]) t.tokens[k] += step[k]
       // "tool-calls" means the loop continues with another step.
-      if (str(d.finish) !== "tool-calls" || turn?.interrupted) endTurn(t, at)
+      if (str(d.finish) !== "tool-calls") endTurn(t, at)
       break
     }
     case "session.next.step.failed": {
       t.stepOpen = false
-      t.openTool = undefined
+      t.openTools.clear()
       const message = str((d.error as { message?: unknown } | undefined)?.message) || "step failed"
-      if (turn) {
+      if (turn && !turn.endedAt) {
         turn.failure = message
-        turn.interrupted = INTERRUPTED.test(message)
+        turn.interrupted = isInterruptMessage(message)
       }
       endTurn(t, at)
       break
     }
     case "session.next.tool.called":
-      t.openTool = { callID: str(d.callID), tool: str(d.tool), input: (d.input ?? {}) as Record<string, unknown> }
+      t.openTools.set(str(d.callID), { tool: str(d.tool), input: (d.input ?? {}) as Record<string, unknown> })
       break
     case "session.next.tool.success":
-      if (t.openTool?.callID === str(d.callID)) t.openTool = undefined
+      t.openTools.delete(str(d.callID))
       break
     case "session.next.tool.failed": {
-      if (t.openTool?.callID === str(d.callID)) t.openTool = undefined
+      t.openTools.delete(str(d.callID))
       const message = str((d.error as { message?: unknown } | undefined)?.message)
-      if (turn && INTERRUPTED.test(message)) {
-        turn.interrupted = true
-        turn.failure = message
+      // An interrupted tool halts the loop (OpenCode may not end the step), e.g. a rejected question.
+      if (isInterruptMessage(message)) {
+        if (turn && !turn.endedAt) {
+          turn.interrupted = true
+          turn.failure = message
+        }
+        t.stepOpen = false
+        t.openTools.clear()
+        endTurn(t, at)
       }
       break
     }
