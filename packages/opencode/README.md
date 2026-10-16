@@ -15,15 +15,16 @@ It is built on OpenCode's **v2 server API** (`/v2/session/*`, through `@opencode
 | Get notified when agents finish | `opencode_wait` (returns each result once), or channel push (below) |
 | See live what an agent is doing (current tool, streaming text, retries, cost) | `opencode_status` |
 | Interact while it runs: `steer` (next step) or `queue` (after the turn). Can switch model, effort, profile, policies or limits | `opencode_message` |
-| Stop immediately, or pause after the current step (tools are never killed mid-run) | `opencode_interrupt` |
-| Resume an interrupted or failed agent | `opencode_resume` |
+| Stop immediately (running tools are killed), or pause after the current step (`when: "after_step"` lets running tools finish) | `opencode_interrupt` |
+| Resume an interrupted or failed agent (refused while it is still running) | `opencode_resume` |
 | Answer permission prompts and questions | `opencode_respond`, or the human answers them in a dialog |
 | Review and merge an isolated agent's work | `opencode_worktree` (`diff`, `commit`, `merge`) |
 | Read transcripts (also as MCP resources: `opencode://agents/{id}/transcript`) | `opencode_output` |
 | Clean up | `opencode_dispose` |
-| Watch agents live in the OpenCode TUI | `opencode_server info` prints the `opencode attach` command |
+| Watch agents live in the OpenCode TUI | `opencode_server info` prints the `opencode attach` command (it reads the password from a file, so the password never enters the model's context) |
+| Stop the shared server | `opencode_server stop` (the next call starts a fresh one) |
 
-Agents are OpenCode sessions. You can address them by `name` or by `ses_…` id.
+Agents are OpenCode sessions. You can address them by `name` or by `ses_…` id. A session started elsewhere (for example in the OpenCode TUI) is listed by `opencode_status include_untracked:true` and adopted when you pass its id; adopted sessions get the cautious `ask` policy, so this server never auto-approves a human's session. A subagent's id resolves to its root agent.
 
 ### Agent states
 
@@ -33,13 +34,13 @@ Agents are OpenCode sessions. You can address them by `name` or by `ses_…` id.
 | `needs_input` | Blocked on a permission request (`per_…`) or a question (`que_…`) that is for the calling model. Answer it with `opencode_respond`. |
 | `idle` | The turn finished. Its result comes back once through `opencode_wait`. |
 | `interrupted` | Stopped by `opencode_interrupt` or by a limit; the reason is shown. Unread messages are delivered when it resumes. |
-| `error` | The turn failed: a provider error, or a turn OpenCode accepted but never ran (detected after about 10 s). |
+| `error` | The turn failed: a provider error, or a turn OpenCode accepted but never ran (detected after 30 s, or 60 s for an agent's first turn). |
 
 ### Permissions and questions
 
 When OpenCode needs approval (shell commands, edits outside the project, …), the agent's policy decides what happens:
 
-- `user` (default): the **human** is asked in an MCP elicitation dialog, the way Claude Code asks about its own subagents. If the client can't show dialogs, or the dialog is dismissed, the request goes to the calling model as `needs_input`.
+- `user` (default): the **human** is asked in an MCP elicitation dialog, the way Claude Code asks about its own subagents. If the client can't show form dialogs, the dialog is dismissed, fails, or goes unanswered for `HORDE_OPENCODE_DIALOG_TIMEOUT` seconds, the request goes to the calling model as `needs_input` (and `opencode_respond` can still answer while a dialog is open).
 - `ask`: the calling model answers with `opencode_respond` (`once`, `always`, `reject`).
 - `allow` / `deny`: approve or reject automatically.
 
@@ -47,16 +48,24 @@ Questions the agent asks follow the same idea (`user`, `ask`, `dismiss`). `dismi
 
 ### Limits
 
-Each agent can have per-turn safety limits: `max_steps`, `max_cost_usd`, `timeout_minutes`. When one is reached, the agent is interrupted and the reason is reported. The server also caps how many agents can work at once (`HORDE_OPENCODE_MAX_RUNNING`, default 8).
+Each agent can have per-turn safety limits: `max_steps`, `max_cost_usd`, `timeout_minutes`. When one is reached, the agent is interrupted and the reason is reported. Costs include the agent's subagents. OpenCode 1.19's v2 runner reports every step as free, so costs are computed from the model's pricing in the catalog (a model without pricing costs $0 and `max_cost_usd` cannot trip). Setting limits with `opencode_message` changes only the limits you pass.
+
+Limits are enforced by an MCP server process. With a shared server, an agent keeps working after every MCP process exits, and its limits are only checked again when one starts (it catches up at startup).
+
+The server also caps how many agents can work at once (`HORDE_OPENCODE_MAX_RUNNING`, default 8).
+
+### Several MCP sessions
+
+With the shared server, several harness sessions (each with its own MCP process) see the same OpenCode server. Each agent belongs to the MCP process that spawned or adopted it: only that process answers its dialogs, applies its policies and limits, and reports its results. Another session can't drive it while the owner is alive; when the owner exits, the next process that touches the agent takes it over.
 
 ### Worktrees
 
 With `isolation: "worktree"`, the agent gets a new worktree on branch `horde/<name>`, created outside the repository (under `~/.local/share/mcp-horde/worktrees`).
 
 - **Uncommitted work:** your uncommitted and untracked changes are carried over (`include_uncommitted`, default on) as a baseline commit, so the agent sees what you see. Merges skip that baseline.
-- **Dependencies:** `link` symlinks paths such as `node_modules` or `.env` from your checkout, and `setup` runs a command (e.g. `npm ci`) before the agent starts. Linked paths are never committed.
+- **Dependencies:** `link` symlinks untracked paths such as `node_modules` or `.env` from your checkout (relative paths only; on Windows, files that can't be symlinked are copied), and `setup` runs a command (e.g. `npm ci`) before the agent starts. Linked paths are never committed. `submodules: true` initializes submodules in the worktree. Long setups report progress and can be cancelled.
 - **Commits:** the agent is told to commit on its branch.
-- **Merging back:** `opencode_worktree merge` replays only the agent's own commits onto your current branch. `squash` stages them without committing. On a conflict the merge is aborted and your checkout is left unchanged.
+- **Merging back:** `opencode_worktree merge` replays only the agent's own commits onto your current branch; a later merge only brings commits made since. `squash` stages them without committing (it needs a clean index). The merge is refused on a detached HEAD, while a merge, rebase or cherry-pick is in progress, or when the agent made merge commits. On a conflict the merge is aborted and your checkout is left unchanged.
 - **Cleanup:** `opencode_dispose` keeps the worktree by default and commits leftover changes so nothing is lost. `remove` deletes the worktree but keeps the branch if it has commits; `discard` drops uncommitted changes.
 
 ### Push notifications (Claude Code channels)
@@ -69,7 +78,7 @@ claude --dangerously-load-development-channels server:opencode
 
 Requirements: claude.ai or Console auth, and on Team/Enterprise plans the org setting `channelsEnabled`. Pushes are best effort, so `opencode_wait` still returns every result once, even if a push was already delivered.
 
-Without channels, `opencode_wait` is the way to get notified. Claude Code moves MCP calls that run longer than 2 minutes to a background task and notifies on completion. So a long `opencode_wait` (default timeout 30 min, with progress notifications that keep it alive) behaves much like a background-agent notification.
+Without channels, `opencode_wait` is the way to get notified. Claude Code moves MCP calls that run longer than 2 minutes to a background task and notifies on completion. So a long `opencode_wait` (default timeout 30 min in Claude Code, with progress notifications that keep it alive) behaves much like a background-agent notification. Other clients get a 50 s default, below the usual 60 s client timeout. When a wait times out, it still returns whatever news it has.
 
 ## Setup
 
@@ -103,11 +112,12 @@ The model, effort, profile, directory, policies and limits are chosen by the cal
 | `HORDE_OPENCODE_URL` | none | Attach to a server you run yourself (e.g. one whose TUI you watch). |
 | `OPENCODE_SERVER_PASSWORD` / `OPENCODE_SERVER_USERNAME` | random / `opencode` | Basic auth. A password is required for non-loopback URLs unless `HORDE_OPENCODE_ALLOW_INSECURE=1`. |
 | `HORDE_OPENCODE_BIN` | `opencode` | Binary used to start `opencode serve`. |
-| `HORDE_OPENCODE_DIRECTORY` | current directory | Default working directory for agents. |
+| `HORDE_OPENCODE_DIRECTORY` | current directory | Default working directory for agents; relative `directory` arguments resolve against it. |
 | `HORDE_OPENCODE_PERMISSIONS` | `user` | Default permission policy. |
 | `HORDE_OPENCODE_MAX_RUNNING` | `8` | Maximum number of agents working at once (`0` = unlimited). |
-| `HORDE_OPENCODE_CHANNEL` | off | Push Claude Code channel notifications. |
-| `HORDE_OPENCODE_STATE_DIR` | `~/.local/state/mcp-horde/opencode` | Agent records and the shared-server record (mode 0600). |
+| `HORDE_OPENCODE_CHANNEL` | off | Push Claude Code channel notifications (`1`/`true`/`yes`/`on`, any case). |
+| `HORDE_OPENCODE_DIALOG_TIMEOUT` | `600` | Seconds a permission or question dialog waits for the human before the request goes to the calling model. |
+| `HORDE_OPENCODE_STATE_DIR` | `~/.local/state/mcp-horde/opencode` | One record per agent (`agents/<id>.json`), the shared-server record and its password file (all mode 0600). |
 | `HORDE_OPENCODE_WORKTREE_DIR` | `~/.local/share/mcp-horde/worktrees` | Where isolated worktrees go. |
 
 ## Example (Claude Code orchestrating DeepSeek and Kimi)
@@ -137,13 +147,14 @@ These are set by OpenCode 1.19's v2 API or by MCP:
 - **Variants come from config:** effort variants exist only where the model or provider config defines them.
 - **Agents can't spawn subagents yet:** the v2 runner has no subagent tool. Child sessions created other ways are handled.
 - **The dashboard is the TUI:** there is no Claude-Code-style agent panel. Use `opencode_server info`, then `opencode attach`.
-- **Version pinned:** tested with opencode 1.19.x; other versions trigger a warning in `opencode_status`.
+- **Version pinned:** tested with opencode 1.19.x; other versions trigger a warning in `opencode_status`. A shared server started by a different `opencode` binary is reused with a warning; `opencode_server stop` replaces it.
+- **No step costs from OpenCode:** the v2 runner reports $0 per step, so costs are estimated from catalog pricing (see Limits).
 
 ## Development
 
 ```sh
 npm run build
-npm test            # unit tests + integration tests with a real `opencode serve` and a mock LLM
+npm test            # unit tests, integration tests with a real `opencode serve` and a mock LLM, and a smoke test of dist/
 npm run test:e2e    # against a real model: HORDE_E2E_MODEL=provider/model npm run test:e2e
 npm run lint        # at the repo root (Biome)
 ```
@@ -154,7 +165,9 @@ The integration tests drive the server over stdio the way a harness does. They c
 - permissions and questions under every policy, including elicitation
 - limits, provider errors, silent failures, attachments, child sessions
 - worktrees (carry-over, link, setup, profile, diff, merge, conflicts)
-- the running cap, channel pushes, resources
+- the running cap (including concurrent spawns), dialog timeouts, server stop and restart, channel pushes, resources
+- cost and time limits, limit merging, queued delivery, spawn rollback, name reuse
 - restart survival, private-mode SIGKILL cleanup, attach-mode auth, adoption of outside sessions
+- the compiled package (`dist/index.js` with the private-mode supervisor)
 
 Set `SHOW_OUTPUT=1` to print every tool call and response.
