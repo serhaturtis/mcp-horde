@@ -136,7 +136,8 @@ ${output}`)
         const listed = await h.call("opencode_status", { include_untracked: true })
         assert.match(listed, new RegExp(outside))
         assert.match(await h.call("opencode_message", { id: outside, message: "adopted", wait: true, timeout_seconds: 60 }), /Echo\[none\]: adopted/)
-        await assert.rejects(h.call("opencode_status", { ids: ["ses_doesnotexist"] }), /does not exist on this OpenCode server/)
+        // One bad id is reported without failing the whole status call.
+        assert.match(await h.call("opencode_status", { ids: ["ses_doesnotexist"] }), /ses_doesnotexist: .*does not exist on this OpenCode server/)
         assert.equal(idOf(listed).startsWith("ses_"), true)
       } finally {
         await h.close()

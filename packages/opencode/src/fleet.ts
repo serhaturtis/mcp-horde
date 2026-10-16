@@ -134,6 +134,8 @@ interface Live {
    * (settled) turn would look current.
    */
   sent?: { at: number; seq: number }
+  /** Start seq of the turn a limit already stopped: never stop the same turn twice. */
+  limitedTurn?: number
   /** Local time a turn was first seen live, for time limits that do not depend on server clocks. */
   turnSeen: Map<number, number>
   lastPushKey?: string
@@ -523,8 +525,12 @@ export class Fleet {
     await this.refresh(live)
     if (this.config.maxRunning > 0) await this.refreshUnknown()
     // Waking a settled agent takes a running slot.
-    const release = live.state && SETTLED.has(live.state) && live.state !== "needs_input" ? this.reserve() : () => undefined
+    const waking = !!live.state && SETTLED.has(live.state) && live.state !== "needs_input"
+    const release = waking ? this.reserve() : () => undefined
     try {
+      // After an interrupt OpenCode may still be winding the old loop down; a
+      // steer sent now would be parked in that loop instead of starting a turn.
+      if (waking) await this.untilInactive(live)
       const session = await this.session(id)
       const directory = session.location.directory
       const prepared = await prepareFiles(opts.files ?? [], directory)
@@ -710,6 +716,16 @@ export class Fleet {
 
   async session(id: string): Promise<SessionV2Info> {
     return unwrap(await this.api.session.get({ sessionID: id }), `loading session ${id}`).data
+  }
+
+  private async untilInactive(live: Live, timeoutMs = 10_000) {
+    const tree = [live.record.id, ...live.hotChildren.keys()]
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+      const active = await this.activeSet().catch(() => undefined)
+      if (!active || !tree.some((sid) => active.has(sid))) return
+      await sleep(100)
+    }
   }
 
   private async activeSet(): Promise<Set<string>> {
@@ -964,6 +980,8 @@ export class Fleet {
     const turn = currentTurn(track)
     // Only the turn that is running now: an ended turn's totals must not stop a new prompt.
     if (!turn || turn.endedAt !== undefined || !track.inLoop) return
+    // Already stopping it, or a prompt we sent is not in history yet (the open turn is the old one).
+    if (record.interruptedSeq !== undefined || live.sent || live.limitedTurn === turn.startSeq) return
     const { maxSteps, maxCostUsd, timeoutMinutes } = record.limits
     const started = live.turnSeen.get(turn.startSeq) ?? turn.startedAt
     let childCost = 0
@@ -973,7 +991,10 @@ export class Fleet {
     if (maxSteps && (turn.steps > maxSteps || (turn.steps >= maxSteps && !track.stepOpen))) reason = `step limit reached (${maxSteps} steps this turn)`
     else if (maxCostUsd && cost >= maxCostUsd) reason = `cost limit reached ($${cost.toFixed(4)} ≥ $${maxCostUsd} this turn)`
     else if (timeoutMinutes && Date.now() - started > timeoutMinutes * 60_000) reason = `time limit reached (${timeoutMinutes} min this turn)`
-    if (reason) await this.interruptNow(live, reason)
+    if (reason) {
+      live.limitedTurn = turn.startSeq
+      await this.interruptNow(live, reason)
+    }
   }
 
   private async scanChildren(live: Live) {
