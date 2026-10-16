@@ -58,5 +58,12 @@ process.stdin.on("close", shutdown)
 
 await server.connect(new StdioServerTransport())
 // Reconnect to agents left running by a previous process (shared server) so
-// policies, limits and notifications keep working without a tool call.
-if (store.server || config.url) void getFleet().catch(() => undefined)
+// policies, limits and notifications keep working without a tool call. Only
+// when that server is still alive: never start one before a tool needs it.
+const known = config.url ? undefined : store.server
+if (known && config.serverMode === "shared") {
+  const auth = `Basic ${Buffer.from(`${config.username}:${known.password}`).toString("base64")}`
+  void fetch(`${known.url}/global/health`, { headers: { Authorization: auth }, signal: AbortSignal.timeout(2000) })
+    .then((res) => (res.ok ? getFleet() : undefined))
+    .catch(() => undefined)
+}
