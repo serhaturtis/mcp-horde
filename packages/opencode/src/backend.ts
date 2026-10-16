@@ -252,7 +252,8 @@ async function spawnPrivate(config: Config, password: string) {
     // Our own directory, so loader flags resolve; the supervisor starts OpenCode in config.directory.
     cwd: fileURLToPath(new URL(".", import.meta.url)),
     env: { ...process.env, OPENCODE_SERVER_PASSWORD: password, HORDE_SUPERVISED_CWD: config.directory },
-    stdio: ["ignore", "pipe", "pipe"],
+    // stdin stays open as a lifeline: the supervisor stops OpenCode when it closes.
+    stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
   })
   const killChild = () => {

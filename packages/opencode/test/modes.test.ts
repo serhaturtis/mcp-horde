@@ -4,7 +4,7 @@ import fs from "node:fs"
 import path from "node:path"
 import { after, before, describe, test } from "node:test"
 import { createOpencodeClient } from "@opencode-ai/sdk/v2"
-import { connect, idOf, isolatedEnv, type Mock, makeRepo, opencodeBin, until } from "./harness.js"
+import { connect, freePort, idOf, isolatedEnv, killTree, type Mock, makeRepo, opencodeBin, until } from "./harness.js"
 import { startMockLlm } from "./mock-llm.js"
 
 let mock: Mock
@@ -89,16 +89,26 @@ describe("server modes and durability", { timeout: 600_000 }, () => {
   test("attach mode: password required, wrong password reported, adoption of outside sessions", async () => {
     const { tmp, repo } = makeRepo(mock.url)
     const password = "s3cret-test"
-    const port = 40_000 + Math.floor(Math.random() * 20_000)
+    const port = await freePort()
     const proc = spawn(opencodeBin, ["serve", "--hostname", "127.0.0.1", "--port", String(port)], {
       cwd: repo,
       env: { ...process.env, ...isolatedEnv(tmp, repo), OPENCODE_SERVER_PASSWORD: password },
-      stdio: "ignore",
+      stdio: ["ignore", "pipe", "pipe"],
       shell: process.platform === "win32",
     })
+    let output = ""
+    proc.stdout?.on("data", (c: Buffer) => (output += c.toString()))
+    proc.stderr?.on("data", (c: Buffer) => (output += c.toString()))
     const url = `http://127.0.0.1:${port}`
     try {
-      await until(async () => (await fetch(`${url}/global/health`, { signal: AbortSignal.timeout(2000) }).catch(() => undefined)) !== undefined, 60_000, 300)
+      await until(
+        async () => (await fetch(`${url}/global/health`, { signal: AbortSignal.timeout(2000) }).catch(() => undefined)) !== undefined,
+        90_000,
+        300,
+      ).catch((err: Error) => {
+        throw new Error(`${err.message}; opencode serve output:
+${output}`)
+      })
       const base = isolatedEnv(tmp, repo)
 
       const wrong = await connect({ ...base, HORDE_OPENCODE_URL: url, OPENCODE_SERVER_PASSWORD: "nope" })
@@ -126,7 +136,7 @@ describe("server modes and durability", { timeout: 600_000 }, () => {
         await h.close()
       }
     } finally {
-      proc.kill("SIGTERM")
+      killTree(proc.pid)
     }
   })
 })

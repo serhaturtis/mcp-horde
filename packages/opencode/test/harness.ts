@@ -59,6 +59,8 @@ export function makeRepo(mockUrl: string, extra: Record<string, unknown> = {}) {
   fs.writeFileSync(path.join(repo, "README.md"), "# test repo\n")
   fs.writeFileSync(path.join(repo, ".gitignore"), "node_modules/\nbuild/\n")
   git(repo, "init", "-q")
+  // Deterministic line endings on Windows runners.
+  git(repo, "config", "core.autocrlf", "false")
   git(repo, "add", ".")
   git(repo, "commit", "-qm", "init")
   return { tmp, repo }
@@ -107,6 +109,29 @@ export async function connect(env: Record<string, string>, opts: { elicitation?:
     return text
   }
   return { client, call, elicit, channel, close: () => client.close() }
+}
+
+export async function freePort(): Promise<number> {
+  const net = await import("node:net")
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer()
+    srv.on("error", reject)
+    srv.listen(0, "127.0.0.1", () => {
+      const { port } = srv.address() as { port: number }
+      srv.close(() => resolve(port))
+    })
+  })
+}
+
+/** Kill a process and its children (on Windows, opencode runs behind a .cmd shim). */
+export function killTree(pid: number | undefined) {
+  if (!pid) return
+  try {
+    if (process.platform === "win32") execFileSync("taskkill", ["/pid", String(pid), "/T", "/F"], { stdio: "ignore" })
+    else process.kill(pid, "SIGTERM")
+  } catch {
+    // already gone
+  }
 }
 
 export const idOf = (text: string) => text.match(/ses_[A-Za-z0-9]+/)![0]

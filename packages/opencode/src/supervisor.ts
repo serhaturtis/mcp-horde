@@ -15,7 +15,7 @@ if (!parent || !bin) {
 
 const child = spawn(bin, args, {
   cwd: process.env.HORDE_SUPERVISED_CWD || process.cwd(),
-  stdio: "inherit",
+  stdio: ["ignore", "inherit", "inherit"],
   windowsHide: true,
   shell: process.platform === "win32",
 })
@@ -31,6 +31,13 @@ child.on("error", (err) => {
   process.exit(1)
 })
 for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"] as const) process.on(sig, stop)
+
+// Our stdin is a pipe from the MCP server: it closes on any parent death,
+// including SIGKILL / TerminateProcess, on every platform.
+process.stdin.on("end", stop)
+process.stdin.on("close", stop)
+process.stdin.on("error", stop)
+process.stdin.resume()
 
 setInterval(() => {
   try {
