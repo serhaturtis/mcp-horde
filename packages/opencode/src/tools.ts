@@ -1,14 +1,24 @@
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
+import { type McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js"
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js"
 import { z } from "zod"
+import { type Backend, stopSharedServer } from "./backend.js"
+import { POLICIES } from "./config.js"
 import type { Fleet, Snapshot } from "./fleet.js"
-import { SETTLED, formatModel } from "./fleet.js"
-import { truncate, truncateHead } from "./render.js"
+import { formatModel, SETTLED, unsupportedReason } from "./fleet.js"
+import { formatTokens, formatUsd, indent, oneLine, truncate, truncateHead } from "./render.js"
+import type { Store } from "./state.js"
+import type { Turn } from "./tracker.js"
 
 type Extra = {
   signal: AbortSignal
   _meta?: { progressToken?: string | number }
   sendNotification: (n: { method: "notifications/progress"; params: Record<string, unknown> }) => Promise<void>
+}
+
+export interface Context {
+  fleet: () => Promise<Fleet>
+  backend: () => Promise<Backend>
+  store: Store
 }
 
 const ok = (text: string): CallToolResult => ({ content: [{ type: "text", text }] })
@@ -17,48 +27,83 @@ const fail = (err: unknown): CallToolResult => ({
   isError: true,
 })
 
-const id = z.string().describe("Agent session id (ses_…) or the name given at spawn.")
+const DEFAULT_WAIT_S = 1800
+
+const id = z.string().describe("Agent name (given at spawn) or session id (ses_…).")
 const permissions = z
-  .enum(["ask", "allow", "deny"])
+  .enum(POLICIES as [string, ...string[]])
   .describe(
-    'How to handle the agent\'s permission requests (shell commands, edits outside the project, …). "ask" surfaces them as needs_input for you to answer with opencode_respond; "allow" approves each one automatically; "deny" rejects them automatically.',
+    'Permission requests (shell commands, edits outside the project, …): "user" (default) shows them to the human as a dialog; "ask" hands them to you as needs_input; "allow" approves all; "deny" rejects all.',
   )
+const questions = z
+  .enum(["user", "ask", "dismiss"])
+  .describe(
+    'Questions the agent asks: "user" shows them to the human, "ask" hands them to you, "dismiss" makes the agent decide itself. Defaults follow permissions.',
+  )
+const limits = z
+  .object({
+    max_steps: z.number().int().min(1).optional().describe("Interrupt after this many agent-loop steps in one turn."),
+    max_cost_usd: z.number().positive().optional().describe("Interrupt once a turn has cost this much."),
+    timeout_minutes: z.number().positive().optional().describe("Interrupt a turn that runs longer than this."),
+  })
+  .describe("Safety limits per turn. Hitting one interrupts the agent (state interrupted, with the reason).")
 const timeout = z
   .number()
   .int()
   .min(1)
-  .max(3600)
-  .describe("How long to block, in seconds (default 300). On timeout you get the current status; the agents keep working.")
-const files = z.array(z.string()).describe("File paths (relative to the agent's directory or absolute) to attach to the prompt.")
+  .max(86_400)
+  .describe(
+    `Max seconds to block (default ${DEFAULT_WAIT_S}). Claude Code moves long calls to the background automatically. On timeout the agents keep working.`,
+  )
+const files = z.array(z.string()).describe("Files to attach (paths relative to the agent's directory, or absolute).")
 
-export function renderSnapshot(s: Snapshot, fleet: Fleet, resultChars = 0): string {
-  const head = `◆ ${s.name ? `${s.name} (${s.id})` : s.id} — ${s.state.toUpperCase()}`
-  const lines = [head, `  model: ${formatModel(s.model)} · agent: ${s.agent ?? "default"} · permissions: ${s.policy}`, `  dir: ${s.directory}`]
-  if (s.title && !s.title.startsWith("New session")) lines.splice(1, 0, `  title: ${s.title}`)
-  if (s.worktree) lines.push(`  worktree branch: ${s.worktree.branch} (base ${s.worktree.base.slice(0, 10)})`)
-  if (s.activity) lines.push(`  doing: ${s.activity}`)
-  if (s.error) lines.push(`  error: ${truncate(s.error, 400)}`)
-  for (const p of s.permissions) {
-    lines.push(`  needs permission ${p.id}: ${p.action} ${JSON.stringify(p.resources)} → opencode_respond decision once|always|reject`)
-  }
-  for (const q of s.questions) {
-    q.questions.forEach((item, i) => {
-      const opts = item.options.map((o) => o.label).join(" | ")
-      lines.push(`  needs answer ${q.id}${q.questions.length > 1 ? ` #${i + 1}` : ""}: ${item.question}${opts ? ` [${opts}]` : ""}${item.multiple ? " (multi)" : ""}`)
-    })
-  }
-  if (resultChars > 0 && SETTLED.has(s.state)) {
-    const text = fleet.lastText(s)
-    if (text) lines.push(`  result:\n${indent(truncateHead(text, resultChars))}`)
-  }
-  return lines.join("\n")
+function limitsIn(l?: { max_steps?: number; max_cost_usd?: number; timeout_minutes?: number }) {
+  if (!l) return undefined
+  return { maxSteps: l.max_steps, maxCostUsd: l.max_cost_usd, timeoutMinutes: l.timeout_minutes }
 }
 
-function indent(text: string) {
-  return text
-    .split("\n")
-    .map((l) => `    ${l}`)
-    .join("\n")
+function renderTurn(t: Turn, chars: number, label: boolean): string {
+  const head = label ? `turn "${truncate(oneLine(t.prompt.replace(/<[^>]+>[\s\S]*?<\/[^>]+>/g, "")), 60)}":\n` : ""
+  const body = t.finalText.trim() || (t.failure ? `(no answer: ${t.failure})` : "(no text answer)")
+  return indent(`${head}${truncateHead(body, chars)}`)
+}
+
+export function renderSnapshot(s: Snapshot, opts: { resultChars?: number; mode?: "news" | "last" } = {}): string {
+  const stats = [`${s.steps} steps`, formatUsd(s.cost), `${formatTokens(s.tokens.input + s.tokens.output + s.tokens.reasoning)} tok`].join(" · ")
+  const lines = [`◆ ${s.name ? `${s.name} (${s.id})` : s.id} — ${s.state.toUpperCase()} · ${stats}`]
+  if (s.title && !s.title.startsWith("New session") && !s.title.startsWith("horde: ")) lines.push(`  title: ${s.title}`)
+  const lim = [
+    s.limits.maxSteps && `${s.limits.maxSteps} steps`,
+    s.limits.maxCostUsd && `$${s.limits.maxCostUsd}`,
+    s.limits.timeoutMinutes && `${s.limits.timeoutMinutes} min`,
+  ].filter(Boolean)
+  lines.push(
+    `  model: ${formatModel(s.model)} · agent: ${s.agent ?? "default"} · permissions: ${s.policy}/${s.questionPolicy}${lim.length ? ` · limits: ${lim.join(", ")}` : ""}`,
+  )
+  lines.push(`  dir: ${s.directory}${s.worktree ? ` (worktree, branch ${s.worktree.branch})` : ""}`)
+  if (s.children.length) lines.push(`  subagents: ${s.children.join(", ")}`)
+  if (s.activity) lines.push(`  doing: ${s.activity}`)
+  if (s.retry) lines.push(`  ${s.retry}`)
+  if (s.error) lines.push(`  ${s.state === "interrupted" ? "reason" : "error"}: ${truncate(s.error, 500)}`)
+  for (const p of s.pending.permissions) {
+    lines.push(
+      `  needs permission ${p.id}${p.sessionID !== s.id ? ` (subagent ${p.sessionID})` : ""}: ${p.action} ${JSON.stringify(p.resources)} → opencode_respond once|always|reject`,
+    )
+  }
+  for (const q of s.pending.questions) {
+    q.questions.forEach((item, i) => {
+      const opts = item.options.map((o) => o.label).join(" | ")
+      lines.push(
+        `  needs answer ${q.id}${q.questions.length > 1 ? ` #${i + 1}` : ""}: ${item.question}${opts ? ` [${opts}]` : ""}${item.multiple ? " (multi)" : ""}`,
+      )
+    })
+  }
+  const chars = opts.resultChars ?? 0
+  if (chars > 0 && SETTLED.has(s.state) && s.state !== "needs_input") {
+    const turns = opts.mode === "news" && s.unreported.length ? s.unreported : s.lastTurn?.endedAt ? [s.lastTurn] : []
+    if (turns.length) lines.push(`  result:\n${turns.map((t) => renderTurn(t, Math.max(500, Math.floor(chars / turns.length)), turns.length > 1)).join("\n")}`)
+  }
+  return lines.join("\n")
 }
 
 function progress(extra: Extra) {
@@ -66,17 +111,17 @@ function progress(extra: Extra) {
   if (token === undefined) return undefined
   let n = 0
   return (snaps: Snapshot[], elapsed: number) => {
-    const running = snaps.filter((s) => !SETTLED.has(s.state)).map((s) => s.name ?? s.id)
+    const running = snaps.filter((s) => !SETTLED.has(s.state)).map((s) => `${s.name ?? s.id}${s.activity ? ` (${truncate(s.activity, 60)})` : ""}`)
     void extra
       .sendNotification({
         method: "notifications/progress",
-        params: { progressToken: token, progress: ++n, message: `${Math.round(elapsed / 1000)}s: waiting on ${running.join(", ")}` },
+        params: { progressToken: token, progress: ++n, message: `${Math.round(elapsed / 1000)}s · ${running.join(", ")}` },
       })
       .catch(() => undefined)
   }
 }
 
-export function registerTools(server: McpServer, getFleet: () => Promise<Fleet>) {
+export function registerTools(server: McpServer, ctx: Context) {
   const tool = <S extends z.ZodRawShape>(
     name: string,
     description: string,
@@ -84,155 +129,198 @@ export function registerTools(server: McpServer, getFleet: () => Promise<Fleet>)
     run: (args: z.infer<z.ZodObject<S>>, fleet: Fleet, extra: Extra) => Promise<string>,
     annotations: { readOnlyHint?: boolean; destructiveHint?: boolean; idempotentHint?: boolean } = {},
   ) => {
-    server.registerTool(
-      name,
-      { description, inputSchema: shape, annotations: { openWorldHint: false, ...annotations } },
-      (async (args: z.infer<z.ZodObject<S>>, extra: Extra) => {
-        try {
-          return ok(await run(args, await getFleet(), extra))
-        } catch (err) {
-          return fail(err)
-        }
-      }) as never,
-    )
+    server.registerTool(name, { description, inputSchema: shape, annotations: { openWorldHint: false, ...annotations } }, (async (
+      args: z.infer<z.ZodObject<S>>,
+      extra: Extra,
+    ) => {
+      try {
+        const fleet = await ctx.fleet()
+        const text = await run(args, fleet, extra)
+        const warnings = (await ctx.backend()).info.warnings
+        return ok(warnings.length && name === "opencode_status" ? `${text}\n\n⚠ ${warnings.join("\n⚠ ")}` : text)
+      } catch (err) {
+        return fail(err)
+      }
+    }) as never)
+  }
+
+  const waitAndRender = async (fleet: Fleet, ids: string[], mode: "any" | "all", seconds: number | undefined, extra: Extra, chars: number) => {
+    const r = await fleet.waitFor(ids, mode, (seconds ?? DEFAULT_WAIT_S) * 1000, { signal: extra.signal, onTick: progress(extra) })
+    const news = r.snapshots.filter((s) => r.news.has(s.id))
+    const running = r.snapshots.filter((s) => !SETTLED.has(s.state))
+    const quiet = r.snapshots.filter((s) => SETTLED.has(s.state) && !r.news.has(s.id))
+    const head = r.timedOut
+      ? `Timed out after ${seconds ?? DEFAULT_WAIT_S}s with no news; ${running.length} still running.`
+      : r.nothingToWaitFor
+        ? "Nothing new: no listed agent is running, and their results were already reported."
+        : `${news.length} with news, ${running.length} still running.`
+    const parts = [head, ...news.map((s) => renderSnapshot(s, { resultChars: chars, mode: "news" })), ...running.map((s) => renderSnapshot(s))]
+    if (quiet.length) parts.push(`Already reported: ${quiet.map((s) => `${s.name ?? s.id} (${s.state})`).join(", ")}`)
+    return parts.join("\n\n")
   }
 
   tool(
     "opencode_models",
-    "List the models OpenCode can run (provider/model ids, reasoning variants a.k.a. effort levels, context size). Use the ids with opencode_spawn's model/variant.",
+    "List models OpenCode agents can run (any provider: DeepSeek, Kimi, GLM, Qwen, GPT, Claude, local …) with their effort variants and context size. Use the ids with opencode_spawn model/variant.",
     {
-      provider: z.string().optional().describe("Only this provider id (e.g. deepseek, anthropic, openrouter)."),
+      provider: z.string().optional().describe("Only this provider id (e.g. deepseek, openrouter)."),
       query: z.string().optional().describe("Case-insensitive substring filter on the model id or name."),
-      directory: z.string().optional().describe("Project directory whose opencode config to use."),
+      include_unsupported: z.boolean().optional().describe("Also list models the v2 agent runner cannot use."),
+      directory: z.string().optional().describe("Project directory whose opencode config applies."),
     },
     async (a, fleet) => {
       const q = a.query?.toLowerCase()
-      const models = (await fleet.models(a.directory)).filter(
-        (m) => m.enabled && (!a.provider || m.providerID === a.provider) && (!q || `${m.id} ${m.name}`.toLowerCase().includes(q)),
+      const all = (await fleet.models(a.directory)).filter(
+        (m) => m.enabled && (!a.provider || m.providerID === a.provider) && (!q || `${m.providerID}/${m.id} ${m.name}`.toLowerCase().includes(q)),
       )
-      if (!models.length) return "No matching models. Configure providers in opencode (opencode auth login / opencode.json)."
-      const lines = models.map((m) => {
+      const usable = all.filter((m) => !unsupportedReason(m))
+      const shown = a.include_unsupported ? all : usable
+      if (!shown.length) {
+        return all.length
+          ? `${all.length} model(s) match, but none can run agents (pass include_unsupported to see why).`
+          : "No matching models. Configure providers in OpenCode (opencode auth login, or opencode.json)."
+      }
+      const lines = shown.map((m) => {
         const variants = m.variants.map((v) => v.id)
-        return `${m.providerID}/${m.id} — ${m.name} · ctx ${Math.round(m.limit.context / 1000)}k${variants.length ? ` · variants: ${variants.join(", ")}` : ""}`
+        const why = unsupportedReason(m)
+        return `${m.providerID}/${m.id} — ${m.name} · ctx ${Math.round(m.limit.context / 1000)}k · ${variants.length ? `effort variants: ${variants.join(", ")}` : "no effort variants"}${why ? ` · UNSUPPORTED: ${why}` : ""}`
       })
-      return `${models.length} model(s):\n${lines.slice(0, 300).join("\n")}${lines.length > 300 ? "\n… (narrow with provider/query)" : ""}`
+      const hidden = all.length - usable.length
+      return `${shown.length} model(s)${!a.include_unsupported && hidden ? ` (${hidden} unsupported hidden)` : ""}:\n${lines.slice(0, 300).join("\n")}${lines.length > 300 ? "\n… (narrow with provider/query)" : ""}`
     },
     { readOnlyHint: true },
   )
 
   tool(
     "opencode_agents",
-    'List OpenCode agent profiles (e.g. "build" can edit and run commands, "plan" is read-only, plus custom agents from the project config).',
-    { directory: z.string().optional().describe("Project directory whose opencode config to use.") },
-    async (a, fleet) => {
-      const agents = (await fleet.agents(a.directory)).filter((x) => !x.hidden)
-      return agents
-        .map((x) => `${x.id} (${x.mode})${x.model ? ` · ${formatModel(x.model)}` : ""}${x.description ? ` — ${truncate(x.description, 200)}` : ""}`)
-        .join("\n")
-    },
+    'List OpenCode agent profiles usable with opencode_spawn agent (e.g. "build" edits and runs commands, "plan" is read-only, plus custom ones from the project config).',
+    { directory: z.string().optional().describe("Project directory whose opencode config applies.") },
+    async (a, fleet) =>
+      (await fleet.agents(a.directory))
+        .filter((x) => !x.hidden && x.mode !== "subagent")
+        .map(
+          (x) =>
+            `${x.id}${x.model ? ` · ${formatModel(x.model)}` : ""}${x.steps ? ` · max ${x.steps} steps` : ""}${x.description ? ` — ${truncate(x.description, 200)}` : ""}`,
+        )
+        .join("\n"),
     { readOnlyHint: true },
   )
 
   tool(
     "opencode_spawn",
-    "Start a new OpenCode agent on a task and return immediately (default) or wait for it. Spawn several to work in parallel, then use opencode_wait. The prompt must be self-contained: the agent does not see your conversation.",
+    "Spawn an OpenCode agent on a task with any model and effort level. Returns immediately (it runs in the background) unless wait is set. Spawn several for parallel work, then opencode_wait. The agent does not see your conversation: make the prompt self-contained (put shared context in instructions).",
     {
-      prompt: z.string().min(1).describe("The full task description."),
-      name: z.string().optional().describe("Short unique name to address the agent by (e.g. 'tests', 'refactor-auth')."),
-      model: z.string().optional().describe('"provider/model", e.g. "deepseek/deepseek-chat". Pick per task (see opencode_models); omitted = the default from opencode config.'),
-      variant: z.string().optional().describe('Reasoning effort / model variant, e.g. "low", "high", "max" (see opencode_models).'),
-      agent: z.string().optional().describe('OpenCode agent profile, e.g. "build" (default) or "plan" (read-only).'),
+      prompt: z.string().min(1).describe("The task."),
+      name: z.string().optional().describe("Unique short name to address it by (letters, digits, . _ -)."),
+      model: z.string().optional().describe('"provider/model" from opencode_models, chosen for this task. Omitted = OpenCode\'s configured default.'),
+      variant: z.string().optional().describe('Effort level / model variant, e.g. "low", "high", "max" (see opencode_models; requires model).'),
+      agent: z.string().optional().describe('Existing agent profile (opencode_agents), e.g. "build" (default) or "plan" (read-only).'),
+      instructions: z.string().optional().describe("Role, constraints and context for the agent, prepended to the prompt (like a subagent system prompt)."),
+      profile: z
+        .object({
+          tools: z.record(z.string(), z.boolean()).optional().describe('Enable/disable tools, e.g. {"bash": false, "webfetch": false}.'),
+          steps: z.number().int().min(1).optional().describe("Max agent-loop steps per turn (enforced by OpenCode)."),
+          description: z.string().optional(),
+        })
+        .optional()
+        .describe('A custom agent profile created for this agent. Requires isolation "worktree" unless OpenCode has not opened the directory yet.'),
       directory: z.string().optional().describe("Working directory (absolute). Defaults to the server's directory."),
       isolation: z
         .enum(["none", "worktree"])
         .optional()
-        .describe('"worktree" runs the agent in its own git worktree + branch (horde/<name>) so parallel agents never clobber each other.'),
+        .describe('"worktree": own git worktree + branch horde/<name>, so parallel agents never collide. Merge with opencode_worktree.'),
+      worktree: z
+        .object({
+          include_uncommitted: z.boolean().optional().describe("Copy your uncommitted and untracked changes into the worktree (default true)."),
+          link: z.array(z.string()).optional().describe('Paths to symlink from the main checkout, e.g. ["node_modules", ".env"].'),
+          setup: z.string().optional().describe('Shell command to run in the worktree before the agent starts, e.g. "npm ci".'),
+        })
+        .optional(),
       permissions: permissions.optional(),
+      questions: questions.optional(),
+      limits: limits.optional(),
       files: files.optional(),
-      wait: z.boolean().optional().describe("Block until the agent settles (finished, needs input, or failed). Default false."),
+      wait: z.boolean().optional().describe("Block until it settles. Default false."),
       timeout_seconds: timeout.optional(),
     },
     async (a, fleet, extra) => {
-      let snap = await fleet.spawn({
+      const { snapshot, notes } = await fleet.spawn({
         prompt: a.prompt,
         name: a.name,
         model: a.model,
         variant: a.variant,
         agent: a.agent,
+        instructions: a.instructions,
+        profile: a.profile,
         directory: a.directory,
         isolation: a.isolation,
-        permissions: a.permissions,
+        worktree: a.worktree && { includeUncommitted: a.worktree.include_uncommitted, link: a.worktree.link, setup: a.worktree.setup },
+        permissions: a.permissions as never,
+        questions: a.questions,
+        limits: limitsIn(a.limits),
         files: a.files,
       })
-      if (a.wait) {
-        const r = await fleet.waitFor([snap.id], "all", (a.timeout_seconds ?? 300) * 1000, { signal: extra.signal, onTick: progress(extra) })
-        snap = r.snapshots[0]!
-        return `${r.timedOut ? "Still running after timeout.\n" : ""}${renderSnapshot(snap, fleet, 8000)}`
-      }
-      return `Spawned.\n${renderSnapshot(snap, fleet)}\nUse opencode_wait to block until it settles, opencode_status to peek.`
+      const noteText = notes.length ? `\n${notes.map((n) => `  · ${n}`).join("\n")}` : ""
+      if (a.wait) return `Spawned.${noteText}\n${await waitAndRender(fleet, [snapshot.id], "all", a.timeout_seconds, extra, 8000)}`
+      return `Spawned.${noteText}\n${renderSnapshot(snapshot)}\nIt runs in the background: opencode_wait to collect the result.`
     },
   )
 
   tool(
     "opencode_message",
-    'Send a message to an agent. delivery "steer" (default) injects it at the agent\'s next step even mid-turn — use it to correct course; "queue" delivers it after the current turn finishes. An idle/interrupted agent starts working again. Can also switch model, variant, agent profile or permission policy first.',
+    'Talk to an agent. delivery "steer" (default) reaches it at its next step even mid-turn — use it to correct course; "queue" is handled after the current turn. An idle, interrupted or failed agent starts working again. Can also switch model, effort, agent profile, policies or limits first.',
     {
       id,
       message: z.string().min(1),
       delivery: z.enum(["steer", "queue"]).optional(),
-      model: z.string().optional().describe('Switch to "provider/model" before this message.'),
-      variant: z.string().optional().describe("Switch reasoning effort / variant before this message."),
-      agent: z.string().optional().describe("Switch agent profile before this message."),
+      model: z.string().optional().describe('Switch to "provider/model" from now on.'),
+      variant: z.string().optional().describe("Switch effort level from now on."),
+      agent: z.string().optional().describe("Switch agent profile from now on."),
       permissions: permissions.optional(),
+      questions: questions.optional(),
+      limits: limits.optional(),
       files: files.optional(),
-      wait: z.boolean().optional().describe("Block until the agent settles. Default false."),
+      wait: z.boolean().optional(),
       timeout_seconds: timeout.optional(),
     },
     async (a, fleet, extra) => {
-      if (a.permissions) fleet.setPolicy(a.id, a.permissions)
-      let snap = await fleet.message(a.id, a.message, { delivery: a.delivery, model: a.model, variant: a.variant, agent: a.agent, files: a.files })
-      if (a.wait) {
-        const r = await fleet.waitFor([snap.id], "all", (a.timeout_seconds ?? 300) * 1000, { signal: extra.signal, onTick: progress(extra) })
-        snap = r.snapshots[0]!
-        return `${r.timedOut ? "Still running after timeout.\n" : ""}${renderSnapshot(snap, fleet, 8000)}`
-      }
-      return `Delivered (${a.delivery ?? "steer"}).\n${renderSnapshot(snap, fleet)}`
+      const snap = await fleet.message(a.id, a.message, {
+        delivery: a.delivery,
+        model: a.model,
+        variant: a.variant,
+        agent: a.agent,
+        files: a.files,
+        permissions: a.permissions as never,
+        questions: a.questions,
+        limits: limitsIn(a.limits),
+      })
+      if (a.wait) return waitAndRender(fleet, [snap.id], "all", a.timeout_seconds, extra, 8000)
+      return `Delivered (${a.delivery ?? "steer"}).\n${renderSnapshot(snap)}`
     },
   )
 
   tool(
     "opencode_wait",
-    'Block until agents settle (idle, needs_input, interrupted or error) and return their status plus final answers. mode "any" (default) returns when the first one settles — pass only the agents you are still waiting on; "all" waits for every one.',
+    'Block until agents have news and return it (final answers, failures, pending requests). mode "any" (default) returns at the first agent with news and marks it seen, so call it again for the next one; "all" waits until every agent is settled. In Claude Code a long wait becomes a background task automatically.',
     {
-      ids: z.array(z.string()).optional().describe("Agents to wait on. Defaults to every tracked agent that is currently running."),
+      ids: z.array(z.string()).optional().describe("Agents to wait on. Default: all tracked agents."),
       mode: z.enum(["any", "all"]).optional(),
       timeout_seconds: timeout.optional(),
-      result_chars: z.number().int().min(0).max(100_000).optional().describe("Max chars of each settled agent's final answer to include (default 6000)."),
+      result_chars: z.number().int().min(0).max(100_000).optional().describe("Max chars of final answers per agent (default 6000)."),
     },
     async (a, fleet, extra) => {
-      let ids = a.ids
-      if (!ids?.length) {
-        const all = await fleet.list({})
-        ids = all.filter((s) => !SETTLED.has(s.state)).map((s) => s.id)
-        if (!ids.length) return "No running agents to wait on.\n\n" + all.map((s) => renderSnapshot(s, fleet)).join("\n\n")
-      }
-      const r = await fleet.waitFor(ids, a.mode ?? "any", (a.timeout_seconds ?? 300) * 1000, { signal: extra.signal, onTick: progress(extra) })
-      const chars = a.result_chars ?? 6000
-      const settled = r.snapshots.filter((s) => SETTLED.has(s.state))
-      const running = r.snapshots.filter((s) => !SETTLED.has(s.state))
-      const parts = [r.timedOut ? `Timed out; ${running.length} still running.` : `${settled.length} settled, ${running.length} still running.`]
-      for (const s of [...settled, ...running]) parts.push(renderSnapshot(s, fleet, chars))
-      return parts.join("\n\n")
+      const ids = a.ids?.length ? a.ids : fleet.ids()
+      if (!ids.length) return "No agents. Start one with opencode_spawn."
+      return waitAndRender(fleet, ids, a.mode ?? "any", a.timeout_seconds, extra, a.result_chars ?? 6000)
     },
-    { readOnlyHint: true },
   )
 
   tool(
     "opencode_status",
-    "Peek at agents without blocking: state, current activity, pending permission requests/questions. With no ids, lists every agent this server is tracking.",
+    "Peek at agents without blocking: state, what they are doing right now, pending requests, cost, last answer. With no ids: every agent tracked by this server.",
     {
       ids: z.array(z.string()).optional(),
-      include_untracked: z.boolean().optional().describe("Also list recent OpenCode sessions in `directory` that this server did not spawn (e.g. from before a restart) so you can adopt them by id."),
+      include_untracked: z.boolean().optional().describe("Also adopt recent OpenCode sessions in `directory` that were not spawned here."),
       directory: z.string().optional(),
     },
     async (a, fleet) => {
@@ -240,96 +328,139 @@ export function registerTools(server: McpServer, getFleet: () => Promise<Fleet>)
         ? await Promise.all(a.ids.map((i) => fleet.snapshot(i)))
         : await fleet.list({ includeUntracked: a.include_untracked, directory: a.directory })
       if (!snaps.length) return "No agents yet. Start one with opencode_spawn."
-      return snaps.map((s) => renderSnapshot(s, fleet, 600)).join("\n\n")
+      return snaps.map((s) => renderSnapshot(s, { resultChars: 800, mode: "last" })).join("\n\n")
     },
     { readOnlyHint: true },
   )
 
   tool(
     "opencode_output",
-    'Read what an agent did. detail "final" = last answer only, "summary" (default) = messages plus one line per tool call, "full" = also tool outputs and reasoning. scope "turn" (default) = since the latest prompt, "all" = whole session.',
+    'Read an agent\'s transcript. detail "final" = last answer, "summary" (default) = messages plus one line per tool call, "full" = also tool outputs and reasoning. scope "turn" (default) = current turn, "all" = whole session.',
     {
       id,
       detail: z.enum(["final", "summary", "full"]).optional(),
       scope: z.enum(["turn", "all"]).optional(),
       max_chars: z.number().int().min(500).max(200_000).optional().describe("Default 20000; older content is cut first."),
     },
-    async (a, fleet) => {
-      const text = await fleet.transcript(a.id, { scope: a.scope ?? "turn", detail: a.detail ?? "summary" })
-      return truncateHead(text, a.max_chars ?? 20_000)
-    },
+    async (a, fleet) => truncateHead(await fleet.transcript(a.id, { scope: a.scope ?? "turn", detail: a.detail ?? "summary" }), a.max_chars ?? 20_000),
     { readOnlyHint: true },
   )
 
   tool(
     "opencode_interrupt",
-    "Stop an agent's current turn (pause). Its context is kept; continue later with opencode_resume or opencode_message. Messages that were not picked up yet stay pending and are delivered on resume.",
-    { id },
-    async (a, fleet) => renderSnapshot(await fleet.interrupt(a.id), fleet),
-    { destructiveHint: false, idempotentHint: true },
+    'Stop or pause an agent. when "now" (default) aborts immediately, killing a running tool; "after_step" lets the current step (and its tool call) finish first. Context is kept: continue with opencode_resume or opencode_message. Pending messages are delivered on resume.',
+    { id, when: z.enum(["now", "after_step"]).optional() },
+    async (a, fleet) => renderSnapshot(await fleet.interrupt(a.id, a.when ?? "now")),
+    { idempotentHint: true },
   )
 
   tool(
     "opencode_resume",
     "Resume an interrupted, failed or idle agent. Without a message it is told to continue where it left off.",
-    {
-      id,
-      message: z.string().optional(),
-      wait: z.boolean().optional(),
-      timeout_seconds: timeout.optional(),
-    },
+    { id, message: z.string().optional(), wait: z.boolean().optional(), timeout_seconds: timeout.optional() },
     async (a, fleet, extra) => {
-      let snap = await fleet.resume(a.id, a.message)
-      if (a.wait) {
-        const r = await fleet.waitFor([snap.id], "all", (a.timeout_seconds ?? 300) * 1000, { signal: extra.signal, onTick: progress(extra) })
-        snap = r.snapshots[0]!
-        return renderSnapshot(snap, fleet, 8000)
-      }
-      return `Resumed.\n${renderSnapshot(snap, fleet)}`
+      const snap = await fleet.message(a.id, a.message ?? "You were interrupted. Continue the task from where you left off.")
+      if (a.wait) return waitAndRender(fleet, [snap.id], "all", a.timeout_seconds, extra, 8000)
+      return `Resumed.\n${renderSnapshot(snap)}`
     },
   )
 
   tool(
     "opencode_respond",
-    "Answer an agent that is in needs_input: approve/reject a permission request, or answer/reject a question.",
+    "Answer an agent in needs_input: approve or reject a permission request (per_…), or answer or dismiss a question (que_…).",
     {
       id,
-      request_id: z.string().describe("The per_… or que_… id shown by opencode_status / opencode_wait."),
+      request_id: z.string(),
       decision: z
         .enum(["once", "always", "reject"])
         .optional()
-        .describe('Permissions: "once" (default) approves this call, "always" also approves matching future calls, "reject" denies. Questions: "reject" dismisses.'),
+        .describe(
+          'Permissions: "once" (default) approves this call, "always" also matching future calls, "reject" denies. Questions: "reject" stops the agent\'s turn; omit answers to let it decide itself.',
+        ),
       message: z.string().optional().describe("Feedback to the agent when rejecting a permission."),
-      answers: z
-        .array(z.array(z.string()))
-        .optional()
-        .describe("Question answers: one array of selected option labels (or free text) per question, in order."),
+      answers: z.array(z.array(z.string())).optional().describe("Question answers: per question, the selected option labels (or free text)."),
     },
-    async (a, fleet) =>
-      renderSnapshot(await fleet.respond(a.id, a.request_id, { decision: a.decision, message: a.message, answers: a.answers }), fleet),
+    async (a, fleet) => renderSnapshot(await fleet.respond(a.id, a.request_id, { decision: a.decision, message: a.message, answers: a.answers })),
+  )
+
+  tool(
+    "opencode_worktree",
+    'Work with an isolated agent\'s git worktree: "diff" shows the agent\'s commits and changes, "commit" commits its leftover changes, "merge" replays the agent\'s own commits onto your checkout\'s current branch (carried-over changes excluded; aborted cleanly on conflicts; strategy "squash" stages them without committing).',
+    {
+      id,
+      action: z.enum(["diff", "commit", "merge"]),
+      strategy: z.enum(["merge", "squash"]).optional(),
+      max_chars: z.number().int().min(500).max(200_000).optional(),
+    },
+    async (a, fleet) => fleet.worktree(a.id, a.action, { strategy: a.strategy, maxChars: a.max_chars }),
   )
 
   tool(
     "opencode_dispose",
-    "Stop and forget an agent. Optionally remove its git worktree (kept if it has uncommitted changes unless force). The session stays in OpenCode history.",
+    'Stop and forget an agent. worktree: "keep" (default; leftover changes are committed to its branch), "remove" (commit leftovers, remove the worktree, keep the branch if it has commits), "discard" (drop uncommitted changes). delete_session removes it from OpenCode history.',
     {
       id,
-      remove_worktree: z.boolean().optional(),
-      force: z.boolean().optional().describe("Discard uncommitted worktree changes."),
+      worktree: z.enum(["keep", "remove", "discard"]).optional(),
+      delete_session: z.boolean().optional(),
     },
-    async (a, fleet) => fleet.dispose(a.id, { removeWorktree: a.remove_worktree, force: a.force }),
+    async (a, fleet) => fleet.dispose(a.id, { worktree: a.worktree, deleteSession: a.delete_session }),
     { destructiveHint: true },
+  )
+
+  server.registerTool(
+    "opencode_server",
+    {
+      description:
+        'The OpenCode server behind the agents: "info" shows its URL, version and the command to watch agents live in the OpenCode TUI; "stop" stops the shared server (and every agent on it).',
+      inputSchema: { action: z.enum(["info", "stop"]) },
+      annotations: { openWorldHint: false },
+    },
+    (async (a: { action: "info" | "stop" }) => {
+      try {
+        if (a.action === "stop") return ok(await stopSharedServer(ctx.store))
+        const b = await ctx.backend()
+        const i = b.info
+        const attach = i.password ? `OPENCODE_SERVER_PASSWORD=${i.password} opencode attach ${i.url}` : `opencode attach ${i.url}`
+        return ok(
+          [
+            `${i.mode} server ${i.url} (opencode ${i.version}${i.pid ? `, pid ${i.pid}` : ""})`,
+            `watch agents live: ${attach}`,
+            i.mode === "shared" ? "The shared server outlives this MCP process, so running agents survive restarts." : "",
+            ...i.warnings.map((w) => `⚠ ${w}`),
+          ]
+            .filter(Boolean)
+            .join("\n"),
+        )
+      } catch (err) {
+        return fail(err)
+      }
+    }) as never,
+  )
+
+  // Transcripts as resources, for clients that let the user @-mention them.
+  server.registerResource(
+    "agent-transcript",
+    new ResourceTemplate("opencode://agents/{id}/transcript", {
+      list: async () => {
+        const fleet = await ctx.fleet()
+        return { resources: fleet.ids().map((i) => ({ uri: `opencode://agents/${i}/transcript`, name: `transcript ${i}`, mimeType: "text/markdown" })) }
+      },
+    }),
+    { description: "Full transcript of an OpenCode agent", mimeType: "text/markdown" },
+    async (uri, vars) => {
+      const fleet = await ctx.fleet()
+      const text = await fleet.transcript(String(vars.id), { scope: "all", detail: "summary" })
+      return { contents: [{ uri: uri.href, mimeType: "text/markdown", text }] }
+    },
   )
 }
 
-export const INSTRUCTIONS = `Delegate coding work to OpenCode agents running any model OpenCode supports (DeepSeek, Kimi, GLM, Qwen, GPT, Claude, local models, …).
+export const INSTRUCTIONS = `opencode: delegate coding work to OpenCode agents running any model (DeepSeek, Kimi, GLM, Qwen, GPT, Claude, local, …), in parallel, like your own subagents.
 
-Typical flow:
-1. opencode_models to pick a "provider/model" (and a variant for reasoning effort) if you need a specific one.
-2. opencode_spawn one or more agents with self-contained prompts. They run in parallel in the background. Use isolation "worktree" when several agents edit the same repo.
-3. opencode_wait (mode "any") to block until the next one settles; it returns each settled agent's final answer.
-4. While they run: opencode_status to peek, opencode_message to steer, opencode_interrupt to pause, opencode_resume to continue.
-5. Agents in state needs_input are blocked on a permission request or a question: answer with opencode_respond.
-6. opencode_output for the detailed transcript, opencode_dispose when done.
-
-Agents are OpenCode sessions; their ids (ses_…) stay valid across restarts and can be watched live with \`opencode attach <url>\`.`
+1. Pick a model per task: opencode_models (provider/model + effort variants). opencode_agents lists profiles.
+2. opencode_spawn with a self-contained prompt (shared context in instructions). It runs in the background. Use isolation "worktree" when several agents edit one repo.
+3. opencode_wait returns the next agent with news (final answer, failure or a request for you). Call it again for the next one.
+4. While they run: opencode_status to peek, opencode_message to steer or queue, opencode_interrupt to stop or pause, opencode_resume to continue.
+5. needs_input = waiting on you: opencode_respond. Permission prompts go to the human by default.
+6. Isolated agents: opencode_worktree diff/merge, then opencode_dispose.
+If channel notifications are enabled, a <channel source="opencode"> message arrives whenever an agent settles; then you do not need to wait.`

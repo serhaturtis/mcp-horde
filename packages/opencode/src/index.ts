@@ -4,21 +4,38 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { Backend } from "./backend.js"
 import { loadConfig } from "./config.js"
 import { Fleet } from "./fleet.js"
+import { makeHooks } from "./hooks.js"
+import { Store } from "./state.js"
 import { INSTRUCTIONS, registerTools } from "./tools.js"
 
+const VERSION = "0.2.0"
+
 const config = loadConfig()
-const server = new McpServer({ name: "mcp-horde-opencode", version: "0.1.0" }, { instructions: INSTRUCTIONS })
+const store = new Store(config.stateDir)
+const server = new McpServer(
+  { name: "opencode", version: VERSION },
+  {
+    instructions: INSTRUCTIONS,
+    // Claude Code "channels" (research preview): lets us push a message into the
+    // session when an agent settles. Harmless for clients that ignore it.
+    capabilities: config.channel ? { experimental: { "claude/channel": {} } } : {},
+  },
+)
 
 // OpenCode is started lazily so the MCP handshake stays fast and a missing
 // binary surfaces as a tool error instead of a dead server.
-let backend: Backend | undefined
+let backend: Promise<Backend> | undefined
 let fleet: Promise<Fleet> | undefined
+const getBackend = () => {
+  backend ??= Backend.start(config, store).catch((err: unknown) => {
+    backend = undefined
+    throw err
+  })
+  return backend
+}
 const getFleet = () => {
-  fleet ??= Backend.start(config).then(
-    (b) => {
-      backend = b
-      return new Fleet(b, config)
-    },
+  fleet ??= getBackend().then(
+    (b) => new Fleet(b, config, store, makeHooks(server, config)),
     (err: unknown) => {
       fleet = undefined
       throw err
@@ -27,14 +44,19 @@ const getFleet = () => {
   return fleet
 }
 
-registerTools(server, getFleet)
+registerTools(server, { fleet: getFleet, backend: getBackend, store })
 
+let closing = false
 const shutdown = () => {
-  backend?.close()
-  process.exit(0)
+  if (closing) return
+  closing = true
+  void Promise.allSettled([fleet?.then((f) => f.close()), backend?.then((b) => b.close())]).finally(() => process.exit(0))
 }
 process.on("SIGINT", shutdown)
 process.on("SIGTERM", shutdown)
 process.stdin.on("close", shutdown)
 
 await server.connect(new StdioServerTransport())
+// Reconnect to agents left running by a previous process (shared server) so
+// policies, limits and notifications keep working without a tool call.
+if (store.server || config.url) void getFleet().catch(() => undefined)

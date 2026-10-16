@@ -2,50 +2,97 @@ import http from "node:http"
 import type { AddressInfo } from "node:net"
 
 /**
- * A tiny OpenAI-compatible chat completions server driven by the prompt text:
- *   "TOOL: <cmd>"  → calls the bash tool with <cmd>, then answers "DONE: <output>"
- *   "SLOW"         → streams "Working...." for ~15s
- *   anything else  → answers "Echo: <prompt>"
+ * A tiny OpenAI-compatible chat completions server scripted by the latest user prompt:
+ *   "TOOL: <cmd>"   → calls bash with <cmd>, then answers "DONE: <tool output>"
+ *   "STEPS: <n>"    → calls bash `echo step` n times in a row, then answers "DONE"
+ *   "ASK: <q>"      → calls the question tool (options Red/Blue), then answers "DONE: <tool output>"
+ *   "SLOW"          → streams "Working...." for ~15s
+ *   "FAIL400"       → HTTP 400
+ *   "TOOLS?"        → answers with the tool names it was offered
+ *   anything else   → "Echo[<reasoning_effort>]: <prompt>" (+ " FILE:<name>" for attached files)
  */
-export async function startMockLlm(): Promise<{ url: string; close: () => void }> {
+export async function startMockLlm(): Promise<{ url: string; close: () => void; requests: unknown[] }> {
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+  const requests: unknown[] = []
+  type Msg = { role: string; content: unknown }
+  const textOf = (m?: Msg) =>
+    typeof m?.content === "string" ? m.content : ((m?.content as { type?: string; text?: string }[] | undefined) ?? []).map((p) => p.text ?? "").join(" ")
+
   const server = http.createServer(async (req, res) => {
     let body = ""
     for await (const c of req) body += c
     if (req.url?.endsWith("/models")) return void res.end(JSON.stringify({ data: [{ id: "mock" }] }))
-    const b = JSON.parse(body || "{}") as { stream?: boolean; messages?: { role: string; content: unknown }[] }
+    const b = JSON.parse(body || "{}") as { stream?: boolean; messages?: Msg[]; tools?: { function: { name: string } }[]; reasoning_effort?: string }
+    requests.push(b)
     const msgs = b.messages ?? []
     const last = msgs[msgs.length - 1]
-    const lastUser = [...msgs].reverse().find((m) => m.role === "user")
-    const userText =
-      typeof lastUser?.content === "string"
-        ? lastUser.content
-        : ((lastUser?.content as { text?: string }[] | undefined) ?? []).map((p) => p.text ?? "").join(" ")
+    const lastUserIdx = msgs.map((m) => m.role).lastIndexOf("user")
+    const lastUser = msgs[lastUserIdx]
+    const userText = textOf(lastUser)
+    const toolResults = msgs.slice(lastUserIdx + 1).filter((m) => m.role === "tool").length
+
     if (b.stream === false) {
       return void res.end(
-        JSON.stringify({ id: "c", object: "chat.completion", choices: [{ index: 0, message: { role: "assistant", content: "Mock title" }, finish_reason: "stop" }] }),
+        JSON.stringify({
+          id: "c",
+          object: "chat.completion",
+          choices: [{ index: 0, message: { role: "assistant", content: "Mock title" }, finish_reason: "stop" }],
+        }),
       )
+    }
+    if (userText.includes("FAIL400")) {
+      res.writeHead(400, { "content-type": "application/json" })
+      return void res.end(JSON.stringify({ error: { message: "bad request from mock", type: "invalid_request_error" } }))
     }
     res.writeHead(200, { "content-type": "text/event-stream" })
     const chunk = (delta: object, finish: string | null = null) =>
-      res.write(`data: ${JSON.stringify({ id: "c1", object: "chat.completion.chunk", created: 1, model: "mock", choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`)
+      res.write(
+        `data: ${JSON.stringify({ id: "c1", object: "chat.completion.chunk", created: 1, model: "mock", choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`,
+      )
     const end = () => {
-      res.write(`data: ${JSON.stringify({ id: "c1", object: "chat.completion.chunk", created: 1, model: "mock", choices: [], usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 } })}\n\n`)
+      res.write(
+        `data: ${JSON.stringify({ id: "c1", object: "chat.completion.chunk", created: 1, model: "mock", choices: [], usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 } })}\n\n`,
+      )
       res.write("data: [DONE]\n\n")
       res.end()
     }
-    if (last?.role === "tool") {
-      chunk({ role: "assistant", content: `DONE: ${String(last.content).slice(0, 80)}` })
+    const say = (text: string) => {
+      chunk({ role: "assistant", content: text })
       chunk({}, "stop")
-      return end()
+      end()
     }
-    if (userText.includes("TOOL:")) {
-      const cmd = userText.split("TOOL:")[1]!.trim()
-      chunk({ role: "assistant", tool_calls: [{ index: 0, id: `call_${Date.now()}`, type: "function", function: { name: "bash", arguments: "" } }] })
-      chunk({ tool_calls: [{ index: 0, function: { arguments: JSON.stringify({ command: cmd, description: "run" }) } }] })
+    const callTool = (name: string, args: object) => {
+      chunk({
+        role: "assistant",
+        tool_calls: [{ index: 0, id: `call_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`, type: "function", function: { name, arguments: "" } }],
+      })
+      chunk({ tool_calls: [{ index: 0, function: { arguments: JSON.stringify(args) } }] })
       chunk({}, "tool_calls")
-      return end()
+      end()
     }
+
+    const steps = userText.match(/STEPS:\s*(\d+)/)
+    if (steps) {
+      if (toolResults < Number(steps[1])) return callTool("bash", { command: `echo step ${toolResults + 1}`, description: "step" })
+      return say("DONE")
+    }
+    if (last?.role === "tool") return say(`DONE: ${textOf(last).slice(0, 120)}`)
+    if (userText.includes("TOOL:")) return callTool("bash", { command: userText.split("TOOL:")[1]!.trim(), description: "run" })
+    if (userText.includes("ASK:")) {
+      return callTool("question", {
+        questions: [
+          {
+            question: userText.split("ASK:")[1]!.trim(),
+            header: "Pick",
+            options: [
+              { label: "Red", description: "warm" },
+              { label: "Blue", description: "cool" },
+            ],
+          },
+        ],
+      })
+    }
+    if (userText.includes("TOOLS?")) return say(`Tools: ${(b.tools ?? []).map((t) => t.function.name).join(",")}`)
     if (userText.includes("SLOW")) {
       chunk({ role: "assistant", content: "Working" })
       for (let i = 0; i < 30 && !res.destroyed; i++) {
@@ -55,14 +102,18 @@ export async function startMockLlm(): Promise<{ url: string; close: () => void }
       chunk({}, "stop")
       return end()
     }
-    chunk({ role: "assistant", content: `Echo: ${userText.slice(0, 200)}` })
-    chunk({}, "stop")
-    end()
+    const files = Array.isArray(lastUser?.content)
+      ? (lastUser.content as { type?: string; text?: string; file?: { filename?: string } }[])
+          .map((p) => (p.type === "file" ? `FILE:${p.file?.filename ?? "?"}` : p.type === "text" && p.text?.includes("hello-attachment") ? "FILE-CONTENT" : ""))
+          .filter(Boolean)
+      : []
+    say(`Echo[${b.reasoning_effort ?? "none"}]: ${userText.slice(0, 200)}${files.length ? ` ${files.join(" ")}` : ""}`)
   })
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", r))
   const { port } = server.address() as AddressInfo
   return {
     url: `http://127.0.0.1:${port}/v1`,
+    requests,
     close: () => {
       server.closeAllConnections()
       server.close()

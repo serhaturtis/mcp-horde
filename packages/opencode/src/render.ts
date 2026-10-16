@@ -2,7 +2,7 @@ import type { SessionMessage, SessionMessageAssistant, SessionMessageAssistantTo
 
 export type Detail = "final" | "summary" | "full"
 
-const INPUT_KEYS = ["command", "filePath", "path", "pattern", "url", "query", "description", "prompt"]
+const INPUT_KEYS = ["command", "filePath", "path", "pattern", "url", "query", "description", "prompt", "name"]
 
 export function truncate(text: string, max: number): string {
   if (text.length <= max) return text
@@ -15,16 +15,18 @@ export function truncateHead(text: string, max: number): string {
   return `[… ${text.length - max} earlier chars omitted …]\n${text.slice(text.length - max)}`
 }
 
-function oneLine(text: string): string {
+export function oneLine(text: string): string {
   return text.replace(/\s+/g, " ").trim()
 }
 
-export function toolInputSummary(tool: SessionMessageAssistantTool): string {
-  const input = tool.state.input
+export function inputSummary(input: unknown): string {
   if (typeof input === "string") return truncate(oneLine(input), 160)
-  for (const key of INPUT_KEYS) {
-    const value = input[key]
-    if (typeof value === "string" && value) return truncate(oneLine(value), 160)
+  if (input && typeof input === "object") {
+    const rec = input as Record<string, unknown>
+    for (const key of INPUT_KEYS) {
+      const value = rec[key]
+      if (typeof value === "string" && value) return truncate(oneLine(value), 160)
+    }
   }
   return truncate(JSON.stringify(input), 160)
 }
@@ -32,9 +34,7 @@ export function toolInputSummary(tool: SessionMessageAssistantTool): string {
 function toolOutput(tool: SessionMessageAssistantTool): string {
   const state = tool.state
   if (state.status === "pending") return ""
-  const text = state.content
-    .map((c) => (c.type === "text" ? c.text : `[file ${c.name ?? c.uri}]`))
-    .join("\n")
+  const text = state.content.map((c) => (c.type === "text" ? c.text : `[file ${c.name ?? c.uri}]`)).join("\n")
   if (state.status === "error") return [state.error.message, text].filter(Boolean).join("\n")
   return text
 }
@@ -42,7 +42,7 @@ function toolOutput(tool: SessionMessageAssistantTool): string {
 const STATUS_MARK: Record<string, string> = { pending: "…", running: "…", completed: "✓", error: "✗" }
 
 export function renderTool(tool: SessionMessageAssistantTool, withOutput: boolean): string {
-  const head = `[${tool.name} ${STATUS_MARK[tool.state.status] ?? tool.state.status}] ${toolInputSummary(tool)}`
+  const head = `[${tool.name} ${STATUS_MARK[tool.state.status] ?? tool.state.status}] ${inputSummary(tool.state.input)}`
   if (!withOutput) {
     return tool.state.status === "error" ? `${head} — ${truncate(oneLine(tool.state.error.message), 200)}` : head
   }
@@ -50,10 +50,10 @@ export function renderTool(tool: SessionMessageAssistantTool, withOutput: boolea
   return out ? `${head}\n${indent(truncate(out, 2000))}` : head
 }
 
-function indent(text: string): string {
+export function indent(text: string, by = "    "): string {
   return text
     .split("\n")
-    .map((l) => `    ${l}`)
+    .map((l) => `${by}${l}`)
     .join("\n")
 }
 
@@ -75,7 +75,7 @@ export function renderTranscript(messages: SessionMessage[], detail: Detail): st
   for (const m of messages) {
     switch (m.type) {
       case "user":
-        out.push(`## user\n${m.text}`)
+        out.push(`## user\n${m.text}${m.files?.length ? `\n[attached: ${m.files.map((f) => f.name ?? f.uri).join(", ")}]` : ""}`)
         break
       case "synthetic":
       case "system":
@@ -110,16 +110,11 @@ export function renderTranscript(messages: SessionMessage[], detail: Detail): st
   return out.join("\n\n")
 }
 
-/** A short description of what the agent is doing right now. */
-export function currentActivity(messages: SessionMessage[]): string | undefined {
-  const last = messages[messages.length - 1]
-  if (!last) return undefined
-  if (last.type !== "assistant") return last.type === "user" ? "waiting to start on the latest prompt" : undefined
-  const c = last.content[last.content.length - 1]
-  if (!c) return "thinking"
-  if (c.type === "tool") return `${c.name}: ${toolInputSummary(c)}`
-  if (c.type === "reasoning") return "thinking"
-  // Text is projected when a block ends, so it is empty while streaming.
-  const text = oneLine(c.text)
-  return text ? `writing: …${text.slice(-160)}` : "writing a response"
+export function formatUsd(n: number): string {
+  if (n === 0) return "$0"
+  return n < 0.01 ? `$${n.toFixed(4)}` : `$${n.toFixed(2)}`
+}
+
+export function formatTokens(n: number): string {
+  return n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n)
 }

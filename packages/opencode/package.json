@@ -1,29 +1,50 @@
 {
   "name": "@mcp-horde/opencode",
-  "version": "0.1.0",
-  "description": "MCP server that lets any harness delegate work to OpenCode agents: spawn, steer, wait on, interrupt and resume them in parallel.",
+  "version": "0.2.0",
+  "description": "MCP server that lets any harness delegate work to OpenCode agents on any model: spawn them in parallel, steer, wait, pause, resume, and answer their permission prompts.",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "opencode",
+    "agents",
+    "subagents",
+    "claude-code",
+    "deepseek"
+  ],
   "type": "module",
   "bin": {
     "mcp-horde-opencode": "dist/index.js"
   },
   "main": "dist/index.js",
   "files": [
-    "dist"
+    "dist",
+    "README.md"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/serhaturtis/mcp-horde.git",
+    "directory": "packages/opencode"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --import tsx --test test/*.test.ts",
+    "test": "node --import tsx --test --test-concurrency=1 test/unit.test.ts test/core.test.ts test/modes.test.ts",
+    "test:unit": "node --import tsx --test test/unit.test.ts",
+    "test:e2e": "node --import tsx --test test/e2e.test.ts",
+    "prepublishOnly": "npm run build",
     "start": "node dist/index.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.1",
-    "@opencode-ai/sdk": "^1.19.3",
+    "@opencode-ai/sdk": "1.19.3",
     "zod": "^4.0.0"
   },
   "devDependencies": {
     "@types/node": "^22.20.5",
-    "opencode-ai": "^1.19.3",
+    "opencode-ai": "1.19.3",
     "tsx": "^4.23.15",
     "typescript": "^5.9.3"
   },

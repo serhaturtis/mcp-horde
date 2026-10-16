@@ -4,7 +4,7 @@ A collection of [MCP](https://modelcontextprotocol.io) servers for agentic codin
 
 | Package | What it does |
 | --- | --- |
-| [`@mcp-horde/opencode`](packages/opencode) | Delegate work to [OpenCode](https://opencode.ai) agents running any model (DeepSeek, Kimi, GLM, Qwen, GPT, local, …). Spawn them in parallel, steer them mid-flight, wait on them, interrupt and resume them, and answer their permission prompts. |
+| [`@mcp-horde/opencode`](packages/opencode) | Subagents for any harness, powered by [OpenCode](https://opencode.ai) on any model (DeepSeek, Kimi, GLM, Qwen, GPT, local, …): parallel runs, isolated worktrees, steering, pause/resume, limits, completion notifications, and permission prompts routed to the human. |
 
 ## Development
 
@@ -12,6 +12,7 @@ A collection of [MCP](https://modelcontextprotocol.io) servers for agentic codin
 npm install          # installs every workspace
 npm run build        # builds every package
 npm run typecheck
+npm run lint         # Biome
 npm test
 ```
 
