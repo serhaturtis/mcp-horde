@@ -499,22 +499,22 @@ export async function mergeWorktree(wt: Worktree, name: string, strategy: "merge
 }
 
 /** Remove the worktree. Uncommitted work is committed to the branch first unless discard is set. */
-export async function removeWorktree(wt: Worktree, name: string, discard: boolean): Promise<string> {
+export async function removeWorktree(wt: Worktree, name: string, discard: boolean, release?: () => Promise<void>): Promise<string> {
   const notes: string[] = []
   if (!discard) {
     // Throws (and keeps the worktree) if the work cannot be committed safely.
     const committed = await commitAll(wt, `horde: uncommitted work from ${name}`)
     if (committed) notes.push(committed)
   }
-  if (await exists(wt.root)) {
-    try {
-      await git(wt.repo, "worktree", "remove", "--force", wt.root)
-    } catch {
-      // Something may still be writing into it (e.g. OpenCode); delete it outright.
-      await fs.rm(wt.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 }).catch(() => undefined)
-      await git(wt.repo, "worktree", "prune").catch(() => undefined)
-    }
+  // Windows refuses to delete files another process (OpenCode, a tool it ran) still has
+  // open, so ask for them to be released and retry for a while.
+  for (let attempt = 0; attempt < 5 && (await exists(wt.root)); attempt++) {
+    if (attempt > 0) await new Promise((r) => setTimeout(r, 500 * attempt))
+    await release?.()
+    if (attempt === 0) await git(wt.repo, "worktree", "remove", "--force", wt.root).catch(() => undefined)
+    else await fs.rm(wt.root, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 }).catch(() => undefined)
   }
+  await git(wt.repo, "worktree", "prune").catch(() => undefined)
   if (await exists(wt.root)) notes.push(`could not fully remove worktree ${wt.root} (files still in use?); delete it by hand`)
   else notes.push(`removed worktree ${wt.root}`)
   let ahead: number

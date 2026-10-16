@@ -693,10 +693,15 @@ export class Fleet {
         if (committed) notes.push(committed)
         notes.push(`kept worktree ${wt.root} (branch ${wt.branch})`)
       } else {
-        // Let OpenCode release the directory before it disappears.
-        await this.backend.client.instance.dispose({ directory: wt.path }).catch(() => undefined)
-        // Throws without removing anything if leftover work cannot be committed safely.
-        notes.push(await removeWorktree(wt, name, mode === "discard"))
+        // Stop tracking first: our own refreshes would make OpenCode reopen the directory.
+        this.forget(id)
+        // Let OpenCode release the directory (again before each retry) before it disappears.
+        const release = () =>
+          this.backend.client.instance.dispose({ directory: wt.path }).then(
+            () => undefined,
+            () => undefined,
+          )
+        notes.push(await removeWorktree(wt, name, mode === "discard", release))
       }
     }
     if (live.record.agentFile) await fs.rm(live.record.agentFile, { force: true })
