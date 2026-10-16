@@ -11,9 +11,6 @@ export interface Config {
   bin: string
   /** Default working directory for spawned agents. */
   directory: string
-  defaultModel?: string
-  defaultVariant?: string
-  defaultAgent?: string
   defaultPermissions: PermissionPolicy
 }
 
@@ -30,9 +27,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     password: env.OPENCODE_SERVER_PASSWORD || undefined,
     bin: env.HORDE_OPENCODE_BIN || "opencode",
     directory: path.resolve(env.HORDE_OPENCODE_DIRECTORY || process.cwd()),
-    defaultModel: env.HORDE_OPENCODE_MODEL || undefined,
-    defaultVariant: env.HORDE_OPENCODE_VARIANT || undefined,
-    defaultAgent: env.HORDE_OPENCODE_AGENT || undefined,
     defaultPermissions: policy(env.HORDE_OPENCODE_PERMISSIONS),
   }
 }

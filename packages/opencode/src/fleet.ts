@@ -157,10 +157,8 @@ export class Fleet {
     if (!stat?.isDirectory()) throw new Error(`directory does not exist: ${directory}`)
     if (input.name && this.findByName(input.name)) throw new Error(`an agent named "${input.name}" already exists`)
 
-    const modelSpec = input.model ?? this.config.defaultModel
-    const variant = input.variant ?? (input.model ? undefined : this.config.defaultVariant)
-    const model = modelSpec ? parseModel(modelSpec, variant) : undefined
-    if (!model && variant) throw new Error("variant requires a model")
+    const model = input.model ? parseModel(input.model, input.variant) : undefined
+    if (!model && input.variant) throw new Error("variant requires a model")
     if (model) await this.validateModel(model, directory)
 
     let worktree: Worktree | undefined
@@ -173,7 +171,7 @@ export class Fleet {
       await this.api.session.create({
         location: { directory },
         ...(model ? { model } : {}),
-        ...((input.agent ?? this.config.defaultAgent) ? { agent: input.agent ?? this.config.defaultAgent } : {}),
+        ...(input.agent ? { agent: input.agent } : {}),
       }),
       "creating session",
     ).data

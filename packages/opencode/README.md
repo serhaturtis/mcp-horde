@@ -48,7 +48,7 @@ OpenCode asks before running risky tools, based on your opencode config. Each ag
 **Claude Code**
 
 ```sh
-claude mcp add opencode -e HORDE_OPENCODE_MODEL=deepseek/deepseek-chat -- node /path/to/mcp-horde/packages/opencode/dist/index.js
+claude mcp add opencode -- node /path/to/mcp-horde/packages/opencode/dist/index.js
 ```
 
 Or in `.mcp.json`:
@@ -58,8 +58,7 @@ Or in `.mcp.json`:
   "mcpServers": {
     "opencode": {
       "command": "node",
-      "args": ["/path/to/mcp-horde/packages/opencode/dist/index.js"],
-      "env": { "HORDE_OPENCODE_MODEL": "deepseek/deepseek-chat" }
+      "args": ["/path/to/mcp-horde/packages/opencode/dist/index.js"]
     }
   }
 }
@@ -69,15 +68,14 @@ Any other MCP client takes the same command over stdio.
 
 ### Configuration (environment variables)
 
+None of these is needed. Model, effort, agent profile, directory and permission policy are chosen by the calling agent on each `opencode_spawn` call, and can be changed mid-task with `opencode_message`. These variables only control how the server reaches OpenCode:
+
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `HORDE_OPENCODE_URL` | none | Attach to a running `opencode serve` instead of spawning a private one |
 | `OPENCODE_SERVER_PASSWORD` / `OPENCODE_SERVER_USERNAME` | random / `opencode` | Basic-auth credentials for that server |
 | `HORDE_OPENCODE_BIN` | `opencode` | Binary used to spawn `opencode serve` |
 | `HORDE_OPENCODE_DIRECTORY` | the current working directory | Default working directory for agents |
-| `HORDE_OPENCODE_MODEL` | opencode's default | Default `provider/model` |
-| `HORDE_OPENCODE_VARIANT` | none | Default effort variant, used only with the default model |
-| `HORDE_OPENCODE_AGENT` | `build` | Default agent profile |
 | `HORDE_OPENCODE_PERMISSIONS` | `ask` | Default permission policy: `ask`, `allow` or `deny` |
 
 Without `HORDE_OPENCODE_URL`, the server starts a private `opencode serve` on a free localhost port the first time a tool is called. It protects that server with a random password and stops it on exit.

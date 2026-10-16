@@ -139,7 +139,7 @@ export function registerTools(server: McpServer, getFleet: () => Promise<Fleet>)
     {
       prompt: z.string().min(1).describe("The full task description."),
       name: z.string().optional().describe("Short unique name to address the agent by (e.g. 'tests', 'refactor-auth')."),
-      model: z.string().optional().describe('"provider/model", e.g. "deepseek/deepseek-chat". Defaults to HORDE_OPENCODE_MODEL or opencode\'s default.'),
+      model: z.string().optional().describe('"provider/model", e.g. "deepseek/deepseek-chat". Pick per task (see opencode_models); omitted = the default from opencode config.'),
       variant: z.string().optional().describe('Reasoning effort / model variant, e.g. "low", "high", "max" (see opencode_models).'),
       agent: z.string().optional().describe('OpenCode agent profile, e.g. "build" (default) or "plan" (read-only).'),
       directory: z.string().optional().describe("Working directory (absolute). Defaults to the server's directory."),
