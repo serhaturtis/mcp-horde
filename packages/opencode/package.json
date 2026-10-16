@@ -15,7 +15,9 @@
   "bin": {
     "mcp-horde-opencode": "dist/index.js"
   },
-  "main": "dist/index.js",
+  "exports": {
+    "./package.json": "./package.json"
+  },
   "files": [
     "dist",
     "README.md"
@@ -29,9 +31,9 @@
     "access": "public"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --import tsx --test --test-concurrency=1 test/unit.test.ts test/core.test.ts test/modes.test.ts",
+    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json",
+    "test": "node --import tsx --test --test-concurrency=1 test/unit.test.ts test/core.test.ts test/modes.test.ts test/dist.test.ts",
     "test:unit": "node --import tsx --test test/unit.test.ts",
     "test:e2e": "node --import tsx --test test/e2e.test.ts",
     "prepublishOnly": "npm run build",
