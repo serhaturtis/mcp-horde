@@ -85,7 +85,9 @@ export async function createWorktree(directory: string, name: string, opts: Work
   }
   await fs.mkdir(path.dirname(root), { recursive: true })
   await git(repo, "worktree", "add", "-b", branch, root, base)
-  const worktree: Worktree = { path: path.join(root, path.relative(repo, directory)), root, branch, base, repo, links: opts.link }
+  // git reports resolved paths (e.g. /private/var on macOS), so compare like with like.
+  const sub = path.relative(await fs.realpath(repo), await fs.realpath(directory))
+  const worktree: Worktree = { path: path.join(root, sub), root, branch, base, repo, links: opts.link }
 
   try {
     if (opts.includeUncommitted) {

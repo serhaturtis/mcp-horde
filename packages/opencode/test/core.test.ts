@@ -272,6 +272,16 @@ describe("opencode MCP server: core behaviour (real opencode, mock LLM)", { time
     assert.equal(fs.existsSync(dir), false)
   })
 
+  test("worktree isolation through a symlinked path (macOS /var → /private/var)", async () => {
+    const link = path.join(tmp, "repo-link")
+    fs.symlinkSync(repo, link, "dir")
+    const out = await h.call("opencode_spawn", { prompt: "via link", name: "linked", directory: link, isolation: "worktree", wait: true, timeout_seconds: 60 })
+    assert.match(out, /linked .*— IDLE/)
+    const dir = out.match(/dir: (\S+) \(worktree/)![1]!
+    assert.ok(fs.existsSync(dir), `worktree dir ${dir} exists`)
+    await h.call("opencode_dispose", { id: "linked", worktree: "discard" })
+  })
+
   test("merge conflicts abort cleanly", async () => {
     const out = await h.call("opencode_spawn", {
       prompt: "TOOL: echo theirs > clash.txt",
