@@ -17,7 +17,8 @@ const child = spawn(bin, args, {
   cwd: process.env.HORDE_SUPERVISED_CWD || process.cwd(),
   stdio: ["ignore", "inherit", "inherit"],
   windowsHide: true,
-  shell: process.platform === "win32",
+  // A resolved .exe needs no shell; only fall back to one for .cmd/.bat shims.
+  shell: process.platform === "win32" && /\.(cmd|bat)$/i.test(bin),
 })
 const stop = () => {
   if (child.exitCode !== null) return

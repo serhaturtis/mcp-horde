@@ -249,7 +249,7 @@ describe("opencode MCP server: core behaviour (real opencode, mock LLM)", { time
 
     await h.call("opencode_message", {
       id: "iso",
-      message: "TOOL: echo feature > feature.txt && git add feature.txt && git commit -qm 'add feature'",
+      message: 'TOOL: echo feature > feature.txt && git add feature.txt && git commit -qm "add feature"',
       wait: true,
       timeout_seconds: 60,
     })

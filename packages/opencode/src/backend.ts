@@ -186,7 +186,32 @@ async function freePort(): Promise<number> {
 const LISTENING = /opencode server listening on\s+(https?:\/\/\S+)/
 const isWindows = process.platform === "win32"
 
-/** Stop a process and everything it started (on Windows the binary runs behind a .cmd shim). */
+/**
+ * On Windows, npm installs `opencode.cmd`, a shim around the native
+ * opencode.exe. Spawning the shim needs a shell and leaves the real server
+ * running when the shim is killed, so resolve it to the executable.
+ */
+export function resolveBinary(bin: string): { command: string; shell: boolean } {
+  if (!isWindows) return { command: bin, shell: false }
+  const candidates = /[\\/]/.test(bin)
+    ? [bin]
+    : (process.env.PATH ?? "").split(path.delimiter).flatMap((dir) => [path.join(dir, `${bin}.exe`), path.join(dir, `${bin}.cmd`), path.join(dir, bin)])
+  for (const candidate of candidates) {
+    if (!fs.existsSync(candidate)) continue
+    if (candidate.toLowerCase().endsWith(".exe")) return { command: candidate, shell: false }
+    if (candidate.toLowerCase().endsWith(".cmd")) {
+      const target = fs.readFileSync(candidate, "utf8").match(/"%~?dp0%?\\([^"]+?\.exe)"/i)?.[1]
+      if (target) {
+        const exe = path.join(path.dirname(candidate), target)
+        if (fs.existsSync(exe)) return { command: exe, shell: false }
+      }
+      return { command: candidate, shell: true }
+    }
+  }
+  return { command: bin, shell: true }
+}
+
+/** Stop a process and everything it started. */
 export function killTree(pid: number) {
   try {
     if (isWindows) spawnSync("taskkill", ["/pid", String(pid), "/T", "/F"], { stdio: "ignore", windowsHide: true })
@@ -205,13 +230,14 @@ async function spawnShared(config: Config, stateDir: string, password: string) {
   const port = await freePort()
   const logPath = path.join(stateDir, "opencode-server.log")
   const log = fs.openSync(logPath, "w", 0o600)
-  const proc = spawn(config.bin, serveArgs(port), {
+  const bin = resolveBinary(config.bin)
+  const proc = spawn(bin.command, serveArgs(port), {
     cwd: config.directory,
     env: { ...process.env, OPENCODE_SERVER_PASSWORD: password },
     stdio: ["ignore", log, log],
     detached: true,
     windowsHide: true,
-    shell: isWindows,
+    shell: bin.shell,
   })
   fs.closeSync(log)
   const launchError = new Promise<never>((_, reject) =>
@@ -248,7 +274,7 @@ async function spawnPrivate(config: Config, password: string) {
   // Built: supervisor.js next to this file. From source (tsx): supervisor.ts with our loader flags.
   const js = fileURLToPath(new URL("./supervisor.js", import.meta.url))
   const supervisor = fs.existsSync(js) ? [js] : [...process.execArgv, fileURLToPath(new URL("./supervisor.ts", import.meta.url))]
-  const proc = spawn(process.execPath, [...supervisor, String(process.pid), config.bin, ...serveArgs(port)], {
+  const proc = spawn(process.execPath, [...supervisor, String(process.pid), resolveBinary(config.bin).command, ...serveArgs(port)], {
     // Our own directory, so loader flags resolve; the supervisor starts OpenCode in config.directory.
     cwd: fileURLToPath(new URL(".", import.meta.url)),
     env: { ...process.env, OPENCODE_SERVER_PASSWORD: password, HORDE_SUPERVISED_CWD: config.directory },
