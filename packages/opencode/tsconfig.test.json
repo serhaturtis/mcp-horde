@@ -2,7 +2,8 @@
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
     "noEmit": true,
-    "declaration": false
+    "declaration": false,
+    "customConditions": ["source"]
   },
   "include": ["src", "test"]
 }

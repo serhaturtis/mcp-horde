@@ -1,8 +1,8 @@
+import { truncate } from "@mcp-horde/core"
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import type { PermissionV2Request, QuestionV2Request } from "@opencode-ai/sdk/v2"
 import type { Config } from "./config.js"
 import type { Hooks, Snapshot } from "./fleet.js"
-import { truncate } from "./render.js"
 import { renderSnapshot } from "./tools.js"
 
 type Schema = Record<string, unknown>

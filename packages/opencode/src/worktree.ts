@@ -1,35 +1,19 @@
-import { execFile, spawn } from "node:child_process"
+import { spawn } from "node:child_process"
 import { createHash } from "node:crypto"
 import { existsSync } from "node:fs"
 import fs from "node:fs/promises"
 import path from "node:path"
+import { GIT_ENV, git, gitRaw, runCommand } from "@mcp-horde/core"
 
 const isWindows = process.platform === "win32"
 
-/** Environment for git: never prompt, never page. */
-const GIT_ENV = { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_PAGER: "cat", LC_ALL: "C" }
 /** Never sign automated commits (a signer could block on a missing TTY). */
 const NO_SIGN = ["-c", "commit.gpgsign=false"]
 const IDENTITY = ["-c", "user.name=mcp-horde", "-c", "user.email=mcp-horde@localhost"]
 /** Diff output that does not depend on the user's config (prefixes, colors, external tools). */
 const DIFF = ["-c", "color.ui=never", "-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", "diff", "--no-ext-diff", "--no-color", "--no-textconv"]
 
-/** Run git and return stdout (raw: untrimmed). */
-export function gitRaw(cwd: string, args: string[], timeoutMs = 120_000): Promise<string> {
-  return new Promise((resolve, reject) => {
-    execFile("git", args, { cwd, env: GIT_ENV, maxBuffer: 64 * 1024 * 1024, timeout: timeoutMs }, (err, stdout, stderr) => {
-      if (err) {
-        const e = err as Error & { stderr?: string }
-        e.message = `git ${args.join(" ")} failed: ${String(stderr).trim() || err.message}`
-        reject(e)
-      } else resolve(stdout)
-    })
-  })
-}
-
-export async function git(cwd: string, ...args: string[]): Promise<string> {
-  return (await gitRaw(cwd, args)).trim()
-}
+export { git, gitRaw }
 
 export interface Worktree {
   /** The agent's working directory (inside the worktree). */
@@ -288,52 +272,17 @@ async function carryUncommitted(repo: string, root: string, notes: string[]): Pr
 
 /** Run the setup command; it is killed with all its children on timeout or abort. */
 async function runSetup(command: string, cwd: string, signal?: AbortSignal, onProgress?: (m: string) => void): Promise<string> {
-  const env = { ...process.env }
-  for (const k of Object.keys(env)) if (k.startsWith("OPENCODE_SERVER_")) delete env[k]
-  return new Promise((resolve, reject) => {
-    const child = spawn(command, { cwd, env, shell: true, stdio: ["ignore", "pipe", "pipe"], detached: !isWindows, windowsHide: true })
-    let out = ""
-    const collect = (c: Buffer) => {
-      out = (out + c.toString()).slice(-4000)
-    }
-    child.stdout.on("data", collect)
-    child.stderr.on("data", collect)
-    const killAll = () => {
-      if (child.exitCode !== null || child.pid === undefined) return
-      try {
-        if (isWindows) spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true })
-        else process.kill(-child.pid, "SIGKILL")
-      } catch {
-        // already gone
-      }
-    }
-    let reason = ""
-    const timer = setTimeout(() => {
-      reason = "timed out after 15 minutes"
-      killAll()
-    }, 15 * 60_000)
-    const onAbort = () => {
-      reason = "cancelled"
-      killAll()
-    }
-    signal?.addEventListener("abort", onAbort)
-    const ticker = setInterval(() => onProgress?.(`setup: ${out.trim().split("\n").pop()?.slice(0, 120) ?? "running"}`), 5_000)
-    const done = () => {
-      clearTimeout(timer)
-      clearInterval(ticker)
-      signal?.removeEventListener("abort", onAbort)
-    }
-    child.on("error", (e) => {
-      done()
-      reject(e)
-    })
-    // "close" fires after the output pipes drained, so the tail is complete.
-    child.on("close", (code) => {
-      done()
-      if (code === 0 && !reason) resolve(`setup \`${command}\` succeeded`)
-      else reject(new Error(`worktree setup \`${command}\` ${reason || `failed (exit ${code})`}:\n${out}`))
-    })
+  const r = await runCommand(command, {
+    cwd,
+    signal,
+    timeoutMs: 15 * 60_000,
+    stripEnv: ["OPENCODE_SERVER_"],
+    maxChars: 8_000,
+    onProgress: onProgress && ((line) => onProgress(`setup: ${line.slice(0, 120) || "running"}`)),
   })
+  if (r.code === 0 && !r.stopped) return `setup \`${command}\` succeeded`
+  const why = r.stopped === "timeout" ? "timed out after 15 minutes" : r.stopped === "cancelled" ? "cancelled" : `failed (exit ${r.code})`
+  throw new Error(`worktree setup \`${command}\` ${why}:\n${r.output.slice(-4000)}`)
 }
 
 /** Hide files we generate (agent profiles, links) from git in every worktree of the repo. */

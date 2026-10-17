@@ -1,4 +1,4 @@
-import { type ChildProcess, spawn, spawnSync } from "node:child_process"
+import { type ChildProcess, spawn } from "node:child_process"
 import { randomBytes } from "node:crypto"
 import { EventEmitter } from "node:events"
 import fs from "node:fs"
@@ -6,10 +6,11 @@ import net from "node:net"
 import os from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
+import { killTree, pidAlive } from "@mcp-horde/core"
 import { createOpencodeClient, type OpencodeClient, type V2Event } from "@opencode-ai/sdk/v2"
 import { serverVersion } from "./compat.js"
 import type { Config } from "./config.js"
-import { pidAlive, type Store } from "./state.js"
+import type { Store } from "./state.js"
 
 /** OpenCode versions this server was tested against. Others work but get a warning. */
 export const TESTED_OPENCODE = { major: 1, minor: 19 }
@@ -363,20 +364,6 @@ export function resolveBinary(bin: string, platform = process.platform, env = pr
 export function shimTarget(shim: string): string | undefined {
   const matches = [...shim.matchAll(/"%~?dp0%?\\([^"]+?\.exe)"/gi)].map((m) => m[1]!)
   return matches.filter((m) => !/(^|\\)node\.exe$/i.test(m)).pop()
-}
-
-/** Stop a process and everything it started (`group`: it leads its own process group). */
-export function killTree(pid: number, group: boolean) {
-  try {
-    if (isWindows) spawnSync("taskkill", ["/pid", String(pid), "/T", "/F"], { stdio: "ignore", windowsHide: true })
-    else process.kill(group ? -pid : pid, "SIGTERM")
-  } catch {
-    try {
-      if (!isWindows && group) process.kill(pid, "SIGTERM")
-    } catch {
-      // Already gone.
-    }
-  }
 }
 
 function serveArgs(port: number) {

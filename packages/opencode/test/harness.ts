@@ -98,7 +98,7 @@ export async function connect(env: Record<string, string>, opts: { elicitation?:
     new StdioClientTransport({
       command: process.execPath,
       // `built` runs the compiled package exactly as npm installs it.
-      args: opts.built ? [path.join(pkg, "dist/index.js")] : ["--import", "tsx", path.join(pkg, "src/index.ts")],
+      args: opts.built ? [path.join(pkg, "dist/index.js")] : ["--conditions=source", "--import", "tsx", path.join(pkg, "src/index.ts")],
       cwd: pkg,
       env: { ...(process.env as Record<string, string>), HORDE_OPENCODE_BIN: opencodeBin, ...env },
       stderr: "inherit",
