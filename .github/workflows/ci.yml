@@ -39,3 +39,24 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm test
+
+  # OpenCode's v2 API is still moving: see breaking changes before users do. Never blocks.
+  test-opencode-dev:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Git identity for test commits
+        run: |
+          git config --global user.name "CI"
+          git config --global user.email "ci@example.com"
+      - run: npm ci
+      - run: npm install --no-save opencode-ai@dev @opencode-ai/sdk@dev -w @mcp-horde/opencode
+      - run: npx opencode --version
+      - run: npm run build
+      - run: npm test

@@ -314,6 +314,20 @@ describe("helpers", () => {
   })
 })
 
+describe("API policy", () => {
+  test("only compat.ts uses OpenCode's legacy API; everything else is v2", () => {
+    const src = path.resolve(import.meta.dirname, "../src")
+    const legacy = /\bclient\.(session|instance|global|config|project|app|file|find|tool|agent|provider|mcp|event|lsp|command|tui|path|auth|pty)\./
+    for (const f of fs.readdirSync(src)) {
+      if (!f.endsWith(".ts") || f === "compat.ts") continue
+      const lines = fs.readFileSync(path.join(src, f), "utf8").split("\n")
+      lines.forEach((line, i) => {
+        assert.doesNotMatch(line, legacy, `${f}:${i + 1} uses the legacy API; add it to compat.ts with the v2 gap it covers`)
+      })
+    }
+  })
+})
+
 describe("state store", () => {
   test("migrates the legacy state.json to per-agent files with a stable server key", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "horde-state-"))

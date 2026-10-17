@@ -2,7 +2,7 @@
 
 An MCP server that gives any harness (Claude Code, Codex, Cursor, OpenCode itself, …) subagents powered by [OpenCode](https://opencode.ai). Each agent can run any model OpenCode supports: DeepSeek, Kimi, GLM, Qwen, GPT, Claude, local models. The calling model picks the model and effort level per agent at runtime. Agents run in parallel, report back when they finish, and can be steered, paused, resumed and stopped while they work.
 
-It is built on OpenCode's **v2 server API** (`/v2/session/*`, through `@opencode-ai/sdk/v2`).
+It is built on OpenCode's **v2 server API** (`/api/*`, through `@opencode-ai/sdk/v2`). The legacy API is used only for what v2 lacks (session titles and deletion, releasing a directory, the server version), from one adapter module (`src/compat.ts`); each use is best effort and goes away when v2 covers it.
 
 ## What the calling agent can do
 

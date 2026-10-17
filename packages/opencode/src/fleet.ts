@@ -4,6 +4,7 @@ import path from "node:path"
 import { pathToFileURL } from "node:url"
 import type { AgentV2Info, ModelRef, ModelV2Info, PermissionV2Request, QuestionV2Request, SessionMessage, SessionV2Info, V2Event } from "@opencode-ai/sdk/v2"
 import type { Backend } from "./backend.js"
+import { deleteSession, releaseDirectory, renameSession } from "./compat.js"
 import type { Config, PermissionPolicy } from "./config.js"
 import { type Detail, inputSummary, oneLine, renderTranscript } from "./render.js"
 import { type AgentRecord, type Limits, ownerAlive, SELF, type Store } from "./state.js"
@@ -420,8 +421,7 @@ export class Fleet {
         "creating session",
       ).data
       sessionId = session.id
-      // v2 cannot set titles; the legacy endpoint can, and it makes agents recognisable in the TUI.
-      await this.backend.client.session.update({ sessionID: session.id, directory, title: `horde: ${name}` }).catch(() => undefined)
+      await renameSession(this.backend.client, session.id, directory, `horde: ${name}`)
       const policy = input.permissions ?? this.config.defaultPermissions
       const record: AgentRecord = {
         id: session.id,
@@ -455,7 +455,7 @@ export class Fleet {
       if (!prompted) {
         if (sessionId) {
           this.forget(sessionId)
-          await this.backend.client.session.delete({ sessionID: sessionId, directory }).catch(() => undefined)
+          await deleteSession(this.backend.client, sessionId, directory)
         }
         if (agentFile) await fs.rm(agentFile, { force: true })
         if (worktree) await removeWorktree(worktree, name, true).catch(() => undefined)
@@ -680,10 +680,9 @@ export class Fleet {
     }
     if (opts.deleteSession) {
       // First, while its directory still exists: OpenCode opens the session's
-      // directory to serve the request. v2 has no delete yet; the legacy
-      // endpoint removes the session and its children.
-      const res = await this.backend.client.session.delete({ sessionID: id, directory: live.session?.location.directory ?? live.record.directory })
-      notes.push(res.response?.ok ? `deleted session ${id}` : `could not delete session ${id} (HTTP ${res.response?.status})`)
+      // directory to serve the request. Deleting removes the session and its children.
+      const res = await deleteSession(this.backend.client, id, live.session?.location.directory ?? live.record.directory)
+      notes.push(res.ok ? `deleted session ${id}` : `could not delete session ${id}${res.status ? ` (HTTP ${res.status})` : ""}; it stays in OpenCode history`)
     }
     const wt = live.record.worktree
     if (wt) {
@@ -696,11 +695,7 @@ export class Fleet {
         // Stop tracking first: our own refreshes would make OpenCode reopen the directory.
         this.forget(id)
         // Let OpenCode release the directory (again before each retry) before it disappears.
-        const release = () =>
-          this.backend.client.instance.dispose({ directory: wt.path }).then(
-            () => undefined,
-            () => undefined,
-          )
+        const release = () => releaseDirectory(this.backend.client, wt.path)
         notes.push(await removeWorktree(wt, name, mode === "discard", release))
       }
     }

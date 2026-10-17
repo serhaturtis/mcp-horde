@@ -7,6 +7,7 @@ import os from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 import { createOpencodeClient, type OpencodeClient, type V2Event } from "@opencode-ai/sdk/v2"
+import { serverVersion } from "./compat.js"
 import type { Config } from "./config.js"
 import { pidAlive, type Store } from "./state.js"
 
@@ -140,7 +141,7 @@ export class Backend {
 
   private static async ready(client: OpencodeClient, info: ServerInfo, config: Config, proc?: ChildProcess) {
     const [major, minor] = info.version.split(".").map(Number)
-    if (major !== TESTED_OPENCODE.major || minor !== TESTED_OPENCODE.minor) {
+    if (info.version !== "unknown" && (major !== TESTED_OPENCODE.major || minor !== TESTED_OPENCODE.minor)) {
       info.warnings.push(
         `opencode ${info.version} is untested (tested: ${TESTED_OPENCODE.major}.${TESTED_OPENCODE.minor}.x). The v2 API is still evolving; report issues.`,
       )
@@ -263,8 +264,12 @@ interface Probe {
 
 async function probeHealth(client: OpencodeClient, timeoutMs = 5_000): Promise<Probe> {
   try {
-    const res = await client.global.health({ signal: AbortSignal.timeout(timeoutMs) })
-    if (res.data?.healthy) return { ok: true, version: res.data.version, reachable: true, timedOut: false, reason: "" }
+    const res = await client.v2.health.get({ signal: AbortSignal.timeout(timeoutMs) })
+    if (res.data?.healthy) {
+      // v2 health has no version; it only matters for the tested-version warning.
+      const version = (await serverVersion(client, timeoutMs)) ?? "unknown"
+      return { ok: true, version, reachable: true, timedOut: false, reason: "" }
+    }
     const status = res.response?.status
     return {
       ok: false,
