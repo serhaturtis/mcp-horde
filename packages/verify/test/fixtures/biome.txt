@@ -1,0 +1,35 @@
+x.js:1:18 lint/suspicious/noDoubleEquals  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Using == may be unsafe if you are relying on type coercion.
+  
+  > 1 │ var a = 1; if (a == 2) { debugger }
+      │                  ^^
+    2 │ 
+  
+  i == is only allowed when comparing against null.
+  
+  i Unsafe fix: Use === instead.
+  
+    1 │ var·a·=·1;·if·(a·===·2)·{·debugger·}
+      │                    +                
+
+x.js:1:26 lint/suspicious/noDebugger  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × This is an unexpected use of the debugger statement.
+  
+  > 1 │ var a = 1; if (a == 2) { debugger }
+      │                          ^^^^^^^^
+    2 │ 
+  
+  i Unsafe fix: Remove debugger statement
+  
+    1 │ var·a·=·1;·if·(a·==·2)·{·debugger·}
+      │                          --------- 
+
+Checked 1 file in 3ms. No fixes applied.
+Found 2 errors.
+lint ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Some errors were emitted while running checks.
+  
+

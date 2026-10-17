@@ -1,0 +1,49 @@
+
+ RUN  v3.2.7 /work/proj
+
+ ❯ math.spec.mjs (4 tests | 2 failed | 1 skipped) 10ms
+   × adds numbers 8ms
+     → expected 2 to be 3 // Object.is equality
+   ✓ keeps passing 0ms
+   × throws on bad input 0ms
+     → bad input: expected string
+   ↓ not yet
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  math.spec.mjs > adds numbers
+AssertionError: expected 2 to be 3 // Object.is equality
+
+- Expected
++ Received
+
+- 3
++ 2
+
+ ❯ math.spec.mjs:2:44
+      1| import { test, expect } from "vitest"
+      2| test("adds numbers", () => { expect(1 + 1).toBe(3) })
+       |                                            ^
+      3| test("keeps passing", () => { expect(true).toBe(true) })
+      4| test("throws on bad input", () => { throw new TypeError("bad input: ex…
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
+
+ FAIL  math.spec.mjs > throws on bad input
+TypeError: bad input: expected string
+ ❯ math.spec.mjs:4:43
+      2| test("adds numbers", () => { expect(1 + 1).toBe(3) })
+      3| test("keeps passing", () => { expect(true).toBe(true) })
+      4| test("throws on bad input", () => { throw new TypeError("bad input: ex…
+       |                                           ^
+      5| test.skip("not yet", () => {})
+      6| 
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/2]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  2 failed | 1 passed | 1 skipped (4)
+   Start at  17:33:23
+   Duration  392ms (transform 108ms, setup 0ms, collect 51ms, tests 10ms, environment 0ms, prepare 105ms)
+

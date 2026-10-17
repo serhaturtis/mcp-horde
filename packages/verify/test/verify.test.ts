@@ -1,0 +1,309 @@
+import assert from "node:assert/strict"
+import { execFileSync } from "node:child_process"
+import fs from "node:fs"
+import os from "node:os"
+import path from "node:path"
+import { after, describe, test } from "node:test"
+import { Client } from "@modelcontextprotocol/sdk/client/index.js"
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
+import { audit, detectChecks, gate, globMatcher, isTestPath, loadSettings } from "../src/lib.js"
+
+const pkg = path.resolve(import.meta.dirname, "..")
+const temps: string[] = []
+after(() => {
+  for (const t of temps) fs.rmSync(t, { recursive: true, force: true })
+})
+
+function tmp() {
+  const d = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "horde-verify-")))
+  temps.push(d)
+  return d
+}
+
+function git(cwd: string, ...args: string[]) {
+  return execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false", ...args], { cwd })
+    .toString()
+    .trim()
+}
+
+function write(root: string, files: Record<string, string | Buffer>) {
+  for (const [rel, content] of Object.entries(files)) {
+    const p = path.join(root, rel)
+    fs.mkdirSync(path.dirname(p), { recursive: true })
+    fs.writeFileSync(p, content)
+  }
+}
+
+function repo(files: Record<string, string | Buffer>) {
+  const root = tmp()
+  git(root, "init", "-q")
+  git(root, "config", "core.autocrlf", "false")
+  write(root, files)
+  git(root, "add", "-A")
+  git(root, "commit", "-qm", "base")
+  return { root, base: git(root, "rev-parse", "HEAD") }
+}
+
+describe("detect", () => {
+  test("package.json scripts, cheapest first; npm's placeholder test is ignored; build only without typecheck", async () => {
+    const { root } = repo({
+      "package.json": JSON.stringify({ scripts: { test: "node --test", lint: "biome check .", typecheck: "tsc --noEmit", build: "tsc" } }),
+    })
+    assert.deepEqual(
+      (await detectChecks(root)).map((c) => [c.name, c.command]),
+      [
+        ["typecheck", "npm run typecheck"],
+        ["lint", "npm run lint"],
+        ["test", "npm test"],
+      ],
+    )
+    write(root, { "package.json": JSON.stringify({ scripts: { test: 'echo "Error: no test specified" && exit 1', build: "tsc" } }), "pnpm-lock.yaml": "" })
+    assert.deepEqual(
+      (await detectChecks(root)).map((c) => c.command),
+      ["pnpm run build"],
+    )
+  })
+
+  test("Python, Rust, Go and Make; nearest project root from a subdirectory", async () => {
+    const { root } = repo({
+      "pyproject.toml": "[tool.pytest.ini_options]\n[tool.ruff]\n[tool.mypy]\n",
+      "svc/go.mod": "module x\n",
+      "svc/internal/a.go": "package internal\n",
+      "lib/Cargo.toml": "[package]\nname='x'\n",
+      "tools/Makefile": "lint:\n\techo\ntest:\n\techo\n",
+    })
+    const py = (await detectChecks(root)).map((c) => c.name)
+    assert.deepEqual(py, ["typecheck", "lint", "test"])
+    assert.deepEqual(
+      (await detectChecks(path.join(root, "svc", "internal"))).map((c) => c.command),
+      ["go vet ./...", "go test ./..."],
+      "found from a subdirectory",
+    )
+    assert.equal((await detectChecks(path.join(root, "lib")))[0]!.command, "cargo test --color never")
+    assert.deepEqual(
+      (await detectChecks(path.join(root, "tools"))).map((c) => c.command),
+      ["make lint", "make test"],
+    )
+  })
+
+  test("horde.json checks replace detection; settings are validated", async () => {
+    const { root } = repo({
+      "package.json": JSON.stringify({ scripts: { test: "jest" } }),
+      "horde.json": JSON.stringify({ verify: { checks: { unit: "node --test", style: { command: "biome check .", kind: "lint" } }, timeoutSeconds: 30 } }),
+    })
+    const checks = await detectChecks(root)
+    assert.deepEqual(
+      checks.map((c) => [c.name, c.kind, c.source]),
+      [
+        ["unit", "test", "horde.json"],
+        ["style", "lint", "horde.json"],
+      ],
+    )
+    assert.equal(loadSettings(root).timeoutMs, 30_000)
+    write(root, { "horde.json": JSON.stringify({ verify: { audit: { block: ["nonsense"] } } }) })
+    assert.throws(() => loadSettings(root), /audit\.block must be a list of/)
+    write(root, { "horde.json": JSON.stringify({ verify: { checks: { x: {} } } }) })
+    assert.throws(() => loadSettings(root), /checks\.x needs a command/)
+  })
+})
+
+describe("audit", () => {
+  test("globs and test paths", () => {
+    const m = globMatcher(["src/auth/**", "*.md", "docs/"])
+    assert.ok(m("src/auth/login.ts"))
+    assert.ok(m("src/auth/deep/x.ts"))
+    assert.ok(m("README.md") && m("packages/a/CHANGELOG.md"))
+    assert.ok(m("docs/guide/intro.txt"))
+    assert.ok(!m("src/authz/x.ts"))
+    assert.ok(!m("src/other.ts"))
+    for (const p of ["test/a.ts", "src/__tests__/a.ts", "a.test.ts", "b.spec.mjs", "tests/test_x.py", "pkg/x_test.go", "tests/it.rs"])
+      assert.ok(isTestPath(p), p)
+    for (const p of ["src/testing.ts", "src/contest.ts", "latest.json"]) assert.ok(!isTestPath(p), p)
+  })
+
+  test("every category, with the right severity, without echoing secrets", async () => {
+    const { root, base } = repo({
+      "src/auth/login.ts": "export const login = () => true\n",
+      "src/app.ts": "export const app = 1\n",
+      "test/login.test.ts": 'test("a", () => { expect(1).toBe(1); expect(2).toBe(2) })\ntest("b", () => {})\n',
+      "test/old.test.ts": "test('old', () => {})\n",
+      "test/moved.test.ts": "test('m', () => { expect(1).toBe(1) })\n",
+      "package.json": JSON.stringify({ dependencies: { a: "^1.0.0" } }, null, 2),
+    })
+    // A worker's typical sins, committed and uncommitted.
+    write(root, {
+      "src/auth/login.ts": "// @ts-ignore\nexport const login = () => { try { return check() } catch {} }\n",
+      "test/login.test.ts": 'test.skip("a", () => { expect(1).toBe(1) })\ntest.only("b", () => {})\n',
+      "package.json": JSON.stringify({ dependencies: { a: "^1.0.0", "left-pad": "^1.3.0" } }, null, 2),
+      "package-lock.json": "{}",
+    })
+    fs.rmSync(path.join(root, "test/old.test.ts"))
+    git(root, "mv", "test/moved.test.ts", "src/moved.ts")
+    git(root, "add", "-A")
+    git(root, "commit", "-qm", "work")
+    write(root, {
+      "src/app.ts": 'export const app = 1\nconst key = "AKIAABCDEFGHIJKLMNOP"\n',
+      "assets/logo.bin": Buffer.from([0, 1, 2, 3, 0, 255]),
+      "scratch/notes.txt": `token = "${"x".repeat(20)}"\n`,
+    })
+    const r = await audit(root, {
+      base,
+      allowed: ["src/auth/**", "test/**", "package.json", "package-lock.json"],
+      block: ["scope", "tests", "secrets", "binaries"],
+      warn: ["suppressions", "dependencies", "git"],
+    })
+    const lines = r.findings.map((f) => `${f.severity} ${f.category} ${f.file ?? ""}${f.line ? `:${f.line}` : ""} ${f.text}`)
+    const has = (re: RegExp) =>
+      assert.ok(
+        lines.some((l) => re.test(l)),
+        `expected ${re} in:\n${lines.join("\n")}`,
+      )
+    has(/^block scope src\/app\.ts /)
+    has(/^block scope assets\/logo\.bin /)
+    has(/^block scope src\/moved\.ts /)
+    has(/^block tests test\/old\.test\.ts deletes a test file/)
+    has(/^block tests test\/moved\.test\.ts moves a test file out of the test suite/)
+    has(/^block tests test\/login\.test\.ts:1 skips a test/)
+    has(/^block tests test\/login\.test\.ts:2 focuses tests with \.only/)
+    has(/^warn tests test\/login\.test\.ts removes 1 assertion/)
+    has(/^warn suppressions src\/auth\/login\.ts:1 silences the type checker/)
+    has(/^warn suppressions src\/auth\/login\.ts:2 swallows errors \(empty catch\)/)
+    has(/^warn dependencies package\.json adds left-pad@\^1\.3\.0/)
+    has(/^warn dependencies package-lock\.json updates a lockfile/)
+    has(/^block secrets src\/app\.ts:2 adds what looks like an AWS access key/)
+    has(/^block secrets scratch\/notes\.txt:1 adds what looks like a hard-coded credential/)
+    has(/^block binaries assets\/logo\.bin adds or changes a binary file/)
+    assert.ok(!lines.join("\n").includes("AKIAABCDEFGHIJKLMNOP"), "the secret itself is never printed")
+    assert.equal(r.commits, 1)
+  })
+
+  test("merge commits are flagged; categories can be switched off", async () => {
+    const { root, base } = repo({ "a.txt": "a\n" })
+    git(root, "checkout", "-qb", "side")
+    write(root, { "b.txt": "b\n" })
+    git(root, "add", "-A")
+    git(root, "commit", "-qm", "side")
+    git(root, "checkout", "-q", "-")
+    write(root, { "c.txt": "c\n" })
+    git(root, "add", "-A")
+    git(root, "commit", "-qm", "main")
+    git(root, "merge", "-q", "--no-edit", "side")
+    const r = await audit(root, { base, block: [], warn: ["git"] })
+    assert.match(r.findings.map((f) => f.text).join("\n"), /1 merge commit on the branch/)
+    const off = await audit(root, { base, block: [], warn: [] })
+    assert.equal(off.findings.length, 0)
+    await assert.rejects(audit(root, { base: "nope", block: [], warn: [] }), /not a commit/)
+  })
+})
+
+describe("gate", () => {
+  const passing = 'import { test } from "node:test"\nimport assert from "node:assert/strict"\ntest("adds", () => { assert.equal(1 + 1, 2) })\n'
+  const failing = 'import { test } from "node:test"\nimport assert from "node:assert/strict"\ntest("adds", () => { assert.equal(1 + 1, 3) })\n'
+  const project = (test: string) =>
+    repo({
+      "horde.json": JSON.stringify({ verify: { checks: { typecheck: 'node -e "process.exit(0)"', test: "node --test test/math.test.mjs" } } }),
+      "test/math.test.mjs": test,
+      "src/math.mjs": "export const add = (a, b) => a + b\n",
+    })
+
+  test("fail with the assertion and location, then pass once fixed; unchanged trees come from the cache", async () => {
+    const { root, base } = project(passing)
+    const stateDir = tmp()
+    write(root, { "test/math.test.mjs": failing })
+    const bad = await gate(root, { base, stateDir })
+    assert.equal(bad.pass, false)
+    assert.equal(bad.cached, false)
+    assert.match(bad.text, /^FAIL · 1 check failed/)
+    assert.match(bad.text, /✗ test · 1 failed, 0 passed/)
+    assert.match(bad.text, /✗ test: adds — test\/math\.test\.mjs:3\n\s+Expected values to be strictly equal:/)
+    assert.match(bad.text, /✓ typecheck · ok/)
+    assert.match(bad.text, /audit: 1 file changed, 0 commits since/)
+    assert.deepEqual(bad.blockers, ["test: 1 failed, 0 passed"])
+
+    const again = await gate(root, { base, stateDir })
+    assert.equal(again.cached, true, "same tree, same checks: not re-run")
+    assert.match(again.text, /\(cached: tree unchanged\)/)
+
+    write(root, { "test/math.test.mjs": passing })
+    const good = await gate(root, { base, stateDir })
+    assert.equal(good.pass, true, good.text)
+    assert.equal(good.cached, false, "the tree changed")
+    assert.match(good.text, /^PASS · /)
+    assert.match(good.text, /✓ test · 1 passed/)
+
+    const logs = fs.readdirSync(path.join(stateDir, "logs"))
+    assert.equal(logs.length, 1, "one log directory for this project")
+    assert.match(fs.readFileSync(path.join(stateDir, "logs", logs[0]!, "test.log"), "utf8"), /^\$ node --test test\/math\.test\.mjs/)
+  })
+
+  test("blocking audit findings fail a gate whose checks pass; scope comes from the call", async () => {
+    const { root, base } = project(passing)
+    write(root, { "src/math.mjs": "export const add = (a, b) => a + b // ok\n", "README.md": "# new\n" })
+    const v = await gate(root, { base, allowed: ["src/**"], stateDir: tmp() })
+    assert.equal(v.pass, false)
+    assert.match(v.text, /^FAIL · 1 blocking finding/)
+    assert.match(v.text, /✗ scope: README\.md adds a file outside the allowed scope/)
+    const noAudit = await gate(root, { base, audit: false, stateDir: tmp() })
+    assert.equal(noAudit.pass, true)
+  })
+
+  test("many failures stay within the budget and keep the count", async () => {
+    const many = `import { test } from "node:test"\nimport assert from "node:assert/strict"\n${Array.from({ length: 40 }, (_, i) => `test("case ${i}", () => { assert.equal(${i}, -1, "case ${i} is wrong: ${"x".repeat(80)}") })`).join("\n")}\n`
+    const { root } = project(many)
+    const v = await gate(root, { budgetChars: 1200, stateDir: tmp() })
+    assert.ok(v.text.length <= 1200, `within budget: ${v.text.length}`)
+    assert.match(v.text, /40 failed, 0 passed/, "exact count survives truncation")
+    assert.match(v.text, /failures in test not shown \(verify_logs test\)/)
+    await assert.rejects(gate(root, { checks: ["nope"], stateDir: tmp() }), /unknown check nope; available: typecheck, test/)
+  })
+
+  test("a cancelled gate stops its checks and is not cached", async () => {
+    const { root } = repo({ "horde.json": JSON.stringify({ verify: { checks: { slow: 'node -e "setTimeout(() => {}, 30000)"' } } }) })
+    const ac = new AbortController()
+    setTimeout(() => ac.abort(), 300)
+    const started = Date.now()
+    const v = await gate(root, { signal: ac.signal, stateDir: tmp() })
+    assert.ok(Date.now() - started < 10_000, "stopped quickly")
+    assert.equal(v.pass, false)
+    assert.match(v.text, /slow · cancelled/)
+    const fresh = gate(root, { signal: AbortSignal.timeout(300), stateDir: tmp() })
+    assert.equal((await fresh).cached, false, "a cancelled verdict was not cached")
+  })
+})
+
+describe("MCP server", () => {
+  test("detect, gate and logs over stdio", async () => {
+    const { root, base } = repo({
+      "horde.json": JSON.stringify({ verify: { checks: { test: "node --test test/math.test.mjs" } } }),
+      "test/math.test.mjs": 'import { test } from "node:test"\nimport assert from "node:assert/strict"\ntest("adds", () => { assert.equal(1 + 1, 3) })\n',
+    })
+    const client = new Client({ name: "test", version: "0" })
+    await client.connect(
+      new StdioClientTransport({
+        command: process.execPath,
+        args: ["--conditions=source", "--import", "tsx", path.join(pkg, "src/index.ts")],
+        cwd: pkg,
+        env: { ...(process.env as Record<string, string>), HORDE_VERIFY_DIRECTORY: root, HORDE_VERIFY_STATE_DIR: tmp() },
+        stderr: "inherit",
+      }),
+    )
+    try {
+      const call = async (name: string, args: Record<string, unknown> = {}) => {
+        const res = (await client.callTool({ name, arguments: args }, undefined, { timeout: 120_000 })) as { content: { text: string }[]; isError?: boolean }
+        return { text: res.content.map((c) => c.text).join("\n"), isError: !!res.isError }
+      }
+      const tools = (await client.listTools()).tools.map((t) => t.name).sort()
+      assert.deepEqual(tools, ["verify_audit", "verify_detect", "verify_gate", "verify_logs", "verify_run"])
+      assert.match((await call("verify_detect")).text, /^test \(test\): node --test test\/math\.test\.mjs {2}← horde\.json/)
+      const logsFirst = await call("verify_logs", { check: "test" })
+      assert.ok(logsFirst.isError)
+      assert.match(logsFirst.text, /no log for "test"/)
+      const verdict = await call("verify_gate", { base })
+      assert.match(verdict.text, /^FAIL · 1 check failed/)
+      assert.match((await call("verify_logs", { check: "test", max_chars: 4000 })).text, /not ok 1 - adds/)
+      assert.match((await call("verify_audit", { base })).text, /0 files changed, 0 commits since \w+; no findings\./)
+    } finally {
+      await client.close()
+    }
+  })
+})

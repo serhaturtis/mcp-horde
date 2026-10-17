@@ -1,0 +1,40 @@
+FAIL ./math.test.js
+  ✕ adds numbers (4 ms)
+  ✓ keeps passing
+  ✕ throws on bad input (1 ms)
+  ○ skipped not yet
+
+  ● adds numbers
+
+    expect(received).toBe(expected) // Object.is equality
+
+    Expected: 3
+    Received: 2
+
+      1 | const { test, expect } = require("@jest/globals")
+    > 2 | test("adds numbers", () => { expect(1 + 1).toBe(3) })
+        |                                            ^
+      3 | test("keeps passing", () => { expect(true).toBe(true) })
+      4 | test("throws on bad input", () => { throw new TypeError("bad input: expected string") })
+      5 | test.skip("not yet", () => {})
+
+      at Object.toBe (math.test.js:2:44)
+
+  ● throws on bad input
+
+    TypeError: bad input: expected string
+
+      2 | test("adds numbers", () => { expect(1 + 1).toBe(3) })
+      3 | test("keeps passing", () => { expect(true).toBe(true) })
+    > 4 | test("throws on bad input", () => { throw new TypeError("bad input: expected string") })
+        |                                           ^
+      5 | test.skip("not yet", () => {})
+      6 |
+
+      at Object.<anonymous> (math.test.js:4:43)
+
+Test Suites: 1 failed, 1 total
+Tests:       2 failed, 1 skipped, 1 passed, 4 total
+Snapshots:   0 total
+Time:        0.354 s
+Ran all test suites matching /math.test.js/i.

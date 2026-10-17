@@ -1,0 +1,22 @@
+F.Fs                                                                     [100%]
+=================================== FAILURES ===================================
+___________________________________ test_add ___________________________________
+
+>   def test_add(): assert add(1, 1) == 3
+                    ^^^^^^^^^^^^^^^^^^^^^
+E   assert 2 == 3
+E    +  where 2 = add(1, 1)
+
+test_calc.py:3: AssertionError
+_________________________________ test_raises __________________________________
+
+>   def test_raises(): raise ValueError("boom: bad value")
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   ValueError: boom: bad value
+
+test_calc.py:5: ValueError
+=========================== short test summary info ============================
+FAILED test_calc.py::test_add - assert 2 == 3
+ +  where 2 = add(1, 1)
+FAILED test_calc.py::test_raises - ValueError: boom: bad value
+2 failed, 1 passed, 1 skipped in 0.01s

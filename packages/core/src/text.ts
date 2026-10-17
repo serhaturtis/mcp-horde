@@ -43,29 +43,51 @@ export function estimateTokens(text: string): number {
 
 export interface Section {
   text: string
-  /** Shown instead of a section that does not fit at all, e.g. "+3 more failures". */
-  omitted?: string
+  /**
+   * Shown instead of sections that do not fit. A function gets the number of
+   * sections dropped in this section's `group`, so one note can say "+37 more".
+   */
+  omitted?: string | ((dropped: number) => string)
+  /** Sections sharing a group share one omission note (default: each its own). */
+  group?: string
   /** A section that must stay, even if only truncated. */
   required?: boolean
 }
 
 /**
  * Fit sections, in priority order, into `maxChars`. Sections are kept whole
- * while they fit; the first one that does not fit is truncated if it is
- * required (or there is room for a useful part of it), and the rest are
- * replaced by their `omitted` notes. Notes are always kept so counts survive.
+ * while they fit; one that does not fit is truncated if it is required (or a
+ * useful part of it fits), otherwise dropped and counted into its group's
+ * note. Notes come last and always survive, so counts are never lost.
  */
 export function fitSections(sections: Section[], maxChars: number, separator = "\n"): string {
-  const kept: string[] = []
-  const notes: string[] = []
-  const length = (parts: string[]) => parts.reduce((n, p) => n + p.length, 0) + Math.max(0, parts.length - 1) * separator.length
-  // Room left for one more kept section, after what is kept and the notes collected so far.
-  const room = () => maxChars - length([...kept, ...notes]) - (kept.length + notes.length ? separator.length : 0)
-  for (const s of sections) {
-    const r = room()
-    if (s.text.length <= r) kept.push(s.text)
-    else if ((s.required || r >= 200) && r > 40) kept.push(truncate(s.text, r))
-    else if (s.omitted) notes.push(s.omitted)
+  const kept: { section: Section; text: string }[] = []
+  const dropped = new Map<string, { count: number; note: (n: number) => string }>()
+  const render = () => [...kept.map((k) => k.text), ...[...dropped.values()].map((d) => d.note(d.count))].join(separator)
+  const drop = (s: Section) => {
+    if (!s.omitted) return
+    const key = s.group ?? `\0${s.text}`
+    const d = dropped.get(key)
+    if (d) d.count++
+    else dropped.set(key, { count: 1, note: typeof s.omitted === "function" ? s.omitted : () => s.omitted as string })
   }
-  return [...kept, ...notes].join(separator)
+  for (const s of sections) {
+    kept.push({ section: s, text: s.text })
+    if (render().length <= maxChars) continue
+    kept.pop()
+    const room = maxChars - render().length - (kept.length || dropped.size ? separator.length : 0)
+    if ((s.required || room >= 200) && room > 40) {
+      kept.push({ section: s, text: truncate(s.text, room) })
+      if (render().length <= maxChars) continue
+      kept.pop()
+    }
+    drop(s)
+  }
+  // A grown note can push the total over: give back the latest optional sections.
+  while (render().length > maxChars) {
+    const i = kept.findLastIndex((k) => !k.section.required)
+    if (i < 0) break
+    drop(kept.splice(i, 1)[0]!.section)
+  }
+  return render()
 }

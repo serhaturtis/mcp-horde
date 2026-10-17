@@ -1,0 +1,21 @@
+--- FAIL: TestAdd (0.00s)
+    calc_test.go:3: Add(1, 1) = 2, want 3
+--- FAIL: TestPanic (0.00s)
+panic: assignment to entry in nil map [recovered]
+	panic: assignment to entry in nil map
+
+goroutine 8 [running]:
+testing.tRunner.func1.2({0x54fea0, 0x6a0850})
+	/usr/local/go1.24.7/src/testing/testing.go:1734 +0x21c
+testing.tRunner.func1()
+	/usr/local/go1.24.7/src/testing/testing.go:1737 +0x35e
+panic({0x54fea0?, 0x6a0850?})
+	/usr/local/go1.24.7/src/runtime/panic.go:792 +0x132
+example.com/calc.TestPanic(0xc0001421c0?)
+	/work/proj/calc_test.go:5 +0x28
+testing.tRunner(0xc0001421c0, 0x5843a8)
+	/usr/local/go1.24.7/src/testing/testing.go:1792 +0xf4
+created by testing.(*T).Run in goroutine 1
+	/usr/local/go1.24.7/src/testing/testing.go:1851 +0x413
+FAIL	example.com/calc	0.006s
+FAIL
