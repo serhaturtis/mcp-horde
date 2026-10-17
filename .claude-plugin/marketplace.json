@@ -1,0 +1,14 @@
+{
+  "name": "mcp-horde",
+  "description": "MCP servers and a Claude Code playbook for orchestrating cheap, fast coding agents (OpenCode) with mechanical verification.",
+  "owner": {
+    "name": "serhaturtis"
+  },
+  "plugins": [
+    {
+      "name": "horde",
+      "source": "./plugins/horde",
+      "description": "Orchestrate cheap, fast OpenCode workers from Claude: task board, briefs, gates and reports."
+    }
+  ]
+}

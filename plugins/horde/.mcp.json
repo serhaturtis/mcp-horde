@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "opencode": {
+      "command": "npx",
+      "args": ["-y", "@mcp-horde/opencode"]
+    },
+    "board": {
+      "command": "npx",
+      "args": ["-y", "@mcp-horde/board"]
+    },
+    "verify": {
+      "command": "npx",
+      "args": ["-y", "@mcp-horde/verify"]
+    }
+  }
+}
