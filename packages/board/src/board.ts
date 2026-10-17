@@ -206,6 +206,8 @@ export class Board {
       const existing = this.tasks()
       const warnings: string[] = []
       const now = Date.now()
+      // createdAt orders tasks, so it stays after every existing task even within one millisecond.
+      const first = Math.max(now, ...existing.map((t) => t.createdAt + 1))
       const fresh: Task[] = inputs.map((p, i) => {
         if (!p.title?.trim() || !p.goal?.trim()) throw new Error(`task ${i + 1}: title and goal are required`)
         return {
@@ -221,7 +223,7 @@ export class Board {
           attempts: [],
           reports: [],
           cost: 0,
-          createdAt: now + i,
+          createdAt: first + i,
           updatedAt: now,
         }
       })
