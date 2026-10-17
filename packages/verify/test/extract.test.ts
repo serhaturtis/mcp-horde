@@ -214,7 +214,8 @@ describe("extract: Windows paths", () => {
       "not ok 1 - adds",
       "  ---",
       "  type: 'test'",
-      "  location: 'D:\\a\\proj\\test\\math.test.mjs:3:1'",
+      // As Node prints it on Windows: backslashes escaped inside the quoted value.
+      "  location: 'D:\\\\a\\\\proj\\\\test\\\\math.test.mjs:3:1'",
       "  error: 'nope'",
       "  stack: |-",
       "    TestContext.<anonymous> (file:///D:/a/proj/test/math.test.mjs:3:37)",

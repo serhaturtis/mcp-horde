@@ -76,10 +76,14 @@ function isProjectFrame(line: string) {
 
 /** Forward slashes, and no file:// prefix (file:///D:/x on Windows becomes D:/x). */
 function slashes(p: string): string {
-  return p
-    .replace(/file:\/\/\/(?=[A-Za-z]:)/g, "")
-    .replace(/file:\/\//g, "")
-    .replace(/\\/g, "/")
+  return (
+    p
+      .replace(/file:\/\/\/(?=[A-Za-z]:)/g, "")
+      .replace(/file:\/\//g, "")
+      .replace(/\\/g, "/")
+      // Escaped backslashes become doubled slashes; keep a leading "//" (UNC paths).
+      .replace(/(?<!^)\/{2,}/g, "/")
+  )
 }
 
 function clean(frame: string, cwd?: string): string {
@@ -187,7 +191,13 @@ function tap(text: string, cwd?: string): Omit<Extracted, "runner"> {
         for (let j = k + 1; j < yaml.length && (yaml[j]!.startsWith("  ") || !yaml[j]!.trim()); j++) body.push(yaml[j]!.slice(2))
         return body.join("\n")
       }
-      return v.replace(/^'(.*)'$/s, "$1").replace(/''/g, "'")
+      // Node escapes backslashes in quoted values ('D:\\a\\x.ts' on Windows).
+      return v.startsWith("'")
+        ? v
+            .replace(/^'(.*)'$/s, "$1")
+            .replace(/''/g, "'")
+            .replace(/\\\\/g, "\\")
+        : v
     }
     if (field("type") === "suite" || field("failureType") === "subtestsFailed") continue
     const location = field("location")
