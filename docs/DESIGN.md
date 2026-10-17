@@ -24,7 +24,7 @@ The arrangement breaks in three places, and every server exists to fix one of th
 4. **Cheap first, escalate on evidence.** A task starts on the cheapest tier that could plausibly do it. Two failed gates escalate the tier. The last tier is the orchestrator doing it itself.
 5. **One source of truth, shared by both sides.** Orchestrator and workers see the same task graph, findings and memory, through the same server in two modes.
 6. **No daemons, no network.** State is files with atomic writes and cross-process locks (the scheme `opencode` already uses). Every server is a stdio MCP. This keeps Windows, macOS and Linux identical and makes attach-mode and multi-session setups work without a broker.
-7. **Harness-agnostic, OpenCode-specific.** Tools work from any MCP client. Worker integration assumes OpenCode (its config, its agent profiles, its permission system) and uses what OpenCode 1.19 verifiably supports.
+7. **Harness-agnostic, OpenCode-specific, v2 API only.** Tools work from any MCP client. Worker integration assumes OpenCode (its config, its agent profiles, its permission system). All server calls go through OpenCode's v2 API (`/api/*`, `@opencode-ai/sdk/v2`). The legacy API is used only where v2 has no equivalent, from one adapter module, with each use marked for removal (§3.1).
 8. **Reuse the agent runtime for model access.** One-shot model calls go through OpenCode too (its providers, auth and catalog), so there is exactly one place where models are configured.
 
 ## 3. The system
@@ -59,14 +59,34 @@ core ─┬─ verify ─── opencode      (opencode imports verify's library
 
 `opencode` and `board` stay decoupled in v1; the orchestrator composes them. A later optimization lets `opencode_spawn` take a task id directly (see §10).
 
-### Verified facts about OpenCode 1.19 this design relies on
+### 3.1 API policy: the v2 series
 
-Checked against the installed `opencode` 1.19.3 and its SDK types during this pass:
+The target is OpenCode's v2 API: the `/api/*` endpoints served by `opencode serve` and typed by `@opencode-ai/sdk/v2`. The v2 surface of the current release (1.19.3) and of today's `dev` build are identical, so there is no newer shape to chase yet; the policy is about staying on it as it grows.
+
+What v2 provides that the horde uses or will use: sessions (create with `agent`, `model`, `location`; list; get; active; interrupt; switch model; switch agent; prompt with `steer`/`queue` delivery; durable history and per-session events; messages), permissions and questions (per-session list and reply, global request lists, **saved permission rules** list and remove), `session.compact` and `session.context` (context management for long-running workers), `session.revert.stage/clear/commit` (undo a turn's file changes), `model`, `provider`, `agent`, `skill`, `command`, `fs.read/list/find`, `health`, and the SSE event stream.
+
+What v2 does not provide, and how each case is handled:
+
+| Need | v2 status | Handling |
+| --- | --- | --- |
+| health check | `GET /api/health` | use it; the current `global.health` call is replaced |
+| rename a session (`horde: <name>` titles) | missing | legacy `session.update` through the adapter; cosmetic, dropped if it ever breaks |
+| delete a session | missing | legacy `session.delete` through the adapter; without it, `opencode_dispose` leaves the session in history (acceptable degradation) |
+| release a directory before deleting a worktree | missing (`instance.dispose` is legacy) | legacy through the adapter, best effort; removal retries cover the failure case |
+| one-shot call with no tools, structured output | per-call `tools`/`format` exist only on the legacy prompt | **not used.** One-shot calls run as a v2 session with a tool-less agent profile; JSON is requested in the prompt and validated client-side (§4.2c) |
+| worktrees | `/experimental/project/{id}/copy` (experimental, not `/api`) | keep the horde's own worktrees (baseline commits, links, setup, scoped profiles); revisit when project copies reach `/api` |
+| block until a session settles | `GET /api/session/{id}/wait` exists but returns 503 in 1.19 | keep polling history plus the event stream; switch when it works |
+
+Every legacy call lives in `packages/opencode/src/compat.ts`, with the v2 gap it covers named in a comment. A unit test fails if any other source file touches the legacy client, so the list cannot grow silently. CI runs the suite against the pinned `opencode-ai` release and, in a non-blocking job, against the `dev` tag, so v2 changes show up before users hit them.
+
+### Verified facts about OpenCode 1.19.3 this design relies on
+
+Checked against the installed binary and its SDK types during this pass:
 
 - `OPENCODE_CONFIG_CONTENT` (inline JSON) **merges** with the project's `opencode.json`: the project's providers and the injected `mcp` entries are both present in the resolved config. **Agents defined in it do not register** (the agent list ignores them), while agents in the project's `opencode.json` or `.opencode/agent/*.md` do. So MCP mounts can be injected into the server we start; agent profiles cannot.
 - `mcp` config supports `type: "local"` with `command`, `cwd`, `environment` (OpenCode spawns the stdio server) and `type: "remote"` with headers.
 - Agent config supports `tools: {name: boolean}`, `maxSteps`, `prompt`, `mode`, and `permission` with **glob maps per action**: `edit: {"src/auth/**": "allow", "*": "deny"}`.
-- The legacy prompt endpoint (`POST /session/{id}/message`) accepts per-call `tools`, `system`, `agent`, `model`, `variant` and `format: {type: "json_schema", schema}`. The v2 prompt endpoint does not. One-shot calls use the legacy endpoint.
+- The v2 prompt body is `{prompt: {text, files, agents}, delivery, resume}`: no per-call tools, system prompt or output format. Those belong to agent profiles.
 - Agent `.md` files load when OpenCode first opens a directory (already relied on by `opencode` for worktree profiles).
 - OpenCode's v2 runner reports every step as `cost: 0`; `opencode` prices steps from the catalog. Cost figures across the horde come from that estimate.
 
@@ -105,15 +125,23 @@ Requires `isolation: "worktree"` (the only place a per-agent profile can be inst
 
 **c. One-shot calls (`opencode_ask`).**
 ```
-opencode_ask { prompt, model?, variant?, system?, files?, schema?: JSONSchema, directory? } → text | JSON
+opencode_ask { prompt, model?, variant?, files?, schema?: JSONSchema } → text | JSON
 ```
-Creates a session, prompts through the legacy endpoint with every tool disabled (per-call `tools` map; the tool ids come from the server's tool list, falling back to a static list), optional `format: json_schema`, waits for the single step, returns the text or parsed JSON with cost, and deletes the session. No agent loop, no worktree. Uses: classification, summarizing a long log or diff for the orchestrator, judging between candidates, drafting a brief. Best-of-N is `opencode_spawn` ×N + `verify` + `opencode_ask` as judge; the playbook describes it rather than a dedicated tool.
+Runs as a v2 session in a horde-owned directory (`<data dir>/ask/`) that carries one agent profile, `horde-ask`: every tool disabled, a fixed system prompt ("answer directly; no tools are available"). The directory never changes, so OpenCode loads the profile once. The call creates a session there with `agent: "horde-ask"` and the requested model, sends one prompt, waits for the single step through history, returns the text with its cost, and deletes the session (adapter). With `schema`, the prompt asks for JSON matching the schema, the reply is parsed and validated client-side, and one retry with the validation error is attempted before giving up. No agent loop, no worktree. Uses: classification, summarizing a long log or diff for the orchestrator, judging between candidates, drafting a brief. Best-of-N is `opencode_spawn` ×N + `verify` + `opencode_ask` as judge; the playbook describes it rather than a dedicated tool.
+
+To verify before building: whether `tools: {"*": false}` is honoured in a profile (otherwise the profile enumerates every tool id from `/api/agent`'s build agent).
+
+**f. Context management (`opencode_compact`, context in status).** Long tasks on small-context models hit the window. `session.context` gives the usage; the snapshot shows it (`ctx 71%`) so the orchestrator can see a worker about to lose its thread; `opencode_compact` calls `session.compact` on an idle agent before messaging it again. The playbook's rule: compact instead of re-spawning when the task is mid-way and the worktree holds good work.
+
+**g. Undo a turn (`opencode_revert`).** `session.revert.stage` to a message id rolls the worker's files back to that point and marks the later messages reverted; `revert.commit` makes it permanent, `revert.clear` abandons it. `opencode_revert { id, to?: messageID }` defaults to the start of the last turn. Cheaper than discarding a worktree when one bad turn ruined a good run, and it keeps the worker's context consistent with its files, which a manual `git checkout` would not.
+
+**h. Saved permission rules (`opencode_permissions`).** An "always" reply saves a rule in OpenCode. `opencode_permissions { action: "list" | "remove", id? }` shows and removes those rules so the orchestrator can see what has been permanently allowed for a project and undo it.
 
 **d. `opencode_worktree action: "sync"`.** Merges the base branch into the agent's branch inside the agent's worktree, so conflicts with other merged work land where a cheap model (with a gate) can resolve them, instead of at the orchestrator's merge. Refused while the agent is running; after a sync the playbook says to message the agent "resolve the conflicts and run the gate".
 
 **e. Config injection for workers.** When `opencode` starts the shared or private server it sets `OPENCODE_CONFIG_CONTENT` with `mcp` entries for the worker-side horde servers that are installed and enabled (`HORDE_WORKER_TOOLS=board,context,verify`, default: whichever are resolvable next to this package). Each is `type: "local"` with `command: [process.execPath, <bin>, "--worker"]` and `environment` carrying the state dir. In attach mode the server is the user's; the README gives the `opencode.json` snippet. The injected config never changes agents or permissions (the shared server is also the human's TUI server).
 
-Also: the snapshot rendering gains a `task:` line when a board binding exists (§10), and `HORDE_OPENCODE_MAX_RUNNING` becomes a horde-wide `maxRunning` in `horde.json` with the env var as override.
+Also: the snapshot rendering gains a `task:` line when a board binding exists (§10), `HORDE_OPENCODE_MAX_RUNNING` becomes a horde-wide `maxRunning` in `horde.json` with the env var as override, and the health check moves to `v2.health`.
 
 ### 4.3 `@mcp-horde/verify`
 
@@ -309,7 +337,7 @@ Rules that keep this true: every tool takes a `budget` argument with a sane defa
 5. **Test time.** Related tests in the worker gate, full suite at integration, verdict cache so polling never re-runs anything.
 6. **Merge conflicts between parallel workers.** Scopes, locks, `worktree sync` so the cheap model resolves conflicts under a gate; integration gate after every merge.
 7. **Log compaction without a model.** Per-runner extractors with exact counts and a tail fallback; `opencode_ask` with a cheap model as the optional second stage.
-8. **One-shot calls.** Agents cannot be injected via config content (verified), so `opencode_ask` disables tools per call through the legacy prompt endpoint and uses its `format` for JSON. To verify: wildcard `"*"` in the per-call tools map; otherwise enumerate tool ids.
+8. **One-shot calls without leaving v2.** Agents cannot be injected via config content (verified) and v2 prompts carry no per-call tool or format options, so `opencode_ask` uses a tool-less agent profile in a horde-owned directory and validates JSON client-side. To verify: wildcard `"*"` in a profile's tools map; otherwise enumerate tool ids.
 9. **No daemon.** Everything is files plus locks; stdio only. Cost: no push from board to workers; workers read findings when they start and when the orchestrator steers them to.
 10. **Verifying worker claims.** Reports have `unverifiedClaims`; the audit cross-checks claimed tests against the diff; the gate is the only path to done.
 11. **Escalation.** Tiers in `horde.json`; attempts record the tier; the playbook escalates after two failed gates; the final tier is the orchestrator.
@@ -318,13 +346,15 @@ Rules that keep this true: every tool takes a `budget` argument with a sane defa
 14. **Configuration sprawl.** One `horde.json`; env vars only for machine-level settings.
 15. **Many servers in the client.** Claude Code defers tool loading, so eight servers' worth of descriptions do not sit in context; descriptions stay terse; the plugin registers everything in one step.
 16. **The shared server is also the human's.** Injected config may add MCP mounts but must never change agents, permissions or models. A horde server mounted into the human's own TUI sessions is harmless: without a task token its worker tools only read.
+17. **Staying on v2 as it moves.** Legacy calls are confined to one adapter with a test guarding the boundary; CI also runs against OpenCode's `dev` tag (non-blocking) so v2 changes are seen early; `session.wait` and project copies are watched as replacements for polling and for the horde's own worktrees.
 
 ## 11. Open questions to verify empirically before building
 
 - An injected `mcp` local server connects and its tools appear in sessions (and whether `enabled` defaults matter).
 - One MCP process per server or per project directory; whether `cwd` in the mcp config is the project directory.
-- `tools: {"*": false}` semantics in the legacy prompt body; the endpoint that lists tool ids (`/experimental/tool/ids` or equivalent in 1.19).
-- `format: json_schema` behaviour with OpenAI-compatible providers (DeepSeek) and its `retryCount`.
+- `tools: {"*": false}` semantics in an agent profile; whether `/api/agent` exposes the resolved tool list to enumerate from.
+- How reliably cheap models return valid JSON when asked in the prompt (drives the retry count in `opencode_ask`).
+- `session.compact` behaviour on an idle session and what `session.context` reports; `session.revert.stage` semantics for a turn with several messages.
 - `permission.edit` glob semantics: relative to the project root, and whether `write`/`patch` honour the same map.
 - Whether `web-tree-sitter` WASM grammars load acceptably fast for the v2 `context`.
 
@@ -334,10 +364,11 @@ Each goes into a `probe/` script in the relevant package, like the probes used w
 
 | Milestone | Delivers | Why first |
 | --- | --- | --- |
+| **M0** `compat.ts` boundary + v2 health + `dev`-tag CI job | the v2 policy enforced in code | small, and it keeps every later milestone honest |
 | **M1** `core` + `verify` + gates in `opencode` | mechanical verdicts; self-fixing workers | the biggest trust and token win, and it needs no worker-side mounts |
 | **M2** `board` (both modes) + config injection + playbook v1 | shared task graph, reports, findings, memory; the procedure | turns ad-hoc delegation into a tracked workflow |
 | **M3** `context` v1 + `board_brief` composition | precise briefs; related-test mapping for gates | closes most of the quality gap for fast models |
-| **M4** `opencode_ask`, `scope`, `worktree sync`, `opencode_spawn { task }` | one-shot calls and judging; scope enforcement; conflict handling; fewer calls | refinements once the loop works end to end |
+| **M4** `opencode_ask`, `scope`, `worktree sync`, `opencode_compact`, `opencode_revert`, `opencode_permissions`, `opencode_spawn { task }` | one-shot calls and judging; scope enforcement; conflict handling; context and undo for long tasks; fewer calls | refinements once the loop works end to end |
 | **M5** tree-sitter `context`, `board` TUI, plugin packaging, npm publish | depth and distribution | after the shape is proven |
 
 Each milestone ships with the same bar as `opencode`: unit tests, integration tests against a real `opencode serve` with the mock LLM, CI on Linux, macOS and Windows on Node 20 and 22, READMEs updated.
