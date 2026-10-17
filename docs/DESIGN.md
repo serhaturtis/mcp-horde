@@ -1,6 +1,6 @@
 # mcp-horde: system design
 
-Status: October 2026. Built: `@mcp-horde/opencode`, `@mcp-horde/core`, `@mcp-horde/verify`, gates in `opencode` (M0, M1), and `@mcp-horde/board` with its worker CLI (M2). Planned: the playbook plugin (rest of M2) and everything from M3 on.
+Status: October 2026. Built: `@mcp-horde/opencode`, `@mcp-horde/core`, `@mcp-horde/verify`, gates in `opencode` (M0, M1), `@mcp-horde/board` with its worker CLI, and the `horde` Claude Code plugin with its orchestration skill (M2). Planned: the M2 end-to-end mock run and everything from M3 on.
 
 ## 1. What this is for
 
