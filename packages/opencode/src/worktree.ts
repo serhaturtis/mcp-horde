@@ -506,17 +506,28 @@ export async function removeWorktree(wt: Worktree, name: string, discard: boolea
     const committed = await commitAll(wt, `horde: uncommitted work from ${name}`)
     if (committed) notes.push(committed)
   }
+  // Ask OpenCode to let go of the directory once, before anything is removed: asking
+  // again later would make it open an instance on a half-deleted directory.
+  await release?.()
   // Windows refuses to delete files another process (OpenCode, a tool it ran) still has
-  // open, so ask for them to be released and retry for a while.
-  for (let attempt = 0; attempt < 5 && (await exists(wt.root)); attempt++) {
-    if (attempt > 0) await new Promise((r) => setTimeout(r, 500 * attempt))
-    await release?.()
-    if (attempt === 0) await git(wt.repo, "worktree", "remove", "--force", wt.root).catch(() => undefined)
-    else await fs.rm(wt.root, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 }).catch(() => undefined)
+  // open, so retry for a while and say what was left when it still fails.
+  let lastError = ""
+  for (let attempt = 0; attempt < 6 && (await exists(wt.root)); attempt++) {
+    if (attempt > 0) await new Promise((r) => setTimeout(r, 400 * attempt))
+    try {
+      if (attempt === 0) await git(wt.repo, "worktree", "remove", "--force", "--force", wt.root)
+      else await fs.rm(wt.root, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 })
+    } catch (err) {
+      lastError = (err as Error).message.split("\n")[0] ?? String(err)
+    }
   }
   await git(wt.repo, "worktree", "prune").catch(() => undefined)
-  if (await exists(wt.root)) notes.push(`could not fully remove worktree ${wt.root} (files still in use?); delete it by hand`)
-  else notes.push(`removed worktree ${wt.root}`)
+  if (await exists(wt.root)) {
+    const left = await fs.readdir(wt.root).catch(() => [] as string[])
+    notes.push(
+      `could not fully remove worktree ${wt.root}; delete it by hand (${lastError || "no error reported"}; left: ${left.slice(0, 8).join(", ") || "nothing listed"})`,
+    )
+  } else notes.push(`removed worktree ${wt.root}`)
   let ahead: number
   try {
     ahead = Number(await git(wt.repo, "rev-list", "--count", `${wt.baseline ?? wt.base}..${wt.branch}`))
