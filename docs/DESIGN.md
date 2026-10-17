@@ -1,6 +1,6 @@
 # mcp-horde: system design
 
-Status: design pass, October 2026. `@mcp-horde/opencode` is built; everything else here is planned.
+Status: October 2026. Built: `@mcp-horde/opencode`, `@mcp-horde/core`, `@mcp-horde/verify`, and gates in `opencode` (milestones M0 and M1). Planned: everything from M2 on.
 
 ## 1. What this is for
 
@@ -364,8 +364,8 @@ Each goes into a `probe/` script in the relevant package, like the probes used w
 
 | Milestone | Delivers | Why first |
 | --- | --- | --- |
-| **M0** `compat.ts` boundary + v2 health + `dev`-tag CI job | the v2 policy enforced in code | small, and it keeps every later milestone honest |
-| **M1** `core` + `verify` + gates in `opencode` | mechanical verdicts; self-fixing workers | the biggest trust and token win, and it needs no worker-side mounts |
+| **M0** ✓ `compat.ts` boundary + v2 health + `dev`-tag CI job | the v2 policy enforced in code | small, and it keeps every later milestone honest |
+| **M1** ✓ `core` + `verify` + gates in `opencode` | mechanical verdicts; self-fixing workers (related-test selection moves to M3 with `context`) | the biggest trust and token win, and it needs no worker-side mounts |
 | **M2** `board` (both modes) + config injection + playbook v1 | shared task graph, reports, findings, memory; the procedure | turns ad-hoc delegation into a tracked workflow |
 | **M3** `context` v1 + `board_brief` composition | precise briefs; related-test mapping for gates | closes most of the quality gap for fast models |
 | **M4** `opencode_ask`, `scope`, `worktree sync`, `opencode_compact`, `opencode_revert`, `opencode_permissions`, `opencode_spawn { task }` | one-shot calls and judging; scope enforcement; conflict handling; context and undo for long tasks; fewer calls | refinements once the loop works end to end |

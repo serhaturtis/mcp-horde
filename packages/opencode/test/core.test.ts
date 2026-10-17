@@ -381,6 +381,47 @@ describe("opencode MCP server: core behaviour (real opencode, mock LLM)", { time
     await h.call("opencode_dispose", { id: "clash", worktree: "discard" })
   })
 
+  test("gates: a failing check goes back to the agent, which fixes it; the caller only hears the outcome", async () => {
+    // Each scenario lives in its own directory with its own horde.json checks.
+    const scenario = (name: string, command: string) => {
+      const dir = path.join(repo, name)
+      fs.mkdirSync(dir, { recursive: true })
+      fs.writeFileSync(path.join(dir, "horde.json"), JSON.stringify({ verify: { checks: { check: command } } }))
+      return name
+    }
+    // The failure output tells the mock model what to run, so the "fix" is real.
+    const fixable = scenario(
+      "gated-fix",
+      `node -e "process.exit(require('fs').existsSync('fixed.txt') ? 0 : (console.log('Error: fixed.txt is missing. TOOL: echo fixed > fixed.txt'), 1))"`,
+    )
+    const fixed = await h.call("opencode_spawn", {
+      prompt: "start the task",
+      name: "gated",
+      directory: fixable,
+      permissions: "allow",
+      gate: { max_rounds: 2 },
+      wait: true,
+      timeout_seconds: 120,
+    })
+    assert.match(fixed, /gated .*— IDLE/)
+    assert.match(fixed, /gate: ✓ PASS \(round 2\/2\)/, fixed)
+    assert.ok(fs.existsSync(path.join(repo, fixable, "fixed.txt")), "the agent fixed it after the verdict came back")
+    const transcript = await h.call("opencode_output", { id: "gated", scope: "all" })
+    assert.match(transcript, /gate round 1 of 2[\s\S]*Error: fixed\.txt is missing/, "the agent was told what failed")
+
+    const never = scenario("gated-never", `node -e "console.log('Error: never fixed'); process.exit(1)"`)
+    const failed = await h.call("opencode_spawn", { prompt: "try", name: "gated-never", directory: never, gate: true, wait: true, timeout_seconds: 120 })
+    assert.match(failed, /gated-never .*— IDLE/)
+    assert.match(failed, /gate: ✗ FAIL \(round 2\/2\)\n {4}FAIL · 1 check failed[\s\S]*Error: never fixed/, failed)
+
+    const fine = scenario("gated-ok", `node -e "process.exit(0)"`)
+    const passed = await h.call("opencode_spawn", { prompt: "easy", name: "gated-ok", directory: fine, gate: true, wait: true, timeout_seconds: 60 })
+    assert.match(passed, /gate: ✓ PASS \(round 1\/2\) · /)
+    // A new instruction starts the rounds again.
+    const again = await h.call("opencode_message", { id: "gated-ok", message: "more", wait: true, timeout_seconds: 60 })
+    assert.match(again, /gate: ✓ PASS \(round 1\/2\)/)
+  })
+
   test("channel notifications are pushed when agents settle", async () => {
     const before = h.channel.length
     await h.call("opencode_spawn", { prompt: "ping", name: "pinger" })

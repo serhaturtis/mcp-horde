@@ -41,6 +41,7 @@
   },
   "dependencies": {
     "@mcp-horde/core": "^0.1.0",
+    "@mcp-horde/verify": "^0.1.0",
     "@modelcontextprotocol/sdk": "^1.32.1",
     "@opencode-ai/sdk": "1.19.3",
     "zod": "^4.0.0"

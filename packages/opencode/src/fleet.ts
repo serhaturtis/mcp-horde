@@ -2,15 +2,16 @@ import { randomBytes } from "node:crypto"
 import fs from "node:fs/promises"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
-import { oneLine } from "@mcp-horde/core"
+import { git, oneLine } from "@mcp-horde/core"
+import { gate as runGate, defaultStateDir as verifyStateDir } from "@mcp-horde/verify"
 import type { AgentV2Info, ModelRef, ModelV2Info, PermissionV2Request, QuestionV2Request, SessionMessage, SessionV2Info, V2Event } from "@opencode-ai/sdk/v2"
 import type { Backend } from "./backend.js"
 import { deleteSession, releaseDirectory, renameSession } from "./compat.js"
 import type { Config, PermissionPolicy } from "./config.js"
 import { type Detail, inputSummary, renderTranscript } from "./render.js"
-import { type AgentRecord, type Limits, ownerAlive, SELF, type Store } from "./state.js"
+import { type AgentRecord, type GateConfig, type Limits, ownerAlive, SELF, type Store } from "./state.js"
 import { apply, type CostEstimator, costSince, currentTurn, type DurableEvent, emptyTrack, latestTool, type Track, type Turn, turnsSince } from "./tracker.js"
-import { commitAll, createWorktree, excludeFromGit, mergeWorktree, removeWorktree, type Worktree, worktreeDiff } from "./worktree.js"
+import { commitAll, createWorktree, excludeFromGit, mergeWorktree, removeWorktree, type Worktree, workStart, worktreeDiff } from "./worktree.js"
 
 /**
  * running      – the agent loop is executing (or about to start on a fresh prompt)
@@ -64,6 +65,26 @@ export interface Snapshot {
   cost: number
   tokens: Track["tokens"]
   children: string[]
+  /** Present when the agent has a gate. */
+  gate?: GateView
+}
+
+export interface GateView {
+  /**
+   * pending: the turn finished and its gate is about to run; running: checks are
+   * running; retrying: the gate failed and the agent is fixing it; pass / fail:
+   * decided (fail = no rounds left).
+   */
+  state: "pending" | "running" | "retrying" | "pass" | "fail"
+  round: number
+  maxRounds: number
+  /** The latest verdict, compact. */
+  text?: string
+}
+
+/** A gate that has not decided yet: the agent is not done, whatever its session says. */
+export function gateUndecided(s: Snapshot): boolean {
+  return !!s.gate && s.gate.state !== "pass" && s.gate.state !== "fail"
 }
 
 export interface Profile {
@@ -89,9 +110,13 @@ export interface SpawnInput {
   questions?: QuestionPolicy
   limits?: Limits
   files?: string[]
+  gate?: GateInput
   signal?: AbortSignal
   onProgress?: (message: string) => void
 }
+
+/** How a caller asks for a gate: true for the defaults, or settings. */
+export type GateInput = boolean | { checks?: string[]; audit?: boolean; allowed?: string[]; maxRounds?: number }
 
 export interface Hooks {
   /** True when the client can show form dialogs to the human. */
@@ -143,6 +168,8 @@ interface Live {
   lastPushKey?: string
   running?: Promise<void>
   queued?: Promise<void>
+  /** A gate run in flight, for the turn that started at `turn`. */
+  gating?: { turn: number; abort: AbortController }
 }
 
 type Res<T> = { data?: T; error?: unknown; response?: Response }
@@ -184,6 +211,33 @@ export function defaultQuestionPolicy(p: PermissionPolicy): QuestionPolicy {
 }
 
 /** Drop undefined values, so a partial update never erases other fields. */
+/** Turn a caller's gate request into stored settings (audit defaults to on only in a worktree). */
+export async function gateConfig(input: GateInput | undefined, directory: string, worktree: boolean, current?: GateConfig): Promise<GateConfig | undefined> {
+  if (input === undefined) return current
+  if (input === false) return undefined
+  const o = input === true ? {} : input
+  if (o.maxRounds !== undefined && (!Number.isInteger(o.maxRounds) || o.maxRounds < 1 || o.maxRounds > 10)) throw new Error("gate.max_rounds must be 1–10")
+  // Outside a worktree the audit compares against HEAD at spawn; the human may be editing the same files.
+  const base = worktree ? undefined : (current?.base ?? (await git(directory, "rev-parse", "HEAD").catch(() => undefined)))
+  return defined({
+    checks: o.checks ?? current?.checks,
+    audit: o.audit ?? current?.audit ?? worktree,
+    allowed: o.allowed ?? current?.allowed,
+    maxRounds: o.maxRounds ?? current?.maxRounds ?? 2,
+    base,
+  }) as GateConfig
+}
+
+/** What the agent is told when its gate fails. The verdict comes last, verbatim. */
+export function gateFeedback(round: number, maxRounds: number, verdict: string): string {
+  return [
+    `The checks for this task failed (gate round ${round} of ${maxRounds}). Fix the problems below, then stop.`,
+    "Do not skip, delete or weaken tests, do not silence errors or type checks, and stay within the files the task is about.",
+    "",
+    verdict,
+  ].join("\n")
+}
+
 export function defined<T extends object>(o: T): Partial<T> {
   return Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined)) as Partial<T>
 }
@@ -437,6 +491,7 @@ export class Fleet {
         createdAt: Date.now(),
         owner: SELF,
         reportedSeq: 0,
+        gate: await gateConfig(input.gate, directory, !!worktree),
       }
       this.store.put(record)
       const live = this.adoptRecord(record)
@@ -519,10 +574,13 @@ export class Fleet {
       permissions?: PermissionPolicy
       questions?: QuestionPolicy
       limits?: Limits
+      gate?: GateInput
     } = {},
   ): Promise<Snapshot> {
     const live = await this.get(ref)
     const id = live.record.id
+    // A new instruction is a new task for the gate: cancel a run in flight and start counting rounds again.
+    live.gating?.abort.abort()
     await this.refresh(live)
     if (this.config.maxRunning > 0) await this.refreshUnknown()
     // Waking a settled agent takes a running slot.
@@ -557,6 +615,8 @@ export class Fleet {
       }
       if (opts.questions) patch.questions = opts.questions
       if (opts.limits) patch.limits = { ...live.record.limits, ...defined(opts.limits) }
+      if (opts.gate !== undefined) patch.gate = await gateConfig(opts.gate, directory, !!live.record.worktree, live.record.gate)
+      if (live.record.gate || patch.gate) patch.gateState = { round: 0 }
       if (Object.keys(patch).length) this.updateRecord(id, patch)
       await this.sendPrompt(live, text, prepared, opts.delivery)
     } finally {
@@ -586,6 +646,19 @@ export class Fleet {
   async interrupt(ref: string, when: "now" | "after_step" = "now", reason?: string): Promise<Snapshot> {
     const live = await this.get(ref)
     const id = live.record.id
+    // Stopping an agent stops its checks too; the gate is decided (cancelled) so it does not start again.
+    if (live.gating) {
+      const turn = live.gating.turn
+      live.gating.abort.abort()
+      live.gating = undefined
+      const round = live.record.gateState?.round ?? 0
+      this.updateRecord(id, {
+        gateState: {
+          round,
+          verdict: { turn, pass: false, final: true, text: `gate cancelled: ${reason ?? "interrupted by the orchestrator"}`, at: Date.now() },
+        },
+      })
+    }
     await this.refresh(live)
     if (live.state !== "running" && live.state !== "needs_input") return this.snapshot(id)
     if (when === "after_step" && (live.track.stepOpen || live.track.openTools.size)) {
@@ -669,6 +742,7 @@ export class Fleet {
     const id = live.record.id
     const name = live.record.name ?? id
     const notes: string[] = []
+    live.gating?.abort.abort()
     await this.refresh(live).catch(() => undefined)
     if (live.state === "running" || live.state === "needs_input") {
       await this.interruptNow(live, "disposed")
@@ -837,6 +911,7 @@ export class Fleet {
       live.liveText = ""
       live.settledAt = Date.now()
     }
+    this.maybeGate(live)
     this.maybePush(live)
   }
 
@@ -851,17 +926,97 @@ export class Fleet {
     }
   }
 
+  /** What the caller sees of the gate. Undefined when the agent has none, or none applies to its state. */
+  private gateView(live: Live): GateView | undefined {
+    const cfg = live.record.gate
+    if (!cfg) return undefined
+    const gs = live.record.gateState ?? { round: 0 }
+    const v = gs.verdict
+    const turn = currentTurn(live.track)
+    const view = { round: gs.round, maxRounds: cfg.maxRounds, text: v?.text }
+    if (live.gating) return { ...view, state: "running", round: gs.round + 1 }
+    if (v && turn && v.turn === turn.startSeq) return { ...view, state: v.final ? (v.pass ? "pass" : "fail") : "retrying" }
+    if (this.gateTurn(live)) return { ...view, state: "pending" }
+    if (v && !v.final) return { ...view, state: "retrying" }
+    return undefined
+  }
+
+  /** The turn a gate would judge now: the current one, if it finished cleanly. */
+  private gateTurn(live: Live): Turn | undefined {
+    const turn = currentTurn(live.track)
+    if (!live.record.gate || live.state !== "idle" || !turn?.endedAt || turn.interrupted || turn.failure) return undefined
+    return turn
+  }
+
+  /** Start the gate for a finished turn that has no verdict yet. Runs in the background. */
+  private maybeGate(live: Live) {
+    const turn = this.gateTurn(live)
+    // Never while a prompt is on its way: the finished turn is about to be superseded.
+    if (!turn || live.gating || live.sent) return
+    const gs = live.record.gateState ?? { round: 0 }
+    if (gs.verdict?.turn === turn.startSeq) return
+    const abort = new AbortController()
+    live.gating = { turn: turn.startSeq, abort }
+    void this.runGateFor(live, turn.startSeq, abort).finally(() => {
+      if (live.gating?.abort === abort) live.gating = undefined
+      this.wake()
+      void this.refresh(live).catch(() => undefined)
+    })
+  }
+
+  private async runGateFor(live: Live, turn: number, abort: AbortController) {
+    const id = live.record.id
+    const cfg = live.record.gate!
+    const round = (live.record.gateState?.round ?? 0) + 1
+    const wt = live.record.worktree
+    let pass = false
+    let text: string
+    try {
+      const v = await runGate(live.session?.location.directory ?? live.record.directory, {
+        base: wt ? workStart(wt) : cfg.base,
+        audit: cfg.audit,
+        checks: cfg.checks,
+        allowed: cfg.allowed,
+        signal: abort.signal,
+        stateDir: verifyStateDir(),
+      })
+      pass = v.pass
+      text = v.text
+    } catch (err) {
+      text = `the gate could not run: ${(err as Error).message}`
+    }
+    // A new instruction (or dispose) superseded this run: its verdict is about an old task.
+    if (abort.signal.aborted || !this.live.has(id)) return
+    if (live.sent || live.track.lastPromptedSeq > turn || currentTurn(live.track)?.startSeq !== turn) return
+    const final = pass || round >= cfg.maxRounds || text.startsWith("the gate could not run")
+    this.updateRecord(id, { gateState: { round, verdict: { turn, pass, final, text, at: Date.now() } } })
+    if (!final) {
+      await this.sendPrompt(live, gateFeedback(round, cfg.maxRounds, text), { files: [], inlined: [] }).catch((err: Error) => {
+        // The agent could not be told: report the failure instead of waiting forever.
+        this.updateRecord(id, {
+          gateState: {
+            round,
+            verdict: { turn, pass, final: true, text: `${text}\n(could not send the failure back to the agent: ${err.message})`, at: Date.now() },
+          },
+        })
+      })
+    }
+  }
+
   /** Push once per distinct settled outcome (and per new request). */
   private maybePush(live: Live) {
-    if (!live.state || !SETTLED.has(live.state)) {
-      live.lastPushKey = undefined
+    // An idle agent whose gate has not decided is not finished yet.
+    const gate = this.gateView(live)
+    const holding = live.state === "idle" && !!gate && gate.state !== "pass" && gate.state !== "fail"
+    if (!live.state || !SETTLED.has(live.state) || holding) {
+      if (!holding) live.lastPushKey = undefined
       return
     }
     const ids = [...live.pending.permissions, ...live.pending.questions]
       .filter((r) => !live.handled.has(r.id))
       .map((r) => r.id)
       .sort()
-    const key = `${live.state}:${currentTurn(live.track)?.startSeq ?? 0}:${ids.join(",")}`
+    const key = `${live.state}:${currentTurn(live.track)?.startSeq ?? 0}:${ids.join(",")}:${gate?.state ?? ""}`
     if (key === live.lastPushKey) return
     const first = live.lastPushKey === undefined && live.settledAt === 0
     live.lastPushKey = key
@@ -1083,6 +1238,7 @@ export class Fleet {
       cost,
       tokens,
       children: [...live.children],
+      gate: this.gateView(live),
     }
   }
 
@@ -1164,6 +1320,7 @@ export class Fleet {
   /** Whether a settled agent has something the caller has not seen yet. */
   hasNews(s: Snapshot, live = this.live.get(s.id)): boolean {
     if (!live || !SETTLED.has(s.state)) return false
+    if (s.state === "idle" && gateUndecided(s)) return false
     if (s.state === "needs_input") return [...s.pending.permissions, ...s.pending.questions].some((r) => !live.reportedRequests.has(r.id))
     if (s.unreported.length > 0) return true
     // Interrupted or stuck before any turn could finish.
@@ -1200,7 +1357,8 @@ export class Fleet {
       const results = await Promise.allSettled(ids.map((id) => this.snapshot(id, active)))
       const snaps = results.filter((r): r is PromiseFulfilledResult<Snapshot> => r.status === "fulfilled").map((r) => r.value)
       const errors = results.flatMap((r, i) => (r.status === "rejected" ? [`${ids[i]}: ${(r.reason as Error).message}`] : []))
-      const settled = snaps.filter((s) => SETTLED.has(s.state))
+      // An idle agent is not done while its gate is undecided; anything needing attention still surfaces.
+      const settled = snaps.filter((s) => SETTLED.has(s.state) && !(s.state === "idle" && gateUndecided(s)))
       const news = settled.filter((s) => this.hasNews(s))
       const allSettled = settled.length === snaps.length
       const done = mode === "any" ? news.length > 0 || allSettled : allSettled

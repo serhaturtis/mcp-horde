@@ -12,6 +12,7 @@ It is built on OpenCode's **v2 server API** (`/api/*`, through `@opencode-ai/sdk
 | Spawn an agent with its own model, effort (`variant`), profile, instructions, directory, limits and permission policy | `opencode_spawn` |
 | Give an agent a custom profile (tool allow/deny list, step cap) | `opencode_spawn` `profile` |
 | Run agents in parallel without collisions, each in its own git worktree and branch | `opencode_spawn` `isolation: "worktree"` |
+| Check an agent's work mechanically when it finishes, and send failures back to it to fix | `opencode_spawn` / `opencode_message` `gate` |
 | Get notified when agents finish | `opencode_wait` (returns each result once), or channel push (below) |
 | See live what an agent is doing (current tool, streaming text, retries, cost) | `opencode_status` |
 | Interact while it runs: `steer` (next step) or `queue` (after the turn). Can switch model, effort, profile, policies or limits | `opencode_message` |
@@ -45,6 +46,21 @@ When OpenCode needs approval (shell commands, edits outside the project, …), t
 - `allow` / `deny`: approve or reject automatically.
 
 Questions the agent asks follow the same idea (`user`, `ask`, `dismiss`). `dismiss` tells the agent to use its own judgment. Requests from an agent's child sessions are surfaced on the agent itself.
+
+### Gates
+
+With `gate: true` (or settings), an agent's work is checked when it finishes a turn, using [`@mcp-horde/verify`](../verify): the project's tests, typecheck and lint (from `horde.json`, or detected from `package.json`, `pyproject.toml`, `Cargo.toml`, `go.mod`), plus an audit of the agent's diff for out-of-scope edits, deleted or skipped tests, suppressions, new dependencies and secrets.
+
+- **Failures go back to the agent first.** The compact verdict is sent to it as a new instruction ("fix these; do not skip or weaken tests"), up to `max_rounds` (default 2). Only the outcome is news: `opencode_wait` reports the agent when its gate has passed or run out of rounds, never in between.
+- **What you see** is one line on a pass (`gate: ✓ PASS (round 2/2) · 3.1s`), or the final verdict on a failure: failing tests with their assertion and location, blocking audit findings, exact counts.
+- **The audit** covers the agent's own work: in a worktree, everything after the carried-over baseline (or after the last merge). Outside a worktree the audit is off by default, because the human's edits in the same directory would be audited too; the checks still run. `allowed` restricts the scope (`["src/auth/**", "test/auth/**"]`).
+- **Interplay:** a gate only runs after a clean finish (not after an interrupt or an error, which are reported as they are). A new `opencode_message` starts counting rounds again and cancels a gate in flight; `opencode_interrupt` stops it. An agent that needs input during a fix round surfaces immediately. An unchanged tree is not re-checked.
+
+```text
+opencode_spawn name:"auth" prompt:"Add rate limiting to src/auth/login.ts …" isolation:"worktree"
+               gate:{allowed:["src/auth/**","test/auth/**"]}
+opencode_wait  → auth IDLE · gate: ✓ PASS (round 2/2) · 4.2s
+```
 
 ### Limits
 
@@ -165,6 +181,7 @@ The integration tests drive the server over stdio the way a harness does. They c
 - permissions and questions under every policy, including elicitation
 - limits, provider errors, silent failures, attachments, child sessions
 - worktrees (carry-over, link, setup, profile, diff, merge, conflicts)
+- gates: pass on the first try, a failure fixed by the agent from the verdict, giving up after `max_rounds`, round reset on a new message
 - the running cap (including concurrent spawns), dialog timeouts, server stop and restart, channel pushes, resources
 - cost and time limits, limit merging, queued delivery, spawn rollback, name reuse
 - restart survival, private-mode SIGKILL cleanup, attach-mode auth, adoption of outside sessions

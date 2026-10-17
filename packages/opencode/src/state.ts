@@ -18,6 +18,34 @@ export interface Owner {
   token: string
 }
 
+/** Mechanical checks run when the agent finishes a turn (see @mcp-horde/verify). */
+export interface GateConfig {
+  /** Check names to run (default: all detected or configured). */
+  checks?: string[]
+  /** Audit the agent's diff (default: on in a worktree, off in a shared directory). */
+  audit: boolean
+  /** Scope globs (repo-relative) for the audit. */
+  allowed?: string[]
+  /** Gate runs per task before the failure is reported (each failure is sent back to the agent first). */
+  maxRounds: number
+  /** Audit base outside a worktree: HEAD when the agent was spawned. */
+  base?: string
+}
+
+export interface GateState {
+  /** Gate runs since the last instruction from the caller. */
+  round: number
+  verdict?: {
+    /** Start seq of the turn this verdict judged. */
+    turn: number
+    pass: boolean
+    /** No more rounds: this verdict is the result. */
+    final: boolean
+    text: string
+    at: number
+  }
+}
+
 /** What this server remembers about an agent, persisted across restarts. */
 export interface AgentRecord {
   id: string
@@ -45,6 +73,8 @@ export interface AgentRecord {
   stopReason?: string
   /** Interrupt once the current step finishes. */
   pauseAfterStep?: boolean
+  gate?: GateConfig
+  gateState?: GateState
 }
 
 export interface ServerRecord {

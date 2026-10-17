@@ -7,7 +7,7 @@
     "packages/*"
   ],
   "scripts": {
-    "build": "npm run build -w @mcp-horde/core && npm run build --workspaces --if-present",
+    "build": "npm run build -w @mcp-horde/core && npm run build -w @mcp-horde/verify && npm run build -w @mcp-horde/opencode",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "test": "npm run test --workspaces --if-present",
     "lint": "biome check .",

@@ -4,7 +4,7 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js"
 import { z } from "zod"
 import type { Backend } from "./backend.js"
 import { POLICIES } from "./config.js"
-import type { Fleet, Snapshot } from "./fleet.js"
+import type { Fleet, GateView, Snapshot } from "./fleet.js"
 import { defined, formatModel, SETTLED, unsupportedReason } from "./fleet.js"
 import type { Turn } from "./tracker.js"
 
@@ -57,6 +57,29 @@ const limits = z
     timeout_minutes: z.number().positive().optional().describe("Interrupt a turn that runs longer than this."),
   })
   .describe("Safety limits per turn. Hitting one interrupts the agent (state interrupted, with the reason).")
+const gate = z
+  .union([
+    z.boolean(),
+    z.object({
+      checks: z.array(z.string()).optional().describe("Only these checks (names from verify_detect / horde.json); default all."),
+      audit: z.boolean().optional().describe("Audit the agent's diff (scope, test tampering, suppressions, deps, secrets). Default: on in a worktree."),
+      allowed: z.array(z.string()).optional().describe('Scope globs, repo-relative, e.g. ["src/auth/**", "test/auth/**"].'),
+      max_rounds: z
+        .number()
+        .int()
+        .min(1)
+        .max(10)
+        .optional()
+        .describe("Gate runs before a failure is reported to you (each failure goes back to the agent first). Default 2."),
+    }),
+  ])
+  .describe(
+    "Check the agent's work mechanically when it finishes: the project's tests/typecheck/lint (from horde.json or detected) and a diff audit. A failure goes back to the agent to fix, up to max_rounds; you only hear the outcome. true = defaults.",
+  )
+function gateIn(g?: z.infer<typeof gate>) {
+  if (g === undefined || typeof g === "boolean") return g
+  return { checks: g.checks, audit: g.audit, allowed: g.allowed, maxRounds: g.max_rounds }
+}
 const timeout = z
   .number()
   .int()
@@ -82,6 +105,23 @@ function renderTurn(t: Turn, chars: number, label: boolean): string {
   return indent(`${head}${truncateHead(body, chars)}`)
 }
 
+const GATE_STATE: Record<GateView["state"], string> = {
+  pending: "about to run checks",
+  running: "running checks",
+  retrying: "failed; the agent is fixing it",
+  pass: "✓ PASS",
+  fail: "✗ FAIL",
+}
+
+function renderGate(g: GateView): string {
+  const rounds = `round ${Math.max(1, g.round)}/${g.maxRounds}`
+  const head = `  gate: ${GATE_STATE[g.state]} (${rounds})`
+  // A pass is one line; a final failure carries its verdict (already compact) so the caller can act.
+  if (g.state === "fail" && g.text) return `${head}\n${indent(g.text, "    ")}`
+  if (g.state === "pass" && g.text) return `${head} · ${g.text.split("\n")[0]!.replace(/^PASS · /, "")}`
+  return head
+}
+
 export function renderSnapshot(s: Snapshot, opts: { resultChars?: number; mode?: "news" | "last" } = {}): string {
   const stats = [`${s.steps} steps`, formatUsd(s.cost), `${formatTokens(s.tokens.input + s.tokens.output + s.tokens.reasoning)} tok`].join(" · ")
   const lines = [`◆ ${s.name ? `${s.name} (${s.id})` : s.id} — ${s.state.toUpperCase()} · ${stats}`]
@@ -99,6 +139,7 @@ export function renderSnapshot(s: Snapshot, opts: { resultChars?: number; mode?:
   if (s.activity) lines.push(`  doing: ${s.activity}`)
   if (s.retry) lines.push(`  ${s.retry}`)
   if (s.error) lines.push(`  ${s.state === "interrupted" ? "reason" : "error"}: ${truncate(s.error, 500)}`)
+  if (s.gate) lines.push(renderGate(s.gate))
   for (const p of s.pending.permissions) {
     lines.push(
       `  needs permission ${p.id}${p.sessionID !== s.id ? ` (subagent ${p.sessionID})` : ""}: ${p.action} ${JSON.stringify(p.resources)} → opencode_respond once|always|reject`,
@@ -114,7 +155,9 @@ export function renderSnapshot(s: Snapshot, opts: { resultChars?: number; mode?:
   }
   const chars = opts.resultChars ?? 0
   if (chars > 0 && SETTLED.has(s.state) && s.state !== "needs_input") {
-    const turns = opts.mode === "news" && s.unreported.length ? s.unreported : s.lastTurn?.endedAt ? [s.lastTurn] : []
+    // With a gate, the turns in between were fix-up rounds the gate line already accounts for: show the last answer only.
+    const news = s.gate ? s.unreported.slice(-1) : s.unreported
+    const turns = opts.mode === "news" && news.length ? news : s.lastTurn?.endedAt ? [s.lastTurn] : []
     // `chars` caps the total; the latest turns matter most.
     if (turns.length) {
       const per = Math.max(1, Math.floor(chars / turns.length))
@@ -275,6 +318,7 @@ export function registerTools(server: McpServer, ctx: Context) {
       questions: questions.optional(),
       limits: limits.optional(),
       files: files.optional(),
+      gate: gate.optional(),
       wait: z.boolean().optional().describe("Block until it settles. Default false."),
       timeout_seconds: timeout.optional(),
     },
@@ -299,6 +343,7 @@ export function registerTools(server: McpServer, ctx: Context) {
         questions: a.questions,
         limits: limitsIn(a.limits),
         files: a.files,
+        gate: gateIn(a.gate),
         signal: extra.signal,
         onProgress: progressMessage(extra),
       })
@@ -322,6 +367,7 @@ export function registerTools(server: McpServer, ctx: Context) {
       questions: questions.optional(),
       limits: limits.optional(),
       files: files.optional(),
+      gate: gate.optional(),
       wait: z.boolean().optional(),
       timeout_seconds: timeout.optional(),
     },
@@ -335,6 +381,7 @@ export function registerTools(server: McpServer, ctx: Context) {
         permissions: a.permissions as never,
         questions: a.questions,
         limits: limitsIn(a.limits),
+        gate: gateIn(a.gate),
       })
       if (a.wait) return waitAndRender(fleet, [snap.id], "all", a.timeout_seconds, extra, 8000)
       return `Delivered (${a.delivery ?? "steer"}).\n${renderSnapshot(snap)}`
@@ -543,6 +590,7 @@ export const INSTRUCTIONS = `opencode: delegate coding work to OpenCode agents r
 1. Pick a model per task: opencode_models (provider/model + effort variants). opencode_agents lists profiles.
 2. opencode_spawn with a self-contained prompt (shared context in instructions). It runs in the background. Use isolation "worktree" when several agents edit one repo.
 3. opencode_wait returns the next agent with news (final answer, failure or a request for you). Call it again for the next one.
+   Pass gate: true (or settings) to have the agent's work checked when it finishes (tests, typecheck, lint, diff audit). Failures go back to the agent; you hear "gate ✓ PASS" or the final failing verdict.
 4. While they run: opencode_status to peek, opencode_message to steer or queue, opencode_interrupt to stop or pause, opencode_resume to continue.
 5. needs_input = waiting on you: opencode_respond. Permission prompts go to the human by default.
 6. Isolated agents: opencode_worktree diff/merge, then opencode_dispose.
