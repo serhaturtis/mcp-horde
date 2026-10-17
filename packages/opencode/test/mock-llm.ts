@@ -4,6 +4,8 @@ import type { AddressInfo } from "node:net"
 /**
  * A tiny OpenAI-compatible chat completions server scripted by the latest user prompt:
  *   "TOOL: <cmd>"   → calls bash with <cmd>, then answers "DONE: <tool output>"
+ *   "CALL: <tool> {json}" → calls any offered tool with those arguments, then answers "DONE: <tool output>"
+ *   a board brief    → runs its "First:" command, then its report command, then answers
  *   "STEPS: <n>"    → calls bash `echo step` n times in a row, then answers "DONE"
  *   "ASK: <q>"      → calls the question tool (options Red/Blue), then answers "DONE: <tool output>"
  *   "SLOW"          → streams "Working...." for ~15s
@@ -76,7 +78,25 @@ export async function startMockLlm(): Promise<{ url: string; close: () => void; 
       if (toolResults < Number(steps[1])) return callTool("bash", { command: `echo step ${toolResults + 1}`, description: "step" })
       return say("DONE")
     }
-    if (last?.role === "tool") return say(`DONE: ${textOf(last).slice(0, 120)}`)
+    // A board brief: run its first command, then its report command, like a cooperative worker.
+    if (userText.includes("## Reporting (required)")) {
+      const lines = userText.split("\n")
+      const first = lines
+        .find((l) => l.includes("- First:"))
+        ?.split("- First:")[1]
+        ?.trim()
+      const report = lines
+        .find((l) => / report t-\w+ \w+ --summary /.test(l))
+        ?.trim()
+        .replace(/--summary "[^"]*"/, '--summary "mock work done"')
+      if (toolResults === 0 && first) return callTool("bash", { command: first, description: "read the task" })
+      if (toolResults === 1 && report) return callTool("bash", { command: report, description: "report" })
+      return say(`DONE: reported. ${textOf(last).slice(0, 200)}`)
+    }
+    if (last?.role === "tool") return say(`DONE: ${textOf(last).slice(0, 400)}`)
+    // "CALL: <tool> <json args>" calls any offered tool (e.g. one from an MCP server).
+    const call = userText.match(/CALL:\s*(\S+)\s*(\{.*\})?\s*$/s)
+    if (call) return callTool(call[1]!, call[2] ? JSON.parse(call[2]) : {})
     if (userText.includes("TOOL:")) return callTool("bash", { command: userText.split("TOOL:")[1]!.trim(), description: "run" })
     if (userText.includes("ASK:")) {
       return callTool("question", {

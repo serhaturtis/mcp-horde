@@ -146,4 +146,44 @@ ${output}`)
       killTree(proc.pid)
     }
   })
+
+  // Canary: workers reach the board through bash because v2 runners do not offer MCP tools
+  // (OpenCode 1.19). When this starts failing (the dev-tag CI job runs it first), v2 has
+  // gained MCP tools and the horde can mount its servers for workers instead.
+  test("canary: an injected MCP server connects, but v2 runners do not offer its tools yet", async () => {
+    const { tmp, repo } = makeRepo(mock.url)
+    const port = await freePort()
+    const fixture = path.join(import.meta.dirname, "fixtures", "probe-mcp.mjs")
+    const config = { mcp: { horde: { type: "local", command: [process.execPath, fixture] } } }
+    const proc = spawn(opencodeBin, ["serve", "--hostname", "127.0.0.1", "--port", String(port)], {
+      cwd: repo,
+      env: { ...process.env, ...isolatedEnv(tmp, repo), OPENCODE_CONFIG_CONTENT: JSON.stringify(config) },
+      stdio: "ignore",
+      shell: process.platform === "win32",
+    })
+    const url = `http://127.0.0.1:${port}`
+    try {
+      await until(async () => (await fetch(`${url}/api/health`, { signal: AbortSignal.timeout(2000) }).catch(() => undefined))?.ok, 90_000, 300)
+      const status = await until(async () => {
+        const s = (await fetch(`${url}/mcp?directory=${encodeURIComponent(repo)}`, { signal: AbortSignal.timeout(10_000) }).then((r) => r.json())) as Record<
+          string,
+          { status: string }
+        >
+        return s.horde?.status === "connected" ? s : undefined
+      }, 30_000)
+      assert.equal(status.horde!.status, "connected")
+      const oc = createOpencodeClient({ baseUrl: url })
+      const sid = (await oc.v2.session.create({ location: { directory: repo } })).data!.data.id
+      await oc.v2.session.prompt({ sessionID: sid, prompt: { text: "TOOLS?" } })
+      const tools = await until(async () => {
+        const msgs = (await oc.v2.session.messages({ sessionID: sid })).data as { data: { type: string; content?: { type: string; text?: string }[] }[] }
+        const text = msgs.data.flatMap((m) => (m.type === "assistant" ? (m.content ?? []) : [])).find((c) => c.type === "text" && c.text?.startsWith("Tools:"))
+        return text?.text
+      }, 60_000)
+      assert.match(tools, /\bbash\b/, "built-in tools are offered")
+      assert.doesNotMatch(tools, /horde_echo/, "MCP tools reached the v2 runner: switch workers from the CLI to MCP mounts (docs/DESIGN.md §4.2e)")
+    } finally {
+      killTree(proc.pid)
+    }
+  })
 })

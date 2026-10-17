@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto"
 import fs from "node:fs/promises"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
+import { isTrustedCommand } from "@mcp-horde/board"
 import { git, oneLine } from "@mcp-horde/core"
 import { gate as runGate, defaultStateDir as verifyStateDir } from "@mcp-horde/verify"
 import type { AgentV2Info, ModelRef, ModelV2Info, PermissionV2Request, QuestionV2Request, SessionMessage, SessionV2Info, V2Event } from "@opencode-ai/sdk/v2"
@@ -888,6 +889,7 @@ export class Fleet {
     ])
     live.pending = { permissions: perms.flat(), questions: questions.flat() }
     this.pruneRequestSets(live)
+    await this.approveTrusted(live)
 
     if (live.record.pauseAfterStep && !live.track.inLoop) this.updateRecord(id, { pauseAfterStep: undefined })
     // Interrupting before the loop picked up the prompt is a no-op in OpenCode, so
@@ -1058,6 +1060,20 @@ export class Fleet {
     }
     if (turn?.failure) return { state: "error", error: turn.failure }
     return { state: "idle" }
+  }
+
+  /**
+   * Board commands from a brief (`horde … report t-x <token> …`) are horde
+   * plumbing: approve exactly those, whatever the agent's policy, so reporting
+   * never waits on a human. Anything else, including a board command with a
+   * chained shell command, goes through the normal policy.
+   */
+  private async approveTrusted(live: Live) {
+    for (const p of live.pending.permissions) {
+      if (live.handled.has(p.id) || p.action !== "bash" || !p.resources.length || !p.resources.every((r) => isTrustedCommand(r))) continue
+      live.handled.add(p.id)
+      await this.replyPermission(p, "once").catch(() => live.handled.delete(p.id))
+    }
   }
 
   private async applyPolicies(live: Live) {

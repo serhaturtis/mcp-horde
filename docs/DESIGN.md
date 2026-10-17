@@ -1,6 +1,6 @@
 # mcp-horde: system design
 
-Status: October 2026. Built: `@mcp-horde/opencode`, `@mcp-horde/core`, `@mcp-horde/verify`, and gates in `opencode` (milestones M0 and M1). Planned: everything from M2 on.
+Status: October 2026. Built: `@mcp-horde/opencode`, `@mcp-horde/core`, `@mcp-horde/verify`, gates in `opencode` (M0, M1), and `@mcp-horde/board` with its worker CLI (M2). Planned: the playbook plugin (rest of M2) and everything from M3 on.
 
 ## 1. What this is for
 
@@ -43,7 +43,8 @@ The arrangement breaks in three places, and every server exists to fix one of th
      │  sessions = agents, each in its own git worktree on branch horde/<name>
      ▼
    worker model (DeepSeek …) with tools: bash, edit, read …
-     └── worker-side MCP mounts (injected): board --worker, context, verify
+     └── worker-side access through bash: the `horde` CLI (board, verify, context);
+         the fleet auto-approves exactly those commands (v2 runners offer no MCP tools yet)
                                               │
                                               ▼
                       ~/.local/state/mcp-horde/<project>/   (board state: tasks, findings, memory, locks, events)
@@ -88,6 +89,7 @@ Checked against the installed binary and its SDK types during this pass:
 - Agent config supports `tools: {name: boolean}`, `maxSteps`, `prompt`, `mode`, and `permission` with **glob maps per action**: `edit: {"src/auth/**": "allow", "*": "deny"}`.
 - The v2 prompt body is `{prompt: {text, files, agents}, delivery, resume}`: no per-call tools, system prompt or output format. Those belong to agent profiles.
 - Agent `.md` files load when OpenCode first opens a directory (already relied on by `opencode` for worktree profiles).
+- **The v2 session runner does not offer MCP tools to agents** (1.19.3 and `dev` 0.0.0-dev-202610161232, probed in M2). An injected `mcp` local server does connect (`/mcp` reports `connected`), OpenCode starts **one process per project directory** lazily on its first request, with that directory as the working directory and the configured `environment` merged over the inherited one, and the **legacy** runner offers its tools (`horde_echo`). The v2 runner offers only built-in tools (and no `task` subagent tool either). So worker-side horde access goes through `bash` (§4.4), and a canary test watches for the day v2 gains MCP tools.
 - OpenCode's v2 runner reports every step as `cost: 0`; `opencode` prices steps from the catalog. Cost figures across the horde come from that estimate.
 
 ## 4. Package designs
@@ -139,7 +141,9 @@ To verify before building: whether `tools: {"*": false}` is honoured in a profil
 
 **d. `opencode_worktree action: "sync"`.** Merges the base branch into the agent's branch inside the agent's worktree, so conflicts with other merged work land where a cheap model (with a gate) can resolve them, instead of at the orchestrator's merge. Refused while the agent is running; after a sync the playbook says to message the agent "resolve the conflicts and run the gate".
 
-**e. Config injection for workers.** When `opencode` starts the shared or private server it sets `OPENCODE_CONFIG_CONTENT` with `mcp` entries for the worker-side horde servers that are installed and enabled (`HORDE_WORKER_TOOLS=board,context,verify`, default: whichever are resolvable next to this package). Each is `type: "local"` with `command: [process.execPath, <bin>, "--worker"]` and `environment` carrying the state dir. In attach mode the server is the user's; the README gives the `opencode.json` snippet. The injected config never changes agents or permissions (the shared server is also the human's TUI server).
+**e. Worker access to the horde (revised in M2).** v2 runners offer no MCP tools (§3.1), so workers reach the board, verify and context through a `horde` CLI they run with `bash`; the brief contains the exact command. The fleet auto-approves a `bash` permission request only when the command is exactly that CLI with plain arguments (a shell-word check rejects `;`, `&&`, `||`, pipes, redirects, `$`, backticks and newlines anywhere outside single quotes), whatever the agent's policy, so board plumbing never prompts the human and a hijacked worker cannot chain anything onto a trusted command. The rest of this item describes the MCP route, kept for when v2 runners load MCP tools:
+
+When `opencode` starts the shared or private server it sets `OPENCODE_CONFIG_CONTENT` with `mcp` entries for the worker-side horde servers that are installed and enabled (`HORDE_WORKER_TOOLS=board,context,verify`, default: whichever are resolvable next to this package). Each is `type: "local"` with `command: [process.execPath, <bin>, "--worker"]` and `environment` carrying the state dir. In attach mode the server is the user's; the README gives the `opencode.json` snippet. The injected config never changes agents or permissions (the shared server is also the human's TUI server).
 
 Also: the snapshot rendering gains a `task:` line when a board binding exists (§10), `HORDE_OPENCODE_MAX_RUNNING` becomes a horde-wide `maxRunning` in `horde.json` with the env var as override, and the health check moves to `v2.health`.
 
@@ -205,7 +209,7 @@ The shared task graph. One server, two modes: orchestrator (default) and `--work
 - `board_locks { }`, `board_unlock { path }` (orchestrator can break a lease).
 - `board_archive { }` moves done/failed tasks out of the active set.
 
-**Worker tools** (`--worker`)
+**Worker commands** (the `horde` CLI over the same library; see §4.2e for why not MCP tools today. Each tool below maps to a subcommand: `horde task <id> <token>`, `horde progress <id> <token> "<note>"`, `horde report <id> <token> --summary "…" …`, `horde finding "<text>" --paths a,b`, `horde findings`, `horde recall "<query>"`, `horde lock|unlock <id> <token> <paths…>`.)
 - `board_task { id, token }` → the task as the worker should see it (goal, acceptance, scope, open questions' answers), never other tasks' internals beyond titles.
 - `board_progress { id, token, note }` → one-line status, renews the lease.
 - `board_report { id, token, report }` → files the structured report; status becomes `review`. Does **not** complete the task.
@@ -330,7 +334,7 @@ Rules that keep this true: every tool takes a `budget` argument with a sane defa
 
 ## 10. Gaps found in this pass, and the decisions
 
-1. **How do workers get horde tools?** Decided: `opencode` injects `mcp` entries through `OPENCODE_CONFIG_CONTENT` into the server it starts (verified to merge); attach mode documents the `opencode.json` snippet. Not decided by assumption: whether an injected local MCP actually connects and exposes tools to sessions, and whether OpenCode starts one MCP process per directory or per server (affects state-dir sharing, which the file-based store tolerates either way). Verify first in M2.
+1. **How do workers get horde tools?** Probed in M2: injected MCP servers connect, one process per project directory, but **v2 runners do not offer MCP tools** (release and `dev`). Decided: a `horde` CLI run through `bash`, auto-approved by the fleet only for exact, metacharacter-free invocations (§4.2e). Same library as the MCP servers, so moving to MCP mounts later changes the transport only. A canary test asserts the current behaviour so the `dev`-tag CI job reports when it changes.
 2. **How does a worker identify itself?** No session identity reaches an MCP server OpenCode spawns. Decided: task id + token quoted by the worker, carried in the brief; reduced worker tool set; acceptance only on the orchestrator side.
 3. **Call overhead for the orchestrator.** Five calls per task is a lot. Decided: the gate loop lives inside `opencode` (no orchestrator involvement for retries); `board_brief` composes context and memory in one call; later, `opencode_spawn { task }` fetches the brief and records the assignment itself, cutting a task to three calls (`board_plan`, `opencode_spawn`, `opencode_wait` + `board_accept`).
 4. **Scope enforcement.** `edit` permission globs in a per-agent profile (worktrees only) plus the audit as backstop. `bash` writes cannot be fenced reliably; accepted and documented.
@@ -350,8 +354,8 @@ Rules that keep this true: every tool takes a `budget` argument with a sane defa
 
 ## 11. Open questions to verify empirically before building
 
-- An injected `mcp` local server connects and its tools appear in sessions (and whether `enabled` defaults matter).
-- One MCP process per server or per project directory; whether `cwd` in the mcp config is the project directory.
+- ~~An injected `mcp` local server connects and its tools appear in sessions~~ (answered in M2: connects, but v2 runners do not offer its tools).
+- ~~One MCP process per server or per project directory~~ (answered: per directory, started lazily, cwd = the directory).
 - `tools: {"*": false}` semantics in an agent profile; whether `/api/agent` exposes the resolved tool list to enumerate from.
 - How reliably cheap models return valid JSON when asked in the prompt (drives the retry count in `opencode_ask`).
 - `session.compact` behaviour on an idle session and what `session.context` reports; `session.revert.stage` semantics for a turn with several messages.

@@ -62,6 +62,10 @@ opencode_spawn name:"auth" prompt:"Add rate limiting to src/auth/login.ts …" i
 opencode_wait  → auth IDLE · gate: ✓ PASS (round 2/2) · 4.2s
 ```
 
+### Board commands
+
+Workers briefed by [`@mcp-horde/board`](../board) report through a CLI they run with `bash`. Those exact commands are approved automatically, whatever the agent's permission policy, so reporting never waits on a human. Only a command that is this installation's board CLI with plain arguments qualifies: anything chained onto it (`;`, `&&`, pipes, redirects, `$(…)`, backticks) goes through the normal policy.
+
 ### Limits
 
 Each agent can have per-turn safety limits: `max_steps`, `max_cost_usd`, `timeout_minutes`. When one is reached, the agent is interrupted and the reason is reported. Costs include the agent's subagents. OpenCode 1.19's v2 runner reports every step as free, so costs are computed from the model's pricing in the catalog (a model without pricing costs $0 and `max_cost_usd` cannot trip). Setting limits with `opencode_message` changes only the limits you pass.

@@ -2,6 +2,7 @@ import assert from "node:assert/strict"
 import fs from "node:fs"
 import path from "node:path"
 import { after, before, describe, test } from "node:test"
+import { Board, renderBrief, workerCommand } from "@mcp-horde/board"
 import { createOpencodeClient } from "@opencode-ai/sdk/v2"
 import { connect, git, type Harness, idOf, isolatedEnv, type Mock, makeRepo, until } from "./harness.js"
 import { startMockLlm } from "./mock-llm.js"
@@ -420,6 +421,38 @@ describe("opencode MCP server: core behaviour (real opencode, mock LLM)", { time
     // A new instruction starts the rounds again.
     const again = await h.call("opencode_message", { id: "gated-ok", message: "more", wait: true, timeout_seconds: 60 })
     assert.match(again, /gate: ✓ PASS \(round 1\/2\)/)
+  })
+
+  test("board: a worker reports through the CLI without prompting; a chained command is not trusted", async () => {
+    const board = await Board.open(repo, path.join(tmp, "board-state"))
+    const task = (await board.plan([{ title: "Limit logins", goal: "Add a rate limit to login.", acceptance: ["429 after 5 failures"], scope: ["src/**"] }]))
+      .tasks[0]!
+    const { attempt } = await board.assign(task.id, "limiter")
+    // permissions "ask": anything not trusted would stop at needs_input.
+    const out = await h.call("opencode_spawn", {
+      prompt: renderBrief(board, board.task(task.id), attempt),
+      name: "limiter",
+      permissions: "ask",
+      wait: true,
+      timeout_seconds: 120,
+    })
+    assert.match(out, /limiter .*— IDLE/, out)
+    assert.doesNotMatch(out, /needs permission/)
+    const t = board.task(task.id)
+    assert.equal(t.status, "review")
+    assert.equal(t.reports[0]!.summary, "mock work done")
+    assert.deepEqual(t.reports[0]!.unverifiedClaims, ["anything you did not run or check"])
+    assert.ok(t.attempts[0]!.seenAt, "the worker read its task first")
+
+    // The same command with something chained onto it goes through the normal policy.
+    const other = (await board.plan([{ title: "Other", goal: "x" }])).tasks[0]!
+    const second = await board.assign(other.id)
+    const chained = `${workerCommand(board.dir)} task ${other.id} ${second.attempt.token}; echo pwned`
+    const blocked = await h.call("opencode_spawn", { prompt: `TOOL: ${chained}`, name: "chained", permissions: "ask", wait: true, timeout_seconds: 60 })
+    assert.match(blocked, /chained .*— NEEDS_INPUT[\s\S]*needs permission per_\w+: bash/)
+    const req = blocked.match(/needs permission (per_\w+)/)![1]!
+    await h.call("opencode_respond", { id: "chained", request_id: req, decision: "reject" })
+    assert.equal(board.task(other.id).attempts[0]!.seenAt, undefined, "the untrusted command never ran")
   })
 
   test("channel notifications are pushed when agents settle", async () => {
