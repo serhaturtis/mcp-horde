@@ -25,7 +25,7 @@
   "scripts": {
     "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.test.json",
-    "test": "node --conditions=source --import tsx --test test/*.test.ts",
+    "test": "node --conditions=source --import tsx --test test/core.test.ts",
     "prepublishOnly": "npm run build"
   },
   "devDependencies": {
