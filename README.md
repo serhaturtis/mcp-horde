@@ -6,6 +6,10 @@ A collection of [MCP](https://modelcontextprotocol.io) servers for agentic codin
 | --- | --- |
 | [`@mcp-horde/opencode`](packages/opencode) | Subagents for any harness, powered by [OpenCode](https://opencode.ai) on any model (DeepSeek, Kimi, GLM, Qwen, GPT, local, …): parallel runs, isolated worktrees, steering, pause/resume, limits, completion notifications, and permission prompts routed to the human. |
 
+## Design
+
+[`docs/DESIGN.md`](docs/DESIGN.md) describes the whole horde: the servers that are planned (`verify`, `board`, `context`, a Claude Code playbook plugin), how they fit around `opencode`, what was verified against OpenCode 1.19, and the build order.
+
 ## Development
 
 ```sh
