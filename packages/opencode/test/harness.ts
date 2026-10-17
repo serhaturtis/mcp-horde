@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process"
+import { type ChildProcess, execFileSync } from "node:child_process"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
@@ -135,6 +135,29 @@ export function killTree(pid: number | undefined) {
   } catch {
     // already gone
   }
+}
+
+/**
+ * Stop a server spawned with `detached: true` and wait for it to exit: SIGTERM to its process
+ * group, then SIGKILL. OpenCode can ignore SIGTERM while it has MCP servers running (macOS),
+ * and a surviving child keeps the test process alive.
+ */
+export async function stopTree(proc: ChildProcess, graceMs = 5000) {
+  if (!proc.pid || proc.exitCode !== null || proc.signalCode !== null) return
+  const exited = new Promise<void>((r) => proc.once("exit", () => r()))
+  if (process.platform === "win32") return void killTree(proc.pid)
+  const signal = (s: NodeJS.Signals) => {
+    try {
+      process.kill(-proc.pid!, s)
+    } catch {
+      // already gone
+    }
+  }
+  signal("SIGTERM")
+  const timer = setTimeout(() => signal("SIGKILL"), graceMs)
+  await exited
+  clearTimeout(timer)
+  signal("SIGKILL") // the group's other members (MCP servers) too
 }
 
 export const idOf = (text: string) => text.match(/ses_[A-Za-z0-9]+/)![0]

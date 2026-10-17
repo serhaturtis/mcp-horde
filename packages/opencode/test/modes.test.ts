@@ -4,7 +4,7 @@ import fs from "node:fs"
 import path from "node:path"
 import { after, before, describe, test } from "node:test"
 import { createOpencodeClient } from "@opencode-ai/sdk/v2"
-import { connect, freePort, idOf, isolatedEnv, killTree, type Mock, makeRepo, opencodeBin, until } from "./harness.js"
+import { connect, freePort, idOf, isolatedEnv, killTree, type Mock, makeRepo, opencodeBin, stopTree, until } from "./harness.js"
 import { startMockLlm } from "./mock-llm.js"
 
 let mock: Mock
@@ -160,6 +160,7 @@ ${output}`)
       env: { ...process.env, ...isolatedEnv(tmp, repo), OPENCODE_CONFIG_CONTENT: JSON.stringify(config) },
       stdio: "ignore",
       shell: process.platform === "win32",
+      detached: process.platform !== "win32",
     })
     const url = `http://127.0.0.1:${port}`
     try {
@@ -183,7 +184,7 @@ ${output}`)
       assert.match(tools, /\bbash\b/, "built-in tools are offered")
       assert.doesNotMatch(tools, /horde_echo/, "MCP tools reached the v2 runner: switch workers from the CLI to MCP mounts (docs/DESIGN.md §4.2e)")
     } finally {
-      killTree(proc.pid)
+      await stopTree(proc)
     }
   })
 })
