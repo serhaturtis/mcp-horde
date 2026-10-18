@@ -29,6 +29,23 @@ audit: 4 files changed, 0 commits since de5399ad
 | `verify_detect` | Which checks would run and where each comes from. |
 | `verify_logs` | The full output of a check's latest run, for when the excerpt is not enough. |
 
+## Related tests
+
+`verify_gate { base, related: true }` (and `verify_run { related_to: [files] }`) runs only the tests that cover what changed, using `@mcp-horde/context` to map files to tests: tests named after them (next to them or in a mirrored test directory) and every test that reaches them through imports, at any depth, including workspace package names. It narrows only when that is safe, and the verdict says what happened:
+
+```text
+✓ test · 12 passed · 3.1s · related tests only (2 files)
+✓ test · 412 passed · 48s · full suite: 1 changed file(s) without related tests (package.json)
+! tests: no test covers 1 changed source file(s): src/rate.ts
+```
+
+- The full suite runs when any changed file is not a source file with a known test (config, manifests, fixtures, untested code), or when the runner cannot take test paths.
+- Runners that can: pytest, vitest, jest, `go test ./...` (narrowed to packages), and `npm test` when the script is a plain vitest or jest call. Other checks (typecheck, lint) always run in full.
+- A test check whose directory has neither changes nor related tests (another package in a monorepo) is skipped.
+- Changed source files that no test covers are a warning, never a blocker.
+
+`@mcp-horde/opencode` gates use related tests by default (`related_only: false` to turn it off). Run the full suite yourself after merging (`verify_run`).
+
 An unchanged tree is never re-run: the key is HEAD, the working-tree diff, untracked files, and the exact checks and audit settings, so polling a gate is free.
 
 ## What the verdict contains
@@ -99,6 +116,6 @@ claude mcp add verify -- node /path/to/mcp-horde/packages/verify/dist/index.js
 
 ## Known limits
 
-- **No related-test selection yet.** Gates run the configured checks in full. Running only the tests that cover the changed files needs the planned `context` package (milestone M3 in [`docs/DESIGN.md`](../../docs/DESIGN.md)).
+- **Related tests are found by naming and static imports**, not coverage data. A test that reaches the changed code only at run time (dynamic `import(variable)`, dependency injection by name, a subprocess) is not selected; that is why gates say "related tests only" and the full suite still runs after merging.
 - **The audit reads lines, not syntax.** It flags suppressions and skipped tests by pattern, so an unusual spelling can slip through or a harmless string can match. Blocking categories are chosen to be the ones where false positives are rare.
 - **`bash` can write anywhere.** Scope is checked after the fact from the diff; preventing out-of-scope edits up front is the job of the agent's permission profile.

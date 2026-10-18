@@ -1,6 +1,6 @@
 # mcp-horde: system design
 
-Status: October 2026. Built: `@mcp-horde/opencode`, `@mcp-horde/core`, `@mcp-horde/verify`, gates in `opencode` (M0, M1), `@mcp-horde/board` with its worker CLI, and the `horde` Claude Code plugin with its orchestration skill (M2). Planned: everything from M3 on.
+Status: October 2026. Built: `@mcp-horde/opencode`, `@mcp-horde/core`, `@mcp-horde/verify`, gates in `opencode` (M0, M1), `@mcp-horde/board` with its worker CLI, the `horde` Claude Code plugin with its orchestration skill (M2), and `@mcp-horde/context` with code context in briefs and related-test gates (M3). Planned: everything from M4 on.
 
 ## 1. What this is for
 
@@ -154,7 +154,7 @@ Mechanical judgement with a compact verdict. Library + MCP server; both orchestr
 **Tools**
 
 - `verify_detect { directory }` → the checks that would run: from `horde.json` `verify.checks`, else auto-detected: `package.json` scripts (`test`, `typecheck`, `lint`, `build`), `pyproject.toml`/`pytest.ini`/`setup.cfg` (pytest, ruff, mypy), `Cargo.toml` (`cargo test`, `cargo clippy`), `go.mod` (`go test ./...`, `go vet`), `Makefile` targets named `test`/`lint`. Output is one line per check.
-- `verify_run { directory, checks?, related_to?: string[] (changed files), timeout_seconds?, budget_chars? }` → per check: `PASS 12s` or `FAIL 9s` plus extracted failures. With `related_to`, test commands are narrowed to the tests `context` maps to those files when the runner supports path arguments (node:test, jest, vitest, pytest, go test by package, cargo by `--test`); otherwise the full suite runs.
+- `verify_run { directory, checks?, related_to?: string[] (changed files), timeout_seconds?, budget_chars? }` → per check: `PASS 12s` or `FAIL 9s` plus extracted failures. With `related_to`, test commands are narrowed to the tests `context` maps to those files (transitively through imports) when every changed file is covered and the runner supports path arguments (built in M3: pytest, jest, vitest, `go test ./...` by package, and an npm `test` script that is a plain jest/vitest call; node:test script file lists and cargo are not narrowed); otherwise the full suite runs, and the verdict says which and why.
 - `verify_audit { directory, base }` → findings over `git diff base...HEAD` plus the working tree:
   - scope: files outside `allowed` globs (from the task, or `horde.json`)
   - tests: deleted test files, `.skip`/`.only`/`xit`/`@pytest.mark.skip` added, assertions removed (count of `expect(`/`assert` lines lost per test file), snapshot files rewritten wholesale
@@ -163,7 +163,7 @@ Mechanical judgement with a compact verdict. Library + MCP server; both orchestr
   - hygiene: binaries, files over 1 MB, generated directories, secret-looking strings (common key prefixes, private key headers)
   - git: merge commits on the branch, commits that touch only `.horde`/`.opencode`
   Each finding has `severity: block | warn`, a file, a line when known, and one line of text. Which categories block is configurable (`horde.json` `verify.audit`); defaults: scope, test deletion/skips, secrets and binaries block; suppressions and dependency changes warn.
-- `verify_gate { directory, base, checks?, related_to?, allowed?, budget_chars? (default 1500) }` → `PASS` or `FAIL` with `blockers` (failing checks, blocking audit findings) and `warnings`, rendered within the budget. This is what `opencode` calls.
+- `verify_gate { directory, base, checks?, related?, allowed?, budget_chars? (default 1500) }` (`related` derives the changed files from `base`) → `PASS` or `FAIL` with `blockers` (failing checks, blocking audit findings) and `warnings`, rendered within the budget. This is what `opencode` calls.
 - `verify_logs { directory, check }` → the last run's full output for one check, head-truncated to a requested size. Available, never automatic.
 
 **Output extraction without a model.** Per-runner extractors run on captured stdout+stderr: TAP (`not ok` blocks with their YAML), jest/vitest (`●`/`FAIL` blocks, `AssertionError`, `expected`/`received` lines), pytest (`FAILED path::test - message` and the `E ` lines), cargo (`---- name stdout ----` to `failures:`), go (`--- FAIL` to the next `===`), tsc (`path(line,col): error TSxxxx`), eslint/ruff/biome (path:line rule lines), generic (`Error:`/`Traceback`/`panicked at` with 6 lines of context). Each failure keeps: the test or file name, the assertion text (up to 300 chars), and the first stack frame inside the project (not `node_modules`, not `node:internal`). Fallback when nothing matches: the last 40 lines. Counts are always exact (`14 failed, 212 passed`) even when details are truncated. For logs that still exceed the budget, the playbook's option is `opencode_ask` with a cheap model summarizing them: cheap compresses for expensive.
@@ -227,7 +227,7 @@ Worker questions go through OpenCode's own question tool (they already surface a
 
 Precise briefs instead of exploration. Fast models are weakest at navigating large codebases and spend most of their tokens doing it; the orchestrator should not spend its tokens doing it for them either. Library + MCP; mounted by both sides.
 
-**v1 (no native dependencies):** ripgrep when available (bundled `@vscode/ripgrep` optional dependency, system `rg` otherwise, a JS fallback for small repos), plus language-aware regexes for definitions and imports in TypeScript/JavaScript, Python, Go, Rust, Java/Kotlin, C#. **v2:** tree-sitter via `web-tree-sitter` (WASM, portable) for real symbol extraction and call-site resolution.
+**v1 (built in M3, no native dependencies):** git's file list (so `.gitignore` applies) scanned in-process with content-keyed caches, plus language-aware regexes for definitions, block extents and imports in TypeScript/JavaScript, Python, Go, Rust, Java/Kotlin, C#. Ripgrep turned out unnecessary at this size (a 100-file repository maps in ~25 ms, a full pack with the import graph in ~0.5 s); it stays an option if large monorepos need it. Import resolution includes workspace packages by name, so monorepo tests are linked to the packages they exercise. **v2:** tree-sitter via `web-tree-sitter` (WASM, portable) for real symbol extraction and call-site resolution.
 
 **Tools**
 - `context_map { directory, depth?, budget_chars? }` → directory tree with file counts and languages per directory, entry points, manifests, test directories, the project's own instructions files (`CLAUDE.md`, `AGENTS.md`, `CONTRIBUTING.md`) listed, not inlined.
@@ -235,7 +235,7 @@ Precise briefs instead of exploration. Fast models are weakest at navigating lar
 - `context_symbol { name, path? }` → definition with signature and doc comment, the enclosing file, and call sites (count plus the first N with one line each).
 - `context_file { path, lines?: "a-b", symbols?: string[], budget_chars? }` → an excerpt with line numbers; with `symbols`, only those definitions.
 - `context_imports { path, direction: "in" | "out" }` → files this file imports, or files importing it.
-- `context_tests_for { files: string[] }` → test files that cover them: naming conventions (`x.test.ts`, `test_x.py`, `x_test.go`), directory mirrors (`src/a/b.ts` → `test/a/b.*`), and tests that import the file. Used by `verify` for `related_to`.
+- `context_tests_for { files: string[] }` → test files that cover them: naming conventions (`x.test.ts`, `test_x.py`, `x_test.go`), directory mirrors (`src/a/b.ts` → `test/a/b.*`), and tests that import the file (through re-exporting index/lib files; `verify` follows imports transitively). Used by `verify` for related tests.
 - `context_pack { goal, files?, symbols?, scope?, budget_tokens }` → an assembled brief section: the scoped files' excerpts (whole file when small, signatures plus relevant regions when large), the symbols the goal mentions with their definitions, the tests that cover the scope, and the conventions section (the first 60 lines of the project's instructions files). Sections are ranked (scope files > named symbols > tests > conventions) and trimmed to the budget with the `core` `Budget` helper.
 
 **Conventions file.** `horde.json` `context.ignore` extends `.gitignore`; `context.entrypoints` names files always worth listing.
@@ -371,7 +371,7 @@ Each goes into a `probe/` script in the relevant package, like the probes used w
 | **M0** ✓ `compat.ts` boundary + v2 health + `dev`-tag CI job | the v2 policy enforced in code | small, and it keeps every later milestone honest |
 | **M1** ✓ `core` + `verify` + gates in `opencode` | mechanical verdicts; self-fixing workers (related-test selection moves to M3 with `context`) | the biggest trust and token win, and it needs no worker-side mounts |
 | **M2** ✓ `board` (MCP for the orchestrator, an auto-approved CLI for workers) + the `horde` plugin with its skill | shared task graph, reports, findings, memory; the procedure, proven end to end by a mock run (`opencode/test/flow.test.ts`) | turns ad-hoc delegation into a tracked workflow |
-| **M3** `context` v1 + `board_brief` composition | precise briefs; related-test mapping for gates | closes most of the quality gap for fast models |
+| **M3** ✓ `context` v1 + `board_brief` composition + related-test gates | precise briefs; gates that run only the tests reaching the change (transitively through imports), with a full-suite fallback whenever that is not safe | closes most of the quality gap for fast models |
 | **M4** `opencode_ask`, `scope`, `worktree sync`, `opencode_compact`, `opencode_revert`, `opencode_permissions`, `opencode_spawn { task }` | one-shot calls and judging; scope enforcement; conflict handling; context and undo for long tasks; fewer calls | refinements once the loop works end to end |
 | **M5** tree-sitter `context`, `board` TUI, plugin packaging, npm publish | depth and distribution | after the shape is proven |
 

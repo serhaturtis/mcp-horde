@@ -71,6 +71,12 @@ const gate = z
         .max(10)
         .optional()
         .describe("Gate runs before a failure is reported to you (each failure goes back to the agent first). Default 2."),
+      related_only: z
+        .boolean()
+        .optional()
+        .describe(
+          "Run only the tests that cover the agent's changes when every change is covered and the runner takes test paths (otherwise the full suite). Default true; the verdict says which ran.",
+        ),
     }),
   ])
   .describe(
@@ -78,7 +84,7 @@ const gate = z
   )
 function gateIn(g?: z.infer<typeof gate>) {
   if (g === undefined || typeof g === "boolean") return g
-  return { checks: g.checks, audit: g.audit, allowed: g.allowed, maxRounds: g.max_rounds }
+  return { checks: g.checks, audit: g.audit, allowed: g.allowed, maxRounds: g.max_rounds, related: g.related_only }
 }
 const timeout = z
   .number()

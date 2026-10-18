@@ -35,15 +35,16 @@ const tool = <S extends z.ZodRawShape>(
   name: string,
   description: string,
   shape: S,
-  run: (args: z.infer<z.ZodObject<S>>, board: Board) => Promise<string>,
+  run: (args: z.infer<z.ZodObject<S>>, board: Board, repo: string) => Promise<string>,
   readOnly = false,
 ) => {
   server.registerTool(name, { description, inputSchema: shape, annotations: { openWorldHint: false, readOnlyHint: readOnly } }, (async (
     args: z.infer<z.ZodObject<S>> & { directory?: string },
   ) => {
     try {
-      const board = await Board.open(args.directory ? path.resolve(DEFAULT_DIR, args.directory) : DEFAULT_DIR, STATE_ROOT)
-      return ok(await run(args, board))
+      const repo = args.directory ? path.resolve(DEFAULT_DIR, args.directory) : DEFAULT_DIR
+      const board = await Board.open(repo, STATE_ROOT)
+      return ok(await run(args, board, repo))
     } catch (err) {
       return fail(err)
     }
@@ -97,16 +98,16 @@ tool(
 
 tool(
   "board_brief",
-  "Start an attempt on a task and return the worker's prompt: goal, done criteria, scope, relevant findings and project notes, and the exact commands it reports with (including a token for this attempt). Pass it unchanged to opencode_spawn. A new brief for the same task ends any previous attempt.",
+  "Start an attempt on a task and return the worker's prompt: goal, done criteria, scope, relevant findings and project notes, the exact commands it reports with (including a token for this attempt), and code context (the scoped files, symbols the goal names, the tests that cover the scope, the project's conventions). Pass it unchanged to opencode_spawn. A new brief for the same task ends any previous attempt.",
   {
     directory,
     id,
     agent: z.string().optional().describe("Name of the agent that will work it (shown in summaries)."),
     budget_tokens: z.number().int().min(500).max(30_000).optional().describe("Size limit for the brief (default 6000)."),
   },
-  async (a, board) => {
+  async (a, board, repo) => {
     const { task, attempt } = await board.assign(a.id, a.agent)
-    return renderBrief(board, task, attempt, a.budget_tokens)
+    return renderBrief(board, task, attempt, a.budget_tokens, repo)
   },
 )
 

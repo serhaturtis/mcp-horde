@@ -54,6 +54,7 @@ With `gate: true` (or settings), an agent's work is checked when it finishes a t
 - **Failures go back to the agent first.** The compact verdict is sent to it as a new instruction ("fix these; do not skip or weaken tests"), up to `max_rounds` (default 2). Only the outcome is news: `opencode_wait` reports the agent when its gate has passed or run out of rounds, never in between.
 - **What you see** is one line on a pass (`gate: ✓ PASS (round 2/2) · 3.1s`), or the final verdict on a failure: failing tests with their assertion and location, blocking audit findings, exact counts.
 - **The audit** covers the agent's own work: in a worktree, everything after the carried-over baseline (or after the last merge). Outside a worktree the audit is off by default, because the human's edits in the same directory would be audited too; the checks still run. `allowed` restricts the scope (`["src/auth/**", "test/auth/**"]`).
+- **Related tests only,** by default: test checks run just the tests that cover the agent's changes when every change is covered and the runner takes test paths, otherwise the full suite (the verdict says which). `gate: {related_only: false}` always runs everything. Run the full suite after merging.
 - **Interplay:** a gate only runs after a clean finish (not after an interrupt or an error, which are reported as they are). A new `opencode_message` starts counting rounds again and cancels a gate in flight; `opencode_interrupt` stops it. An agent that needs input during a fix round surfaces immediately. An unchanged tree is not re-checked.
 
 ```text

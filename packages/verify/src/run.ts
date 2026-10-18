@@ -4,6 +4,7 @@ import path from "node:path"
 import { runCommand } from "@mcp-horde/core"
 import type { Check, CheckKind } from "./detect.js"
 import { type Extracted, extract } from "./extract.js"
+import type { Narrowing } from "./related.js"
 
 export interface CheckResult {
   name: string
@@ -16,6 +17,8 @@ export interface CheckResult {
   extracted: Extracted
   /** Full (capped) output of this run, for verify_logs. */
   logFile?: string
+  /** How a related-tests run narrowed (or skipped) this check. */
+  related?: Narrowing
 }
 
 export interface RunChecksOptions {

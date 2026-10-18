@@ -48,6 +48,7 @@ export const INSTRUCTIONS = `verify: mechanical judgement of code changes, with 
 - verify_gate is the one to use: it runs the project's checks (tests, typecheck, lint) and, given a base commit, audits the diff for out-of-scope edits, deleted or skipped tests, suppressions, new dependencies, secrets and binaries. PASS means the checks passed and nothing blocking was found.
 - The verdict is short on purpose: failing tests with their assertion and location, exact counts. Read a full log with verify_logs only when the verdict is not enough.
 - Checks come from horde.json ("verify.checks") or are detected from package.json, pyproject.toml, Cargo.toml, go.mod or a Makefile; verify_detect shows which.
+- related (gate, with base) or related_to (run) runs only the tests that cover the changed files, when every change is covered and the runner takes paths; the verdict says which.
 - An unchanged tree is not re-run: the cached verdict comes back instantly (pass fresh: true to force a run).`
 
 const server = new McpServer({ name: "verify", version: VERSION }, { instructions: INSTRUCTIONS })
@@ -104,6 +105,10 @@ tool(
     allowed: z.array(z.string()).optional().describe('Scope: globs (repo-relative) every changed file must match, e.g. ["src/auth/**", "test/auth/**"].'),
     audit: z.boolean().optional().describe("Set false to skip the audit even with a base."),
     fresh: z.boolean().optional().describe("Run again even if this exact tree was already judged."),
+    related: z
+      .boolean()
+      .optional()
+      .describe("With base: run only the tests related to the changed files when that is safe (the full suite otherwise); other checks run as usual."),
     budget_chars: budget,
   },
   async (a, extra) => {
@@ -113,6 +118,7 @@ tool(
       allowed: a.allowed,
       audit: a.audit,
       fresh: a.fresh,
+      related: a.related,
       budgetChars: a.budget_chars,
       signal: extra.signal,
       onProgress: progress(extra),
@@ -125,10 +131,20 @@ tool(
 tool(
   "verify_run",
   "Run checks without auditing (e.g. after integrating several branches). Same compact output as verify_gate.",
-  { directory, checks: z.array(z.string()).optional(), fresh: z.boolean().optional(), budget_chars: budget },
+  {
+    directory,
+    checks: z.array(z.string()).optional(),
+    related_to: z
+      .array(z.string())
+      .optional()
+      .describe("Changed files (repository-relative): run only the tests related to them when that is safe, the full suite otherwise."),
+    fresh: z.boolean().optional(),
+    budget_chars: budget,
+  },
   async (a, extra) => {
     const v = await gate(dir(a.directory), {
       checks: a.checks,
+      relatedTo: a.related_to,
       audit: false,
       fresh: a.fresh,
       budgetChars: a.budget_chars,

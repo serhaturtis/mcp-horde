@@ -6,7 +6,7 @@ import path from "node:path"
 import { after, describe, test } from "node:test"
 import { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
-import { Board, cliArgv, isTrustedCommand, overlaps, projectOf, renderSummary, shellWords, workerCommand } from "../src/lib.js"
+import { Board, cliArgv, isTrustedCommand, overlaps, projectOf, renderBrief, renderSummary, shellWords, workerCommand } from "../src/lib.js"
 
 const pkg = path.resolve(import.meta.dirname, "..")
 const temps: string[] = []
@@ -204,6 +204,27 @@ describe("board", () => {
     assert.equal(failed.tier, 1)
     await board.assign(t.id)
     assert.equal((await board.fail(t.id, { reason: "out of tiers", retry: false })).status, "failed")
+  })
+
+  test("given the repository, a brief carries code context within its budget", async () => {
+    const root = repo()
+    fs.mkdirSync(path.join(root, "src/api"), { recursive: true })
+    fs.writeFileSync(path.join(root, "src/api/login.ts"), "export function login(user: string) {\n  return user\n}\n")
+    fs.writeFileSync(path.join(root, "src/api/login.test.ts"), "import { login } from './login.js'\nlogin('a')\n")
+    fs.writeFileSync(path.join(root, "CLAUDE.md"), "Prefer small functions.\n")
+    const board = new Board(tmp())
+    const t = (await board.plan([{ title: "Rate-limit login", goal: "Make `login` refuse after 5 failures.", scope: ["src/api/**"] }])).tasks[0]!
+    const { attempt } = await board.assign(t.id)
+    const brief = renderBrief(board, board.task(t.id), attempt, 6000, root)
+    assert.match(brief, /## Reporting \(required\)[\s\S]*## Code context\n\n### src\/api\/login\.ts\n1 {2}export function login/)
+    assert.match(brief, /- src\/api\/login\.ts: src\/api\/login\.test\.ts \(naming\)/)
+    assert.match(brief, /### CLAUDE\.md \(project conventions\)\nPrefer small functions\./)
+    assert.ok(brief.length <= 6000 * 4 + 200, `${brief.length}`)
+    assert.doesNotMatch(renderBrief(board, board.task(t.id), attempt, 6000), /## Code context/, "no repository, no code context")
+    // A small budget keeps the required sections and drops code context first.
+    const small = renderBrief(board, board.task(t.id), attempt, 700, root)
+    assert.match(small, /## Reporting \(required\)/)
+    assert.doesNotMatch(small, /## Code context/)
   })
 
   test("notes: duplicates collapse, recall ranks by overlap, forget hides", async () => {

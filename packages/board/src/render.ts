@@ -1,4 +1,5 @@
-import { fitSections, formatUsd, type Section, truncate } from "@mcp-horde/core"
+import { openProject, pack } from "@mcp-horde/context"
+import { estimateTokens, fitSections, formatUsd, type Section, truncate } from "@mcp-horde/core"
 import { type Attempt, type Board, current, LEASE_MS, type Note, type Task } from "./board.js"
 import { workerCommand } from "./command.js"
 
@@ -9,12 +10,17 @@ const ago = (t: number, now = Date.now()) => {
 
 const list = (items: string[], bullet = "- ") => items.map((i) => `${bullet}${i}`).join("\n")
 
+/** Code context gets at most this share of a brief's budget (and whatever the rest leaves). */
+const CONTEXT_SHARE = 0.6
+
 /**
  * The prompt a worker gets: the task, what done means, where to work, what
- * others already learned, and the exact commands to report with. Sections the
- * worker cannot do without are required; notes fill the rest of the budget.
+ * others already learned, the exact commands to report with, and, given the
+ * repository, code context (scoped files, named symbols, covering tests, the
+ * project's conventions). Sections the worker cannot do without are required;
+ * notes and code context fill the rest of the budget.
  */
-export function renderBrief(board: Board, t: Task, a: Attempt, budgetTokens = 6000): string {
+export function renderBrief(board: Board, t: Task, a: Attempt, budgetTokens = 6000, repo?: string): string {
   const cmd = workerCommand(board.dir)
   const id = t.id
   const notes = (ns: Note[], title: string, caveat: string) =>
@@ -50,7 +56,21 @@ export function renderBrief(board: Board, t: Task, a: Attempt, budgetTokens = 60
     { text: notes(memory, "Project notes", "From earlier tasks; they may be outdated.") },
     { text: notes(findings, "Findings from other workers", "Shared during this work; check before relying on them.") },
   ].filter((s) => s.text)
-  return fitSections(sections, budgetTokens * 4, "\n\n")
+  const brief = fitSections(sections, budgetTokens * 4, "\n\n")
+  if (!repo) return brief
+  const left = Math.min(Math.floor(budgetTokens * CONTEXT_SHARE), budgetTokens - estimateTokens(brief) - 50)
+  if (left < 300) return brief
+  let context = ""
+  try {
+    context = pack(openProject(repo, { fresh: true }), {
+      goal: `${t.title}\n${t.goal}\n${t.acceptance.join("\n")}`,
+      scope: t.scope,
+      budgetTokens: left,
+    })
+  } catch {
+    // Code context is a help, never a reason to withhold the brief.
+  }
+  return context ? `${brief}\n\n${context}` : brief
 }
 
 function attemptLine(t: Task, now: number): string {

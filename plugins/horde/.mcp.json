@@ -11,6 +11,10 @@
     "verify": {
       "command": "npx",
       "args": ["-y", "@mcp-horde/verify"]
+    },
+    "context": {
+      "command": "npx",
+      "args": ["-y", "@mcp-horde/context"]
     }
   }
 }

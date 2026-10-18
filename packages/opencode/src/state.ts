@@ -28,6 +28,8 @@ export interface GateConfig {
   allowed?: string[]
   /** Gate runs per task before the failure is reported (each failure is sent back to the agent first). */
   maxRounds: number
+  /** Run only the tests related to the agent's changes when that is safe (default true; absent in older records). */
+  related?: boolean
   /** Audit base outside a worktree: HEAD when the agent was spawned. */
   base?: string
 }

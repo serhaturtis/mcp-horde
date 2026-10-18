@@ -6,7 +6,7 @@ import path from "node:path"
 import { after, describe, test } from "node:test"
 import { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
-import { audit, detectChecks, gate, globMatcher, isTestPath, loadSettings } from "../src/lib.js"
+import { audit, type Check, detectChecks, gate, globMatcher, isTestPath, loadSettings, narrowCommand } from "../src/lib.js"
 
 const pkg = path.resolve(import.meta.dirname, "..")
 const temps: string[] = []
@@ -268,6 +268,68 @@ describe("gate", () => {
     assert.match(v.text, /slow · cancelled/)
     const fresh = gate(root, { signal: AbortSignal.timeout(300), stateDir: tmp() })
     assert.equal((await fresh).cached, false, "a cancelled verdict was not cached")
+  })
+})
+
+describe("related tests", () => {
+  const check = (command: string, cwd = "/p"): Check => ({ name: "test", command, kind: "test", cwd, source: "test" })
+
+  test("runners that take test paths are narrowed; the rest are not", () => {
+    assert.equal(narrowCommand(check("pytest -q"), ["tests/test_a.py", "src/a.ts"]), "pytest -q tests/test_a.py")
+    assert.equal(narrowCommand(check("python -m pytest"), ["tests/test a.py"]), 'python -m pytest "tests/test a.py"')
+    assert.equal(narrowCommand(check("npx vitest run"), ["src/a.test.ts"]), "npx vitest run src/a.test.ts")
+    assert.equal(narrowCommand(check("jest --ci"), ["a.test.js"]), "jest --ci a.test.js")
+    assert.equal(narrowCommand(check("go test ./..."), ["internal/calc/calc_test.go", "a_test.go"]), "go test ./internal/calc .")
+    assert.equal(narrowCommand(check("go test ./pkg"), ["pkg/a_test.go"]), undefined, "only ./... is replaced")
+    assert.equal(narrowCommand(check("jest && echo done"), ["a.test.js"]), undefined)
+    assert.equal(narrowCommand(check("cargo test"), ["tests/a.rs"]), undefined)
+    assert.equal(narrowCommand(check("pytest"), ["src/a.test.ts"]), undefined, "no tests for this runner")
+    const npm = tmp()
+    write(npm, { "package.json": JSON.stringify({ scripts: { test: "vitest run --reporter=dot" } }) })
+    assert.equal(narrowCommand(check("npm test", npm), ["src/a.test.ts"]), "npm test -- src/a.test.ts")
+    write(npm, { "package.json": JSON.stringify({ scripts: { test: "node --test test/a.test.ts" } }) })
+    assert.equal(narrowCommand(check("npm test", npm), ["src/a.test.ts"]), undefined, "node --test lists its own files")
+  })
+
+  test("a gate runs only the tests for what changed, falls back to the full suite when unsure, and flags untested code", async () => {
+    // A stand-in test runner named like jest: it prints what it was asked to run.
+    const { root, base } = repo({
+      jest: "console.log('ran: ' + (process.argv.slice(2).join(' ') || 'everything'))\n",
+      "horde.json": JSON.stringify({ verify: { checks: { test: "node jest" } } }),
+      "package.json": "{}",
+      "src/a.js": "exports.a = 1\n",
+      "src/a.test.js": "require('./a')\n",
+      "src/b.js": "exports.b = 1\n",
+      "test/b.test.js": "require('../src/b')\n",
+    })
+    const ran = async () => {
+      const v = await gate(root, { base, related: true, audit: false, stateDir: tmp() })
+      return { v, log: fs.readFileSync(v.checks[0]!.logFile!, "utf8") }
+    }
+    write(root, { "src/a.js": "exports.a = 2\n" })
+    let { v, log } = await ran()
+    assert.match(v.text, /✓ test · ok · \S+ · related tests only \(1 file\)/, v.text)
+    assert.match(log, /ran: src\/a\.test\.js\n/)
+
+    write(root, { "src/b.js": "exports.b = 2\n" })
+    ;({ v, log } = await ran())
+    assert.match(log, /ran: src\/a\.test\.js test\/b\.test\.js\n/, "naming next to it and in a mirrored test directory")
+
+    write(root, { "package.json": '{"name":"x"}' })
+    ;({ v, log } = await ran())
+    assert.match(v.text, /full suite: 1 changed file\(s\) without related tests \(package\.json\)/)
+    assert.match(log, /ran: everything/)
+
+    git(root, "checkout", "-q", "package.json")
+    write(root, { "src/c.js": "exports.c = 1\n" })
+    ;({ v, log } = await ran())
+    assert.match(log, /ran: everything/)
+    assert.match(v.text, /! tests: no test covers 1 changed source file\(s\): src\/c\.js/)
+    assert.ok(v.pass, "untested code is a warning, not a blocker")
+    // Without related, the full suite runs.
+    const full = await gate(root, { base, audit: false, stateDir: tmp() })
+    assert.match(fs.readFileSync(full.checks[0]!.logFile!, "utf8"), /ran: everything/)
+    assert.doesNotMatch(full.text, /related|full suite/)
   })
 })
 

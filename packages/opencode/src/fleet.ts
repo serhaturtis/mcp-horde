@@ -117,7 +117,7 @@ export interface SpawnInput {
 }
 
 /** How a caller asks for a gate: true for the defaults, or settings. */
-export type GateInput = boolean | { checks?: string[]; audit?: boolean; allowed?: string[]; maxRounds?: number }
+export type GateInput = boolean | { checks?: string[]; audit?: boolean; allowed?: string[]; maxRounds?: number; related?: boolean }
 
 export interface Hooks {
   /** True when the client can show form dialogs to the human. */
@@ -225,6 +225,7 @@ export async function gateConfig(input: GateInput | undefined, directory: string
     audit: o.audit ?? current?.audit ?? worktree,
     allowed: o.allowed ?? current?.allowed,
     maxRounds: o.maxRounds ?? current?.maxRounds ?? 2,
+    related: o.related ?? current?.related ?? true,
     base,
   }) as GateConfig
 }
@@ -979,6 +980,7 @@ export class Fleet {
         audit: cfg.audit,
         checks: cfg.checks,
         allowed: cfg.allowed,
+        related: cfg.related !== false,
         signal: abort.signal,
         stateDir: verifyStateDir(),
       })

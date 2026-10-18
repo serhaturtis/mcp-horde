@@ -4,6 +4,7 @@ import path from "node:path"
 import { fitSections, formatDuration, git, gitRaw, type Section, splitZ, truncate } from "@mcp-horde/core"
 import { type AuditResult, audit, type Finding } from "./audit.js"
 import { type Check, detectChecks, loadSettings } from "./detect.js"
+import { changedFiles, type Narrowing, planRelated } from "./related.js"
 import { type CheckResult, logDirFor, runChecks } from "./run.js"
 
 export interface GateOptions {
@@ -23,6 +24,13 @@ export interface GateOptions {
   stateDir?: string
   /** Re-run even if an identical tree was already judged. */
   fresh?: boolean
+  /**
+   * Run only the tests related to what changed since `base` (see planRelated), when that is
+   * safe; other checks run as usual.
+   */
+  related?: boolean
+  /** Like `related`, for these changed files (repository-relative) instead of the diff from base. */
+  relatedTo?: string[]
 }
 
 export interface Verdict {
@@ -73,16 +81,41 @@ export async function gate(directory: string, opts: GateOptions = {}): Promise<V
   const allowed = [...settings.audit.allowed, ...(opts.allowed ?? [])]
   const doAudit = opts.audit !== false && !!opts.base
   const budget = opts.budgetChars ?? 1500
-  const key = await treeKey(dir, { checks: selected.map((c) => [c.name, c.command, c.cwd]), base: doAudit ? opts.base : null, allowed, a: settings.audit })
+  const relatedMode = !!opts.relatedTo || (!!opts.related && !!opts.base)
+  const key = await treeKey(dir, {
+    checks: selected.map((c) => [c.name, c.command, c.cwd]),
+    base: doAudit || relatedMode ? opts.base : null,
+    allowed,
+    a: settings.audit,
+    related: relatedMode ? (opts.relatedTo ?? true) : false,
+  })
   const hit = key && !opts.fresh ? cache.get(key) : undefined
   if (hit) return { ...hit, cached: true, text: render(hit, budget, true) }
 
   const started = Date.now()
-  const checks = await runChecks(selected, {
+  let plans = new Map<Check, Narrowing>()
+  let untested: string[] = []
+  if (relatedMode) {
+    const { root, files } = opts.relatedTo
+      ? { root: await git(dir, "rev-parse", "--show-toplevel"), files: opts.relatedTo.map((f) => f.replace(/\\/g, "/")) }
+      : await changedFiles(dir, opts.base!)
+    ;({ plans, untested } = planRelated(root, files, selected))
+  }
+  const toRun = selected.filter((c) => !plans.get(c)?.skipped).map((c) => ({ ...c, command: plans.get(c)?.command ?? c.command }))
+  const ran = await runChecks(toRun, {
     timeoutMs: settings.timeoutMs,
     signal: opts.signal,
     logDir: logDirFor(path.join(opts.stateDir ?? defaultStateDir(), "logs"), dir),
     onProgress: opts.onProgress,
+  })
+  const checks = selected.flatMap((c): CheckResult[] => {
+    const plan = plans.get(c)
+    if (plan?.skipped)
+      return [
+        { name: c.name, command: c.command, kind: c.kind, pass: true, code: 0, durationMs: 0, extracted: { runner: "generic", failures: [] }, related: plan },
+      ]
+    const r = ran.find((x) => x.name === c.name)
+    return r ? [{ ...r, related: plan }] : []
   })
   const auditResult = doAudit ? await audit(dir, { base: opts.base!, allowed, block: settings.audit.block, warn: settings.audit.warn }) : undefined
   const blockers = [
@@ -90,6 +123,8 @@ export async function gate(directory: string, opts: GateOptions = {}): Promise<V
     ...(auditResult?.findings.filter((f) => f.severity === "block").map(findingLine) ?? []),
   ]
   const warnings = auditResult?.findings.filter((f) => f.severity === "warn").map(findingLine) ?? []
+  if (untested.length)
+    warnings.push(`tests: no test covers ${untested.length} changed source file(s): ${untested.slice(0, 5).join(", ")}${untested.length > 5 ? ", …" : ""}`)
   const verdict = {
     pass: blockers.length === 0 && !opts.signal?.aborted,
     directory: dir,
@@ -144,7 +179,19 @@ export function render(v: Omit<Verdict, "cached" | "text">, budget: number, cach
   if (!v.checks.length) sections.push({ text: "no checks found (configure verify.checks in horde.json)", required: true })
   // One status line per check, failing ones first.
   for (const c of [...failed, ...v.checks.filter((x) => x.pass)]) {
-    sections.push({ text: `${c.pass ? "✓" : "✗"} ${c.name} · ${c.pass ? summaryPass(c) : summary(c)} · ${formatDuration(c.durationMs)}`, required: !c.pass })
+    if (c.related?.skipped) {
+      sections.push({ text: `- ${c.name} · skipped: ${c.related.skipped}` })
+      continue
+    }
+    const scope = c.related
+      ? c.related.command
+        ? ` · related tests only (${c.related.tests.length} file${c.related.tests.length === 1 ? "" : "s"})`
+        : ` · full suite: ${c.related.full}`
+      : ""
+    sections.push({
+      text: `${c.pass ? "✓" : "✗"} ${c.name} · ${c.pass ? summaryPass(c) : summary(c)} · ${formatDuration(c.durationMs)}${scope}`,
+      required: !c.pass,
+    })
   }
   for (const c of failed) {
     for (const f of c.extracted.failures) {
@@ -161,6 +208,7 @@ export function render(v: Omit<Verdict, "cached" | "text">, budget: number, cach
       })
     }
   }
+  for (const w of v.warnings.filter((x) => x.startsWith("tests: no test covers"))) sections.push({ text: `! ${w}` })
   if (v.audit) {
     const n = v.audit.files.length
     sections.push({

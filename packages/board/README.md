@@ -31,7 +31,7 @@ locks   src/shared/rate.ts → t-77ab
 | --- | --- |
 | `board_plan` | Adds tasks: title, goal, acceptance criteria, scope (paths), dependencies (by id, or by title within the plan), starting tier. Refuses cycles; warns when tasks that could run in parallel have overlapping scopes. |
 | `board_next` | Tasks that are ready: open, with every dependency done. |
-| `board_brief` | Starts an attempt and returns the worker prompt: goal, done criteria, scope, relevant project notes and findings, and the exact commands to report with (including a token for this attempt). A new brief ends the previous attempt. |
+| `board_brief` | Starts an attempt and returns the worker prompt: goal, done criteria, scope, relevant project notes and findings, the exact commands to report with (including a token for this attempt), and code context for the scope. A new brief ends the previous attempt. |
 | `board_task` | One task with its latest report (changes, tests added, unverified claims, questions). |
 | `board_accept` / `board_fail` | Close the attempt. Failing reopens the task by default; `escalate` raises its tier, `retry: false` gives it up. |
 | `board_block` / `board_edit` | Park a task on an outside decision; change or reopen it. |
@@ -76,5 +76,5 @@ claude mcp add board -- node /path/to/mcp-horde/packages/board/dist/index.js
 
 ## Known limits
 
-- Briefs include project notes and findings, but not code context yet: `@mcp-horde/context` (milestone M3) adds the relevant files and symbols.
+- Code context in briefs comes from `@mcp-horde/context` (the scoped files, symbols the goal names, covering tests, the project's instruction files) and gets what the rest of the brief leaves of its budget, at most 60%. Name symbols in the goal in backticks to have their definitions included.
 - Stale attempts (no worker activity for 30 minutes) are shown, never changed automatically: the orchestrator decides whether to re-brief, fail or wait.
