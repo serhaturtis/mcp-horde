@@ -21,6 +21,7 @@ It is built on OpenCode's **v2 server API** (`/api/*`, through `@opencode-ai/sdk
 | Resume an interrupted or failed agent (refused while it is still running) | `opencode_resume` |
 | Answer permission prompts and questions | `opencode_respond`, or the human answers them in a dialog |
 | Review and merge an isolated agent's work | `opencode_worktree` (`diff`, `commit`, `merge`) |
+| Bring an agent's branch up to date with work merged since it started (its commits are replayed onto your branch's tip; aborted cleanly on conflicts) | `opencode_worktree` `sync` |
 | Undo a bad turn: OpenCode restores the files it changed and drops it from the conversation | `opencode_revert` (`turns`, or `to: <message id>`) |
 | See how full an agent's context window is (`ctx 71k/128k (55%)` in every status) and compact it | `opencode_status`, `opencode_compact` (needs an OpenCode with v2 compaction; 1.19 answers "not available yet") |
 | See and remove the rules OpenCode saved from "always" answers | `opencode_permissions` |

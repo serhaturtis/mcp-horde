@@ -22,7 +22,7 @@ import type { Config, PermissionPolicy } from "./config.js"
 import { type Detail, inputSummary, renderTranscript } from "./render.js"
 import { type AgentRecord, type GateConfig, type Limits, ownerAlive, SELF, type Store } from "./state.js"
 import { apply, type CostEstimator, costSince, currentTurn, type DurableEvent, emptyTrack, latestTool, type Track, type Turn, turnsSince } from "./tracker.js"
-import { commitAll, createWorktree, excludeFromGit, mergeWorktree, removeWorktree, type Worktree, workStart, worktreeDiff } from "./worktree.js"
+import { commitAll, createWorktree, excludeFromGit, mergeWorktree, removeWorktree, syncWorktree, type Worktree, workStart, worktreeDiff } from "./worktree.js"
 
 /**
  * running      – the agent loop is executing (or about to start on a fresh prompt)
@@ -853,7 +853,7 @@ export class Fleet {
     return notes.join("\n")
   }
 
-  async worktree(ref: string, action: "diff" | "commit" | "merge", opts: { strategy?: "merge" | "squash"; maxChars?: number }): Promise<string> {
+  async worktree(ref: string, action: "diff" | "commit" | "merge" | "sync", opts: { strategy?: "merge" | "squash"; maxChars?: number }): Promise<string> {
     const live = await this.get(ref)
     const wt = live.record.worktree
     const name = live.record.name ?? live.record.id
@@ -862,6 +862,22 @@ export class Fleet {
     await this.refresh(live)
     if (this.working(live) && live.state !== "needs_input") throw new Error(`${name} is still running; wait for it or interrupt it first`)
     if (action === "commit") return (await commitAll(wt, `horde: work from ${name}`)) ?? "nothing to commit"
+    if (action === "sync") {
+      const synced = await syncWorktree(wt, name)
+      if (synced.worktree) {
+        // The gate's base moved with the branch; its verdict is about the old tree.
+        this.updateRecord(live.record.id, { worktree: synced.worktree, gateState: undefined })
+        const task = live.record.task
+        if (task) {
+          const board = await Board.open(wt.repo).catch(() => undefined)
+          const t = board?.task(task.id)
+          const a = t?.attempts.find((x) => x.n === task.attempt)
+          if (board && a?.workspace && !a.endedAt)
+            await board.bindWorkspace(task.id, a.token, { ...a.workspace, base: workStart(synced.worktree) }).catch(() => undefined)
+        }
+      }
+      return `${synced.text}${synced.worktree ? "\nMessage the agent to re-run its checks on the updated code (a gate runs when it finishes)." : ""}`
+    }
     const result = await mergeWorktree(wt, name, opts.strategy ?? "merge")
     if (result.merged && result.merged !== wt.merged) this.updateRecord(live.record.id, { worktree: { ...wt, merged: result.merged } })
     return result.text

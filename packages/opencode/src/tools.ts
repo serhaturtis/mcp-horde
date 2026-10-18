@@ -583,10 +583,10 @@ export function registerTools(server: McpServer, ctx: Context) {
 
   tool(
     "opencode_worktree",
-    'Work with an isolated agent\'s git worktree: "diff" shows the agent\'s commits and changes, "commit" commits its leftover changes, "merge" replays the agent\'s own commits onto your checkout\'s current branch (carried-over changes excluded; aborted cleanly on conflicts; strategy "squash" stages them without committing).',
+    'Work with an isolated agent\'s git worktree: "diff" shows the agent\'s commits and changes, "commit" commits its leftover changes, "merge" replays the agent\'s own commits onto your checkout\'s current branch (carried-over changes excluded; aborted cleanly on conflicts; strategy "squash" stages them without committing), "sync" replays the agent\'s commits onto your branch\'s current tip inside the worktree, so it continues on top of what was merged since it started (aborted cleanly on conflicts).',
     {
       id,
-      action: z.enum(["diff", "commit", "merge"]),
+      action: z.enum(["diff", "commit", "merge", "sync"]),
       strategy: z.enum(["merge", "squash"]).optional(),
       max_chars: z.number().int().min(500).max(200_000).optional(),
     },

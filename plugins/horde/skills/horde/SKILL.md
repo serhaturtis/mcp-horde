@@ -41,6 +41,8 @@ For each task from `board_next` (several in parallel, within `HORDE_OPENCODE_MAX
 
 `board_summary` shows the whole picture in one call whenever you lose track.
 
+A merge that conflicts with work merged before it: `opencode_worktree { action: "sync" }` on the waiting worker replays its commits onto your branch's tip (it aborts cleanly on conflicts and names the files), then `opencode_message` it to re-run its checks; the gate runs again when it finishes.
+
 ## 4. When to step in yourself
 
 - The last tier is you: when a task fails on the strongest worker tier, do it yourself, starting from the worker's report and the failing verdict (that is usually most of the diagnosis).

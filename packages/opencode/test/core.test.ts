@@ -390,6 +390,32 @@ describe("opencode MCP server: core behaviour (real opencode, mock LLM)", { time
     await h.call("opencode_dispose", { id: "clash", worktree: "discard" })
   })
 
+  test("worktree sync: the agent's work is replayed onto what was merged since; conflicts abort cleanly", async () => {
+    await h.call("opencode_spawn", { prompt: "TOOL: echo mine > synced-mine.txt", name: "syncer", isolation: "worktree", permissions: "allow", wait: true, timeout_seconds: 60 })
+    fs.writeFileSync(path.join(repo, "synced-theirs.txt"), "theirs\n")
+    git(repo, "add", "synced-theirs.txt")
+    git(repo, "commit", "-qm", "someone else's work")
+    const synced = await h.call("opencode_worktree", { id: "syncer", action: "sync" })
+    assert.match(synced, /rebased 1 commit\(s\) of horde\/syncer onto \S+ \(\w{10}\)/, synced)
+    const status = await h.call("opencode_status", { ids: ["syncer"] })
+    const dir = status.match(/dir: (\S+) \(worktree/)![1]!
+    assert.ok(fs.existsSync(path.join(dir, "synced-theirs.txt")), "the agent now sees the merged work")
+    assert.match(await h.call("opencode_worktree", { id: "syncer", action: "sync" }), /already contains .*nothing to sync/)
+    assert.match(await h.call("opencode_worktree", { id: "syncer", action: "merge" }), /merged 1 commit\(s\) from horde\/syncer/)
+    assert.equal(fs.readFileSync(path.join(repo, "synced-mine.txt"), "utf8").trim(), "mine")
+    await h.call("opencode_dispose", { id: "syncer", worktree: "remove" })
+
+    await h.call("opencode_spawn", { prompt: "TOOL: echo agent > sync-clash.txt", name: "clasher", isolation: "worktree", permissions: "allow", wait: true, timeout_seconds: 60 })
+    fs.writeFileSync(path.join(repo, "sync-clash.txt"), "main\n")
+    git(repo, "add", "sync-clash.txt")
+    git(repo, "commit", "-qm", "clash")
+    const before = git(repo, "rev-parse", "horde/clasher")
+    await assert.rejects(h.call("opencode_worktree", { id: "clasher", action: "sync" }), /failed and was aborted; the worktree is unchanged[\s\S]*sync-clash\.txt/)
+    // The agent's leftovers were committed first; nothing was rebased.
+    assert.equal(git(repo, "rev-parse", "horde/clasher~1"), before)
+    await h.call("opencode_dispose", { id: "clasher", worktree: "discard" })
+  })
+
   test("gates: a failing check goes back to the agent, which fixes it; the caller only hears the outcome", async () => {
     // Each scenario lives in its own directory with its own horde.json checks.
     const scenario = (name: string, command: string) => {
