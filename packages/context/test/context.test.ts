@@ -368,7 +368,8 @@ describe("map and pack", () => {
 })
 
 describe("paths and files", () => {
-  test("readText reads only the project's regular files inside its root", () => {
+  // Symlinks and FIFOs need POSIX (Windows checkouts get symlinks as plain files).
+  test("readText reads only the project's regular files inside its root", { skip: process.platform === "win32" }, () => {
     const dir = fixture({ "a.ts": "export const a = 1\n", "sub/x.ts": "" })
     fs.symlinkSync("/etc/passwd", path.join(dir, "passwd"))
     fs.symlinkSync("a.ts", path.join(dir, "inside.ts"))

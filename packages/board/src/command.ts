@@ -24,9 +24,10 @@ export function cliArgv(): string[] {
   return [fwd(process.execPath), "--conditions=source", "--import", `file://${tsx.startsWith("/") ? "" : "/"}${tsx}`, fwd(source)]
 }
 
-// Single quotes protect everything but a quote itself; a path with one cannot be quoted safely
-// for the trust check (which accepts no backslashes), so it is double-quoted as before.
-const quote = (w: string) => (/^[\w./:@%+=,-]+$/.test(w) ? w : w.includes("'") ? `"${w}"` : `'${w}'`)
+// Single quotes protect everything but a quote itself (POSIX shells). cmd.exe knows only double
+// quotes, and a path with a single quote cannot be single-quoted for the trust check (which
+// accepts no backslashes): those stay double-quoted.
+const quote = (w: string) => (/^[\w./:@%+=,-]+$/.test(w) ? w : process.platform === "win32" || w.includes("'") ? `"${w}"` : `'${w}'`)
 
 /** The command prefix a brief tells the worker to use, for a given board state directory. */
 export function workerCommand(stateDir: string): string {

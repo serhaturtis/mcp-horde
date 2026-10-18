@@ -28,7 +28,8 @@ after(() => {
 })
 
 function tmp() {
-  const d = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "horde-verify-")))
+  // native: long names on Windows (RUNNER~1 → runneradmin), as detection resolves them.
+  const d = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "horde-verify-")))
   temps.push(d)
   return d
 }
@@ -289,8 +290,12 @@ describe("related tests", () => {
 
   test("runners that take test paths are narrowed; the rest are not", () => {
     assert.equal(narrowCommand(check("pytest -q"), ["tests/test_a.py", "src/a.ts"]), "pytest -q tests/test_a.py")
-    assert.equal(narrowCommand(check("python -m pytest"), ["tests/test a.py"]), "python -m pytest 'tests/test a.py'")
-    assert.equal(narrowCommand(check("pytest"), ["tests/it's $x.py"]), "pytest 'tests/it'\\''s $x.py'", "nothing expands inside single quotes")
+    assert.equal(
+      narrowCommand(check("python -m pytest"), ["tests/test a.py"]),
+      `python -m pytest ${process.platform === "win32" ? '"tests/test a.py"' : "'tests/test a.py'"}`,
+    )
+    if (process.platform !== "win32")
+      assert.equal(narrowCommand(check("pytest"), ["tests/it's $x.py"]), "pytest 'tests/it'\\''s $x.py'", "nothing expands inside single quotes")
     assert.equal(narrowCommand(check("npx vitest run"), ["src/a.test.ts"]), "npx vitest run src/a.test.ts")
     assert.equal(narrowCommand(check("jest --ci"), ["a.test.js"]), "jest --ci --runTestsByPath a.test.js", "jest reads bare arguments as patterns")
     assert.equal(narrowCommand(check("go test ./..."), ["internal/calc/calc_test.go", "a_test.go"]), "go test ./internal/calc .")
@@ -425,13 +430,15 @@ describe("fixes", () => {
   })
 
   test("diff parsing: fixed prefixes, headers only before the first hunk, quoted paths", async () => {
-    const { root, base } = repo({ "test/a.test.ts": "-- note\nkeep\n", 'test/we"ird.test.ts': "x\n" })
+    // Windows has no file names with a double quote: the quoted-path case is POSIX only.
+    const weird = process.platform !== "win32"
+    const { root, base } = repo({ "test/a.test.ts": "-- note\nkeep\n", ...(weird ? { 'test/we"ird.test.ts': "x\n" } : {}) })
     git(root, "config", "diff.mnemonicPrefix", "true")
     git(root, "config", "diff.noprefix", "true")
-    write(root, { "test/a.test.ts": "++ y\nkeep\ntest.skip('a', () => {})\n", 'test/we"ird.test.ts': "x\nit.only('b', () => {})\n" })
+    write(root, { "test/a.test.ts": "++ y\nkeep\ntest.skip('a', () => {})\n", ...(weird ? { 'test/we"ird.test.ts': "x\nit.only('b', () => {})\n" } : {}) })
     const l = await lines(root, base)
     assert.ok(l.includes("block tests test/a.test.ts:3 skips a test"), l.join("\n"))
-    assert.ok(l.includes('block tests test/we"ird.test.ts:2 focuses tests with .only (all others stop running)'), l.join("\n"))
+    if (weird) assert.ok(l.includes('block tests test/we"ird.test.ts:2 focuses tests with .only (all others stop running)'), l.join("\n"))
   })
 
   test("tests renamed so no runner picks them up are flagged", async () => {

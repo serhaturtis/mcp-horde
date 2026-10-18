@@ -179,7 +179,7 @@ describe("ask schemas", () => {
 
 describe("server support", () => {
   test("the attach command quotes the password file, with a PowerShell variant", () => {
-    assert.equal(attachCommand("http://h:1", "/a b/it's"), `OPENCODE_SERVER_PASSWORD="$(cat '/a b/it'\\''s')" opencode attach http://h:1`)
+    assert.equal(attachCommand("http://h:1", "/a b/it's", "opencode", "linux"), `OPENCODE_SERVER_PASSWORD="$(cat '/a b/it'\\''s')" opencode attach http://h:1`)
     assert.match(
       attachCommand("http://h:1", "C:\\x y\\pw", "me", "win32"),
       /^\$env:OPENCODE_SERVER_USERNAME = 'me'; \$env:OPENCODE_SERVER_PASSWORD = Get-Content -Raw 'C:\\x y\\pw'; opencode attach/,
