@@ -22,7 +22,7 @@ Optional, in the repository's `horde.json`: the worker models per tier, cheapest
 }
 ```
 
-To see the board from a terminal while the horde works: `node <plugin dir>/servers/cli.js status` in the repository (add a task id for one task in full).
+To follow the horde from a terminal: `node <plugin dir>/servers/cli.js watch` in the repository shows the board live (tasks, their agents' state and gate verdicts, costs, locks, recent events); `status` prints it once (add a task id for one task in full).
 
 ## Requirements
 

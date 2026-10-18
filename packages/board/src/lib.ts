@@ -17,3 +17,4 @@ export {
 } from "./board.js"
 export { cliArgv, isTrustedCommand, shellWords, WORKER_COMMANDS, workerCommand } from "./command.js"
 export { renderBrief, renderNotes, renderSummary, renderTask } from "./render.js"
+export { recentEvents, renderWatch, type WatchState, watch } from "./watch.js"

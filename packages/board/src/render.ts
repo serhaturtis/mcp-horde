@@ -78,7 +78,8 @@ function attemptLine(t: Task, now: number): string {
   if (!a) return ""
   const who = a.agent ? `agent ${a.agent}, ` : ""
   const seen = a.seenAt ? `last seen ${ago(a.seenAt, now)}` : "worker not seen yet"
-  return ` (${who}attempt ${a.n}, ${seen}${a.progress ? `: "${truncate(a.progress, 80)}"` : ""})`
+  const doing = a.activity && !a.endedAt ? `${a.activity.state}${a.activity.gate ? `, gate ${a.activity.gate}` : ""}, ` : ""
+  return ` (${who}attempt ${a.n}, ${doing}${seen}${a.progress ? `: "${truncate(a.progress, 80)}"` : ""})`
 }
 
 /** One screen for the orchestrator: what is running, what needs a decision, what is next. */

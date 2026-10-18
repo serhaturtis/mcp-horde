@@ -6,7 +6,19 @@ import path from "node:path"
 import { after, describe, test } from "node:test"
 import { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
-import { Board, cliArgv, isTrustedCommand, overlaps, projectOf, renderBrief, renderSummary, renderTask, shellWords, workerCommand } from "../src/lib.js"
+import {
+  Board,
+  cliArgv,
+  isTrustedCommand,
+  overlaps,
+  projectOf,
+  renderBrief,
+  renderSummary,
+  renderTask,
+  renderWatch,
+  shellWords,
+  workerCommand,
+} from "../src/lib.js"
 
 const pkg = path.resolve(import.meta.dirname, "..")
 const temps: string[] = []
@@ -181,6 +193,8 @@ describe("board", () => {
     const human = `${cliArgv().join(" ")} status --state "${board.dir.replace(/\\/g, "/")}"`
     assert.match(sh(human, root), /^3 tasks: 1 claimed, 1 review, 1 open/)
     assert.match(sh(`${human} ${api!.id}`, root), /API" — review[\s\S]*sliding-window limiter/)
+    // Without a terminal, watch prints one frame and exits.
+    assert.match(sh(human.replace(" status ", " watch "), root), /^horde · [^\n]*1 review, 1 claimed, 1 open[\s\S]*TASK +STATUS +TITLE/)
 
     // The finding reaches the next brief that touches the same paths.
     await board.accept(api!.id, { cost: 0.04 })
@@ -196,20 +210,64 @@ describe("board", () => {
     assert.match(renderBrief(board, board.task(docs!.id), docsAttempt.attempt), /Findings from other workers[\s\S]*session middleware/)
   })
 
+  test("horde watch: the board as a terminal frame, sized, ordered by what needs attention", async () => {
+    const board = new Board(tmp())
+    const { tasks } = await board.plan([
+      { title: "API limiter", goal: "x" },
+      { title: "Docs", goal: "y", deps: ["API limiter"] },
+      { title: "Cleanup", goal: "z" },
+    ])
+    const [api, docs, cleanup] = tasks
+    const { attempt } = await board.assign(api!.id, "wa")
+    await board.recordActivity(api!.id, attempt.n, { cost: 1.5, state: "idle", gate: "pass 1/2" })
+    await board.report(api!.id, attempt.token, { summary: "done" })
+    await board.assign(cleanup!.id, "wc")
+    const now = Date.now()
+    const tiers = [{ model: "deepseek/flash" }]
+    const frame = renderWatch(board, { selected: 1 }, { width: 120, height: 20, now, tiers, title: "repo" })
+    assert.equal(frame.lines.length, 20, "fills the terminal exactly")
+    assert.ok(
+      frame.lines.every((l) => l.length <= 120),
+      "never wider than the terminal",
+    )
+    assert.match(frame.lines[0]!, /^horde · repo · 1 review, 1 claimed, 1 open · \$1\.50 +\d\d:\d\d:\d\d$/)
+    // Review first (it needs a decision), then running, then open.
+    assert.deepEqual(frame.order, [api!.id, cleanup!.id, docs!.id])
+    const row = (id: string) => frame.lines.find((l) => l.includes(id))!
+    assert.match(row(api!.id), /^ {2}t-\w+ +review +API limiter +tier 0 \(deepseek\/flash\)/)
+    assert.match(row(cleanup!.id), /^▸ t-\w+ +claimed .*#1 wc seen 0s ago/)
+    assert.match(frame.lines.join("\n"), /recent\n.*plan[\s\S]*assign[\s\S]*report +t-/)
+    assert.match(frame.lines.at(-1)!, /enter details · q quit/)
+    // Narrow terminals keep the essentials.
+    const narrow = renderWatch(board, { selected: 0 }, { width: 60, height: 12, now })
+    assert.ok(narrow.lines.every((l) => l.length <= 60))
+    assert.match(narrow.lines.join("\n"), /review +API limiter/)
+    // A task opened in full, scrolled.
+    const text = renderTask(board.task(api!.id), "full")
+    const detail = renderWatch(board, { selected: 0, detail: { id: api!.id, text, scroll: 1 } }, { width: 80, height: 10, now })
+    assert.equal(detail.lines.length, 10)
+    assert.ok(!detail.lines.includes(text.split("\n")[0]!), "scrolled past the first line")
+    assert.match(detail.lines.at(-1)!, /esc back/)
+    // Colors only when asked for.
+    assert.ok(!frame.lines.join("").includes("\x1b["))
+    assert.ok(renderWatch(board, { selected: 0 }, { width: 120, height: 20, now, color: true }).lines.join("").includes("\x1b[33mreview"))
+  })
+
   test("attempt costs are recorded as they accrue and summed per task", async () => {
     const board = new Board(tmp())
     const t = (await board.plan([{ title: "x", goal: "y" }])).tasks[0]!
     const first = await board.assign(t.id)
-    await board.recordCost(t.id, first.attempt.n, 0.5)
+    await board.recordActivity(t.id, first.attempt.n, { cost: 0.5, state: "running" })
+    assert.equal(board.task(t.id).attempts[0]!.activity?.state, "running")
     assert.equal(board.task(t.id).cost, 0.5)
     await board.fail(t.id, { reason: "nope" })
     const second = await board.assign(t.id)
-    await board.recordCost(t.id, second.attempt.n, 0.25)
-    await board.recordCost(t.id, second.attempt.n, 0.75)
+    await board.recordActivity(t.id, second.attempt.n, { cost: 0.25 })
+    await board.recordActivity(t.id, second.attempt.n, { cost: 0.75, state: "idle", gate: "pass 1/2" })
     assert.equal(board.task(t.id).cost, 1.25)
     await board.accept(t.id, {})
     assert.equal(board.task(t.id).attempts[1]!.cost, 0.75, "accept keeps the recorded cost")
-    await assert.rejects(board.recordCost(t.id, 9, 1), /has no attempt 9/)
+    await assert.rejects(board.recordActivity(t.id, 9, { cost: 1 }), /has no attempt 9/)
   })
 
   test("a new attempt invalidates the old token; failing can escalate the tier or give up", async () => {

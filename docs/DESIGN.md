@@ -1,6 +1,6 @@
 # mcp-horde: system design
 
-Status: October 2026. Built: `@mcp-horde/opencode`, `@mcp-horde/core`, `@mcp-horde/verify`, gates in `opencode` (M0, M1), `@mcp-horde/board` with its worker CLI, the `horde` Claude Code plugin with its orchestration skill (M2), `@mcp-horde/context` with code context in briefs and related-test gates (M3), and the M4 refinements (one-shot asks, scopes, worktree sync, revert, saved permissions, task-bound spawns that check reports against the diff; compaction waits on OpenCode), and the integration pass after it (model tiers from `horde.json`, attempt costs recorded on the board automatically, checks on the main checkout after every merge, `opencode.maxRunning` in `horde.json`, `horde status` for humans). Planned: M5.
+Status: October 2026. Built: `@mcp-horde/opencode`, `@mcp-horde/core`, `@mcp-horde/verify`, gates in `opencode` (M0, M1), `@mcp-horde/board` with its worker CLI, the `horde` Claude Code plugin with its orchestration skill (M2), `@mcp-horde/context` with code context in briefs and related-test gates (M3), and the M4 refinements (one-shot asks, scopes, worktree sync, revert, saved permissions, task-bound spawns that check reports against the diff; compaction waits on OpenCode), and the integration pass after it (model tiers from `horde.json`, attempt costs recorded on the board automatically, checks on the main checkout after every merge, `opencode.maxRunning` in `horde.json`, `horde status` for humans), and M5 (tree-sitter definitions in `context`, `horde watch`). The milestones in §12 are complete.
 
 ## 1. What this is for
 
@@ -350,7 +350,7 @@ Rules that keep this true: every tool takes a `budget` argument with a sane defa
 10. **Verifying worker claims.** Reports have `unverifiedClaims`; the audit cross-checks claimed tests against the diff; the gate is the only path to done.
 11. **Escalation.** Built: tiers in `horde.json`; a task-bound spawn picks the tier's model; `board_fail { escalate }` moves to the next tier and says which model that is; the playbook escalates after two failed gates; past the last tier is the orchestrator.
 12. **Cost.** Tracking, not budgets. `opencode` estimates from the catalog; a task-bound agent's spend is written to its attempt whenever it settles (and when it is disposed), so `board_task`/`board_summary` show it without the orchestrator passing anything; `board_accept`/`board_fail` may still override it. There is no spending limit unless the caller sets `limits.max_cost_usd` on a spawn (per turn); the default is none.
-13. **Observability.** Built: `events.jsonl`, and `horde status [task id]` on the command line (the board summary, or one task in full with its report checked against the diff; read-only, and not a worker command, so the fleet never approves it). A TUI later (M5).
+13. **Observability.** Built: `events.jsonl`, and `horde status [task id]` on the command line (the board summary, or one task in full with its report checked against the diff; read-only, and not a worker command, so the fleet never approves it). Built in M5: `horde watch`, the board live in a terminal (tasks, tiers, costs, each attempt's agent state and gate as `opencode` records them on the board, locks, recent events; a task's full view on enter). It only reads files, like everything else: no daemon.
 14. **Configuration sprawl.** One `horde.json`; env vars only for machine-level settings.
 15. **Many servers in the client.** Claude Code defers tool loading, so eight servers' worth of descriptions do not sit in context; descriptions stay terse; the plugin registers everything in one step.
 16. **The shared server is also the human's.** Injected config may add MCP mounts but must never change agents, permissions or models. A horde server mounted into the human's own TUI sessions is harmless: without a task token its worker tools only read.
@@ -378,13 +378,13 @@ Each goes into a `probe/` script in the relevant package, like the probes used w
 | **M3** ✓ `context` v1 + `board_brief` composition + related-test gates | precise briefs; gates that run only the tests reaching the change (transitively through imports), with a full-suite fallback whenever that is not safe | closes most of the quality gap for fast models |
 | **M4** ✓ `opencode_ask`, `scope`, `worktree sync`, `opencode_compact`, `opencode_revert`, `opencode_permissions`, `opencode_spawn { task }` (+ report-vs-diff checks, context use in status, prices in the catalog) | one-shot calls and judging; scope enforcement; conflict handling; context and undo for long tasks; fewer calls | refinements once the loop works end to end |
 | **Integration** ✓ tiers from `horde.json`, automatic attempt costs, checks after merges, `opencode.maxRunning`, `horde status` | the loop without hand-carried models, costs or limits | gaps found by running the whole flow |
-| **M5** tree-sitter `context`, `board` TUI (plugin packaging done early: bundled servers, no npm) | depth and visibility | after the shape is proven |
+| **M5** ✓ tree-sitter `context`, `horde watch` (plugin packaging done early: bundled servers, no npm) | depth and visibility | after the shape is proven |
 
 Each milestone ships with the same bar as `opencode`: unit tests, integration tests against a real `opencode serve` with the mock LLM, CI on Linux, macOS and Windows on Node 20 and 22, READMEs updated.
 
 ## 13. Non-goals
 
 - Replacing OpenCode's agent loop, tools or provider layer. The horde drives OpenCode; it does not reimplement it.
-- A web UI or cloud sync. State is local files; the TUI is the most that is planned.
+- A web UI or cloud sync. State is local files; `horde watch` in a terminal is as far as viewing goes.
 - Security isolation between the orchestrator and workers beyond scope and audit. Sandboxing workers is OpenCode's and the OS's job.
 - Supporting agent runtimes other than OpenCode as workers. The orchestrator side is runtime-agnostic through MCP; the worker side is OpenCode.

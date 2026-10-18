@@ -39,7 +39,7 @@ For each task from `board_next` (it shows each task's tier; several in parallel,
 - **`NEEDS_INPUT`** → answer with `opencode_respond`. Questions about intent are yours to answer from the plan; permission requests outside the task's scope should usually be rejected with a reason.
 - **`INTERRUPTED` / `ERROR`** → read the reason; `opencode_resume` or `board_fail`.
 
-`board_summary` shows the whole picture in one call whenever you lose track. The user can see the same with `horde status` in a terminal.
+`board_summary` shows the whole picture in one call whenever you lose track. The user can follow the same live with `horde watch` in a terminal.
 
 A merge that conflicts with work merged before it: `opencode_worktree { action: "sync" }` on the waiting worker replays its commits onto your branch's tip (it aborts cleanly on conflicts and names the files), then `opencode_message` it to re-run its checks; the gate runs again when it finishes.
 

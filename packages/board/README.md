@@ -52,7 +52,7 @@ The brief contains the exact commands, so workers never have to construct them:
         --unverified "did not load-test" --question "…" --confidence medium
 ```
 
-For people, `horde status` (in the repository, or `--repo <dir>` / `--state <board>`) prints the board summary, and `horde status <task id>` one task in full with its report checked against the diff. It only reads, and it is not a worker command, so the fleet never approves it on a worker's behalf. From the plugin: `node <plugin>/servers/cli.js status`.
+For people, `horde status` (in the repository, or `--repo <dir>` / `--state <board>`) prints the board summary, and `horde status <task id>` one task in full with its report checked against the diff. `horde watch` shows the board live in the terminal: every task with its status, tier and model, cost, and what its agent is doing (state and gate verdict, recorded by `opencode` for task-bound agents), held locks and the latest board events; ↑↓ selects a task, enter opens it in full (esc back), q quits; `--interval <seconds>` sets the refresh (default 1). Without a terminal it prints one frame. Both only read, and it is not a worker command, so the fleet never approves it on a worker's behalf. From the plugin: `node <plugin>/servers/cli.js status` (or `watch`).
 
 The token ties a worker to its attempt: after a new `board_brief` for the same task, the old worker's commands are refused. Planning, accepting and failing are not reachable from the CLI.
 

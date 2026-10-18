@@ -6,12 +6,14 @@
  * the orchestrator's (MCP tools). Output is short, for a model to read.
  *
  * For humans: `horde status [task id] [--repo <dir> | --state <board dir>]` shows the
- * board (read-only; not a worker command, so never approved automatically).
+ * board, and `horde watch` the same live in the terminal (both read-only; not worker
+ * commands, so never approved automatically).
  */
 import path from "node:path"
 import { loadTiers } from "@mcp-horde/core"
 import { Board, type Report } from "./board.js"
 import { renderNotes, renderSummary, renderTask } from "./render.js"
+import { watch } from "./watch.js"
 
 type Flags = Record<string, string[]>
 
@@ -35,13 +37,17 @@ const csv = (values?: string[]) =>
     .map((s) => s.trim())
     .filter(Boolean)
 const USAGE =
-  "usage: horde --state <dir> task|progress|report|finding|findings|recall|lock|unlock …\n       horde status [task id] [--repo <dir> | --state <dir>]"
+  "usage: horde --state <dir> task|progress|report|finding|findings|recall|lock|unlock …\n       horde status [task id] | watch [--interval <seconds>]  [--repo <dir> | --state <dir>]"
+
+/** The board a person asked for: --state, else the one of --repo or the current directory's repository. */
+async function humanBoard(flags: Flags) {
+  const repo = path.resolve(flags.repo?.[0] ?? process.cwd())
+  return { board: flags.state?.[0] ? new Board(flags.state[0]) : await Board.open(repo), tiers: loadTiers(repo), repo }
+}
 
 /** The board at a glance, or one task in full: what a human checks while the horde works. */
 async function status(args: string[], flags: Flags): Promise<string> {
-  const repo = path.resolve(flags.repo?.[0] ?? process.cwd())
-  const board = flags.state?.[0] ? new Board(flags.state[0]) : await Board.open(repo)
-  const tiers = loadTiers(repo)
+  const { board, tiers } = await humanBoard(flags)
   if (args[0]) return renderTask(board.task(args[0]), "full", Date.now(), await board.checkReport(args[0]), tiers)
   return renderSummary(board, 6000)
 }
@@ -49,6 +55,13 @@ async function status(args: string[], flags: Flags): Promise<string> {
 async function main(argv: string[]): Promise<string> {
   const { positional, flags } = parse(argv)
   if (positional[0] === "status") return status(positional.slice(1), flags)
+  if (positional[0] === "watch") {
+    const { board, tiers, repo } = await humanBoard(flags)
+    const seconds = Number(flags.interval?.[0] ?? 1)
+    if (!(seconds > 0)) throw new Error("--interval must be a positive number of seconds")
+    await watch(board, { tiers, title: path.basename(repo), intervalMs: seconds * 1000 })
+    return ""
+  }
   const state = flags.state?.[0]
   if (!state) throw new Error(`missing --state <dir>\n${USAGE}`)
   const board = new Board(state)
@@ -111,7 +124,7 @@ async function main(argv: string[]): Promise<string> {
 
 main(process.argv.slice(2)).then(
   (out) => {
-    process.stdout.write(`${out}\n`)
+    if (out) process.stdout.write(`${out}\n`)
   },
   (err: Error) => {
     process.stderr.write(`error: ${err.message}\n`)

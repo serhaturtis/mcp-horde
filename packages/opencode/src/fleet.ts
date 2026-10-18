@@ -210,6 +210,8 @@ interface Live {
   queued?: Promise<void>
   /** A gate run in flight, for the turn that started at `turn`. */
   gating?: { turn: number; abort: AbortController }
+  /** The last activity written to the board (task-bound agents). */
+  activity?: { key: string; write: Promise<void> }
 }
 
 type Res<T> = { data?: T; error?: unknown; response?: Response }
@@ -967,7 +969,7 @@ export class Fleet {
       await this.interruptNow(live, "disposed")
       notes.push("interrupted the running turn")
     }
-    await this.recordTaskCost(live)
+    await this.recordTaskActivity(live)
     // Commit a worktree's leftovers before anything is deleted (throws if that is not safe).
     if (live.record.worktree && opts.worktree === "remove") {
       const committed = await commitAll(live.record.worktree, `horde: uncommitted work from ${name}`)
@@ -1256,6 +1258,7 @@ export class Fleet {
 
   /** Push once per distinct settled outcome (and per new request). */
   private maybePush(live: Live) {
+    void this.recordTaskActivity(live)
     // An idle agent whose gate has not decided is not finished yet.
     const gate = this.gateView(live)
     const holding = live.state === "idle" && !!gate && gate.state !== "pass" && gate.state !== "fail"
@@ -1273,19 +1276,25 @@ export class Fleet {
     live.lastPushKey = key
     // Agents found already settled at startup are not news.
     if (!first) this.hooks.settled(this.build(live))
-    void this.recordTaskCost(live)
   }
 
-  /** Put a task-bound agent's spend so far on its board attempt (cost tracking only, no limits). */
-  private async recordTaskCost(live: Live) {
+  /**
+   * Put a task-bound agent's spend so far, state and gate on its board attempt (tracking
+   * only, no limits), once per change. Resolves when the board has the latest.
+   */
+  private recordTaskActivity(live: Live): Promise<void> {
     const task = live.record.task
-    if (!task) return
-    const cost = this.build(live).cost
-    if (!cost) return
-    const board = await Board.open(live.record.worktree?.repo ?? live.record.directory).catch(() => undefined)
-    const a = board?.task(task.id).attempts.find((x) => x.n === task.attempt)
-    if (!board || !a || a.cost === cost) return
-    await board.recordCost(task.id, task.attempt, cost).catch(() => undefined)
+    if (!task || !live.state) return Promise.resolve()
+    const s = this.build(live)
+    const gate = s.gate && `${s.gate.state} ${Math.max(1, s.gate.round)}/${s.gate.maxRounds}`
+    const key = JSON.stringify([s.cost.toFixed(6), s.state, gate])
+    if (live.activity?.key === key) return live.activity.write
+    const write = (async () => {
+      const board = await Board.open(live.record.worktree?.repo ?? live.record.directory).catch(() => undefined)
+      await board?.recordActivity(task.id, task.attempt, { cost: s.cost || undefined, state: s.state, gate }).catch(() => undefined)
+    })()
+    live.activity = { key, write }
+    return write
   }
 
   private derive(live: Live, active: Set<string>): { state: AgentState; error?: string } {
@@ -1755,7 +1764,7 @@ export class Fleet {
         // Mark what the caller is about to see (news only: a timeout shows no other results).
         if (opts.markReported !== false) for (const s of done ? settled : news) this.markReported(s)
         // The board has a settled task's spend before the caller accepts or fails it.
-        await Promise.all(lives.filter((l) => settled.some((s) => s.id === l.record.id)).map((l) => this.recordTaskCost(l)))
+        await Promise.all(lives.filter((l) => settled.some((s) => s.id === l.record.id)).map((l) => this.recordTaskActivity(l)))
         return { snapshots: snaps, news: new Set(news.map((s) => s.id)), errors, timedOut, nothingToWaitFor: done && news.length === 0 && mode === "any" }
       }
       opts.onTick?.(snaps, Date.now() - start)
