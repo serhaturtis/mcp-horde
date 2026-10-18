@@ -9,7 +9,7 @@ You plan and judge; workers do the typing. Your context is the scarce resource: 
 
 ## 0. Before the first task
 
-- `opencode_models` to see what can run. Pick tiers: tier 0 = the cheapest model that can plausibly do small, well-specified tasks; tier 1 = a stronger one; the last tier is you. If the repository has `horde.json` with `"tiers"`, use those.
+- `opencode_models` to see what can run. Pick tiers: tier 0 = the cheapest model that can plausibly do small, well-specified tasks; tier 1 = a stronger one; the last tier is you. If the repository has `horde.json` with `"tiers"` (`["provider/model", { "model": "provider/model", "variant": "high" }, …]`, cheapest first), task-bound spawns pick the tier's model themselves; otherwise pass `model`.
 - `context_map` if you do not know the project yet: layout, entry points, test directories, instruction files. Use `context_find` / `context_symbol` / `context_file` instead of reading whole files while you plan.
 - `verify_detect` in the repository: these are the checks every gate runs. If it finds none, ask the user for the test command (or add `verify.checks` to `horde.json`) before delegating; a gate without checks only audits the diff.
 
@@ -23,9 +23,9 @@ You plan and judge; workers do the typing. Your context is the scarce resource: 
 
 ## 2. Run each ready task
 
-For each task from `board_next` (several in parallel, within `HORDE_OPENCODE_MAX_RUNNING`):
+For each task from `board_next` (it shows each task's tier; several in parallel, within the running limit: `opencode.maxRunning` in `horde.json`, default 8):
 
-1. `opencode_spawn { task: <id>, name, model: <tier model>, variant?, limits: { max_cost_usd, timeout_minutes } }`. The agent gets the board's brief (goal, done criteria, scope, code context, reporting commands), runs in its own worktree, and is gated on the task's scope. Add `prompt` for extra instructions only. Use `worktree.link: ["node_modules"]` (or the language's equivalent) and `worktree.setup` when the project needs dependencies to run its checks.
+1. `opencode_spawn { task: <id>, name, model?: <tier model, when horde.json has no tiers>, variant?, limits?: { max_cost_usd, timeout_minutes } }` (no limit unless you set one). The agent gets the board's brief (goal, done criteria, scope, code context, reporting commands), runs in its own worktree, and is gated on the task's scope. Add `prompt` for extra instructions only. Use `worktree.link: ["node_modules"]` (or the language's equivalent) and `worktree.setup` when the project needs dependencies to run its checks.
 2. (Without `task`, the manual way: `board_brief { id, agent }` and pass the brief **unchanged** as the `prompt`, with `isolation: "worktree"` and `gate: { allowed: <task scope> }`.)
 3. Keep going with other tasks; do not watch one worker.
 
@@ -34,12 +34,12 @@ For each task from `board_next` (several in parallel, within `HORDE_OPENCODE_MAX
 `opencode_wait` returns the next worker with news. For each:
 
 - **`gate: ✓ PASS`** → `board_task { id }` and read the report: what changed, tests added, **unverified claims**, questions. For task-bound agents the board checks the report against the actual diff: a `⚠ claimed but not in the diff` line means the worker said it did something it did not. Accept only if the report holds up against the acceptance criteria; anything unverified that matters is yours to check (`opencode_worktree diff` for a specific file, `verify_gate`, or a follow-up message).
-  Then `opencode_worktree { action: "merge" }` (in dependency order), `board_accept { id, cost }`, `opencode_dispose { worktree: "remove" }`. Gates run only the tests related to a worker's change (the verdict says "related tests only"), so after merges run the full suite once with `verify_run` in the main checkout.
-- **`gate: ✗ FAIL (round N/N)`** → the worker already had its tries. Read the verdict (it says what fails, where). Either `opencode_message` it once more with a precise hint, or `board_fail { id, reason, escalate: true }` and re-brief it on the next tier. Two failed gates on one tier means escalate, not retry.
+  Then `opencode_worktree { action: "merge" }` (in dependency order), `board_accept { id }`, `opencode_dispose { worktree: "remove" }`. The board records the attempt's cost itself. Gates run only the tests related to a worker's change (the verdict says "related tests only"); the merge runs the project's full checks in your checkout and shows the verdict, so a merge that breaks something is caught there: fix it, or `sync` and message the worker.
+- **`gate: ✗ FAIL (round N/N)`** → the worker already had its tries. Read the verdict (it says what fails, where). Either `opencode_message` it once more with a precise hint, or `board_fail { id, reason, escalate: true }` (it names the next tier's model) and spawn the task again. Two failed gates on one tier means escalate, not retry.
 - **`NEEDS_INPUT`** → answer with `opencode_respond`. Questions about intent are yours to answer from the plan; permission requests outside the task's scope should usually be rejected with a reason.
 - **`INTERRUPTED` / `ERROR`** → read the reason; `opencode_resume` or `board_fail`.
 
-`board_summary` shows the whole picture in one call whenever you lose track.
+`board_summary` shows the whole picture in one call whenever you lose track. The user can see the same with `horde status` in a terminal.
 
 A merge that conflicts with work merged before it: `opencode_worktree { action: "sync" }` on the waiting worker replays its commits onto your branch's tip (it aborts cleanly on conflicts and names the files), then `opencode_message` it to re-run its checks; the gate runs again when it finishes.
 

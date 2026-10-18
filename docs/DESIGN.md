@@ -1,6 +1,6 @@
 # mcp-horde: system design
 
-Status: October 2026. Built: `@mcp-horde/opencode`, `@mcp-horde/core`, `@mcp-horde/verify`, gates in `opencode` (M0, M1), `@mcp-horde/board` with its worker CLI, the `horde` Claude Code plugin with its orchestration skill (M2), `@mcp-horde/context` with code context in briefs and related-test gates (M3), and the M4 refinements (one-shot asks, scopes, worktree sync, revert, saved permissions, task-bound spawns that check reports against the diff; compaction waits on OpenCode). Planned: M5.
+Status: October 2026. Built: `@mcp-horde/opencode`, `@mcp-horde/core`, `@mcp-horde/verify`, gates in `opencode` (M0, M1), `@mcp-horde/board` with its worker CLI, the `horde` Claude Code plugin with its orchestration skill (M2), `@mcp-horde/context` with code context in briefs and related-test gates (M3), and the M4 refinements (one-shot asks, scopes, worktree sync, revert, saved permissions, task-bound spawns that check reports against the diff; compaction waits on OpenCode), and the integration pass after it (model tiers from `horde.json`, attempt costs recorded on the board automatically, checks on the main checkout after every merge, `opencode.maxRunning` in `horde.json`, `horde status` for humans). Planned: M5.
 
 ## 1. What this is for
 
@@ -150,7 +150,7 @@ To verify before building: whether `tools: {"*": false}` is honoured in a profil
 
 When `opencode` starts the shared or private server it sets `OPENCODE_CONFIG_CONTENT` with `mcp` entries for the worker-side horde servers that are installed and enabled (`HORDE_WORKER_TOOLS=board,context,verify`, default: whichever are resolvable next to this package). Each is `type: "local"` with `command: [process.execPath, <bin>, "--worker"]` and `environment` carrying the state dir. In attach mode the server is the user's; the README gives the `opencode.json` snippet. The injected config never changes agents or permissions (the shared server is also the human's TUI server).
 
-Also: the snapshot rendering gains a `task:` line when a board binding exists (§10), `HORDE_OPENCODE_MAX_RUNNING` becomes a horde-wide `maxRunning` in `horde.json` with the env var as override, and the health check moves to `v2.health`.
+Also built: the snapshot shows a `task:` line when a board binding exists (§10); the running limit is `opencode.maxRunning` in `horde.json`, with `HORDE_OPENCODE_MAX_RUNNING` as override (default 8, 0 = unlimited); a task-bound spawn without `model` takes the model and variant of the task's tier; `opencode_worktree merge` runs the project's checks (no audit) in the main checkout after merging and reports the verdict (`check: false` skips it). The health check stays in `compat.ts`: v2's `/api/health` reports liveness only, not the version.
 
 ### 4.3 `@mcp-horde/verify`
 
@@ -194,7 +194,7 @@ The shared task graph. One server, two modes: orchestrator (default) and `--work
   attempts: [{ n, agent, session, model, startedAt, endedAt?, verdict?, cost? }],
   reports: Report[],         // from the worker, see below
   questions: [{ at, text, answer? }],
-  cost: number,              // sum over attempts (from opencode snapshots the orchestrator passes in)
+  cost: number,              // sum over attempts (task-bound agents record theirs as they settle; accept/fail may override)
   parent?: string,           // epic / feature grouping
   token: string,             // the worker quotes it; weak identity, not security
   createdAt, updatedAt
@@ -253,7 +253,7 @@ Distribution and procedure. A plugin directory with:
 - `skills/horde/SKILL.md`: the orchestration procedure the strong model follows. Plan with `board_plan` (small tasks, each with observable acceptance and a scope). For each ready task: `board_brief` → `opencode_spawn` with `gate`, `scope`, `isolation: "worktree"`, model from the task's tier → `opencode_wait` (gated) → read the verdict and the report, not the transcript → `board_accept` or `board_fail` → `opencode_worktree merge` in dependency order, `verify_gate` on the integrated result. Escalation: two failed gates raise the tier; the top tier is "do it yourself". Best-of-N for hard, well-specified tasks: spawn N on cheap tiers, gate filters, `opencode_ask` judges the survivors' diffs. Steer with `opencode_message` when a worker drifts; never let a worker run more than `limits` allow. What not to do: reading transcripts before a gate has failed twice, re-briefing from memory instead of `board_brief`, merging without a gate.
 - A worker brief template (the fixed part `board_brief` emits), kept here so humans can read and tune it.
 
-The playbook is also the place for the tier table users edit (`horde.json` `tiers`), with examples for DeepSeek, Kimi, GLM, Qwen and local models.
+The playbook also explains the tier table users edit (`horde.json` `tiers`, §5).
 
 ## 5. Configuration: one `horde.json`
 
@@ -262,11 +262,10 @@ At the repository root (optional; everything auto-detects without it):
 ```json
 {
   "project": "myapp",
-  "maxRunning": 8,
+  "opencode": { "maxRunning": 8 },
   "tiers": [
     { "model": "deepseek/deepseek-v4-flash", "variant": "high" },
-    { "model": "moonshot/kimi-k3" },
-    { "model": "orchestrator" }
+    "moonshot/kimi-k3"
   ],
   "verify": {
     "checks": { "test": "npm test", "typecheck": "npm run typecheck", "lint": "npm run lint" },
@@ -278,7 +277,7 @@ At the repository root (optional; everything auto-detects without it):
 }
 ```
 
-Environment variables remain for machine-level settings (state dirs, the OpenCode binary, server mode, passwords), as `opencode` does today. Project behaviour lives in `horde.json`, so it is versioned with the code and shared by every horde server and both sides.
+`tiers` lists worker models cheapest first, as `"provider/model"` or `{ model, variant }`; a task's tier indexes it, and the tier past the last entry is the orchestrator itself (a task-bound spawn there is refused with that explanation; an explicit `model` always wins). Environment variables remain for machine-level settings (state dirs, the OpenCode binary, server mode, passwords), as `opencode` does today. Project behaviour lives in `horde.json`, so it is versioned with the code and shared by every horde server and both sides.
 
 ## 6. Flows
 
@@ -344,14 +343,14 @@ Rules that keep this true: every tool takes a `budget` argument with a sane defa
 3. **Call overhead for the orchestrator.** Five calls per task is a lot. Decided: the gate loop lives inside `opencode` (no orchestrator involvement for retries); `board_brief` composes context and memory in one call; later, `opencode_spawn { task }` fetches the brief and records the assignment itself, cutting a task to three calls (`board_plan`, `opencode_spawn`, `opencode_wait` + `board_accept`).
 4. **Scope enforcement.** `edit` permission globs in a per-agent profile (worktrees only) plus the audit as backstop. `bash` writes cannot be fenced reliably; accepted and documented.
 5. **Test time.** Related tests in the worker gate, full suite at integration, verdict cache so polling never re-runs anything.
-6. **Merge conflicts between parallel workers.** Scopes, locks, `worktree sync` so the cheap model resolves conflicts under a gate; integration gate after every merge.
+6. **Merge conflicts between parallel workers.** Scopes, locks, `worktree sync` so the cheap model resolves conflicts under a gate; the project's checks on the main checkout after every merge (built: `opencode_worktree merge`).
 7. **Log compaction without a model.** Per-runner extractors with exact counts and a tail fallback; `opencode_ask` with a cheap model as the optional second stage.
 8. **One-shot calls without leaving v2.** Agents cannot be injected via config content (verified) and v2 prompts carry no per-call tool or format options, so `opencode_ask` uses a tool-less agent profile in a horde-owned directory and validates JSON client-side. Verified in M4: `tools: { "*": false }` disables every tool.
 9. **No daemon.** Everything is files plus locks; stdio only. Cost: no push from board to workers; workers read findings when they start and when the orchestrator steers them to.
 10. **Verifying worker claims.** Reports have `unverifiedClaims`; the audit cross-checks claimed tests against the diff; the gate is the only path to done.
-11. **Escalation.** Tiers in `horde.json`; attempts record the tier; the playbook escalates after two failed gates; the final tier is the orchestrator.
-12. **Cost.** `opencode` estimates from the catalog; `board_accept`/`board_fail` take the cost from the snapshot; `board_summary` totals it. Budget enforcement stays in `opencode` limits (per turn) with a per-task `maxCostUsd` the brief converts into limits.
-13. **Observability.** `events.jsonl` plus `board status` on the command line now; a TUI later.
+11. **Escalation.** Built: tiers in `horde.json`; a task-bound spawn picks the tier's model; `board_fail { escalate }` moves to the next tier and says which model that is; the playbook escalates after two failed gates; past the last tier is the orchestrator.
+12. **Cost.** Tracking, not budgets. `opencode` estimates from the catalog; a task-bound agent's spend is written to its attempt whenever it settles (and when it is disposed), so `board_task`/`board_summary` show it without the orchestrator passing anything; `board_accept`/`board_fail` may still override it. There is no spending limit unless the caller sets `limits.max_cost_usd` on a spawn (per turn); the default is none.
+13. **Observability.** Built: `events.jsonl`, and `horde status [task id]` on the command line (the board summary, or one task in full with its report checked against the diff; read-only, and not a worker command, so the fleet never approves it). A TUI later (M5).
 14. **Configuration sprawl.** One `horde.json`; env vars only for machine-level settings.
 15. **Many servers in the client.** Claude Code defers tool loading, so eight servers' worth of descriptions do not sit in context; descriptions stay terse; the plugin registers everything in one step.
 16. **The shared server is also the human's.** Injected config may add MCP mounts but must never change agents, permissions or models. A horde server mounted into the human's own TUI sessions is harmless: without a task token its worker tools only read.
@@ -361,11 +360,11 @@ Rules that keep this true: every tool takes a `budget` argument with a sane defa
 
 - ~~An injected `mcp` local server connects and its tools appear in sessions~~ (answered in M2: connects, but v2 runners do not offer its tools).
 - ~~One MCP process per server or per project directory~~ (answered: per directory, started lazily, cwd = the directory).
-- `tools: {"*": false}` semantics in an agent profile; whether `/api/agent` exposes the resolved tool list to enumerate from.
-- How reliably cheap models return valid JSON when asked in the prompt (drives the retry count in `opencode_ask`).
-- `session.compact` behaviour on an idle session and what `session.context` reports; `session.revert.stage` semantics for a turn with several messages.
-- `permission.edit` glob semantics: relative to the project root, and whether `write`/`patch` honour the same map.
-- Whether `web-tree-sitter` WASM grammars load acceptably fast for the v2 `context`.
+- ~~`tools: {"*": false}` semantics in an agent profile~~ (answered in M4: it disables every tool. OpenCode's free tier refuses such agents with 403 `FreeTierError`, hence `opencode_ask`'s guarded fallback, §3).
+- ~~How reliably cheap models return valid JSON when asked in the prompt~~ (answered in M4: usually on the first try with the schema in the prompt; one retry with the validation error covers the rest in the live suite).
+- ~~`session.compact` on v2 sessions; `session.revert.stage` semantics~~ (answered in M4: compaction answers 503 "not available" on 1.19.3 and the legacy summarize does not reach v2 sessions, so `opencode_compact` explains the workaround; `revert.stage { messageID, files: true }` keeps everything up to and including that message, and file snapshots land shortly after a step ends).
+- ~~`permission.edit` glob semantics~~ (answered in M4: globs are relative to the project root and the v2 `write`/`patch` tools honour the same map).
+- Whether `web-tree-sitter` WASM grammars load acceptably fast for the v2 `context` (open; M5).
 
 Each goes into a `probe/` script in the relevant package, like the probes used while building `opencode`, and becomes an integration test once the behaviour is confirmed.
 
@@ -378,6 +377,7 @@ Each goes into a `probe/` script in the relevant package, like the probes used w
 | **M2** ✓ `board` (MCP for the orchestrator, an auto-approved CLI for workers) + the `horde` plugin with its skill | shared task graph, reports, findings, memory; the procedure, proven end to end by a mock run (`opencode/test/flow.test.ts`) | turns ad-hoc delegation into a tracked workflow |
 | **M3** ✓ `context` v1 + `board_brief` composition + related-test gates | precise briefs; gates that run only the tests reaching the change (transitively through imports), with a full-suite fallback whenever that is not safe | closes most of the quality gap for fast models |
 | **M4** ✓ `opencode_ask`, `scope`, `worktree sync`, `opencode_compact`, `opencode_revert`, `opencode_permissions`, `opencode_spawn { task }` (+ report-vs-diff checks, context use in status, prices in the catalog) | one-shot calls and judging; scope enforcement; conflict handling; context and undo for long tasks; fewer calls | refinements once the loop works end to end |
+| **Integration** ✓ tiers from `horde.json`, automatic attempt costs, checks after merges, `opencode.maxRunning`, `horde status` | the loop without hand-carried models, costs or limits | gaps found by running the whole flow |
 | **M5** tree-sitter `context`, `board` TUI (plugin packaging done early: bundled servers, no npm) | depth and visibility | after the shape is proven |
 
 Each milestone ships with the same bar as `opencode`: unit tests, integration tests against a real `opencode serve` with the mock LLM, CI on Linux, macOS and Windows on Node 20 and 22, READMEs updated.

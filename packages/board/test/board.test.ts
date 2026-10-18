@@ -64,6 +64,7 @@ describe("trusted commands", () => {
       `${cmd} finding *`,
       `${cmd} plan t-1 tok`,
       `${cmd} accept t-1 tok`,
+      `${cmd} status`,
       `node /tmp/evil.js --state ${state} task t-1 tok`,
       `${cmd.replace("--state", "--statex")} task t-1 tok`,
       `${cliArgv().join(" ")} task t-1 tok`,
@@ -176,6 +177,10 @@ describe("board", () => {
     assert.match(summary, /^3 tasks: 1 claimed, 1 review, 1 open/)
     assert.match(summary, /review {2}t-\w+ "API": Added a sliding-window limiter.*\(confidence medium, 1 unverified, 1 question\(s\)\)/)
     assert.match(summary, /locks {3}src\/shared\/rate\.ts → t-/)
+    // Humans read the same from the command line.
+    const human = `${cliArgv().join(" ")} status --state "${board.dir.replace(/\\/g, "/")}"`
+    assert.match(sh(human, root), /^3 tasks: 1 claimed, 1 review, 1 open/)
+    assert.match(sh(`${human} ${api!.id}`, root), /API" — review[\s\S]*sliding-window limiter/)
 
     // The finding reaches the next brief that touches the same paths.
     await board.accept(api!.id, { cost: 0.04 })

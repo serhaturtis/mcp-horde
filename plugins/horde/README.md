@@ -10,6 +10,20 @@ Bundles the horde for Claude Code:
 /plugin install horde@mcp-horde
 ```
 
+## Configuration
+
+Optional, in the repository's `horde.json`: the worker models per tier, cheapest first, and the running limit (default 8):
+
+```json
+{
+  "tiers": [{ "model": "deepseek/deepseek-v4-flash", "variant": "high" }, "moonshot/kimi-k3"],
+  "opencode": { "maxRunning": 4 },
+  "verify": { "checks": { "test": "npm test" } }
+}
+```
+
+To see the board from a terminal while the horde works: `node <plugin dir>/servers/cli.js status` in the repository (add a task id for one task in full).
+
 ## Requirements
 
 - Node.js 20 or newer.

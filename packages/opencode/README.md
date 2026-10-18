@@ -15,7 +15,7 @@ It is built on OpenCode's **v2 server API** (`/api/*`, through `@opencode-ai/sdk
 | Run agents in parallel without collisions, each in its own git worktree and branch | `opencode_spawn` `isolation: "worktree"` |
 | Confine an agent's file edits to some paths: OpenCode refuses the rest (`outside: "deny"`) or asks you (`"ask"`, whatever the permission policy) | `opencode_spawn` `scope` (worktree only; `bash` writes are caught by the gate's audit instead) |
 | Check an agent's work mechanically when it finishes, and send failures back to it to fix | `opencode_spawn` / `opencode_message` `gate` |
-| Work a task from [`@mcp-horde/board`](../board): the board's brief as the prompt, a worktree and a gate on the task's scope, the attempt (and its worktree) recorded on the board | `opencode_spawn` `task` |
+| Work a task from [`@mcp-horde/board`](../board): the board's brief as the prompt, a worktree and a gate on the task's scope, the model of the task's tier (`horde.json` `tiers`) unless you pass one, the attempt, its worktree and its cost recorded on the board | `opencode_spawn` `task` |
 | Get notified when agents finish | `opencode_wait` (returns each result once), or channel push (below) |
 | See live what an agent is doing (current tool, streaming text, retries, cost) | `opencode_status` |
 | Interact while it runs: `steer` (next step) or `queue` (after the turn). Can switch model, effort, profile, policies or limits | `opencode_message` |
@@ -80,7 +80,7 @@ Each agent can have per-turn safety limits: `max_steps`, `max_cost_usd`, `timeou
 
 Limits are enforced by an MCP server process. With a shared server, an agent keeps working after every MCP process exits, and its limits are only checked again when one starts (it catches up at startup).
 
-The server also caps how many agents can work at once (`HORDE_OPENCODE_MAX_RUNNING`, default 8).
+The server also caps how many agents can work at once: `opencode.maxRunning` in the project's `horde.json`, overridden by `HORDE_OPENCODE_MAX_RUNNING` (default 8, `0` = unlimited). There is no spending limit unless you set `max_cost_usd`.
 
 ### Several MCP sessions
 
@@ -93,7 +93,7 @@ With `isolation: "worktree"`, the agent gets a new worktree on branch `horde/<na
 - **Uncommitted work:** your uncommitted and untracked changes are carried over (`include_uncommitted`, default on) as a baseline commit, so the agent sees what you see. Merges skip that baseline.
 - **Dependencies:** `link` symlinks untracked paths such as `node_modules` or `.env` from your checkout (relative paths only; on Windows, files that can't be symlinked are copied), and `setup` runs a command (e.g. `npm ci`) before the agent starts. Linked paths are never committed. `submodules: true` initializes submodules in the worktree. Long setups report progress and can be cancelled.
 - **Commits:** the agent is told to commit on its branch.
-- **Merging back:** `opencode_worktree merge` replays only the agent's own commits onto your current branch; a later merge only brings commits made since. `squash` stages them without committing (it needs a clean index). The merge is refused on a detached HEAD, while a merge, rebase or cherry-pick is in progress, or when the agent made merge commits. On a conflict the merge is aborted and your checkout is left unchanged.
+- **Merging back:** `opencode_worktree merge` replays only the agent's own commits onto your current branch; a later merge only brings commits made since. `squash` stages them without committing (it needs a clean index). The merge is refused on a detached HEAD, while a merge, rebase or cherry-pick is in progress, or when the agent made merge commits. On a conflict the merge is aborted and your checkout is left unchanged. After a merge that brought new commits, the project's checks (as `verify` detects them, without the audit) run in your checkout and the verdict is part of the answer, since a worker's gate only judged its own branch; `check: false` skips them.
 - **Cleanup:** `opencode_dispose` keeps the worktree by default and commits leftover changes so nothing is lost. `remove` deletes the worktree but keeps the branch if it has commits; `discard` drops uncommitted changes.
 
 ### Push notifications (Claude Code channels)
@@ -142,7 +142,7 @@ The model, effort, profile, directory, policies and limits are chosen by the cal
 | `HORDE_OPENCODE_BIN` | `opencode` | Binary used to start `opencode serve`. |
 | `HORDE_OPENCODE_DIRECTORY` | current directory | Default working directory for agents; relative `directory` arguments resolve against it. |
 | `HORDE_OPENCODE_PERMISSIONS` | `user` | Default permission policy. |
-| `HORDE_OPENCODE_MAX_RUNNING` | `8` | Maximum number of agents working at once (`0` = unlimited). |
+| `HORDE_OPENCODE_MAX_RUNNING` | `horde.json` `opencode.maxRunning`, else `8` | Maximum number of agents working at once (`0` = unlimited). |
 | `HORDE_OPENCODE_CHANNEL` | off | Push Claude Code channel notifications (`1`/`true`/`yes`/`on`, any case). |
 | `HORDE_OPENCODE_DIALOG_TIMEOUT` | `600` | Seconds a permission or question dialog waits for the human before the request goes to the calling model. |
 | `HORDE_OPENCODE_STATE_DIR` | `~/.local/state/mcp-horde/opencode` | One record per agent (`agents/<id>.json`), the shared-server record and its password file (all mode 0600). |
