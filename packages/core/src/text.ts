@@ -1,7 +1,13 @@
 /** Cut long text at the end, saying how much was dropped. */
 export function truncate(text: string, max: number): string {
   if (text.length <= max) return text
-  return `${text.slice(0, Math.max(0, max - 20))}… [+${text.length - max + 20} chars]`
+  // The marker counts against max; what it reports is exactly what was dropped.
+  let keep = Math.max(0, max - 16)
+  for (;;) {
+    const marker = `… [+${text.length - keep} chars]`
+    if (keep + marker.length <= max || keep === 0) return `${text.slice(0, keep)}${marker}`
+    keep = Math.max(0, max - marker.length)
+  }
 }
 
 /** Keep the end of long text (for logs and transcripts the latest part matters most). */
@@ -83,11 +89,15 @@ export function fitSections(sections: Section[], maxChars: number, separator = "
     }
     drop(s)
   }
-  // A grown note can push the total over: give back the latest optional sections.
+  // A grown note can push the total over: shorten the latest optional section to fit, and
+  // give it back only when too little of it would be left.
   while (render().length > maxChars) {
     const i = kept.findLastIndex((k) => !k.section.required)
     if (i < 0) break
-    drop(kept.splice(i, 1)[0]!.section)
+    const k = kept[i]!
+    const shorter = k.text.length - (render().length - maxChars)
+    if (shorter > 40 && shorter < k.text.length) k.text = truncate(k.section.text, shorter)
+    else drop(kept.splice(i, 1)[0]!.section)
   }
   return render()
 }

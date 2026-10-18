@@ -7,6 +7,7 @@ import { describe, test } from "node:test"
 import {
   fitSections,
   formatDuration,
+  globMatcher,
   loadHordeFile,
   loadTiers,
   readJson,
@@ -122,6 +123,22 @@ describe("runCommand", () => {
     assert.equal(fs.existsSync(marker), false, "the grandchild was killed with its parent")
   })
 
+  test("a shell that exits while its background children hold the output is still stopped", { skip: process.platform === "win32" }, async () => {
+    const dir = tmp()
+    const t0 = Date.now()
+    const r = await runCommand(`${JSON.stringify(process.execPath)} -e "setInterval(() => {}, 1000)" & echo hi`, { cwd: dir, timeoutMs: 400 })
+    assert.ok(Date.now() - t0 < 3000, `took ${Date.now() - t0}ms`)
+    assert.match(r.output, /hi/)
+    const lingering = await runCommand(`${JSON.stringify(process.execPath)} -e "setInterval(() => {}, 1000)" & echo bye`, { cwd: dir })
+    assert.equal(lingering.code, 0, "the command itself succeeded; its leftover child was stopped after a grace period")
+    assert.match(lingering.output, /bye/)
+    // A daemon that left the process group still cannot hold the result hostage.
+    const t1 = Date.now()
+    const escaped = await runCommand(`setsid ${JSON.stringify(process.execPath)} -e "setTimeout(() => {}, 20000)" & echo away`, { cwd: dir, timeoutMs: 300 })
+    assert.ok(Date.now() - t1 < 6000, `took ${Date.now() - t1}ms`)
+    assert.match(escaped.output, /away/)
+  })
+
   test("abort stops the command", async () => {
     const dir = tmp()
     const ac = new AbortController()
@@ -129,6 +146,42 @@ describe("runCommand", () => {
     setTimeout(() => ac.abort(), 200)
     const r = await p
     assert.equal(r.stopped, "cancelled")
+  })
+})
+
+describe("text and config edge cases", () => {
+  test("fitSections under a tight budget shortens the last optional section instead of dropping everything", () => {
+    const out = fitSections(
+      [
+        { text: "## Head", required: true },
+        { text: "A".repeat(800), omitted: (n: number) => `(${n} more file(s) omitted)`, group: "files" },
+        { text: "B".repeat(800), omitted: (n: number) => `(${n} more file(s) omitted)`, group: "files" },
+        { text: "C".repeat(800), omitted: "(definitions omitted)" },
+      ],
+      1000,
+    )
+    assert.ok(out.length <= 1000, String(out.length))
+    assert.ok(out.length > 600, `kept content: ${out.length}`)
+    assert.match(out, /A{100}/)
+  })
+
+  test("truncate never exceeds its limit and counts what it dropped", () => {
+    for (const max of [5, 10, 19, 20, 50]) {
+      const out = truncate("x".repeat(100), max)
+      assert.ok(out.length <= max || max < 12, `${max}: ${out}`)
+      const kept = out.indexOf("…")
+      assert.match(out, new RegExp(`\\[\\+${100 - kept} chars\\]$`))
+    }
+  })
+
+  test("horde.json outside a repository: only the directory itself", () => {
+    const outer = tmp()
+    fs.writeFileSync(path.join(outer, "horde.json"), "{ not json")
+    const inner = path.join(outer, "loose")
+    fs.mkdirSync(inner)
+    assert.deepEqual(loadHordeFile(inner).data, {}, "an unrelated horde.json above is ignored")
+    fs.writeFileSync(path.join(inner, "horde.json"), JSON.stringify({ tiers: ["a/b"] }))
+    assert.deepEqual(loadHordeFile(inner).data, { tiers: ["a/b"] })
   })
 })
 
@@ -193,5 +246,14 @@ describe("horde.json", () => {
     assert.throws(() => tierModel(2, tiers, "t-1"), /t-1 is at tier 2, past the last of the 2 tier\(s\) in horde\.json: the last tier is you/)
     fs.writeFileSync(path.join(repo, "horde.json"), JSON.stringify({ tiers: [{ model: "no-provider" }] }))
     assert.throws(() => loadTiers(repo), /"tiers"\[0\] needs "model": "provider\/model"/)
+  })
+})
+
+describe("globMatcher", () => {
+  test("brace alternatives and character classes", () => {
+    const m = globMatcher(["src/{auth,api/v{1,2}}/**", "*.{ts,tsx}", "doc[0-9].md", "x[!a].txt"])
+    for (const p of ["src/auth/a.js", "src/api/v1/x.js", "src/api/v2/y/z.js", "a.ts", "deep/b.tsx", "doc3.md", "xb.txt"]) assert.ok(m(p), p)
+    for (const p of ["src/api/v3/x.js", "src/other/a.js", "a.js", "docx.md", "xa.txt", "x/.txt"]) assert.ok(!m(p), p)
+    assert.ok(globMatcher(["{a}.md"])("{a}.md"), "a brace without alternatives is literal")
   })
 })

@@ -62,8 +62,7 @@ export function runCommand(command: string, opts: RunOptions): Promise<RunResult
     let tail = ""
     let total = 0
     let lastLine = ""
-    const collect = (chunk: Buffer) => {
-      const text = chunk.toString()
+    const collect = (text: string) => {
       total += text.length
       if (head.length < half) {
         const room = half - head.length
@@ -73,29 +72,60 @@ export function runCommand(command: string, opts: RunOptions): Promise<RunResult
       const lines = text.trimEnd().split("\n")
       lastLine = lines[lines.length - 1] ?? lastLine
     }
+    // Decoded per stream, so a character split across chunks stays whole.
+    child.stdout.setEncoding("utf8")
+    child.stderr.setEncoding("utf8")
     child.stdout.on("data", collect)
     child.stderr.on("data", collect)
     let stopped: RunResult["stopped"]
+    // The whole group, even when the shell itself has exited: what it started in the
+    // background can still hold the output pipes open, and "close" waits for them.
     const killAll = () => {
-      if (child.exitCode !== null || child.pid === undefined) return
-      killTree(child.pid, !isWindows, "SIGKILL")
+      if (child.pid !== undefined) killTree(child.pid, !isWindows, "SIGKILL")
+    }
+    // After a timeout or abort, give up on output a process outside the group still holds.
+    const stopReading = () => {
+      const t = setTimeout(() => {
+        child.stdout.destroy()
+        child.stderr.destroy()
+      }, 3_000)
+      t.unref()
     }
     const timer = setTimeout(
       () => {
         stopped = "timeout"
         killAll()
+        stopReading()
       },
       opts.timeoutMs ?? 10 * 60_000,
     )
     const onAbort = () => {
       stopped = "cancelled"
       killAll()
+      stopReading()
     }
     if (opts.signal?.aborted) onAbort()
     opts.signal?.addEventListener("abort", onAbort)
     const ticker = opts.onProgress ? setInterval(() => opts.onProgress?.(lastLine.slice(0, 200)), opts.progressMs ?? 5_000) : undefined
+    // A command that exits while its background children keep the pipes open is done:
+    // after a grace period those children are stopped so the result can be read.
+    let linger: NodeJS.Timeout | undefined
+    // Something that left the group (setsid) can hold them even then: stop reading after
+    // two more seconds, which lets "close" fire with what was collected.
+    child.on("exit", () => {
+      linger = setTimeout(() => {
+        killAll()
+        linger = setTimeout(() => {
+          child.stdout.destroy()
+          child.stderr.destroy()
+        }, 2_000)
+        linger.unref()
+      }, 5_000)
+      linger.unref()
+    })
     const done = () => {
       clearTimeout(timer)
+      clearTimeout(linger)
       if (ticker) clearInterval(ticker)
       opts.signal?.removeEventListener("abort", onAbort)
     }

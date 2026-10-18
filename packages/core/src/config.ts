@@ -16,27 +16,37 @@ export interface HordeFile {
 
 /**
  * Look for horde.json from `directory` upwards, stopping at the repository
- * root (the first directory containing `.git`). A malformed file throws: a
- * silently ignored typo in project rules is worse than an error.
+ * root (the first directory containing `.git`). Outside a repository only
+ * `directory` itself is looked at, so an unrelated horde.json higher up (say in
+ * the home directory) never applies. A malformed file throws: a silently
+ * ignored typo in project rules is worse than an error.
  */
 export function loadHordeFile(directory: string): HordeFile {
-  let dir = path.resolve(directory)
-  for (;;) {
-    const file = path.join(dir, "horde.json")
-    if (fs.existsSync(file)) {
-      let data: unknown
-      try {
-        data = JSON.parse(fs.readFileSync(file, "utf8"))
-      } catch (err) {
-        throw new Error(`${file} is not valid JSON: ${(err as Error).message}`)
-      }
-      if (!data || typeof data !== "object" || Array.isArray(data)) throw new Error(`${file} must contain a JSON object`)
-      return { root: dir, file, data: data as Record<string, unknown> }
-    }
+  const start = path.resolve(directory)
+  const candidates: string[] = []
+  for (let dir = start; ; ) {
+    candidates.push(dir)
     const parent = path.dirname(dir)
-    if (fs.existsSync(path.join(dir, ".git")) || parent === dir) return { root: path.resolve(directory), data: {} }
+    if (fs.existsSync(path.join(dir, ".git"))) break
+    if (parent === dir) {
+      candidates.splice(1)
+      break
+    }
     dir = parent
   }
+  for (const dir of candidates) {
+    const file = path.join(dir, "horde.json")
+    if (!fs.existsSync(file)) continue
+    let data: unknown
+    try {
+      data = JSON.parse(fs.readFileSync(file, "utf8"))
+    } catch (err) {
+      throw new Error(`${file} is not valid JSON: ${(err as Error).message}`)
+    }
+    if (!data || typeof data !== "object" || Array.isArray(data)) throw new Error(`${file} must contain a JSON object`)
+    return { root: dir, file, data: data as Record<string, unknown> }
+  }
+  return { root: start, data: {} }
 }
 
 declare const HORDE_VERSION: string | undefined

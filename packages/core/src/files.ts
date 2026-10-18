@@ -53,6 +53,20 @@ export function readJson<T>(file: string): T | undefined {
 }
 
 /**
+ * Put back a lock we moved away by mistake, without clobbering one a third contender has
+ * created since (a hard link fails if the name is taken; rename would overwrite it).
+ */
+function restore(tomb: string, file: string) {
+  try {
+    fs.linkSync(tomb, file)
+  } catch (err) {
+    // No hard links on this filesystem: rename, accepting the (tiny) window.
+    if ((err as NodeJS.ErrnoException).code !== "EEXIST") fs.renameSync(tomb, file)
+  }
+  fs.rmSync(tomb, { force: true })
+}
+
+/**
  * Cross-process lock on `<dir>/<name>.lock`. The holder keeps the file fresh;
  * a lock is only taken over when its holder process is gone (same host) or it
  * has not been refreshed for 30 s. Release only removes our own lock.
@@ -91,7 +105,7 @@ export async function withLock<T>(dir: string, name: string, fn: () => Promise<T
       try {
         fs.renameSync(file, tomb)
         if (fs.readFileSync(tomb, "utf8") === content) fs.rmSync(tomb, { force: true })
-        else fs.renameSync(tomb, file)
+        else restore(tomb, file)
       } catch {
         // Another contender took it over first.
       }
