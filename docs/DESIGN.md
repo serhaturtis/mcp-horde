@@ -356,6 +356,10 @@ Rules that keep this true: every tool takes a `budget` argument with a sane defa
 16. **The shared server is also the human's.** Injected config may add MCP mounts but must never change agents, permissions or models. A horde server mounted into the human's own TUI sessions is harmless: without a task token its worker tools only read.
 17. **Staying on v2 as it moves.** Legacy calls are confined to one adapter with a test guarding the boundary; CI also runs against OpenCode's `dev` tag (non-blocking) so v2 changes are seen early; `session.wait` and project copies are watched as replacements for polling and for the horde's own worktrees.
 
+### Review pass (October 2026)
+
+A full review after M5 fixed, among others: gates that could pass with nothing run (no checks is now a FAIL; a worker's edits to `horde.json`, test scripts or runner configs are judged by the base commit's rules and flagged; renamed or moved-out tests and changed test helpers widen to the full suite; aliases, nested Go/Python projects and capped maps never narrow); a line-level audit blind under `diff.mnemonicPrefix`; trusted board commands naming another directory or carrying escape sequences (only the agent's own repository's board is trusted now); briefs whose reporting commands could be cut; spawns of a task that broke its live attempt; processes left holding a gate's output; a hung request freezing every agent's monitoring (requests and ticks time out); two MCP processes driving one agent (claims under a lock, owner heartbeats); `context_file` reading outside the project; and quadratic import resolution in large Java/Go repositories. Details are in the commit history.
+
 ## 11. Open questions to verify empirically before building
 
 - ~~An injected `mcp` local server connects and its tools appear in sessions~~ (answered in M2: connects, but v2 runners do not offer its tools).

@@ -11,7 +11,7 @@ You plan and judge; workers do the typing. Your context is the scarce resource: 
 
 - `opencode_models` to see what can run. Pick tiers: tier 0 = the cheapest model that can plausibly do small, well-specified tasks; tier 1 = a stronger one; the last tier is you. If the repository has `horde.json` with `"tiers"` (`["provider/model", { "model": "provider/model", "variant": "high" }, …]`, cheapest first), task-bound spawns pick the tier's model themselves; otherwise pass `model`.
 - `context_map` if you do not know the project yet: layout, entry points, test directories, instruction files. Use `context_find` / `context_symbol` / `context_file` instead of reading whole files while you plan.
-- `verify_detect` in the repository: these are the checks every gate runs. If it finds none, ask the user for the test command (or add `verify.checks` to `horde.json`) before delegating; a gate without checks only audits the diff.
+- `verify_detect` in the repository: these are the checks every gate runs. If it finds none, ask the user for the test command (or add `verify.checks` to `horde.json`) before delegating; a gate with no checks fails every round.
 
 ## 1. Plan
 
