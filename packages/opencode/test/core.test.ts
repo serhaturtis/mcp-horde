@@ -451,6 +451,7 @@ describe("opencode MCP server: core behaviour (real opencode, mock LLM)", { time
       wait: true,
       timeout_seconds: 60,
     })
+    assert.match(outside, /Unable to write elsewhere\.txt/, "the agent is told the write failed")
     assert.ok(!fs.existsSync(path.join(dir, "elsewhere.txt")), "the out-of-scope write was refused")
     await h.call("opencode_dispose", { id: "scoped", worktree: "discard" })
     // outside "ask": the out-of-scope edit comes to the caller even under the "allow" policy.
