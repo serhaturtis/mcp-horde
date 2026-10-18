@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import path from "node:path"
+import { loadSyntax } from "@mcp-horde/context"
 import { loadTiers, packageVersion, tierLabel } from "@mcp-horde/core"
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
@@ -236,4 +237,6 @@ tool(
 )
 
 process.stdin.on("close", () => process.exit(0))
+// Grammars for code context (briefs, related tests); without them line patterns answer.
+await loadSyntax()
 await server.connect(new StdioServerTransport())

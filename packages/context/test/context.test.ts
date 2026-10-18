@@ -3,10 +3,28 @@ import { execFileSync } from "node:child_process"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { describe, test } from "node:test"
+import { before, describe, test } from "node:test"
 import { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
-import { definitions, excerpt, find, importGraph, importSpecs, openProject, pack, projectMap, symbol, testsFor } from "../src/lib.js"
+import {
+  excerpt,
+  find,
+  importGraph,
+  importSpecs,
+  type Lang,
+  loadSyntax,
+  openProject,
+  pack,
+  definitions as parsedDefinitions,
+  patternDefinitions,
+  projectMap,
+  symbol,
+  syntaxStatus,
+  testsFor,
+} from "../src/lib.js"
+
+// Every test below runs on tree-sitter; "line patterns" repeats the definition tests without it.
+before(() => loadSyntax())
 
 const pkg = path.join(import.meta.dirname, "..")
 
@@ -71,9 +89,9 @@ const FILES: Record<string, string> = {
   "packages/a/test/a.test.ts": "import { thing } from '@demo/a'\nimport { other } from '@demo/a/src/other'\n",
 }
 
-function fixture(): string {
+function fixture(files = FILES): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "horde-ctx-"))
-  for (const [f, text] of Object.entries(FILES)) {
+  for (const [f, text] of Object.entries(files)) {
     fs.mkdirSync(path.dirname(path.join(dir, f)), { recursive: true })
     fs.writeFileSync(path.join(dir, f), text)
   }
@@ -94,71 +112,75 @@ describe("files", () => {
   })
 })
 
-describe("definitions", () => {
-  test("TypeScript: functions, classes, methods, interfaces, types, with docs and block ends", () => {
-    const d = definitions(FILES["src/users/service.ts"]!, "ts")
-    const by = (n: string) => d.find((x) => x.name === n)!
-    assert.deepEqual(
-      d.map((x) => `${x.kind}:${x.name}`),
-      ["function:createUser", "class:UserStore", "method:save"],
-    )
-    assert.equal(by("createUser").doc, "Create a user with a unique slug.")
-    assert.equal(by("createUser").signature, "export function createUser(name: string): User")
-    assert.deepEqual([by("createUser").line, by("createUser").end], [5, 8])
-    assert.deepEqual([by("UserStore").line, by("UserStore").end], [10, 19])
-    assert.deepEqual([by("save").line, by("save").end], [13, 18])
-    assert.ok(by("createUser").exported && !by("save").exported)
-    const t = definitions(FILES["src/users/types.ts"]!, "ts")
-    assert.deepEqual(
-      t.map((x) => `${x.kind}:${x.name}:${x.line}-${x.end}`),
-      ["interface:User:1-4", "type:Id:6-6"],
-    )
-    assert.deepEqual(
-      definitions(FILES["src/util/index.ts"]!, "ts").map((x) => x.name),
-      ["slug"],
-    )
-    const cjs = definitions("exports.add = (a, b) => a + b\nmodule.exports.sub = function (a, b) {\n  return a - b\n}\n", "js")
-    assert.deepEqual(
-      cjs.map((x) => `${x.kind}:${x.name}:${x.line}-${x.end}:${x.exported}`),
-      ["variable:add:1-1:true", "variable:sub:2-4:true"],
-      "CommonJS exports",
-    )
-    // Allman braces (C#) still span the block.
-    assert.deepEqual(
-      definitions("public class Shop\n{\n    public int Total() { return 0; }\n}\n", "cs").map((x) => `${x.name}:${x.line}-${x.end}`),
-      ["Shop:1-4", "Total:3-3"],
-    )
-  })
+for (const [mode, definitions] of [
+  ["tree-sitter", parsedDefinitions],
+  ["line patterns", patternDefinitions],
+] as const)
+  describe(`definitions (${mode})`, () => {
+    test("TypeScript: functions, classes, methods, interfaces, types, with docs and block ends", () => {
+      const d = definitions(FILES["src/users/service.ts"]!, "ts")
+      const by = (n: string) => d.find((x) => x.name === n)!
+      assert.deepEqual(
+        d.map((x) => `${x.kind}:${x.name}`),
+        ["function:createUser", "class:UserStore", "method:save"],
+      )
+      assert.equal(by("createUser").doc, "Create a user with a unique slug.")
+      assert.equal(by("createUser").signature, "export function createUser(name: string): User")
+      assert.deepEqual([by("createUser").line, by("createUser").end], [5, 8])
+      assert.deepEqual([by("UserStore").line, by("UserStore").end], [10, 19])
+      assert.deepEqual([by("save").line, by("save").end], [13, 18])
+      assert.ok(by("createUser").exported && !by("save").exported)
+      const t = definitions(FILES["src/users/types.ts"]!, "ts")
+      assert.deepEqual(
+        t.map((x) => `${x.kind}:${x.name}:${x.line}-${x.end}`),
+        ["interface:User:1-4", "type:Id:6-6"],
+      )
+      assert.deepEqual(
+        definitions(FILES["src/util/index.ts"]!, "ts").map((x) => x.name),
+        ["slug"],
+      )
+      const cjs = definitions("exports.add = (a, b) => a + b\nmodule.exports.sub = function (a, b) {\n  return a - b\n}\n", "js")
+      assert.deepEqual(
+        cjs.map((x) => `${x.kind}:${x.name}:${x.line}-${x.end}:${x.exported}`),
+        ["variable:add:1-1:true", "variable:sub:2-4:true"],
+        "CommonJS exports",
+      )
+      // Allman braces (C#) still span the block.
+      assert.deepEqual(
+        definitions("public class Shop\n{\n    public int Total() { return 0; }\n}\n", "cs").map((x) => `${x.name}:${x.line}-${x.end}`),
+        ["Shop:1-4", "Total:3-3"],
+      )
+    })
 
-  test("Python, Go, Rust, Java", () => {
-    const py = definitions(FILES["py/app/models.py"]!, "py")
-    assert.deepEqual(
-      py.map((x) => `${x.kind}:${x.name}:${x.line}-${x.end}`),
-      ["class:Order:1-7", "function:total:6-7", "variable:LIMIT:10-10"],
-    )
-    assert.equal(py[0]!.doc, "An order.\n\nHolds lines.")
-    assert.equal(definitions(FILES["py/app/api.py"]!, "py")[0]!.signature, "async def handler(req):")
-    const go = definitions(FILES["internal/calc/calc.go"]!, "go")
-    assert.deepEqual(
-      go.map((x) => `${x.kind}:${x.name}`),
-      ["function:Add", "class:Calc", "method:Sum"],
-    )
-    assert.equal(go[0]!.doc, "Add adds.")
-    assert.ok(go[0]!.exported)
-    const rs = definitions(FILES["rs/src/parser.rs"]!, "rs")
-    assert.deepEqual(
-      rs.map((x) => `${x.kind}:${x.name}:${x.line}-${x.end}`),
-      ["class:Parser:3-5", "function:parse:7-9"],
-    )
-    assert.equal(definitions(FILES["rs/src/lib.rs"]!, "rs")[0]!.doc, "Entry.")
-    const java = definitions(FILES["java/src/main/java/com/acme/Billing.java"]!, "java")
-    assert.deepEqual(
-      java.map((x) => `${x.kind}:${x.name}`),
-      ["class:Billing", "method:charge"],
-      "`return new Money(...)` is not a definition",
-    )
+    test("Python, Go, Rust, Java", () => {
+      const py = definitions(FILES["py/app/models.py"]!, "py")
+      assert.deepEqual(
+        py.map((x) => `${x.kind}:${x.name}:${x.line}-${x.end}`),
+        ["class:Order:1-7", `${mode === "tree-sitter" ? "method" : "function"}:total:6-7`, "variable:LIMIT:10-10"],
+      )
+      assert.equal(py[0]!.doc, "An order.\n\nHolds lines.")
+      assert.equal(definitions(FILES["py/app/api.py"]!, "py")[0]!.signature, "async def handler(req):")
+      const go = definitions(FILES["internal/calc/calc.go"]!, "go")
+      assert.deepEqual(
+        go.map((x) => `${x.kind}:${x.name}`),
+        ["function:Add", "class:Calc", "method:Sum"],
+      )
+      assert.equal(go[0]!.doc, "Add adds.")
+      assert.ok(go[0]!.exported)
+      const rs = definitions(FILES["rs/src/parser.rs"]!, "rs")
+      assert.deepEqual(
+        rs.map((x) => `${x.kind}:${x.name}:${x.line}-${x.end}`),
+        ["class:Parser:3-5", "function:parse:7-9"],
+      )
+      assert.equal(definitions(FILES["rs/src/lib.rs"]!, "rs")[0]!.doc, "Entry.")
+      const java = definitions(FILES["java/src/main/java/com/acme/Billing.java"]!, "java")
+      assert.deepEqual(
+        java.map((x) => `${x.kind}:${x.name}`),
+        ["class:Billing", "method:charge"],
+        "`return new Money(...)` is not a definition",
+      )
+    })
   })
-})
 
 describe("imports and tests", () => {
   test("specifiers and resolution: TS ESM .js → .ts, directory index, Python relative, Go module, Rust mod, Java packages", () => {
@@ -219,6 +241,61 @@ describe("imports and tests", () => {
         .map((t) => `${t.test} (${t.why})`),
       ["packages/a/test/a.test.ts (imports it via packages/a/src/index.ts)"],
     )
+  })
+})
+
+describe("syntax trees: what line patterns get wrong", () => {
+  test("definitions follow the grammar, not the line shape", () => {
+    assert.equal(syntaxStatus(), "tree-sitter")
+    const names = (text: string, lang: Lang, file?: string) =>
+      parsedDefinitions(text, lang, file).map((d) => `${d.kind}:${d.name}:${d.line}-${d.end}:${d.exported}`)
+    // Code inside a string or comment defines nothing; a call at the start of a line is no method.
+    assert.deepEqual(names("const tpl = `\nfunction fake() {}\n`\n/*\nclass Ghost {}\n*/\nexport function real() {\n  unwrap(\n    x,\n  )\n}\n", "ts"), [
+      "variable:tpl:1-3:false",
+      "function:real:7-11:true",
+    ])
+    // Names exported through an export list; a signature spread over lines.
+    assert.deepEqual(names("function a() {}\nconst b = 1\nexport { a, b as c }\nexport async function\nlate(x: number) {}\n", "ts"), [
+      "function:a:1-1:true",
+      "variable:b:2-2:true",
+      "function:late:4-5:true",
+    ])
+    assert.deepEqual(names("export const App = () => <div>{1}</div>\n", "ts", "src/App.tsx"), ["variable:App:1-1:true"], "TSX parses with its own grammar")
+    // Grouped Go constants, Rust impl methods, Kotlin interfaces and objects, C# records.
+    assert.deepEqual(names("package p\n\nconst (\n\tA = 1\n\tb = 2\n)\n", "go"), ["variable:A:4-4:true", "variable:b:5-5:false"])
+    assert.deepEqual(names("struct S;\nimpl S {\n    pub fn m(&self) {}\n}\n", "rs"), ["class:S:1-1:false", "method:m:3-3:true"])
+    assert.deepEqual(names("interface Shape {\n    fun area(): Double\n}\n\nobject Registry\n", "kt"), [
+      "interface:Shape:1-3:true",
+      "method:area:2-2:true",
+      "class:Registry:5-5:true",
+    ])
+    assert.deepEqual(names("public record Point(int X, int Y);\n", "cs"), ["class:Point:1-1:true"])
+    // A syntax error does not lose the definitions around it: the patterns cover the broken part.
+    assert.ok(names("export function ok() {}\nfunction broken( {\n", "ts").some((d) => d.startsWith("function:ok:")))
+  })
+
+  test("references skip comments and strings but not interpolations", () => {
+    const dir = fixture({
+      "lib.ts": "export function price(n: number) {\n  return n\n}\n",
+      "use.ts":
+        "import { price } from './lib.js'\n// price is computed here\nconst label = 'price'\nconst total = price(2)\nconst msg = `cost: $" +
+        "{price(3)}`\n/* price */ const x = 1\n",
+      "app.py": 'def total():\n    """Uses total."""\n    return 1\n\nprint(f"{total()} total")\n# total\n',
+    })
+    const p = openProject(dir)
+    assert.deepEqual(
+      find(p, "price", { kind: "reference", paths: ["use.ts"] }).hits.map((h) => h.line),
+      [1, 4, 5],
+    )
+    assert.deepEqual(
+      find(p, "total", { kind: "reference", paths: ["app.py"] }).hits.map((h) => h.line),
+      [5],
+    )
+    assert.equal(symbol(p, "price")[0]!.callCount, 3)
+    // Text search is literal: dots and spaces mean themselves.
+    assert.equal(find(p, "n: number").total, 1)
+    assert.equal(find(p, "lib.js").total, 1)
+    assert.equal(find(p, "lib?js").total, 0)
   })
 })
 

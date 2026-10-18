@@ -1,13 +1,16 @@
 import path from "node:path"
 import { isTestPath } from "@mcp-horde/core"
 import { type Project, readText } from "./files.js"
-import { type Definition, definitions, importSpecs, type Lang, langOf } from "./lang.js"
+import { type Definition, importSpecs, type Lang, langOf, patternDefinitions } from "./lang.js"
+import { type Parsed, parse } from "./syntax.js"
 
 export interface FileInfo {
   lang: Lang
   defs: Definition[]
   /** Import specifiers as written. */
   specs: string[]
+  /** Comment and string spans, when the file was parsed (see syntax.isCode). */
+  spans?: Parsed["spans"]
 }
 
 const infos = new Map<string, { text: string; info: FileInfo }>()
@@ -21,7 +24,8 @@ export function fileInfo(project: Project, rel: string): FileInfo | undefined {
   const key = path.join(project.root, rel)
   const hit = infos.get(key)
   if (hit && hit.text === text) return hit.info
-  const info = { lang, defs: definitions(text, lang), specs: importSpecs(text, lang) }
+  const parsed = parse(text, lang, rel)
+  const info = { lang, defs: parsed?.defs ?? patternDefinitions(text, lang), specs: importSpecs(text, lang), spans: parsed?.spans }
   if (infos.size > 20_000) infos.clear()
   infos.set(key, { text, info })
   return info

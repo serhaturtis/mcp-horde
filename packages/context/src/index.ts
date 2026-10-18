@@ -10,6 +10,7 @@ import { importGraph, testsFor } from "./graph.js"
 import { projectMap } from "./map.js"
 import { pack } from "./pack.js"
 import { excerpt, find, symbol } from "./search.js"
+import { loadSyntax } from "./syntax.js"
 
 const VERSION = packageVersion(import.meta.url)
 
@@ -31,7 +32,7 @@ export const INSTRUCTIONS = `context: precise code context instead of exploratio
 - context_file shows exact lines, or just the named symbols' definitions.
 - context_tests_for: which tests cover given files (run those first).
 - context_pack: a budgeted context section for a worker's brief (scoped files, named symbols, covering tests, conventions).
-Definitions and imports come from language-aware patterns (TS/JS, Python, Go, Rust, Java, Kotlin, C#): accurate for ordinary code, approximate for unusual formatting.`
+Definitions come from tree-sitter syntax trees (TS/JS, Python, Go, Rust, Java, Kotlin, C#), and references skip comments and strings; imports come from language-aware patterns.`
 
 const server = new McpServer({ name: "context", version: VERSION }, { instructions: INSTRUCTIONS })
 
@@ -179,4 +180,6 @@ tool(
     }) || "Nothing relevant found: no scope, files or named symbols matched.",
 )
 
+// Grammars for code context (briefs, related tests); without them line patterns answer.
+await loadSyntax()
 await server.connect(new StdioServerTransport())

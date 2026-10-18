@@ -2,6 +2,7 @@ import path from "node:path"
 import { fitSections, isTestPath, type Section } from "@mcp-horde/core"
 import { type Project, readText } from "./files.js"
 import { LANG_NAMES, type Lang, langOf } from "./lang.js"
+import { syntaxStatus } from "./syntax.js"
 
 const MANIFESTS =
   /(^|\/)(package\.json|pyproject\.toml|setup\.py|setup\.cfg|requirements[^/]*\.txt|Cargo\.toml|go\.mod|pom\.xml|build\.gradle(\.kts)?|settings\.gradle(\.kts)?|[^/]+\.csproj|[^/]+\.sln|Makefile|justfile|deno\.jsonc?|tsconfig\.json|horde\.json)$/
@@ -100,6 +101,7 @@ export function projectMap(project: Project, opts: { depth?: number; budgetChars
       }`,
     },
     { text: `Entry points: ${entryPoints(project).join(", ") || "none found"}` },
+    { text: langs.size ? `Definitions from: ${syntaxStatus()}` : "" },
     { text: testDirs.length ? `Test directories: ${testDirs.join(", ")}` : "" },
     { text: rootFiles.length ? `Root files: ${rootFiles.slice(0, 40).join(", ")}${rootFiles.length > 40 ? ` (+${rootFiles.length - 40})` : ""}` : "" },
     { text: tree.length ? "Directories:" : "" },

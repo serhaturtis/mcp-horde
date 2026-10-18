@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { loadSyntax } from "@mcp-horde/context"
 import { packageVersion } from "@mcp-horde/core"
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
@@ -91,6 +92,8 @@ process.on("SIGINT", shutdown)
 process.on("SIGTERM", shutdown)
 process.stdin.on("close", shutdown)
 
+// Grammars for code context (briefs, related tests); without them line patterns answer.
+await loadSyntax()
 await server.connect(new StdioServerTransport())
 
 // Reconnect to agents left running by a previous process (shared server) so

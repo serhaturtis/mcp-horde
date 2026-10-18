@@ -39,6 +39,7 @@
   },
   "dependencies": {
     "@mcp-horde/board": "^0.1.0",
+    "@mcp-horde/context": "^0.1.0",
     "@mcp-horde/core": "^0.1.0",
     "@mcp-horde/verify": "^0.1.0",
     "@modelcontextprotocol/sdk": "^1.32.1",

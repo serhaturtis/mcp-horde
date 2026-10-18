@@ -2,6 +2,7 @@ import { truncate } from "@mcp-horde/core"
 import { type Project, readText, relPath, select } from "./files.js"
 import { fileInfo } from "./graph.js"
 import type { Definition } from "./lang.js"
+import { isCode } from "./syntax.js"
 
 export interface Hit {
   file: string
@@ -20,7 +21,7 @@ const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
 export function queryRegex(query: string, word = false): RegExp {
   const m = /^\/(.+)\/([a-z]*)$/.exec(query)
   if (m) return new RegExp(m[1]!, m[2]!.replace(/g/g, ""))
-  const body = word ? `(?<![\\w$])${escapeRe(query)}(?![\\w$])` : escape(query)
+  const body = word ? `(?<![\\w$])${escapeRe(query)}(?![\\w$])` : escapeRe(query)
   return new RegExp(body, /[A-Z]/.test(query) ? "" : "i")
 }
 
@@ -52,10 +53,15 @@ export function find(project: Project, query: string, opts: FindOptions = {}): {
   for (const f of files) {
     const text = readText(project, f)
     if (text === undefined || !re.test(text)) continue
-    const defLines = kind === "reference" ? new Set((fileInfo(project, f)?.defs ?? []).filter((d) => d.name === query).map((d) => d.line)) : undefined
-    const lines = text.split(/\r?\n/)
-    for (let i = 0; i < lines.length; i++) {
+    const info = kind === "reference" ? fileInfo(project, f) : undefined
+    const defLines = info ? new Set(info.defs.filter((d) => d.name === query).map((d) => d.line)) : undefined
+    const all = info?.spans ? new RegExp(re.source, `${re.flags}g`) : undefined
+    const lines = text.split(/\n/)
+    let offset = 0
+    for (let i = 0; i < lines.length; offset += lines[i]!.length + 1, i++) {
       if (!re.test(lines[i]!) || defLines?.has(i + 1)) continue
+      // A parsed file knows its comments and strings: a mention there is no reference.
+      if (all && info?.spans && ![...lines[i]!.matchAll(all)].some((m) => isCode(info.spans!, offset + m.index))) continue
       total++
       if (hits.length < limit) hits.push({ file: f, line: i + 1, text: truncate(lines[i]!.trim(), 200) })
     }

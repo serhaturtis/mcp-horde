@@ -26,6 +26,7 @@
   },
   "files": [
     "dist",
+    "grammars",
     "README.md"
   ],
   "repository": {
@@ -42,6 +43,7 @@
   "dependencies": {
     "@mcp-horde/core": "^0.1.0",
     "@modelcontextprotocol/sdk": "^1.32.1",
+    "web-tree-sitter": "0.27.1",
     "zod": "^4.0.0"
   },
   "devDependencies": {

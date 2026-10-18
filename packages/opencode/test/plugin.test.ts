@@ -79,5 +79,7 @@ describe("plugin bundles", { timeout: 300_000 }, () => {
     assert.match(await verify("verify_detect"), /no checks|check/i)
     const context = await server("context", { HORDE_CONTEXT_DIRECTORY: repo })
     assert.match(await context("context_find", { query: "add", kind: "definition" }), /^util\.js:1 {2}/)
+    // The bundle finds its grammars next to it.
+    assert.match(await context("context_map"), /Definitions from: tree-sitter$/m)
   })
 })

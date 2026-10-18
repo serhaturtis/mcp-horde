@@ -274,7 +274,7 @@ export function blockEnd(lines: string[], start: number, lang: Lang): number {
   return start
 }
 
-function docAbove(lines: string[], i: number, lang: Lang): string | undefined {
+export function docAbove(lines: string[], i: number, lang: Lang): string | undefined {
   const out: string[] = []
   let j = i - 1
   // Skip decorators and attributes.
@@ -293,7 +293,7 @@ function docAbove(lines: string[], i: number, lang: Lang): string | undefined {
   return clean(out)
 }
 
-function docstringBelow(lines: string[], i: number): string | undefined {
+export function docstringBelow(lines: string[], i: number): string | undefined {
   let j = i + 1
   while (j < lines.length && j - i < 10 && !/:\s*(#.*)?$/.test(lines[j - 1]!)) j++
   const first = lines[j]?.trim()
@@ -321,7 +321,7 @@ const clean = (ls: string[]) => {
   return text ? text.split("\n").slice(0, 8).join("\n") : undefined
 }
 
-function signatureOf(lines: string[], i: number): string {
+export function signatureOf(lines: string[], i: number): string {
   const out = [lines[i]!.trim()]
   // Parameters spanning lines: continue until the parentheses balance (at most 6 lines).
   let open = (out[0]!.match(/\(/g)?.length ?? 0) - (out[0]!.match(/\)/g)?.length ?? 0)
@@ -335,8 +335,8 @@ function signatureOf(lines: string[], i: number): string {
   return sig.length > 240 ? `${sig.slice(0, 239)}…` : sig
 }
 
-/** Definitions in a file, in order. */
-export function definitions(text: string, lang: Lang): Definition[] {
+/** Definitions in a file, in order, from line patterns (the fallback when no grammar is loaded; see syntax.ts). */
+export function patternDefinitions(text: string, lang: Lang): Definition[] {
   const lines = text.split(/\r?\n/)
   const rules = RULES[lang]
   const out: Definition[] = []
