@@ -45,7 +45,7 @@ describe("the horde flow: board, workers, gates (real opencode, mock LLM)", { ti
     fs.writeFileSync(path.join(repo, "horde.json"), JSON.stringify({ verify: { checks: { exports: "node check.js" } } }))
     git(repo, "add", ".")
     git(repo, "commit", "-qm", "checks")
-    h = await connect({ ...isolatedEnv(tmp, repo), HORDE_OPENCODE_MAX_RUNNING: "4" })
+    h = await connect({ ...isolatedEnv(tmp, repo), HORDE_OPENCODE_MAX_RUNNING: "4", HORDE_BOARD_STATE_DIR: path.join(tmp, "board-state") })
     board = new Client({ name: "test", version: "0" })
     await board.connect(
       new StdioClientTransport({
@@ -85,17 +85,11 @@ describe("the horde flow: board, workers, gates (real opencode, mock LLM)", { ti
     assert.match(next, new RegExp(b))
     assert.doesNotMatch(next, new RegExp(c), "c waits for a and b")
 
-    // Two workers at once, each in its own worktree, each gated on its own scope.
-    const spawn = async (task: string, name: string, scope: string) =>
-      h.call("opencode_spawn", {
-        prompt: await boardCall("board_brief", { id: task, agent: name }),
-        name,
-        isolation: "worktree",
-        permissions: "allow",
-        gate: { allowed: [scope] },
-      })
-    await spawn(a, "wa", "a.js")
-    await spawn(b, "wb", "b.js")
+    // Two workers at once, each working a board task: brief, worktree and a gate on its scope come with it.
+    const spawned = await h.call("opencode_spawn", { task: a, name: "wa", permissions: "allow" })
+    assert.match(spawned, new RegExp(`working ${a} "Module a" \\(attempt 1\\)[\\s\\S]*\\(worktree, branch horde/wa\\)\\n {2}task: ${a} "Module a"`), spawned)
+    await h.call("opencode_spawn", { task: b, name: "wb", permissions: "allow" })
+    await assert.rejects(h.call("opencode_spawn", { task: c, name: "early" }), new RegExp(`${c} waits for`))
     const settled = await h.call("opencode_wait", { ids: ["wa", "wb"], mode: "all", timeout_seconds: 240 })
     assert.match(settled, /wa .*— IDLE[\s\S]*gate: ✓ PASS \(round 1\/2\)/, settled)
     // b's first version fails the check; the verdict goes back to the worker, which fixes it.
@@ -107,7 +101,10 @@ describe("the horde flow: board, workers, gates (real opencode, mock LLM)", { ti
       [a, "wa"],
       [b, "wb"],
     ] as const) {
-      assert.match(await boardCall("board_task", { id: task }), /mock work done/)
+      const report = await boardCall("board_task", { id: task })
+      assert.match(report, /mock work done/)
+      // The mock reports the brief's example file names: the board catches the mismatch with the diff.
+      assert.match(report, /⚠ claimed but not in the diff: a\.ts, b\.ts, a\.test\.ts\n {2}⚠ in the diff but not in the report: [ab]\.js/, report)
       assert.match(await h.call("opencode_worktree", { id: name, action: "merge" }), /merged/)
       await h.call("opencode_dispose", { id: name, worktree: "remove" })
     }

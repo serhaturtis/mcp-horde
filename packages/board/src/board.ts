@@ -34,6 +34,18 @@ export interface Attempt {
   outcome?: "accepted" | "failed" | "abandoned"
   note?: string
   cost?: number
+  /** Where the attempt's work lives, when the runtime that started it said so (opencode_spawn task). */
+  workspace?: { path: string; base: string; session?: string }
+}
+
+/** A report's claims against the attempt's actual diff. */
+export interface ReportCheck {
+  /** Files the report names (changed or tests added) that the diff does not touch. */
+  claimedNotChanged: string[]
+  /** Files the diff touches that the report does not mention. */
+  changedNotReported: string[]
+  /** Every file in the diff. */
+  diff: string[]
 }
 
 export interface Task {
@@ -295,6 +307,44 @@ export class Board {
     }).then((task) => ({ task, attempt }))
   }
 
+  /** Record where the current attempt works (a worktree and the commit its work starts from). */
+  bindWorkspace(id: string, token: string, workspace: NonNullable<Attempt["workspace"]>): Promise<Task> {
+    return this.update(id, (t) => {
+      const a = current(t)
+      if (!a || a.token !== token || a.endedAt) throw new Error(`${id}: that attempt is no longer current`)
+      a.workspace = workspace
+    })
+  }
+
+  /**
+   * Check the latest report against the attempt's diff (its workspace from base, untracked
+   * files included). Undefined when there is no report or no workspace left to look at.
+   */
+  async checkReport(id: string): Promise<ReportCheck | undefined> {
+    const t = this.task(id)
+    const r = t.reports[t.reports.length - 1]
+    const a = r && t.attempts.find((x) => x.n === r.attempt)
+    if (!r || !a?.workspace || !fs.existsSync(a.workspace.path)) return undefined
+    const ws = a.workspace
+    let diff: string[]
+    try {
+      const root = await git(ws.path, "rev-parse", "--show-toplevel")
+      const Q = ["-c", "core.quotePath=false"]
+      const changed = await git(root, ...Q, "diff", "--name-only", ws.base)
+      const untracked = await git(root, ...Q, "ls-files", "--others", "--exclude-standard")
+      diff = [...new Set(`${changed}\n${untracked}`.split("\n").filter(Boolean))].sort()
+    } catch {
+      return undefined
+    }
+    const norm = (p: string) => normalize(p).replace(/^\.\//, "")
+    const claimed = [...new Set([...r.filesChanged, ...r.testsAdded].map(norm).filter(Boolean))]
+    return {
+      claimedNotChanged: claimed.filter((c) => !diff.includes(c)),
+      changedNotReported: diff.filter((d) => !claimed.includes(d)),
+      diff,
+    }
+  }
+
   accept(id: string, opts: { note?: string; cost?: number } = {}): Promise<Task> {
     return this.update(id, (t) => {
       const a = current(t)
@@ -371,11 +421,14 @@ export class Board {
 
   // -------------------------------------------------------------- worker
 
-  /** The worker proves which attempt it belongs to. Anything else is refused. */
+  /**
+   * The worker proves which attempt it belongs to. Anything else is refused. A task in
+   * review still takes its worker's updates (a gate sent the work back; the report changes).
+   */
   private worker(t: Task, token: string): Attempt {
     const a = current(t)
     if (!a || a.token !== token || a.endedAt) throw new Error(`token does not match the current attempt of ${t.id}; this attempt was closed or replaced`)
-    if (!["claimed", "working"].includes(t.status)) throw new Error(`${t.id} is ${t.status}; nothing to do`)
+    if (!["claimed", "working", "review"].includes(t.status)) throw new Error(`${t.id} is ${t.status}; nothing to do`)
     return a
   }
 

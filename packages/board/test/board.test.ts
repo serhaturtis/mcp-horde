@@ -6,7 +6,7 @@ import path from "node:path"
 import { after, describe, test } from "node:test"
 import { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
-import { Board, cliArgv, isTrustedCommand, overlaps, projectOf, renderBrief, renderSummary, shellWords, workerCommand } from "../src/lib.js"
+import { Board, cliArgv, isTrustedCommand, overlaps, projectOf, renderBrief, renderSummary, renderTask, shellWords, workerCommand } from "../src/lib.js"
 
 const pkg = path.resolve(import.meta.dirname, "..")
 const temps: string[] = []
@@ -225,6 +225,28 @@ describe("board", () => {
     const small = renderBrief(board, board.task(t.id), attempt, 700, root)
     assert.match(small, /## Reporting \(required\)/)
     assert.doesNotMatch(small, /## Code context/)
+  })
+
+  test("a report is checked against the attempt's diff", async () => {
+    const root = repo()
+    const base = git(root, "rev-parse", "HEAD")
+    const board = new Board(tmp())
+    const t = (await board.plan([{ title: "x", goal: "y" }])).tasks[0]!
+    const { attempt } = await board.assign(t.id, "w")
+    await board.bindWorkspace(t.id, attempt.token, { path: root, base })
+    await assert.rejects(board.bindWorkspace(t.id, "nope", { path: root, base }), /no longer current/)
+    fs.writeFileSync(path.join(root, "README.md"), "changed\n")
+    fs.writeFileSync(path.join(root, "extra.ts"), "new\n")
+    await board.report(t.id, attempt.token, { summary: "did it", filesChanged: ["./README.md"], testsAdded: ["readme.test.ts"] })
+    const check = (await board.checkReport(t.id))!
+    assert.deepEqual(check, { claimedNotChanged: ["readme.test.ts"], changedNotReported: ["extra.ts"], diff: ["README.md", "extra.ts"] })
+    const shown = renderTask(board.task(t.id), "brief", Date.now(), check)
+    assert.match(shown, /⚠ claimed but not in the diff: readme\.test\.ts\n {2}⚠ in the diff but not in the report: extra\.ts/)
+    fs.rmSync(path.join(root, "extra.ts"))
+    await board.report(t.id, attempt.token, { summary: "again", filesChanged: ["README.md"] })
+    assert.match(renderTask(board.task(t.id), "brief", Date.now(), await board.checkReport(t.id)), /✓ the report matches the diff \(1 file\)/)
+    fs.rmSync(root, { recursive: true, force: true })
+    assert.equal(await board.checkReport(t.id), undefined, "no workspace left: nothing to check")
   })
 
   test("notes: duplicates collapse, recall ranks by overlap, forget hides", async () => {

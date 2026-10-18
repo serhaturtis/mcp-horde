@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto"
 import fs from "node:fs/promises"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
-import { isTrustedCommand } from "@mcp-horde/board"
+import { Board, isTrustedCommand, renderBrief } from "@mcp-horde/board"
 import { git, oneLine } from "@mcp-horde/core"
 import { gate as runGate, defaultStateDir as verifyStateDir } from "@mcp-horde/verify"
 import type {
@@ -80,6 +80,8 @@ export interface Snapshot {
   children: string[]
   /** Present when the agent has a gate. */
   gate?: GateView
+  /** The board task this agent works, when spawned with one. */
+  task?: { id: string; title: string; attempt: number }
 }
 
 export interface GateView {
@@ -109,7 +111,10 @@ export interface Profile {
 }
 
 export interface SpawnInput {
+  /** The task; with `task`, extra instructions appended to the board's brief. */
   prompt: string
+  /** A board task to work: the prompt is its brief, and the attempt is recorded on the board. */
+  task?: string
   name?: string
   model?: string
   variant?: string
@@ -448,9 +453,46 @@ export class Fleet {
     if (this.config.maxRunning > 0) await this.refreshUnknown()
     const release = this.reserve()
     try {
-      return await this.spawnReserved(input)
+      return input.task ? await this.spawnTask(input, input.task) : await this.spawnReserved(input)
     } finally {
       release()
+    }
+  }
+
+  /**
+   * Work a board task: start an attempt, brief the agent from the board (goal, done criteria,
+   * scope, code context, reporting commands), and by default isolate it in a worktree with a
+   * gate on the task's scope. The board records where the attempt works, so its report can
+   * be checked against the diff.
+   */
+  private async spawnTask(input: SpawnInput, taskId: string): Promise<{ snapshot: Snapshot; notes: string[] }> {
+    const directory = this.resolveDir(input.directory)
+    const board = await Board.open(directory)
+    const name = input.name ?? taskId
+    const { task, attempt } = await board.assign(taskId, name)
+    const extra = input.prompt.trim()
+    const prompt = `${renderBrief(board, task, attempt, 6000, directory)}${extra ? `\n\n## Additional instructions\n${extra}` : ""}`
+    let result: { snapshot: Snapshot; notes: string[] }
+    try {
+      result = await this.spawnReserved({
+        ...input,
+        prompt,
+        name,
+        isolation: input.isolation ?? "worktree",
+        gate: input.gate ?? (task.scope.length ? { allowed: task.scope } : true),
+      })
+    } catch (err) {
+      await board.fail(taskId, { reason: `the agent could not start: ${(err as Error).message}` }).catch(() => undefined)
+      throw err
+    }
+    const snap = result.snapshot
+    const wt = snap.worktree
+    const base = wt ? workStart(wt) : await git(snap.directory, "rev-parse", "HEAD").catch(() => "HEAD")
+    await board.bindWorkspace(taskId, attempt.token, { path: snap.directory, base, session: snap.id }).catch(() => undefined)
+    this.updateRecord(snap.id, { task: { id: task.id, title: task.title, attempt: attempt.n } })
+    return {
+      snapshot: await this.snapshot(snap.id),
+      notes: [`working ${task.id} "${task.title}" (attempt ${attempt.n}); its report lands on the board`, ...result.notes],
     }
   }
 
@@ -1286,6 +1328,7 @@ export class Fleet {
       context: this.contextOf(live),
       children: [...live.children],
       gate: this.gateView(live),
+      task: record.task,
     }
   }
 

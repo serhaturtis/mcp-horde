@@ -25,15 +25,15 @@ You plan and judge; workers do the typing. Your context is the scarce resource: 
 
 For each task from `board_next` (several in parallel, within `HORDE_OPENCODE_MAX_RUNNING`):
 
-1. `board_brief { id, agent: "<short name>" }` → the worker's prompt, with code context for its scope (the files, symbols the goal names in backticks, covering tests, conventions). Pass it **unchanged**.
-2. `opencode_spawn { name, prompt: <brief>, model: <tier model>, variant?, isolation: "worktree", gate: { allowed: <task scope> }, limits: { max_cost_usd, timeout_minutes } }`. Use `worktree.link: ["node_modules"]` (or the language's equivalent) and `worktree.setup` when the project needs dependencies to run its checks.
+1. `opencode_spawn { task: <id>, name, model: <tier model>, variant?, limits: { max_cost_usd, timeout_minutes } }`. The agent gets the board's brief (goal, done criteria, scope, code context, reporting commands), runs in its own worktree, and is gated on the task's scope. Add `prompt` for extra instructions only. Use `worktree.link: ["node_modules"]` (or the language's equivalent) and `worktree.setup` when the project needs dependencies to run its checks.
+2. (Without `task`, the manual way: `board_brief { id, agent }` and pass the brief **unchanged** as the `prompt`, with `isolation: "worktree"` and `gate: { allowed: <task scope> }`.)
 3. Keep going with other tasks; do not watch one worker.
 
 ## 3. Collect results
 
 `opencode_wait` returns the next worker with news. For each:
 
-- **`gate: ✓ PASS`** → `board_task { id }` and read the report: what changed, tests added, **unverified claims**, questions. Accept only if the report holds up against the acceptance criteria; anything unverified that matters is yours to check (`opencode_worktree diff` for a specific file, `verify_gate`, or a follow-up message).
+- **`gate: ✓ PASS`** → `board_task { id }` and read the report: what changed, tests added, **unverified claims**, questions. For task-bound agents the board checks the report against the actual diff: a `⚠ claimed but not in the diff` line means the worker said it did something it did not. Accept only if the report holds up against the acceptance criteria; anything unverified that matters is yours to check (`opencode_worktree diff` for a specific file, `verify_gate`, or a follow-up message).
   Then `opencode_worktree { action: "merge" }` (in dependency order), `board_accept { id, cost }`, `opencode_dispose { worktree: "remove" }`. Gates run only the tests related to a worker's change (the verdict says "related tests only"), so after merges run the full suite once with `verify_run` in the main checkout.
 - **`gate: ✗ FAIL (round N/N)`** → the worker already had its tries. Read the verdict (it says what fails, where). Either `opencode_message` it once more with a precise hint, or `board_fail { id, reason, escalate: true }` and re-brief it on the next tier. Two failed gates on one tier means escalate, not retry.
 - **`NEEDS_INPUT`** → answer with `opencode_respond`. Questions about intent are yours to answer from the plan; permission requests outside the task's scope should usually be rejected with a reason.
@@ -49,11 +49,11 @@ For each task from `board_next` (several in parallel, within `HORDE_OPENCODE_MAX
 
 ## Best of N (hard, well-specified tasks)
 
-Brief the same task to 2–3 workers on cheap tiers (one `board_brief` per worker; each brief starts its own attempt, so record which agent you accept). Gates filter out the broken attempts; compare the survivors' reports and `opencode_worktree diff` outputs, merge one, discard the others.
+Brief the same task to 2–3 workers on cheap tiers (one `board_brief` per worker, passed as their prompts; each brief starts a new attempt and ends the previous one, so only the last worker can report: compare the others by their gate verdicts and diffs). Gates filter out the broken attempts; compare the survivors' reports and `opencode_worktree diff` outputs, merge one, discard the others.
 
 ## Do not
 
 - Read transcripts (`opencode_output`) unless a gate failed twice and the verdict does not explain why.
-- Rewrite briefs from memory: always use `board_brief`, which carries the reporting commands and the attempt token.
+- Rewrite briefs from memory: use `opencode_spawn { task }` or `board_brief`, which carry the reporting commands and the attempt token.
 - Merge without a passing gate, or accept a report whose unverified claims cover the acceptance criteria.
 - Give workers vague goals ("improve the auth code"). Vague goals are where cheap models waste money.

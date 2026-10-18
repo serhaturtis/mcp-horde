@@ -1,6 +1,6 @@
 import { openProject, pack } from "@mcp-horde/context"
 import { estimateTokens, fitSections, formatUsd, type Section, truncate } from "@mcp-horde/core"
-import { type Attempt, type Board, current, LEASE_MS, type Note, type Task } from "./board.js"
+import { type Attempt, type Board, current, LEASE_MS, type Note, type ReportCheck, type Task } from "./board.js"
 import { workerCommand } from "./command.js"
 
 const ago = (t: number, now = Date.now()) => {
@@ -134,7 +134,7 @@ export function renderSummary(board: Board, budgetChars = 1500, now = Date.now()
   return fitSections(sections, budgetChars)
 }
 
-export function renderTask(t: Task, detail: "brief" | "full" = "brief", now = Date.now()): string {
+export function renderTask(t: Task, detail: "brief" | "full" = "brief", now = Date.now(), check?: ReportCheck): string {
   const lines = [
     `${t.id} "${t.title}" — ${t.status}${t.blockedOn ? ` on ${t.blockedOn}` : ""} · tier ${t.tier}${t.cost ? ` · ${formatUsd(t.cost)}` : ""}${attemptLine(t, now)}`,
   ]
@@ -158,6 +158,12 @@ export function renderTask(t: Task, detail: "brief" | "full" = "brief", now = Da
     field("unverified", r.unverifiedClaims)
     field("questions", r.questions)
     if (detail === "full") field("decisions", r.decisions)
+    if (check) {
+      if (check.claimedNotChanged.length) lines.push(`  ⚠ claimed but not in the diff: ${check.claimedNotChanged.join(", ")}`)
+      if (check.changedNotReported.length) lines.push(`  ⚠ in the diff but not in the report: ${check.changedNotReported.join(", ")}`)
+      if (!check.claimedNotChanged.length && !check.changedNotReported.length)
+        lines.push(`  ✓ the report matches the diff (${check.diff.length} file${check.diff.length === 1 ? "" : "s"})`)
+    }
   }
   return lines.join("\n")
 }

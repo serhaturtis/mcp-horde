@@ -77,6 +77,8 @@ export interface AgentRecord {
   pauseAfterStep?: boolean
   gate?: GateConfig
   gateState?: GateState
+  /** The board task this agent works (opencode_spawn task). */
+  task?: { id: string; title: string; attempt: number }
 }
 
 export interface ServerRecord {

@@ -1,4 +1,4 @@
-/** Library entry point: what other horde packages (opencode's permission handling) use. */
+/** Library entry point: what other horde packages use (opencode: trusted commands, task-bound spawns). */
 export {
   type Attempt,
   Board,
@@ -11,6 +11,7 @@ export {
   type PlanInput,
   projectOf,
   type Report,
+  type ReportCheck,
   type Status,
   type Task,
 } from "./board.js"

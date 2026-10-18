@@ -8,8 +8,7 @@ One board per repository, shared by every worktree of it, stored as plain files 
 
 ```text
 board_plan     → t-3fa2 "Rate-limit login", t-9c1e "Document the limit" (after t-3fa2)
-board_brief    t-3fa2 agent:"limiter"   → the worker's prompt, with its reporting commands
-opencode_spawn name:"limiter" prompt:<brief> isolation:"worktree" gate:true
+opencode_spawn task:t-3fa2 name:"limiter"       → briefed, in a worktree, gated on the task's scope
 opencode_wait  → limiter IDLE · gate: ✓ PASS (round 1/2)
 board_task     t-3fa2 → report: "Added a sliding-window limiter…" · tests added: … · unverified: "did not load-test"
 board_accept   t-3fa2 → done. Now ready: t-9c1e
@@ -32,7 +31,7 @@ locks   src/shared/rate.ts → t-77ab
 | `board_plan` | Adds tasks: title, goal, acceptance criteria, scope (paths), dependencies (by id, or by title within the plan), starting tier. Refuses cycles; warns when tasks that could run in parallel have overlapping scopes. |
 | `board_next` | Tasks that are ready: open, with every dependency done. |
 | `board_brief` | Starts an attempt and returns the worker prompt: goal, done criteria, scope, relevant project notes and findings, the exact commands to report with (including a token for this attempt), and code context for the scope. A new brief ends the previous attempt. |
-| `board_task` | One task with its latest report (changes, tests added, unverified claims, questions). |
+| `board_task` | One task with its latest report (changes, tests added, unverified claims, questions), checked against the attempt's diff when its worktree is known (`opencode_spawn task` records it): `⚠ claimed but not in the diff`, `⚠ in the diff but not in the report`, or `✓ the report matches the diff`. |
 | `board_accept` / `board_fail` | Close the attempt. Failing reopens the task by default; `escalate` raises its tier, `retry: false` gives it up. |
 | `board_block` / `board_edit` | Park a task on an outside decision; change or reopen it. |
 | `board_summary` | Counts, reviews, running and stale attempts, blocked/failed, what is next, held locks. |

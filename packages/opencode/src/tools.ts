@@ -159,6 +159,7 @@ export function renderSnapshot(s: Snapshot, opts: { resultChars?: number; mode?:
     `  model: ${formatModel(s.model)} · agent: ${s.agent ?? "default"} · permissions: ${s.policy}/${s.questionPolicy}${lim.length ? ` · limits: ${lim.join(", ")}` : ""}`,
   )
   lines.push(`  dir: ${s.directory}${s.worktree ? ` (worktree, branch ${s.worktree.branch})` : ""}`)
+  if (s.task) lines.push(`  task: ${s.task.id} "${s.task.title}" (attempt ${s.task.attempt}; board_task ${s.task.id} for its report)`)
   if (s.children.length) lines.push(`  subagents: ${s.children.join(", ")}`)
   if (s.activity) lines.push(`  doing: ${s.activity}`)
   if (s.retry) lines.push(`  ${s.retry}`)
@@ -308,8 +309,14 @@ export function registerTools(server: McpServer, ctx: Context) {
     "opencode_spawn",
     "Spawn an OpenCode agent on a task with any model and effort level. Returns immediately (it runs in the background) unless wait is set. Spawn several for parallel work, then opencode_wait. The agent does not see your conversation: make the prompt self-contained (put shared context in instructions).",
     {
-      prompt: z.string().min(1).describe("The task."),
-      name: z.string().optional().describe("Unique short name to address it by (letters, digits, . _ -)."),
+      prompt: z.string().optional().describe("The task. With task: extra instructions added to the board's brief."),
+      task: z
+        .string()
+        .optional()
+        .describe(
+          'A board task id (board_plan): the agent gets its brief (goal, done criteria, scope, code context, reporting commands), the attempt is recorded on the board, and isolation defaults to "worktree" with a gate on the task\'s scope. Replaces board_brief + passing the brief by hand.',
+        ),
+      name: z.string().optional().describe("Unique short name to address it by (letters, digits, . _ -). With task: defaults to the task id."),
       model: z.string().optional().describe('"provider/model" from opencode_models, chosen for this task. Omitted = OpenCode\'s configured default.'),
       variant: z.string().optional().describe('Effort level / model variant, e.g. "low", "high", "max" (see opencode_models; requires model).'),
       agent: z
@@ -347,8 +354,10 @@ export function registerTools(server: McpServer, ctx: Context) {
       timeout_seconds: timeout.optional(),
     },
     async (a, fleet, extra) => {
+      if (!a.prompt?.trim() && !a.task) throw new Error("give the agent a prompt, or a board task to work")
       const { snapshot, notes } = await fleet.spawn({
-        prompt: a.prompt,
+        prompt: a.prompt ?? "",
+        task: a.task,
         name: a.name,
         model: a.model,
         variant: a.variant,

@@ -13,6 +13,7 @@ It is built on OpenCode's **v2 server API** (`/api/*`, through `@opencode-ai/sdk
 | Give an agent a custom profile (tool allow/deny list, step cap) | `opencode_spawn` `profile` |
 | Run agents in parallel without collisions, each in its own git worktree and branch | `opencode_spawn` `isolation: "worktree"` |
 | Check an agent's work mechanically when it finishes, and send failures back to it to fix | `opencode_spawn` / `opencode_message` `gate` |
+| Work a task from [`@mcp-horde/board`](../board): the board's brief as the prompt, a worktree and a gate on the task's scope, the attempt (and its worktree) recorded on the board | `opencode_spawn` `task` |
 | Get notified when agents finish | `opencode_wait` (returns each result once), or channel push (below) |
 | See live what an agent is doing (current tool, streaming text, retries, cost) | `opencode_status` |
 | Interact while it runs: `steer` (next step) or `queue` (after the turn). Can switch model, effort, profile, policies or limits | `opencode_message` |

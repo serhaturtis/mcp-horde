@@ -178,9 +178,9 @@ tool(
 
 tool(
   "board_task",
-  "One task: status, attempt, and the latest worker report (what changed, tests added, unverified claims, questions). detail full adds the goal, acceptance and every attempt.",
+  "One task: status, attempt, and the latest worker report (what changed, tests added, unverified claims, questions), checked against the attempt's actual diff when its worktree is known. detail full adds the goal, acceptance and every attempt.",
   { directory, id, detail: z.enum(["brief", "full"]).optional() },
-  async (a, board) => renderTask(board.task(a.id), a.detail),
+  async (a, board) => renderTask(board.task(a.id), a.detail, Date.now(), await board.checkReport(a.id)),
   true,
 )
 
