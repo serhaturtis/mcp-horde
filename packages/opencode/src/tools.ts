@@ -82,6 +82,15 @@ const gate = z
   .describe(
     "Check the agent's work mechanically when it finishes: the project's tests/typecheck/lint (from horde.json or detected) and a diff audit. A failure goes back to the agent to fix, up to max_rounds; you only hear the outcome. true = defaults.",
   )
+/** Base price per million tokens (the cheapest tier), "free" when the catalog says 0, "price unknown" without data. */
+export function price(m: { cost: { input: number; output: number; tier?: unknown }[] }): string {
+  const base = m.cost.find((c) => !c.tier) ?? m.cost[0]
+  if (!base) return "price unknown"
+  if (base.input === 0 && base.output === 0) return "free"
+  const usd = (n: number) => `$${n < 1 ? n.toFixed(2).replace(/0$/, "") : n % 1 ? n.toFixed(2) : n}`
+  return `${usd(base.input)}/${usd(base.output)} per M`
+}
+
 function gateIn(g?: z.infer<typeof gate>) {
   if (g === undefined || typeof g === "boolean") return g
   return { checks: g.checks, audit: g.audit, allowed: g.allowed, maxRounds: g.max_rounds, related: g.related_only }
@@ -240,7 +249,7 @@ export function registerTools(server: McpServer, ctx: Context) {
 
   tool(
     "opencode_models",
-    "List models OpenCode agents can run (any provider: DeepSeek, Kimi, GLM, Qwen, GPT, Claude, local …) with their effort variants and context size. Use the ids with opencode_spawn model/variant.",
+    "List models OpenCode agents can run (any provider: DeepSeek, Kimi, GLM, Qwen, GPT, Claude, local …) with context size, price (USD per million input/output tokens, or free) and effort variants. Use the ids with opencode_spawn model/variant.",
     {
       provider: z.string().optional().describe("Only this provider id (e.g. deepseek, openrouter)."),
       query: z.string().optional().describe("Case-insensitive substring filter on the model id or name."),
@@ -262,7 +271,7 @@ export function registerTools(server: McpServer, ctx: Context) {
       const lines = shown.map((m) => {
         const variants = m.variants.map((v) => v.id)
         const why = unsupportedReason(m)
-        return `${m.providerID}/${m.id} — ${m.name} · ctx ${Math.round(m.limit.context / 1000)}k · ${variants.length ? `effort variants: ${variants.join(", ")}` : "no effort variants"}${why ? ` · UNSUPPORTED: ${why}` : ""}`
+        return `${m.providerID}/${m.id} — ${m.name} · ctx ${Math.round(m.limit.context / 1000)}k · ${price(m)} · ${variants.length ? `effort variants: ${variants.join(", ")}` : "no effort variants"}${why ? ` · UNSUPPORTED: ${why}` : ""}`
       })
       const hidden = all.length - usable.length
       return `${shown.length} model(s)${!a.include_unsupported && hidden ? ` (${hidden} unsupported hidden)` : ""}:\n${lines.slice(0, 300).join("\n")}${lines.length > 300 ? "\n… (narrow with provider/query)" : ""}`

@@ -176,7 +176,7 @@ These are set by OpenCode 1.19's v2 API or by MCP:
 ```sh
 npm run build
 npm test            # unit tests, integration tests with a real `opencode serve` and a mock LLM, and a smoke test of dist/
-npm run test:e2e    # against a real model: HORDE_E2E_MODEL=provider/model npm run test:e2e
+npm run test:e2e    # against real models: HORDE_E2E_MODEL=free (OpenCode's free models, no account) or provider/model
 npm run lint        # at the repo root (Biome)
 ```
 

@@ -11,6 +11,7 @@ import { loadConfig } from "../src/config.js"
 import { defaultQuestionPolicy, defined, formatModel, parseModel } from "../src/fleet.js"
 import { questionAnswers, questionSchema } from "../src/hooks.js"
 import { Store } from "../src/state.js"
+import { price } from "../src/tools.js"
 import { apply, costSince, currentTurn, type DurableEvent, emptyTrack, isInterruptMessage, latestTool, turnsSince } from "../src/tracker.js"
 import { branchSlug, validateLink } from "../src/worktree.js"
 
@@ -183,6 +184,14 @@ describe("tracker", () => {
 })
 
 describe("helpers", () => {
+  test("model prices: base tier per million tokens, free, unknown", () => {
+    const c = (input: number, output: number, tier?: { type: "context"; size: number }) => ({ input, output, tier, cache: { read: 0, write: 0 } })
+    assert.equal(price({ cost: [c(0.27, 1.1)] }), "$0.27/$1.10 per M")
+    assert.equal(price({ cost: [c(3, 15), c(6, 22.5, { type: "context", size: 200_000 })] }), "$3/$15 per M")
+    assert.equal(price({ cost: [c(0, 0)] }), "free")
+    assert.equal(price({ cost: [] }), "price unknown")
+  })
+
   test("parseModel splits on the first slash only", () => {
     assert.deepEqual(parseModel("openrouter/deepseek/deepseek-chat", "high"), { providerID: "openrouter", id: "deepseek/deepseek-chat", variant: "high" })
     assert.throws(() => parseModel("nodash"), /provider\/model/)

@@ -60,3 +60,25 @@ jobs:
       - run: npm ls opencode-ai @opencode-ai/sdk -w @mcp-horde/opencode || true
       - run: npm run build
       - run: npm test
+
+  # The real thing: OpenCode's free models (no account) run the parallel-agents and horde-loop
+  # scenarios. Real models and a rate-limited free tier vary run to run, so this never blocks.
+  test-live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Git identity for test commits
+        run: |
+          git config --global user.name "CI"
+          git config --global user.email "ci@example.com"
+      - run: npm ci
+      - run: npm run build
+      - run: npm run test:e2e -w @mcp-horde/opencode
+        env:
+          HORDE_E2E_MODEL: free

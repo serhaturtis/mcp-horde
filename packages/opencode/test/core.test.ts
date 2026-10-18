@@ -41,6 +41,7 @@ describe("opencode MCP server: core behaviour (real opencode, mock LLM)", { time
     }
     const models = await h.call("opencode_models", { provider: "mock" })
     assert.match(models, /mock\/mock — Mock .* effort variants: high, low/)
+    assert.match(models, /mock\/pricey — Pricey mock · ctx \d+k · \$100000\/\$100000 per M ·/)
     assert.match(models, /mock\/other — .* no effort variants/)
     assert.match(await h.call("opencode_agents"), /^build/m)
     const all = await h.call("opencode_models", { include_unsupported: true })
