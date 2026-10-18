@@ -2,23 +2,31 @@
 
 Bundles the horde for Claude Code:
 
-- **MCP servers:** `opencode` (workers), `board` (tasks, briefs, reports), `verify` (checks and audits) and `context` (code search and the code context in briefs), started with `npx`.
-- **Skill `/horde:horde`:** the procedure Claude follows: plan small tasks with observable acceptance criteria and scopes, brief each worker from the board, spawn it in a worktree with a gate, read the gate verdict and the worker's report instead of its transcript, then merge and accept, or fail and escalate to a stronger tier.
+- **MCP servers:** `opencode` (workers), `board` (tasks, briefs, reports), `verify` (checks and audits) and `context` (code search and the code context in briefs). They ship in `servers/` as self-contained bundles and start with `node`: no npm install, no build step.
+- **Skill `/horde:horde`:** the procedure Claude follows: plan small tasks with observable acceptance criteria and scopes, spawn a worker per task (briefed from the board, in a worktree, behind a gate), read the gate verdict and the worker's report (checked against its diff) instead of its transcript, then merge and accept, or fail and escalate to a stronger tier.
 
 ```text
-/plugin install horde --marketplace serhaturtis/mcp-horde
+/plugin marketplace add serhaturtis/mcp-horde
+/plugin install horde@mcp-horde
 ```
 
-## Before the packages are on npm
+## Requirements
 
-The plugin's servers run with `npx -y @mcp-horde/<name>`, which needs the packages to be published (milestone M5 in [`docs/DESIGN.md`](../../docs/DESIGN.md)). With a local checkout, build it and register the servers yourself; the skill works the same:
+- Node.js 20 or newer.
+- [OpenCode](https://opencode.ai) on your `PATH` (`opencode --version`; tested with 1.19.3), with the providers you want workers to use (`opencode auth login`). Set `HORDE_OPENCODE_BIN` in the server's environment if it lives elsewhere.
+
+## From a clone instead
+
+The same servers, from a checkout of this repository (useful while changing them):
 
 ```sh
-git clone https://github.com/serhaturtis/mcp-horde && cd mcp-horde && npm install && npm run build
-claude mcp add opencode -- node "$PWD/packages/opencode/dist/index.js"
-claude mcp add board    -- node "$PWD/packages/board/dist/index.js"
-claude mcp add verify   -- node "$PWD/packages/verify/dist/index.js"
-claude mcp add context  -- node "$PWD/packages/context/dist/index.js"
+git clone https://github.com/serhaturtis/mcp-horde && cd mcp-horde
+claude mcp add opencode -- node "$PWD/plugins/horde/servers/opencode.js"
+claude mcp add board    -- node "$PWD/plugins/horde/servers/board.js"
+claude mcp add verify   -- node "$PWD/plugins/horde/servers/verify.js"
+claude mcp add context  -- node "$PWD/plugins/horde/servers/context.js"
 ```
 
-Then install the plugin for the skill (its own `npx` servers will fail to start until publishing; disable them with `/mcp` if they get in the way), or copy `skills/horde/SKILL.md` into your project's `.claude/skills/horde/`.
+Copy `skills/horde/SKILL.md` into your project's `.claude/skills/horde/` for the procedure.
+
+The bundles are generated from `packages/*` by `npm run bundle` (esbuild); CI fails when they do not match the sources. Do not edit them by hand.

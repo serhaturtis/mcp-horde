@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import fs from "node:fs"
 import path from "node:path"
-import { truncateHead } from "@mcp-horde/core"
+import { packageVersion, truncateHead } from "@mcp-horde/core"
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js"
@@ -11,7 +11,7 @@ import { detectChecks, loadSettings } from "./detect.js"
 import { defaultStateDir, gate } from "./gate.js"
 import { logDirFor, logFileFor } from "./run.js"
 
-const VERSION = (JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string }).version
+const VERSION = packageVersion(import.meta.url)
 
 process.on("unhandledRejection", (err) => {
   process.stderr.write(`[mcp-horde/verify] unhandled rejection: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`)

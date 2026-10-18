@@ -15,10 +15,11 @@ A collection of [MCP](https://modelcontextprotocol.io) servers for agentic codin
 [`plugins/horde`](plugins/horde) bundles the servers with the orchestration skill (`/horde:horde`), the procedure Claude follows to plan, brief, gate, review and merge workers' tasks:
 
 ```text
-/plugin install horde --marketplace serhaturtis/mcp-horde
+/plugin marketplace add serhaturtis/mcp-horde
+/plugin install horde@mcp-horde
 ```
 
-The plugin starts the servers with `npx`, which works once the packages are published to npm (milestone M5). Until then, see [`plugins/horde/README.md`](plugins/horde/README.md) for using it with a local checkout.
+The plugin carries its servers as self-contained bundles (`plugins/horde/servers/`), so installing it is all it takes: no npm install, no build. It needs Node.js 20+ and [OpenCode](https://opencode.ai) on your `PATH`. The packages are not published to npm; see [`plugins/horde/README.md`](plugins/horde/README.md).
 
 ## Design
 
@@ -34,7 +35,11 @@ npm run lint         # Biome
 npm test
 ```
 
-Requirements: Node.js 20 or newer.
+Requirements: Node.js 20 or newer. After changing a server, `npm run bundle` regenerates the plugin's bundles (CI checks they match the sources).
+
+## License
+
+[MIT](LICENSE)
 
 ### Adding a server
 

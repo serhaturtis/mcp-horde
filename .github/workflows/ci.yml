@@ -17,6 +17,8 @@ jobs:
       - run: npm ci
       - run: npm run lint
       - run: npm run typecheck
+      - name: Plugin bundles match the sources
+        run: node scripts/bundle-plugin.mjs --check
 
   test:
     strategy:

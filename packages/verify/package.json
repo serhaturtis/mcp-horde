@@ -1,7 +1,9 @@
 {
   "name": "@mcp-horde/verify",
   "version": "0.1.0",
+  "private": true,
   "description": "MCP server that judges work mechanically: runs a project's tests, typecheck and lint, audits a diff for scope violations and test tampering, and returns a compact verdict.",
+  "license": "MIT",
   "keywords": [
     "mcp",
     "model-context-protocol",
@@ -31,14 +33,10 @@
     "url": "git+https://github.com/serhaturtis/mcp-horde.git",
     "directory": "packages/verify"
   },
-  "publishConfig": {
-    "access": "public"
-  },
   "scripts": {
     "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.test.json",
     "test": "node --conditions=source --import tsx --test --test-concurrency=1 test/extract.test.ts test/verify.test.ts",
-    "prepublishOnly": "npm run build",
     "start": "node dist/index.js"
   },
   "dependencies": {

@@ -1,20 +1,20 @@
 {
   "mcpServers": {
     "opencode": {
-      "command": "npx",
-      "args": ["-y", "@mcp-horde/opencode"]
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/servers/opencode.js"]
     },
     "board": {
-      "command": "npx",
-      "args": ["-y", "@mcp-horde/board"]
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/servers/board.js"]
     },
     "verify": {
-      "command": "npx",
-      "args": ["-y", "@mcp-horde/verify"]
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/servers/verify.js"]
     },
     "context": {
-      "command": "npx",
-      "args": ["-y", "@mcp-horde/context"]
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/servers/context.js"]
     }
   }
 }

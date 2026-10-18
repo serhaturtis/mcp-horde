@@ -1,7 +1,9 @@
 {
   "name": "@mcp-horde/board",
   "version": "0.1.0",
+  "private": true,
   "description": "A shared task board for an orchestrating model and its workers: a task graph with briefs, structured reports, findings, project memory and file locks, used by the orchestrator over MCP and by workers through a CLI.",
+  "license": "MIT",
   "keywords": [
     "mcp",
     "model-context-protocol",
@@ -33,14 +35,10 @@
     "url": "git+https://github.com/serhaturtis/mcp-horde.git",
     "directory": "packages/board"
   },
-  "publishConfig": {
-    "access": "public"
-  },
   "scripts": {
     "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.test.json",
     "test": "node --conditions=source --import tsx --test --test-concurrency=1 test/board.test.ts",
-    "prepublishOnly": "npm run build",
     "start": "node dist/index.js"
   },
   "dependencies": {

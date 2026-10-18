@@ -85,7 +85,7 @@ export interface Harness {
   close(): Promise<void>
 }
 
-export async function connect(env: Record<string, string>, opts: { elicitation?: boolean; built?: boolean } = {}): Promise<Harness> {
+export async function connect(env: Record<string, string>, opts: { elicitation?: boolean; built?: boolean; entry?: string } = {}): Promise<Harness> {
   const client = new Client({ name: "test", version: "0" }, { capabilities: opts.elicitation ? { elicitation: { form: {} } } : {} })
   const elicit: Harness["elicit"] = { answer: () => ({ action: "cancel" }), seen: [] }
   const channel: Harness["channel"] = []
@@ -105,8 +105,12 @@ export async function connect(env: Record<string, string>, opts: { elicitation?:
   await client.connect(
     new StdioClientTransport({
       command: process.execPath,
-      // `built` runs the compiled package exactly as npm installs it.
-      args: opts.built ? [path.join(pkg, "dist/index.js")] : ["--conditions=source", "--import", "tsx", path.join(pkg, "src/index.ts")],
+      // `built` runs the compiled package; `entry` any other server file (e.g. the plugin's bundles).
+      args: opts.entry
+        ? [opts.entry]
+        : opts.built
+          ? [path.join(pkg, "dist/index.js")]
+          : ["--conditions=source", "--import", "tsx", path.join(pkg, "src/index.ts")],
       cwd: pkg,
       env: { ...(process.env as Record<string, string>), HORDE_OPENCODE_BIN: opencodeBin, ...env },
       stderr: "inherit",

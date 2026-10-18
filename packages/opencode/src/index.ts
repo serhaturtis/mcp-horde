@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { readFileSync } from "node:fs"
+import { packageVersion } from "@mcp-horde/core"
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { Backend, stopServer } from "./backend.js"
@@ -9,7 +9,7 @@ import { makeHooks } from "./hooks.js"
 import { Store } from "./state.js"
 import { INSTRUCTIONS, registerTools } from "./tools.js"
 
-const VERSION = (JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string }).version
+const VERSION = packageVersion(import.meta.url)
 
 // A bug in a background task must not take the whole MCP server down.
 process.on("unhandledRejection", (err) => {

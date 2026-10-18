@@ -117,6 +117,17 @@ describe("definitions", () => {
       definitions(FILES["src/util/index.ts"]!, "ts").map((x) => x.name),
       ["slug"],
     )
+    const cjs = definitions("exports.add = (a, b) => a + b\nmodule.exports.sub = function (a, b) {\n  return a - b\n}\n", "js")
+    assert.deepEqual(
+      cjs.map((x) => `${x.kind}:${x.name}:${x.line}-${x.end}:${x.exported}`),
+      ["variable:add:1-1:true", "variable:sub:2-4:true"],
+      "CommonJS exports",
+    )
+    // Allman braces (C#) still span the block.
+    assert.deepEqual(
+      definitions("public class Shop\n{\n    public int Total() { return 0; }\n}\n", "cs").map((x) => `${x.name}:${x.line}-${x.end}`),
+      ["Shop:1-4", "Total:3-3"],
+    )
   })
 
   test("Python, Go, Rust, Java", () => {

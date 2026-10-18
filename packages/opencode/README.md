@@ -128,7 +128,7 @@ Or in `.mcp.json`:
 }
 ```
 
-Once the package is published to npm, `"command": "npx", "args": ["-y", "@mcp-horde/opencode"]` will work too.
+Or, with no build at all, the self-contained bundle the Claude Code plugin uses: `node /path/to/mcp-horde/plugins/horde/servers/opencode.js` (see [`plugins/horde`](../../plugins/horde)). The packages are not published to npm.
 
 ### Configuration (environment variables, all optional)
 

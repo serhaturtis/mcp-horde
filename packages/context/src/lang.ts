@@ -96,6 +96,8 @@ const JS_RULES: Rule[] = [
   { re: new RegExp(`^\\s*(?:export\\s+)?(?:declare\\s+)?(?:const\\s+)?enum\\s+(${ID})`), kind: "enum" },
   { re: new RegExp(`^\\s*(?:export\\s+)?(?:declare\\s+)?namespace\\s+(${ID})`), kind: "module" },
   { re: new RegExp(`^(?:export\\s+)?(?:declare\\s+)?(?:const|let|var)\\s+(${ID})\\s*[=:]`), kind: "variable" },
+  // CommonJS: exports.name = …, module.exports.name = …
+  { re: new RegExp(`^(?:module\\.)?exports\\.(${ID})\\s*=`), kind: "variable" },
   // Methods in classes and object literals: indented `name(...) {` / `async name(...): T {`.
   {
     re: new RegExp(
@@ -135,7 +137,7 @@ const RULES: Record<Lang, Rule[]> = {
     { re: new RegExp(`^\\s*(?:(?:public|private|protected|static)\\s+)*enum\\s+(${ID})`), kind: "enum" },
     {
       re: new RegExp(
-        `^\\s*(?:@\\w+(?:\\([^)]*\\))?\\s+)*(?:(?:public|private|protected|static|final|abstract|synchronized|native|default)\\s+)*(?:<[^>]+>\\s+)?[\\w$.<>\\[\\],? ]+?\\s+(${ID})\\s*\\([^;]*$`,
+        `^\\s*(?:@\\w+(?:\\([^)]*\\))?\\s+)*(?:(?:public|private|protected|static|final|abstract|synchronized|native|default)\\s+)*(?:<[^>]+>\\s+)?[\\w$.<>\\[\\],? ]+?\\s+(${ID})\\s*\\((?:[^;]*$|[^)]*\\)\\s*\\{.*$)`,
       ),
       kind: "method",
     },
@@ -168,7 +170,7 @@ const RULES: Record<Lang, Rule[]> = {
     { re: /^\s*namespace\s+([\w.]+)/, kind: "module" },
     {
       re: new RegExp(
-        `^\\s*(?:\\[[^\\]]*\\]\\s*)*(?:(?:public|private|protected|internal|static|virtual|override|abstract|async|sealed|extern|unsafe|new|partial)\\s+)+[\\w<>\\[\\],.?]+\\s+(${ID})\\s*(?:<[^>]*>)?\\s*\\([^;]*$`,
+        `^\\s*(?:\\[[^\\]]*\\]\\s*)*(?:(?:public|private|protected|internal|static|virtual|override|abstract|async|sealed|extern|unsafe|new|partial)\\s+)+[\\w<>\\[\\],.?]+\\s+(${ID})\\s*(?:<[^>]*>)?\\s*\\((?:[^;]*$|[^)]*\\)\\s*\\{.*$)`,
       ),
       kind: "method",
     },
@@ -179,7 +181,7 @@ const isExported = (lang: Lang, line: string, name: string) => {
   switch (lang) {
     case "ts":
     case "js":
-      return /^\s*export\b/.test(line)
+      return /^\s*(export\b|(module\.)?exports\.)/.test(line)
     case "py":
       return !/^\s/.test(line) && !name.startsWith("_")
     case "go":
@@ -264,6 +266,9 @@ export function blockEnd(lines: string[], start: number, lang: Lang): number {
     if (opened && depth <= 0) return i
     // No block: a declaration ending in `;` (`type X = …;`), or one line (`const a = 1`).
     if (!opened && /;\s*$/.test(code)) return i
+    // TS/JS without semicolons: a complete first line is the whole declaration. (Not for
+    // C#/Java, where the brace often opens on the next line.)
+    if (!opened && i === start && (lang === "ts" || lang === "js") && code.trim() && !/(=>|[=(,[{+\-*/?:&|<.])\s*$/.test(code)) return i
     if (!opened && i - start >= 2) return start
   }
   return start

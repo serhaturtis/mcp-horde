@@ -38,3 +38,18 @@ export function loadHordeFile(directory: string): HordeFile {
     dir = parent
   }
 }
+
+declare const HORDE_VERSION: string | undefined
+
+/**
+ * The running package's version: baked in by the plugin bundler (`HORDE_VERSION`), else
+ * read from the package.json next to the module's directory.
+ */
+export function packageVersion(moduleUrl: string): string {
+  if (typeof HORDE_VERSION === "string") return HORDE_VERSION
+  try {
+    return (JSON.parse(fs.readFileSync(new URL("../package.json", moduleUrl), "utf8")) as { version: string }).version
+  } catch {
+    return "0.0.0"
+  }
+}

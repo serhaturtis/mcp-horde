@@ -1,7 +1,9 @@
 {
   "name": "@mcp-horde/opencode",
   "version": "0.2.0",
+  "private": true,
   "description": "MCP server that lets any harness delegate work to OpenCode agents on any model: spawn them in parallel, steer, wait, pause, resume, and answer their permission prompts.",
+  "license": "MIT",
   "keywords": [
     "mcp",
     "model-context-protocol",
@@ -27,16 +29,12 @@
     "url": "git+https://github.com/serhaturtis/mcp-horde.git",
     "directory": "packages/opencode"
   },
-  "publishConfig": {
-    "access": "public"
-  },
   "scripts": {
     "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.test.json",
-    "test": "node --conditions=source --import tsx --test --test-concurrency=1 test/unit.test.ts test/core.test.ts test/modes.test.ts test/flow.test.ts test/dist.test.ts",
+    "test": "node --conditions=source --import tsx --test --test-concurrency=1 test/unit.test.ts test/core.test.ts test/modes.test.ts test/flow.test.ts test/dist.test.ts test/plugin.test.ts",
     "test:unit": "node --conditions=source --import tsx --test test/unit.test.ts",
     "test:e2e": "node --conditions=source --import tsx --test test/e2e.test.ts",
-    "prepublishOnly": "npm run build",
     "start": "node dist/index.js"
   },
   "dependencies": {
