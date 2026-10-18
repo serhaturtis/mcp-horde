@@ -1,5 +1,6 @@
 import os from "node:os"
 import path from "node:path"
+import { loadHordeFile } from "@mcp-horde/core"
 
 /**
  * How permission requests (and questions) from an agent are handled.
@@ -30,6 +31,8 @@ export interface Config {
   defaultPermissions: PermissionPolicy
   /** Maximum number of agents running at the same time (0 = unlimited). */
   maxRunning: number
+  /** Where maxRunning came from, for error messages. */
+  maxRunningFrom: string
   /** Where agent metadata and the shared server record are stored. */
   stateDir: string
   /** Root for isolated worktrees. */
@@ -67,10 +70,28 @@ function bool(value: string | undefined, name: string): boolean {
   throw new Error(`${name} must be a boolean (1/0, true/false, yes/no, on/off), got "${value}"`)
 }
 
+/**
+ * The running-agent limit: HORDE_OPENCODE_MAX_RUNNING, else horde.json `opencode.maxRunning`
+ * (found from the default directory), else 8.
+ */
+function maxRunning(env: NodeJS.ProcessEnv, directory: string): { maxRunning: number; maxRunningFrom: string } {
+  if (env.HORDE_OPENCODE_MAX_RUNNING)
+    return { maxRunning: int(env.HORDE_OPENCODE_MAX_RUNNING, 8, "HORDE_OPENCODE_MAX_RUNNING"), maxRunningFrom: "HORDE_OPENCODE_MAX_RUNNING" }
+  const { file, data } = loadHordeFile(directory)
+  const section = data.opencode
+  if (section === undefined) return { maxRunning: 8, maxRunningFrom: "default" }
+  if (!section || typeof section !== "object" || Array.isArray(section)) throw new Error(`${file}: "opencode" must be an object`)
+  const n = (section as Record<string, unknown>).maxRunning
+  if (n === undefined) return { maxRunning: 8, maxRunningFrom: "default" }
+  if (typeof n !== "number" || !Number.isInteger(n) || n < 0) throw new Error(`${file}: "opencode.maxRunning" must be a non-negative integer (0 = unlimited)`)
+  return { maxRunning: n, maxRunningFrom: "horde.json opencode.maxRunning" }
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const home = os.homedir()
   const stateHome = env.XDG_STATE_HOME || path.join(home, ".local", "state")
   const dataHome = env.XDG_DATA_HOME || path.join(home, ".local", "share")
+  const directory = path.resolve(env.HORDE_OPENCODE_DIRECTORY || process.cwd())
   return {
     url: env.HORDE_OPENCODE_URL || undefined,
     username: env.OPENCODE_SERVER_USERNAME || "opencode",
@@ -78,9 +99,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     allowInsecure: bool(env.HORDE_OPENCODE_ALLOW_INSECURE, "HORDE_OPENCODE_ALLOW_INSECURE"),
     serverMode: mode(env.HORDE_OPENCODE_SERVER),
     bin: env.HORDE_OPENCODE_BIN || "opencode",
-    directory: path.resolve(env.HORDE_OPENCODE_DIRECTORY || process.cwd()),
+    directory,
     defaultPermissions: policy(env.HORDE_OPENCODE_PERMISSIONS),
-    maxRunning: int(env.HORDE_OPENCODE_MAX_RUNNING, 8, "HORDE_OPENCODE_MAX_RUNNING"),
+    ...maxRunning(env, directory),
     stateDir: path.resolve(env.HORDE_OPENCODE_STATE_DIR || path.join(stateHome, "mcp-horde", "opencode")),
     worktreeDir: path.resolve(env.HORDE_OPENCODE_WORKTREE_DIR || path.join(dataHome, "mcp-horde", "worktrees")),
     channel: bool(env.HORDE_OPENCODE_CHANNEL, "HORDE_OPENCODE_CHANNEL"),

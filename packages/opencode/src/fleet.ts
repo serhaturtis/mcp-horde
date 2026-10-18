@@ -462,7 +462,7 @@ export class Fleet {
       const busy = [...this.live.values()].filter((l) => this.working(l)).map((l) => l.record.name ?? l.record.id)
       if (busy.length + this.reserved >= this.config.maxRunning) {
         throw new Error(
-          `${busy.length + this.reserved} agents are already working or starting (limit HORDE_OPENCODE_MAX_RUNNING=${this.config.maxRunning})${busy.length ? `: ${busy.join(", ")}` : ""}. Wait for one with opencode_wait, or stop one.`,
+          `${busy.length + this.reserved} agents are already working or starting (limit ${this.config.maxRunning}, from ${this.config.maxRunningFrom})${busy.length ? `: ${busy.join(", ")}` : ""}. Wait for one with opencode_wait, or stop one.`,
         )
       }
     }
@@ -1001,7 +1001,11 @@ export class Fleet {
     return notes.join("\n")
   }
 
-  async worktree(ref: string, action: "diff" | "commit" | "merge" | "sync", opts: { strategy?: "merge" | "squash"; maxChars?: number }): Promise<string> {
+  async worktree(
+    ref: string,
+    action: "diff" | "commit" | "merge" | "sync",
+    opts: { strategy?: "merge" | "squash"; maxChars?: number; check?: boolean; signal?: AbortSignal },
+  ): Promise<string> {
     const live = await this.get(ref)
     const wt = live.record.worktree
     const name = live.record.name ?? live.record.id
@@ -1027,8 +1031,17 @@ export class Fleet {
       return `${synced.text}${synced.worktree ? "\nMessage the agent to re-run its checks on the updated code (a gate runs when it finishes)." : ""}`
     }
     const result = await mergeWorktree(wt, name, opts.strategy ?? "merge")
-    if (result.merged && result.merged !== wt.merged) this.updateRecord(live.record.id, { worktree: { ...wt, merged: result.merged } })
-    return result.text
+    if (!result.merged || result.merged === wt.merged) return result.text
+    this.updateRecord(live.record.id, { worktree: { ...wt, merged: result.merged } })
+    if (opts.check === false) return result.text
+    // The worker's gate judged its branch alone; this judges your checkout with everything merged so far.
+    try {
+      const v = await runGate(wt.repo, { audit: false, signal: opts.signal, stateDir: verifyStateDir() })
+      if (!v.checks.length) return result.text
+      return `${result.text}\nyour checkout after the merge: ${v.text}${v.pass ? "" : "\nThe merge stays; fix it here, or message the agent (sync first) to fix it."}`
+    } catch (err) {
+      return `${result.text}\nthe checks after the merge could not run: ${(err as Error).message}`
+    }
   }
 
   // --------------------------------------------------------------- reading

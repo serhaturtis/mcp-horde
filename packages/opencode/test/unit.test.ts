@@ -350,6 +350,20 @@ describe("helpers", () => {
     assert.throws(() => loadConfig({ HORDE_OPENCODE_CHANNEL: "maybe" } as NodeJS.ProcessEnv), /HORDE_OPENCODE_CHANNEL/)
     assert.equal(loadConfig({ HORDE_OPENCODE_DIALOG_TIMEOUT: "30" } as NodeJS.ProcessEnv).elicitTimeoutMs, 30_000)
   })
+
+  test("the running-agent limit comes from the environment, else horde.json, else 8", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "horde-limit-"))
+    fs.mkdirSync(path.join(dir, ".git"))
+    const at = (env: Record<string, string> = {}) => loadConfig({ HORDE_OPENCODE_DIRECTORY: dir, ...env } as NodeJS.ProcessEnv)
+    assert.equal(at().maxRunning, 8)
+    fs.writeFileSync(path.join(dir, "horde.json"), JSON.stringify({ opencode: { maxRunning: 3 } }))
+    assert.deepEqual([at().maxRunning, at().maxRunningFrom], [3, "horde.json opencode.maxRunning"])
+    assert.equal(at({ HORDE_OPENCODE_MAX_RUNNING: "0" }).maxRunning, 0, "the environment wins; 0 is unlimited")
+    fs.writeFileSync(path.join(dir, "horde.json"), JSON.stringify({ opencode: { maxRunning: "lots" } }))
+    assert.throws(() => at(), /"opencode\.maxRunning" must be a non-negative integer/)
+    fs.writeFileSync(path.join(dir, "horde.json"), JSON.stringify({ opencode: 4 }))
+    assert.throws(() => at(), /"opencode" must be an object/)
+  })
 })
 
 describe("API policy", () => {

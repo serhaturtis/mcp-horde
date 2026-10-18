@@ -110,7 +110,8 @@ describe("the horde flow: board, workers, gates (real opencode, mock LLM)", { ti
       assert.match(report, /mock work done/)
       // The mock reports the brief's example file names: the board catches the mismatch with the diff.
       assert.match(report, /⚠ claimed but not in the diff: a\.ts, b\.ts, a\.test\.ts\n {2}⚠ in the diff but not in the report: [ab]\.js/, report)
-      assert.match(await h.call("opencode_worktree", { id: name, action: "merge" }), /merged/)
+      // The merged checkout is checked too, not just each worker's branch.
+      assert.match(await h.call("opencode_worktree", { id: name, action: "merge" }), /merged 1 commit[\s\S]*your checkout after the merge: PASS/)
       await h.call("opencode_dispose", { id: name, worktree: "remove" })
     }
     await boardCall("board_accept", { id: a })
