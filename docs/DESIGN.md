@@ -1,6 +1,6 @@
 # mcp-horde: system design
 
-Status: October 2026. Built: `@mcp-horde/opencode`, `@mcp-horde/core`, `@mcp-horde/verify`, gates in `opencode` (M0, M1), `@mcp-horde/board` with its worker CLI, the `horde` Claude Code plugin with its orchestration skill (M2), and `@mcp-horde/context` with code context in briefs and related-test gates (M3). Planned: everything from M4 on.
+Status: October 2026. Built: `@mcp-horde/opencode`, `@mcp-horde/core`, `@mcp-horde/verify`, gates in `opencode` (M0, M1), `@mcp-horde/board` with its worker CLI, the `horde` Claude Code plugin with its orchestration skill (M2), `@mcp-horde/context` with code context in briefs and related-test gates (M3), and the M4 refinements (one-shot asks, scopes, worktree sync, revert, saved permissions, task-bound spawns that check reports against the diff; compaction waits on OpenCode). Planned: M5.
 
 ## 1. What this is for
 
@@ -376,7 +376,7 @@ Each goes into a `probe/` script in the relevant package, like the probes used w
 | **M1** ✓ `core` + `verify` + gates in `opencode` | mechanical verdicts; self-fixing workers (related-test selection moves to M3 with `context`) | the biggest trust and token win, and it needs no worker-side mounts |
 | **M2** ✓ `board` (MCP for the orchestrator, an auto-approved CLI for workers) + the `horde` plugin with its skill | shared task graph, reports, findings, memory; the procedure, proven end to end by a mock run (`opencode/test/flow.test.ts`) | turns ad-hoc delegation into a tracked workflow |
 | **M3** ✓ `context` v1 + `board_brief` composition + related-test gates | precise briefs; gates that run only the tests reaching the change (transitively through imports), with a full-suite fallback whenever that is not safe | closes most of the quality gap for fast models |
-| **M4** `opencode_ask`, `scope`, `worktree sync`, `opencode_compact`, `opencode_revert`, `opencode_permissions`, `opencode_spawn { task }` | one-shot calls and judging; scope enforcement; conflict handling; context and undo for long tasks; fewer calls | refinements once the loop works end to end |
+| **M4** ✓ `opencode_ask`, `scope`, `worktree sync`, `opencode_compact`, `opencode_revert`, `opencode_permissions`, `opencode_spawn { task }` (+ report-vs-diff checks, context use in status, prices in the catalog) | one-shot calls and judging; scope enforcement; conflict handling; context and undo for long tasks; fewer calls | refinements once the loop works end to end |
 | **M5** tree-sitter `context`, `board` TUI, plugin packaging, npm publish | depth and distribution | after the shape is proven |
 
 Each milestone ships with the same bar as `opencode`: unit tests, integration tests against a real `opencode serve` with the mock LLM, CI on Linux, macOS and Windows on Node 20 and 22, READMEs updated.

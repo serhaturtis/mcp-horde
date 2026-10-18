@@ -15,7 +15,7 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { after, before, describe, test } from "node:test"
-import { Board, renderBrief } from "@mcp-horde/board"
+import { Board } from "@mcp-horde/board"
 import { connect, git, type Harness } from "./harness.js"
 
 const wanted = process.env.HORDE_E2E_MODEL
@@ -82,6 +82,7 @@ describe("real model end to end", { skip: !wanted && "set HORDE_E2E_MODEL=free o
       HORDE_OPENCODE_WORKTREE_DIR: path.join(tmp, "worktrees"),
       HORDE_OPENCODE_SERVER: "private",
       HORDE_OPENCODE_MAX_RUNNING: "4",
+      HORDE_BOARD_STATE_DIR: path.join(tmp, "board"),
     })
     model = free ? await pickFreeModel() : wanted!
     console.log(`model under test: ${model}${variant ? ` (${variant})` : ""}`)
@@ -118,6 +119,19 @@ describe("real model end to end", { skip: !wanted && "set HORDE_E2E_MODEL=free o
     for (const id of ["writer", "isolated"]) await h.call("opencode_dispose", { id, worktree: "discard" })
   })
 
+  test("a one-shot answer, plain and as checked JSON", async () => {
+    const plain = await h.call("opencode_ask", { model, prompt: "What is 2 + 3? Answer with the number only." })
+    console.log(plain)
+    assert.match(plain, /\b5\b/)
+    const judged = await h.call("opencode_ask", {
+      model,
+      prompt: "Which is the correct implementation of add(a, b)?\nA: return a - b\nB: return a + b",
+      schema: { type: "object", properties: { answer: { enum: ["A", "B"] }, why: { type: "string" } }, required: ["answer"] },
+    })
+    console.log(judged)
+    assert.match(judged, /"answer": "B"/)
+  })
+
   test("the horde loop: a briefed worker fixes a bug in a worktree, passes its gate and files its report", async () => {
     const repo = newRepo("loop", {
       "math.js": "// Arithmetic helpers.\nexports.add = (a, b) => a - b\n",
@@ -136,19 +150,15 @@ describe("real model end to end", { skip: !wanted && "set HORDE_E2E_MODEL=free o
         },
       ])
     ).tasks[0]!
-    const { attempt } = await board.assign(task.id, "fixer")
-    const brief = renderBrief(board, board.task(task.id), attempt, 6000, repo)
-    assert.match(brief, /## Code context[\s\S]*exports\.add = \(a, b\) => a - b/)
+    // The task-bound spawn: the board's brief (with code context), a worktree, a gate on the scope.
     const out = await h.call("opencode_spawn", {
+      task: task.id,
       name: "fixer",
       model,
       variant,
       directory: repo,
-      prompt: brief,
-      isolation: "worktree",
       // Real models also run the tests and git themselves; the trusted report command is covered by the mock suite.
       permissions: "allow",
-      gate: { allowed: ["math.js"] },
       limits: { max_steps: 40, timeout_minutes: 15 },
       wait: true,
       timeout_seconds: 1200,
@@ -163,6 +173,8 @@ describe("real model end to end", { skip: !wanted && "set HORDE_E2E_MODEL=free o
       `the worker filed its report through the CLI:\n${await h.call("opencode_output", { id: "fixer", scope: "all" }).catch(() => "")}`,
     )
     console.log(`report: ${JSON.stringify(t.reports.at(-1))}`)
+    // Informational: real models do not always report what they did.
+    console.log(`report vs diff: ${JSON.stringify(await board.checkReport(task.id))}`)
     assert.match(await h.call("opencode_worktree", { id: "fixer", action: "merge" }), /merged/)
     assert.match(fs.readFileSync(path.join(repo, "math.js"), "utf8"), /a \+ b/)
     await board.accept(task.id)
