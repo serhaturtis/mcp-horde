@@ -277,8 +277,9 @@ export function blockEnd(lines: string[], start: number, lang: Lang): number {
 export function docAbove(lines: string[], i: number, lang: Lang): string | undefined {
   const out: string[] = []
   let j = i - 1
-  // Skip decorators and attributes.
-  while (j >= 0 && /^\s*(@\w|#\[)/.test(lines[j]!)) j--
+  // Skip decorators and attributes (C#'s `[Attr]` lines too).
+  const attr = lang === "cs" ? /^\s*(@\w|#\[|\[)/ : /^\s*(@\w|#\[)/
+  while (j >= 0 && attr.test(lines[j]!)) j--
   if (lang === "py") return undefined
   if (j >= 0 && /\*\/\s*$/.test(lines[j]!)) {
     while (j >= 0) {
@@ -371,8 +372,12 @@ export function patternDefinitions(text: string, lang: Lang): Definition[] {
   return out
 }
 
-/** Import specifiers as written in the file (resolution is in imports.ts). */
-export function importSpecs(text: string, lang: Lang): string[] {
+/**
+ * Import specifiers as written in the file (resolution is in graph.ts). With `submodules`,
+ * Python's `from pkg import a` also yields `pkg.a`, in case `a` is a module of package `pkg`
+ * (the resolver keeps it only when such a file exists).
+ */
+export function importSpecs(text: string, lang: Lang, opts: { submodules?: boolean } = {}): string[] {
   const out: string[] = []
   const add = (s: string | undefined) => {
     if (s) out.push(s)
@@ -385,11 +390,20 @@ export function importSpecs(text: string, lang: Lang): string[] {
       break
     }
     case "py": {
-      for (const m of text.matchAll(/^\s*from\s+(\.*[\w.]*)\s+import\s+\(?([^)\n#]+)/gm)) {
+      // `from x import a, b`, `from x import (\n a,\n b,\n)` and backslash continuations.
+      for (const m of text.matchAll(/^[ \t]*from[ \t]+(\.*[\w.]*)[ \t]+import[ \t]*(?:\(([^)]*)\)|((?:[^\n#\\]|\\\r?\n)+))/gm)) {
         const mod = m[1]!
-        // `from . import a, b` names modules; `from .x import a` names x.
-        if (/^\.+$/.test(mod)) for (const n of m[2]!.split(",")) add(`${mod}${n.trim().split(/\s+/)[0]}`)
-        else add(mod)
+        const names = (m[2] ?? m[3] ?? "")
+          .replace(/#[^\n]*/g, "")
+          .split(/[,\\\n]/)
+          .map((n) => n.trim().split(/\s+/)[0]!)
+          .filter((n) => /^\w+$/.test(n))
+        // `from . import a, b` names modules; `from .x import a` names x (and a, when x.a is a submodule).
+        if (/^\.+$/.test(mod)) for (const n of names) add(`${mod}${n}`)
+        else {
+          add(mod)
+          if (opts.submodules) for (const n of names) add(`${mod}.${n}`)
+        }
       }
       for (const m of text.matchAll(/^\s*import\s+([\w., ]+)/gm)) for (const n of m[1]!.split(",")) add(n.trim().split(/\s+/)[0])
       break
@@ -406,7 +420,8 @@ export function importSpecs(text: string, lang: Lang): string[] {
     }
     case "java":
     case "kt": {
-      for (const m of text.matchAll(/^\s*import\s+(?:static\s+)?([\w.]+)/gm)) add(m[1])
+      // `import a.b.C`, `import a.b.*` (a package), `import static a.b.C.m` (a member of C).
+      for (const m of text.matchAll(/^\s*import\s+(?:static\s+)?([\w.]*\w(?:\.\*)?)/gm)) add(m[1])
       break
     }
     case "cs": {

@@ -1,5 +1,5 @@
 import { fitSections, isTestPath, type Section } from "@mcp-horde/core"
-import { type Project, readText, relPath, select } from "./files.js"
+import { isProjectFile, type Project, readText, relPath, select } from "./files.js"
 import { fileInfo, type TestLink, testsFor } from "./graph.js"
 import { INSTRUCTION_FILES } from "./map.js"
 import { numbered, outline } from "./search.js"
@@ -67,7 +67,13 @@ function regions(text: string, words: string[], max = 3): [number, number][] {
  */
 export function pack(project: Project, opts: PackOptions): string {
   const terms = goalTerms(opts.goal)
-  const explicit = [...(opts.files ?? []), ...terms.paths].map((f) => relPath(project, f)).filter((f) => project.files.includes(f))
+  // Paths as given, or a bare file name that names exactly one project file.
+  const byName = (f: string) => {
+    if (isProjectFile(project, f) || f.includes("/")) return f
+    const same = project.files.filter((x) => x.endsWith(`/${f}`))
+    return same.length === 1 ? same[0]! : f
+  }
+  const explicit = [...new Set([...(opts.files ?? []), ...terms.paths].map((f) => byName(relPath(project, f))))].filter((f) => isProjectFile(project, f))
   const scoped = opts.scope?.length ? select(project, opts.scope) : []
   const words = [...terms.identifiers, ...terms.words]
   const score = (f: string) => {
@@ -94,9 +100,11 @@ export function pack(project: Project, opts: PackOptions): string {
   const wanted = [...new Set([...(opts.symbols ?? []), ...terms.identifiers])]
   const symbolSections: Section[] = []
   const covers: { file: string; a: number; b: number }[] = []
+  // Definitions in the files the work is about come before same-named ones elsewhere.
+  const searchOrder = [...new Set([...explicit, ...scoped, ...project.files])]
   for (const name of wanted) {
     if (symbolSections.length >= MAX_SYMBOLS) break
-    for (const f of project.files) {
+    for (const f of searchOrder) {
       const d = fileInfo(project, f)?.defs.find((x) => x.name === name)
       if (!d) continue
       const text = readText(project, f) ?? ""

@@ -20,6 +20,7 @@ const languages = new Map<Grammar, Language>()
 let parser: Parser | undefined
 let loading: Promise<void> | undefined
 let status = "line patterns (tree-sitter not loaded)"
+let generation = 0
 
 /**
  * Where the grammars are: next to a bundled server (the plugin's servers/grammars), or the
@@ -51,6 +52,7 @@ export function loadSyntax(): Promise<void> {
       parser = new Parser()
     } catch (err) {
       status = `line patterns (tree-sitter failed to start: ${(err as Error).message})`
+      generation++
       return
     }
     const failed: string[] = []
@@ -64,8 +66,14 @@ export function loadSyntax(): Promise<void> {
       }
     }
     status = failed.length ? `tree-sitter, except ${failed.join(", ")} (line patterns)` : "tree-sitter"
+    generation++
   })()
   return loading
+}
+
+/** Bumped whenever loadSyntax finishes: results computed before then may come from line patterns. */
+export function syntaxGeneration(): number {
+  return generation
 }
 
 /** How definitions are found right now, for the project map. */
@@ -102,7 +110,14 @@ export function parse(text: string, lang: Lang, file?: string): Parsed | undefin
     if (root.hasError) {
       const broken = errorRows(root)
       const have = new Set(defs.map((d) => d.line))
-      for (const d of patternDefinitions(text, lang)) if (!have.has(d.line) && broken.some(([a, b]) => d.line >= a && d.line <= b)) defs.push(d)
+      // Not inside a definition the tree did find: a function's body holds local helpers (left
+      // out on purpose), and Kotlin's recovery wraps whole members whose patterns would repeat.
+      const within = defs.filter((d) => d.end > d.line && (lang === "kt" || d.kind === "function" || d.kind === "method" || d.kind === "variable"))
+      for (const d of patternDefinitions(text, lang)) {
+        if (have.has(d.line) || !broken.some(([a, b]) => d.line >= a && d.line <= b) || within.some((w) => d.line > w.line && d.line <= w.end)) continue
+        defs.push(d)
+        if (d.end > d.line && (d.kind === "function" || d.kind === "method")) within.push(d)
+      }
       defs.sort((a, b) => a.line - b.line)
     }
     return { defs, spans: noncode(root) }
@@ -141,6 +156,8 @@ function errorRows(root: Node): [number, number][] {
 
 const COMMENT = /comment/
 const STRING = /string|char_literal|character_literal|rune_literal/
+/** Other text that is not code: regular expression literals and JSX text. */
+const LITERAL = /^(regex|jsx_text)$/
 const HOLE = /substitution|interpolation/
 
 /** Comment and string spans in preorder (outer before inner), so the last one containing an offset is innermost. */
@@ -149,7 +166,7 @@ function noncode(root: Node): Span[] {
   const walk = (n: Node, inString: boolean) => {
     for (const c of n.namedChildren) {
       if (!c) continue
-      if (COMMENT.test(c.type)) out.push({ start: c.startIndex, end: c.endIndex, code: false })
+      if (COMMENT.test(c.type) || LITERAL.test(c.type)) out.push({ start: c.startIndex, end: c.endIndex, code: false })
       else if (STRING.test(c.type) && !inString) {
         out.push({ start: c.startIndex, end: c.endIndex, code: false })
         walk(c, true)
@@ -190,8 +207,9 @@ interface Found {
 function collect(root: Node, lang: Lang, lines: string[]): Definition[] {
   const ctx: Ctx = { lang, lines, out: [], exportList: new Set() }
   if (lang === "ts" || lang === "js") {
+    // `export { a }` names local a; `export { a } from "./x"` re-exports another module's.
     for (const c of root.namedChildren)
-      if (c?.type === "export_statement" && !c.childForFieldName("declaration"))
+      if (c?.type === "export_statement" && !c.childForFieldName("declaration") && !c.childForFieldName("source"))
         for (const s of c.descendantsOfType("export_specifier")) {
           const local = s?.childForFieldName("name") ?? s?.namedChildren[0]
           if (local) ctx.exportList.add(local.text)
@@ -206,6 +224,8 @@ interface Scope {
   /** Whether the enclosing container is visible outside its file. */
   exported: boolean
   topLevel: boolean
+  /** The enclosing container's node type (class_declaration, trait_item, interface_declaration…). */
+  parent?: string
 }
 
 function walk(node: Node, ctx: Ctx, scope: Scope) {
@@ -216,14 +236,20 @@ function walk(node: Node, ctx: Ctx, scope: Scope) {
     const container = found.find((f) => f.container)
     // A Rust impl block is no definition, but its functions are methods.
     if (container || c.type === "impl_item") {
-      walk(c, ctx, { inClass: true, exported: container?.exported ?? true, topLevel: false })
+      walk(c, ctx, { inClass: true, exported: container?.exported ?? scope.exported, topLevel: false, parent: c.type })
       continue
     }
     if (FUNCTION_LIKE.test(c.type)) continue
-    // Declarations wrapped in export statements, decorators, blocks… stay at the same level.
-    walk(c, ctx, { ...scope, topLevel: scope.topLevel && TRANSPARENT.test(c.type) })
+    // Anonymous classes (Java `new I() { … }`, Kotlin `object : I { … }`) are values, not members.
+    if ((ctx.lang === "java" || ctx.lang === "kt") && /^(object_creation_expression|object_literal)$/.test(c.type)) continue
+    // Declarations wrapped in export statements, decorators, blocks… stay at the same level;
+    // so do Python's module-level definitions under `if` and `try`.
+    const transparent = TRANSPARENT.test(c.type) || (ctx.lang === "py" && PY_TRANSPARENT.test(c.type))
+    walk(c, ctx, { ...scope, topLevel: scope.topLevel && transparent })
   }
 }
+
+const PY_TRANSPARENT = /^(if_statement|elif_clause|else_clause|try_statement|except_clause|except_group_clause|finally_clause|block)$/
 
 /** Wrappers that keep their contents at the top level of the file. */
 const TRANSPARENT =
@@ -236,13 +262,20 @@ function emit(f: Found, ctx: Ctx) {
   // (annotations and decorators above it are not the signature).
   let row = f.nameNode?.startPosition.row ?? start
   if (row > start && !/^\s*(@|\[|#\[)/.test(lines[start] ?? "")) row = start
+  // The doc comment is above everything that belongs to the definition: its decorators and
+  // attributes (inside the node, or siblings before it) and an export wrapper.
+  let top = f.span
+  while (top.parent && /^(export_statement|ambient_declaration)$/.test(top.parent.type)) top = top.parent
+  let docRow = Math.min(row, top.startPosition.row)
+  for (let prev = top.previousNamedSibling; prev && /^(decorator|attribute_item|attribute_list)$/.test(prev.type); prev = prev.previousNamedSibling)
+    docRow = Math.min(docRow, prev.startPosition.row)
   ctx.out.push({
     name: f.name,
     kind: f.kind,
     line: row + 1,
     end: Math.max(row, f.span.endPosition.row) + 1,
     signature: signatureOf(lines, row),
-    doc: lang === "py" ? docstringBelow(lines, row) : docAbove(lines, row, lang),
+    doc: lang === "py" ? docstringBelow(lines, row) : docAbove(lines, docRow, lang),
     exported: f.exported,
   })
 }
@@ -269,11 +302,11 @@ function classify(n: Node, ctx: Ctx, scope: Scope): Found[] {
     case "rs":
       return classifyRs(n, scope)
     case "java":
-      return classifyJava(n)
+      return classifyJava(n, scope)
     case "kt":
       return classifyKt(n, scope)
     case "cs":
-      return classifyCs(n)
+      return classifyCs(n, scope)
   }
 }
 
@@ -288,6 +321,19 @@ function classifyJs(n: Node, ctx: Ctx, scope: Scope): Found[] {
     case "function_declaration":
     case "generator_function_declaration":
       return named("function")
+    case "function_signature": {
+      // `declare function`, .d.ts files, overloads. Overloads followed by their implementation
+      // are that one function, defined there.
+      const name = nameOf(n)?.text
+      for (let sib = (n.parent?.type === "export_statement" ? n.parent : n).nextNamedSibling; sib; sib = sib.nextNamedSibling) {
+        if (COMMENT.test(sib.type)) continue
+        const d = sib.type === "export_statement" ? sib.childForFieldName("declaration") : sib
+        if (d?.type === "function_signature" && nameOf(d)?.text === name) continue
+        if (d?.type === "function_declaration" && nameOf(d)?.text === name) return []
+        break
+      }
+      return named("function")
+    }
     case "class_declaration":
     case "abstract_class_declaration":
       return named("class", true)
@@ -302,7 +348,15 @@ function classifyJs(n: Node, ctx: Ctx, scope: Scope): Found[] {
       return named("module", true)
     case "method_definition":
     case "abstract_method_signature":
-      return named("method")
+      // Methods of classes; an object literal's methods are values, not definitions.
+      return scope.inClass && n.parent?.type === "class_body" ? named("method") : []
+    case "public_field_definition":
+    case "field_definition": {
+      // Class fields holding functions (`onClick = () => …`) are methods.
+      const value = n.childForFieldName("value")?.type
+      if (!scope.inClass || !value || !/^(arrow_function|function_expression|function|generator_function)$/.test(value)) return []
+      return def(n, "method", false, false, n.childForFieldName("name") ?? n.childForFieldName("property") ?? undefined)
+    }
     case "variable_declarator": {
       const name = n.childForFieldName("name")
       if (!scope.topLevel || name?.type !== "identifier") return []
@@ -335,8 +389,17 @@ function classifyPy(n: Node, scope: Scope): Found[] {
     }
     case "assignment": {
       const left = n.childForFieldName("left")
-      if (!scope.topLevel || left?.type !== "identifier") return []
-      return def(n, "variable", !left.text.startsWith("_"), false, left)
+      if (!scope.topLevel || !left) return []
+      // `a = …`, and each name of `a, b = …` / `(a, b) = …`.
+      const ids =
+        left.type === "identifier" ? [left] : /^(pattern_list|tuple_pattern)$/.test(left.type) ? left.namedChildren.filter((c) => c?.type === "identifier") : []
+      return ids.flatMap((id) => (id ? def(n, "variable", !id.text.startsWith("_"), false, id) : []))
+    }
+    case "type_alias_statement": {
+      // PEP 695: `type X = …`
+      const left = n.childForFieldName("left")
+      const id = left?.type === "identifier" ? left : left?.namedChildren.find((c) => c?.type === "identifier")
+      return id ? def(n, "type", visible(id.text), false, id) : []
     }
   }
   return []
@@ -367,11 +430,14 @@ function classifyGo(n: Node, scope: Scope): Found[] {
 }
 
 function classifyRs(n: Node, scope: Scope): Found[] {
-  const pub = n.namedChildren.some((c) => c?.type === "visibility_modifier" && c.text.startsWith("pub"))
+  // Exported: plain `pub` (not pub(crate), pub(super), pub(in …)), in a module that is itself exported.
+  const pub = scope.exported && n.namedChildren.some((c) => c?.type === "visibility_modifier" && c.text === "pub")
   switch (n.type) {
     case "function_item":
     case "function_signature_item":
-      return def(n, scope.inClass ? "method" : "function", pub || (scope.inClass && scope.exported && n.type === "function_signature_item"))
+      // A trait's functions are as visible as the trait.
+      // Functions of impls and traits are methods; a `mod { … }`'s are functions.
+      return def(n, scope.parent === "impl_item" || scope.parent === "trait_item" ? "method" : "function", scope.parent === "trait_item" ? scope.exported : pub)
     case "struct_item":
     case "union_item":
       return def(n, "class", pub)
@@ -393,8 +459,11 @@ function classifyRs(n: Node, scope: Scope): Found[] {
   return []
 }
 
-function classifyJava(n: Node): Found[] {
-  const pub = /\bpublic\b/.test(n.namedChildren.find((c) => c?.type === "modifiers")?.text ?? "")
+function classifyJava(n: Node, scope: Scope): Found[] {
+  const mods = n.namedChildren.find((c) => c?.type === "modifiers")?.text ?? ""
+  // Interface members are public unless they say otherwise; anything is only as visible as its container.
+  const inInterface = scope.parent === "interface_declaration" || scope.parent === "annotation_type_declaration"
+  const pub = scope.exported && (/\bpublic\b/.test(mods) || (inInterface && !/\bprivate\b/.test(mods)))
   switch (n.type) {
     case "class_declaration":
     case "record_declaration":
@@ -413,7 +482,7 @@ function classifyJava(n: Node): Found[] {
 
 function classifyKt(n: Node, scope: Scope): Found[] {
   const mods = n.namedChildren.find((c) => c?.type === "modifiers")?.text ?? ""
-  const visible = !/\b(private|internal)\b/.test(mods)
+  const visible = scope.exported && !/\b(private|internal)\b/.test(mods)
   switch (n.type) {
     case "class_declaration": {
       const kind: DefKind = n.children.some((c) => c?.type === "interface") ? "interface" : /\benum\b/.test(mods) ? "enum" : "class"
@@ -427,15 +496,22 @@ function classifyKt(n: Node, scope: Scope): Found[] {
       return def(n, "type", visible)
     case "property_declaration": {
       if (!scope.topLevel) return []
-      const id = n.descendantsOfType("variable_declaration")[0]?.namedChildren.find((c) => c?.type === "identifier")
-      return id ? def(n, "variable", visible, false, id) : []
+      // `val a = …`, or each name of `val (a, b) = …`.
+      const multi = n.namedChildren.find((c) => c?.type === "multi_variable_declaration")
+      const decls = multi ? multi.namedChildren.filter((c) => c?.type === "variable_declaration") : [n.descendantsOfType("variable_declaration")[0]]
+      return decls.flatMap((d) => {
+        const id = d?.namedChildren.find((c) => c?.type === "identifier")
+        return id ? def(n, "variable", visible, false, id) : []
+      })
     }
   }
   return []
 }
 
-function classifyCs(n: Node): Found[] {
-  const pub = n.namedChildren.some((c) => c?.type === "modifier" && c.text === "public")
+function classifyCs(n: Node, scope: Scope): Found[] {
+  const mods = n.namedChildren.filter((c) => c?.type === "modifier").map((c) => c!.text)
+  // Interface members are public unless they say otherwise; anything is only as visible as its container.
+  const pub = scope.exported && (mods.includes("public") || (scope.parent === "interface_declaration" && !mods.includes("private")))
   switch (n.type) {
     case "class_declaration":
     case "struct_declaration":

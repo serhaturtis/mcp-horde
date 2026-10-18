@@ -13,7 +13,7 @@ There is no index to build and nothing to keep in sync: every answer comes from 
 | `context_symbol` | A definition's signature, doc comment and extent, plus its call sites (a count and the first ones). |
 | `context_file` | An excerpt with line numbers: a line range, only the named symbols' definitions, or the whole file when it fits (otherwise its outline and its head). |
 | `context_imports` | Project files a file imports, or the files importing it. |
-| `context_tests_for` | The tests that cover files: named after them (next to them, or in a mirrored `test/`, `tests/`, `__tests__/`, `src/test/java/…` tree), importing them (also through re-exporting `index`/`lib` files and workspace package names), Go package tests, Rust inline `#[cfg(test)]` modules. |
+| `context_tests_for` | The tests that cover files: named after them (next to them, or in a mirrored `test/`, `tests/`, `__tests__/`, `src/test/java/…` tree, or a C# `X.Tests/…/FooTests.cs` project for `X/…/Foo.cs`), importing them (also through re-exporting `index`/`lib` files and workspace package names), Go package tests, Rust inline `#[cfg(test)]` modules. |
 | `context_pack` | A budgeted context section for a worker's brief (below). |
 
 ```text
@@ -38,7 +38,7 @@ function Add (exported) — internal/calc/calc.go:4-6
 
 ## Languages
 
-Definitions come from tree-sitter syntax trees for TypeScript/TSX, JavaScript, Python, Go, Rust, Java, Kotlin and C#: functions, classes, methods, interfaces, types, enums, modules, top-level variables (also names exported through `export { … }` lists and CommonJS `exports.x =`), with their exact extents, doc comments and docstrings. Code inside strings and comments defines nothing, and references and call sites skip mentions in comments and strings (string interpolations count as code). The grammars are prebuilt WebAssembly (`grammars/`, fetched by `scripts/fetch-grammars.mjs`; licenses in `grammars/NOTICE.md`), loaded once at startup in about 60 ms; no native build. If a grammar cannot load, or a file has a syntax error, line patterns cover the file or its broken part, and `context_map` says which is in use. Imports come from language-aware patterns. Import resolution covers relative TS/JS imports (including ESM `.js` specifiers for `.ts` sources and directory `index` files), workspace packages by name (an exports `source` condition, or the source twin of `main`/`types`), Python relative and absolute modules (root, `src/` and `lib/` layouts), Go packages under the module path, Rust `mod` and `use crate::…`, and Java/Kotlin packages. C# namespaces are not mapped to files.
+Definitions come from tree-sitter syntax trees for TypeScript/TSX, JavaScript, Python, Go, Rust, Java, Kotlin and C#: functions, classes, methods, interfaces, types, enums, modules, top-level variables (also names exported through `export { … }` lists and CommonJS `exports.x =`), with their exact extents, doc comments and docstrings. Code inside strings and comments defines nothing, and references and call sites skip mentions in comments and strings (string interpolations count as code). The grammars are prebuilt WebAssembly (`grammars/`, fetched by `scripts/fetch-grammars.mjs`; licenses in `grammars/NOTICE.md`), loaded once at startup in about 60 ms; no native build. If a grammar cannot load, or a file has a syntax error, line patterns cover the file or its broken part, and `context_map` says which is in use. Imports come from language-aware patterns. Import resolution covers relative TS/JS imports (including ESM `.js` specifiers for `.ts` sources and directory `index` files), `compilerOptions.paths` and `baseUrl` from the nearest `tsconfig.json`/`jsconfig.json` (comments allowed, one level of relative `extends`), workspace packages by name (an exports `source` condition, or the source twin of `main`/`types`), Python relative and absolute modules (root, `src/` and `lib/` layouts; `from pkg import mod` links `pkg/mod.py` when it exists), Go packages under the module path of the nearest `go.mod`, Rust `mod`, `use crate::…`, `super::…` and `self::…`, and Java/Kotlin classes, packages (`import a.b.*`) and static imports. C# namespaces are not mapped to files.
 
 ## Configuration
 
@@ -49,6 +49,8 @@ Definitions come from tree-sitter syntax trees for TypeScript/TSX, JavaScript, P
 ```
 
 `ignore` extends `.gitignore`; `entrypoints` are always listed by `context_map`.
+
+Paths and `paths`/`scope` filters are relative to the project root: a plain path (`src/`, `src/users`) covers that file or directory at the root only, a glob (`**/src/**`, `*.ts`) matches as globs do, and `.` means the whole project. Only the project's listed files are read: nothing outside the root (absolute paths, `..`, symlinks pointing out), no ignored files, and no directories, FIFOs or devices. Outside a git repository, or in a directory git lists nothing for (one a parent repository ignores), the files are found by walking the directory.
 
 ## Setup
 
@@ -63,5 +65,5 @@ claude mcp add context -- node /path/to/mcp-horde/packages/context/dist/index.js
 ## Known limits
 
 - **Syntax, not types.** Call sites are found by name, outside comments and strings; two different functions with the same name are not told apart, and definitions generated by macros or code generation are not seen. Functions defined inside other functions are left out on purpose (local helpers).
-- **References are textual.** `context_symbol` counts whole-word uses, so a different symbol with the same name is counted too.
+- **References are textual.** `context_symbol` counts whole-word, case-sensitive uses of the exact name in source files, so a different symbol with the same name is counted too.
 - **Large repositories:** listing stops at 50,000 files and files over 1 MB are not read; narrow searches with `paths`.

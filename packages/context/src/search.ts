@@ -1,7 +1,7 @@
 import { truncate } from "@mcp-horde/core"
-import { type Project, readText, relPath, select } from "./files.js"
+import { type Project, readText, relPath, select, unreadable } from "./files.js"
 import { fileInfo } from "./graph.js"
-import type { Definition } from "./lang.js"
+import { type Definition, langOf } from "./lang.js"
 import { isCode } from "./syntax.js"
 
 export interface Hit {
@@ -20,10 +20,11 @@ const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
  */
 export function queryRegex(query: string, word = false): RegExp {
   const m = /^\/(.+)\/([a-z]*)$/.exec(query)
-  if (m) return new RegExp(m[1]!, m[2]!.replace(/g/g, ""))
-  const body = word ? `(?<![\\w$])${escapeRe(query)}(?![\\w$])` : escapeRe(query)
-  return new RegExp(body, /[A-Z]/.test(query) ? "" : "i")
+  if (m) return new RegExp(m[1]!, m[2]!.replace(/[gy]/g, ""))
+  return wordRegex(query, word, /[A-Z]/.test(query) ? "" : "i")
 }
+
+const wordRegex = (name: string, word: boolean, flags = "") => new RegExp(word ? `(?<![\\w$])${escapeRe(name)}(?![\\w$])` : escapeRe(name), flags)
 
 export interface FindOptions {
   kind?: FindKind
@@ -34,10 +35,10 @@ export interface FindOptions {
 export function find(project: Project, query: string, opts: FindOptions = {}): { hits: Hit[]; total: number } {
   const kind = opts.kind ?? "text"
   const limit = opts.limit ?? 50
-  const hits: Hit[] = []
-  let total = 0
   const files = select(project, opts.paths)
   if (kind === "definition") {
+    const hits: Hit[] = []
+    let total = 0
     const re = queryRegex(query)
     const exact: Hit[] = []
     for (const f of files) {
@@ -49,12 +50,26 @@ export function find(project: Project, query: string, opts: FindOptions = {}): {
     }
     return { hits: [...exact, ...hits].slice(0, limit), total }
   }
-  const re = queryRegex(query, kind === "reference")
+  return scan(project, files, queryRegex(query, kind === "reference"), kind === "reference" ? query : undefined, limit)
+}
+
+/**
+ * Lines matching `re`. With `reference` (a symbol name), only source files (a known language)
+ * are searched, the name's own definition lines are skipped, and so are matches in comments
+ * and strings when the file was parsed.
+ */
+function scan(project: Project, files: string[], re: RegExp, reference: string | undefined, limit: number): { hits: Hit[]; total: number } {
+  const hits: Hit[] = []
+  let total = 0
+  // A whole-text test first, to skip files quickly: multiline, so ^ and $ still mean a line's
+  // start and end. Lookarounds can see across lines, so with them every file is read by line.
+  const pre = /\(\?<?[=!]/.test(re.source) && !reference ? undefined : new RegExp(re.source, re.flags.includes("m") ? re.flags : `${re.flags}m`)
   for (const f of files) {
+    if (reference !== undefined && !langOf(f)) continue
     const text = readText(project, f)
-    if (text === undefined || !re.test(text)) continue
-    const info = kind === "reference" ? fileInfo(project, f) : undefined
-    const defLines = info ? new Set(info.defs.filter((d) => d.name === query).map((d) => d.line)) : undefined
+    if (text === undefined || (pre && !pre.test(text))) continue
+    const info = reference !== undefined ? fileInfo(project, f) : undefined
+    const defLines = info ? new Set(info.defs.filter((d) => d.name === reference).map((d) => d.line)) : undefined
     const all = info?.spans ? new RegExp(re.source, `${re.flags}g`) : undefined
     const lines = text.split(/\n/)
     let offset = 0
@@ -83,7 +98,8 @@ export function symbol(project: Project, name: string, opts: { path?: string; ca
   const defs: { file: string; def: Definition }[] = []
   for (const f of select(project, scope)) for (const d of fileInfo(project, f)?.defs ?? []) if (d.name === name) defs.push({ file: f, def: d })
   if (!defs.length) return []
-  const refs = find(project, name, { kind: "reference", limit: 10_000 }).hits
+  // Call sites are the exact name, case and all, as a whole word.
+  const refs = scan(project, project.files, wordRegex(name, true), name, 10_000).hits
   return defs.map(({ file, def }) => {
     // Call sites: not the definition itself, not comments (its own doc comment included).
     const calls = refs.filter((h) => !(h.file === file && h.line >= def.line && h.line <= def.end) && !/^(\/\/|#|\*|\/\*)/.test(h.text))
@@ -93,14 +109,19 @@ export function symbol(project: Project, name: string, opts: { path?: string; ca
 
 /** Lines `a..b` (1-based, inclusive) with right-aligned line numbers. */
 export function numbered(text: string, a = 1, b = Number.POSITIVE_INFINITY): string {
-  const lines = text.split(/\r?\n/)
-  // A final newline ends the last line; it does not start another.
-  if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop()
+  const lines = linesOf(text)
   const end = Math.min(b, lines.length)
   const w = String(end).length
   const out: string[] = []
   for (let i = Math.max(1, a); i <= end; i++) out.push(`${String(i).padStart(w)}  ${lines[i - 1]}`)
   return out.join("\n")
+}
+
+/** A file's lines: a final newline ends the last line; it does not start another. */
+function linesOf(text: string): string[] {
+  const lines = text.split(/\r?\n/)
+  if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop()
+  return lines
 }
 
 /** One line per definition: `12-40  function name(args)`; methods indented under their class. */
@@ -121,16 +142,20 @@ export interface ExcerptOptions {
  */
 export function excerpt(project: Project, file: string, opts: ExcerptOptions = {}): string {
   const rel = relPath(project, file)
+  const why = unreadable(project, rel)
+  if (why) throw new Error(why)
   const text = readText(project, rel)
-  if (text === undefined) throw new Error(project.files.includes(rel) ? `${rel} is binary or too large to read` : `no file ${rel} in ${project.root}`)
+  if (text === undefined) throw new Error(`${rel} is binary or too large to read`)
   const budget = opts.budgetChars ?? 12_000
-  const total = text.split(/\r?\n/).length
+  const total = linesOf(text).length
   const fit = (s: string) => (s.length > budget ? `${s.slice(0, budget)}\n… (cut at ${budget} chars; ask for a line range)` : s)
   if (opts.lines) {
     const m = /^(\d+)(?:\s*-\s*(\d+))?$/.exec(opts.lines.trim())
     if (!m) throw new Error(`lines must look like "10-40", not "${opts.lines}"`)
     const a = Number(m[1])
     const b = m[2] ? Number(m[2]) : a
+    if (a < 1 || b < a) throw new Error(`lines must be a range "a-b" with 1 <= a <= b, not "${opts.lines}"`)
+    if (a > total) throw new Error(`${rel} has ${total} line${total === 1 ? "" : "s"}; line ${a} is past its end`)
     return fit(`${rel} (lines ${a}-${Math.min(b, total)} of ${total})\n${numbered(text, a, b)}`)
   }
   const defs = fileInfo(project, rel)?.defs ?? []
