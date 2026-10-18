@@ -576,7 +576,10 @@ describe("opencode MCP server: core behaviour (real opencode, mock LLM)", { time
   })
 
   test("ask: one-shot answers without tools; JSON checked against a schema, with one retry", async () => {
-    assert.match(await h.call("opencode_ask", { prompt: "quick question" }), /^Echo\[none\]: Answer the request below directly[\s\S]*\nquick\n\(mock\/mock · \$0\)$/)
+    assert.match(
+      await h.call("opencode_ask", { prompt: "quick question" }),
+      /^Echo\[none\]: Answer the request below directly[\s\S]*\nquick\n\(mock\/mock · \$0\)$/,
+    )
     assert.match(await h.call("opencode_ask", { prompt: "TOOLS?" }), /^Tools:\n/, "no tools are offered")
     const schema = { type: "object", properties: { verdict: { enum: ["a", "b"] }, score: { type: "integer" } }, required: ["verdict"] }
     assert.match(
