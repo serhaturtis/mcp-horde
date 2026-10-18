@@ -81,7 +81,16 @@ export function planRelated(root: string, changed: string[], checks: Check[]): {
     return !langOf(f) || !(links.get(f)?.length ?? 0)
   })
   const related = [...new Set([...links.values()].flat().map((l) => l.test))].filter((t) => project.files.includes(t))
-  const rel = (cwd: string, f: string) => path.relative(cwd, path.join(root, f)).replace(/\\/g, "/")
+  // Compare real paths: git reports long names, a check's cwd may carry a short (8.3) one on Windows.
+  const real = (p: string) => {
+    try {
+      return fs.realpathSync.native(p)
+    } catch {
+      return path.resolve(p)
+    }
+  }
+  const realRoot = real(root)
+  const rel = (cwd: string, f: string) => path.relative(real(cwd), path.join(realRoot, f)).replace(/\\/g, "/")
   const inside = (cwd: string, f: string) => {
     const r = rel(cwd, f)
     return !r.startsWith("../") && r !== ".." && !path.isAbsolute(r)
