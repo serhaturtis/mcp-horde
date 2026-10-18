@@ -11,6 +11,7 @@ import type { AddressInfo } from "node:net"
  *   "SLOW"          → streams "Working...." for ~15s
  *   "FAIL400"       → HTTP 400
  *   "TOOLS?"        → answers with the tool names it was offered
+ *   "JSON: <json>"  → answers with that text; "JSON-RETRY" answers prose until told it was not valid; "JSON-NEVER" always prose
  *   anything else   → "Echo[<reasoning_effort>]: <prompt>" (+ " FILE:<name>" for attached files)
  */
 export async function startMockLlm(): Promise<{ url: string; close: () => void; requests: unknown[] }> {
@@ -122,6 +123,16 @@ export async function startMockLlm(): Promise<{ url: string; close: () => void; 
       })
     }
     if (userText.includes("TOOLS?")) return say(`Tools: ${(b.tools ?? []).map((t) => t.function.name).join(",")}`)
+    // JSON answers: "JSON: <json>" says it; "JSON-RETRY" says prose until told it was not valid.
+    const everything = msgs
+      .filter((m) => m.role === "user")
+      .map(textOf)
+      .join("\n")
+    if (userText.includes("was not valid")) return say(everything.includes("JSON-NEVER") ? "still prose" : '```json\n{"verdict": "b", "score": 7}\n```')
+    if (userText.includes("JSON-NEVER")) return say("prose")
+    if (userText.includes("JSON-RETRY")) return say("I think b is better.")
+    const json = /^JSON: (.+)$/m.exec(userText)
+    if (json) return say(json[1]!)
     if (userText.includes("SLOW")) {
       chunk({ role: "assistant", content: "Working" })
       for (let i = 0; i < 30 && !res.destroyed; i++) {

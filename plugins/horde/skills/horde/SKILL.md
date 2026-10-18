@@ -51,11 +51,11 @@ A merge that conflicts with work merged before it: `opencode_worktree { action: 
 
 ## Best of N (hard, well-specified tasks)
 
-Brief the same task to 2–3 workers on cheap tiers (one `board_brief` per worker, passed as their prompts; each brief starts a new attempt and ends the previous one, so only the last worker can report: compare the others by their gate verdicts and diffs). Gates filter out the broken attempts; compare the survivors' reports and `opencode_worktree diff` outputs, merge one, discard the others.
+Brief the same task to 2–3 workers on cheap tiers (one `board_brief` per worker, passed as their prompts; each brief starts a new attempt and ends the previous one, so only the last worker can report: compare the others by their gate verdicts and diffs). Gates filter out the broken attempts; compare the survivors' reports and `opencode_worktree diff` outputs, merge one, discard the others. To compare long diffs without reading them yourself, `opencode_ask` a cheap model as judge with a `schema` (e.g. `{"winner": …, "why": …}`) and attach the diffs as files.
 
 ## Do not
 
-- Read transcripts (`opencode_output`) unless a gate failed twice and the verdict does not explain why.
+- Read transcripts (`opencode_output`) unless a gate failed twice and the verdict does not explain why. For a long log, `opencode_ask` a cheap model to summarize it.
 - Rewrite briefs from memory: use `opencode_spawn { task }` or `board_brief`, which carry the reporting commands and the attempt token.
 - Merge without a passing gate, or accept a report whose unverified claims cover the acceptance criteria.
 - Give workers vague goals ("improve the auth code"). Vague goals are where cheap models waste money.

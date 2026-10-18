@@ -6,6 +6,7 @@ import path from "node:path"
 import { describe, test } from "node:test"
 import { formatTokens, formatUsd, truncate, truncateHead } from "@mcp-horde/core"
 import type { QuestionV2Request } from "@opencode-ai/sdk/v2"
+import { extractJson, validate } from "../src/ask.js"
 import { isLoopback, shimTarget } from "../src/backend.js"
 import { loadConfig } from "../src/config.js"
 import { defaultQuestionPolicy, defined, formatModel, parseModel } from "../src/fleet.js"
@@ -184,6 +185,34 @@ describe("tracker", () => {
 })
 
 describe("helpers", () => {
+  test("ask: JSON is found in replies and checked against a schema", () => {
+    assert.deepEqual(extractJson('{"a": 1}').value, { a: 1 })
+    assert.deepEqual(extractJson("Sure:\n```json\n[1, 2]\n```").value, [1, 2])
+    assert.deepEqual(extractJson('The answer is {"ok": true}.').value, { ok: true })
+    assert.equal(extractJson("no json here").error, "the reply is not JSON")
+    const schema = {
+      type: "object",
+      properties: {
+        verdict: { enum: ["a", "b"] },
+        score: { type: "integer", minimum: 0, maximum: 10 },
+        tags: { type: "array", items: { type: "string" }, maxItems: 2 },
+      },
+      required: ["verdict", "score"],
+      additionalProperties: false,
+    }
+    assert.deepEqual(validate({ verdict: "a", score: 3, tags: ["x"] }, schema), [])
+    assert.deepEqual(validate({ verdict: "c", score: 11, tags: ["x", 1, "z"], extra: 1 }, schema), [
+      '$.verdict: must be one of ["a","b"]',
+      "$.score: must be at most 10",
+      "$.tags: allows at most 2 items",
+      "$.tags[1]: expected string, got integer",
+      "$.extra: not allowed",
+    ])
+    assert.deepEqual(validate({ verdict: "a" }, schema), ["$.score: required"])
+    assert.deepEqual(validate("x", { type: "object" }), ["$: expected object, got string"])
+    assert.deepEqual(validate(2.5, { type: "number" }), [])
+  })
+
   test("model prices: base tier per million tokens, free, unknown", () => {
     const c = (input: number, output: number, tier?: { type: "context"; size: number }) => ({ input, output, tier, cache: { read: 0, write: 0 } })
     assert.equal(price({ cost: [c(0.27, 1.1)] }), "$0.27/$1.10 per M")

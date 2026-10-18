@@ -2,6 +2,7 @@ import { formatTokens, formatUsd, indent, oneLine, truncate, truncateHead } from
 import { type McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js"
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js"
 import { z } from "zod"
+import type { JsonSchema } from "./ask.js"
 import type { Backend } from "./backend.js"
 import { POLICIES } from "./config.js"
 import type { Fleet, GateView, Snapshot } from "./fleet.js"
@@ -531,6 +532,37 @@ export function registerTools(server: McpServer, ctx: Context) {
       const snap = await fleet.message(a.id, a.message ?? fallback)
       if (a.wait) return waitAndRender(fleet, [snap.id], "all", a.timeout_seconds, extra, 8000)
       return `Resumed.\n${renderSnapshot(snap)}`
+    },
+  )
+
+  tool(
+    "opencode_ask",
+    "A one-shot answer from any model, without an agent loop: no tools, no worktree, nothing left behind. For classifying, summarizing a long log or diff, judging between candidates, drafting a brief. With schema the answer is JSON that conforms to it (checked, with one retry). Attach files to give it material.",
+    {
+      prompt: z.string().min(1),
+      model: z.string().optional().describe('"provider/model" from opencode_models (a cheap one is usually right).'),
+      variant: z.string().optional().describe("Effort level (requires model)."),
+      files: files.optional(),
+      schema: z
+        .record(z.string(), z.unknown())
+        .optional()
+        .describe('JSON Schema for the answer, e.g. {"type":"object","properties":{"verdict":{"enum":["a","b"]}},"required":["verdict"]}.'),
+      directory: z.string().optional().describe("Project whose OpenCode config (providers) applies; default the server's directory."),
+      timeout_seconds: timeout.optional(),
+    },
+    async (a, fleet, extra) => {
+      const r = await fleet.ask({
+        prompt: a.prompt,
+        model: a.model,
+        variant: a.variant,
+        files: a.files,
+        schema: a.schema as JsonSchema | undefined,
+        directory: a.directory,
+        timeoutMs: (a.timeout_seconds ?? 300) * 1000,
+        signal: extra.signal,
+      })
+      const meta = `(${formatModel(r.model)} · ${formatUsd(r.cost)}${r.retried ? " · retried once for the schema" : ""})`
+      return r.json !== undefined ? `${JSON.stringify(r.json, null, 2)}\n${meta}` : `${r.text}\n${meta}`
     },
   )
 

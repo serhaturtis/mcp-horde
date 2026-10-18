@@ -575,6 +575,21 @@ describe("opencode MCP server: core behaviour (real opencode, mock LLM)", { time
     await assert.rejects(h.call("opencode_revert", { id: "undo", turns: 9 }), /has 2 turn\(s\) on record; cannot revert 9/)
   })
 
+  test("ask: one-shot answers without tools; JSON checked against a schema, with one retry", async () => {
+    assert.match(await h.call("opencode_ask", { prompt: "quick question" }), /^Echo\[none\]: quick question\n\(mock\/mock · \$0\)$/)
+    assert.match(await h.call("opencode_ask", { prompt: "TOOLS?" }), /^Tools:\n/, "no tools are offered")
+    const schema = { type: "object", properties: { verdict: { enum: ["a", "b"] }, score: { type: "integer" } }, required: ["verdict"] }
+    assert.match(
+      await h.call("opencode_ask", { prompt: 'JSON: {"verdict": "a", "score": 2}', schema }),
+      /^\{\n {2}"verdict": "a",\n {2}"score": 2\n\}\n\(mock\/mock/,
+    )
+    assert.match(await h.call("opencode_ask", { prompt: "JSON-RETRY which is better?", schema }), /"verdict": "b"[\s\S]*retried once for the schema/)
+    await assert.rejects(h.call("opencode_ask", { prompt: "JSON-NEVER", schema }), /did not match the schema after one retry:\nthe reply is not JSON/)
+    // Nothing is left behind: no agents, no sessions in the project's listing, the directory is ignored by git.
+    assert.doesNotMatch(await h.call("opencode_status"), /ask-/)
+    assert.doesNotMatch(git(repo, "status", "--porcelain"), /horde-ask/)
+  })
+
   test("channel notifications are pushed when agents settle", async () => {
     const before = h.channel.length
     await h.call("opencode_spawn", { prompt: "ping", name: "pinger" })

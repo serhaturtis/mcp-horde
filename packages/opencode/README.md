@@ -10,6 +10,7 @@ It is built on OpenCode's **v2 server API** (`/api/*`, through `@opencode-ai/sdk
 | --- | --- |
 | Discover models (with context size, price and effort variants) and agent profiles | `opencode_models`, `opencode_agents` |
 | Spawn an agent with its own model, effort (`variant`), profile, instructions, directory, limits and permission policy | `opencode_spawn` |
+| Get a one-shot answer from any model, with no tools and nothing left behind (classify, summarize a log or diff, judge candidates); with a JSON Schema, a checked JSON answer | `opencode_ask` |
 | Give an agent a custom profile (tool allow/deny list, step cap) | `opencode_spawn` `profile` |
 | Run agents in parallel without collisions, each in its own git worktree and branch | `opencode_spawn` `isolation: "worktree"` |
 | Confine an agent's file edits to some paths: OpenCode refuses the rest (`outside: "deny"`) or asks you (`"ask"`, whatever the permission policy) | `opencode_spawn` `scope` (worktree only; `bash` writes are caught by the gate's audit instead) |
