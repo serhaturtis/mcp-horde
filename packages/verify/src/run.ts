@@ -54,7 +54,9 @@ export function logDirFor(base: string, directory: string): string {
 }
 
 export function logFileFor(logDir: string, check: string): string {
-  return path.join(logDir, `${check.replace(/[^\w.-]+/g, "_")}.log`)
+  const safe = check.replace(/[^\w.-]+/g, "_")
+  // A name the replacement changed gets a hash of the original, so test:unit and test_unit keep separate logs.
+  return path.join(logDir, safe === check ? `${safe}.log` : `${safe}-${createHash("sha256").update(check).digest("hex").slice(0, 8)}.log`)
 }
 
 export async function runChecks(checks: Check[], opts: RunChecksOptions): Promise<CheckResult[]> {
@@ -67,8 +69,8 @@ export async function runChecks(checks: Check[], opts: RunChecksOptions): Promis
       cwd: check.cwd,
       timeoutMs: opts.timeoutMs,
       signal: opts.signal,
-      env: CI_ENV,
-      stripEnv: STRIP_ENV,
+      env: { ...CI_ENV, ...check.env },
+      stripEnv: [...STRIP_ENV, ...(check.stripEnv ?? [])],
       maxChars: MAX_LOG_CHARS,
       onProgress: (line) => opts.onProgress?.(`${check.name}: ${line}`),
       progressMs: 10_000,

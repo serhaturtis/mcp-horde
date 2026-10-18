@@ -291,7 +291,17 @@ function jest(text: string, cwd?: string): Omit<Extracted, "runner"> {
   }
   const tests = text.match(/^Tests:\s+(.*)$/m)?.[1] ?? ""
   const part = (k: string) => num(tests.match(new RegExp(`(\\d+) ${k}`))?.[1])
-  return { failures, counts: tests ? { failed: part("failed") ?? 0, passed: part("passed"), skipped: part("skipped") } : undefined }
+  const suites = num(text.match(/^Test Suites:.*?(\d+) failed/m)?.[1])
+  return { failures, counts: withSuites(tests ? { failed: part("failed") ?? 0, passed: part("passed"), skipped: part("skipped") } : undefined, suites) }
+}
+
+/**
+ * A test file that fails to load (syntax error, missing import) fails its suite without a
+ * failed test: count those suites, so a failed run never reads "0 failed".
+ */
+function withSuites(counts: Counts | undefined, suitesFailed: number | undefined): Counts | undefined {
+  if (!suitesFailed || (counts?.failed ?? 0) > 0) return counts
+  return { ...counts, failed: suitesFailed }
 }
 
 // ------------------------------------------------------------------ vitest
@@ -319,7 +329,8 @@ function vitest(text: string, cwd?: string): Omit<Extracted, "runner"> {
   }
   const tests = text.match(/^\s+Tests\s+(.*)$/m)?.[1] ?? ""
   const part = (k: string) => num(tests.match(new RegExp(`(\\d+) ${k}`))?.[1])
-  return { failures, counts: tests ? { failed: part("failed") ?? 0, passed: part("passed"), skipped: part("skipped") } : undefined }
+  const files = num(text.match(/^\s*Test Files\s+(\d+) failed/m)?.[1])
+  return { failures, counts: withSuites(tests ? { failed: part("failed") ?? 0, passed: part("passed"), skipped: part("skipped") } : undefined, files) }
 }
 
 // ------------------------------------------------------------------ pytest
@@ -436,6 +447,9 @@ function goTest(text: string, cwd?: string): Omit<Extracted, "runner"> {
       message: message(body.map((b) => b.replace(/^\s+\S+\.go:\d+: /, ""))),
     })
   })
+  // A parent test fails when a subtest does, with nothing of its own to say: report the subtest only.
+  const own = failures.filter((f) => f.message.trim() || f.file || !failures.some((g) => g.test?.startsWith(`${f.test}/`)))
+  failures.splice(0, failures.length, ...own)
   // Build failures print compiler diagnostics instead of test results.
   if (!failures.length) {
     for (const m of text.matchAll(/^(\S+\.go):(\d+):\d+: (.+)$/gm)) failures.push({ file: relative(m[1]!, cwd), line: Number(m[2]), message: m[3]! })

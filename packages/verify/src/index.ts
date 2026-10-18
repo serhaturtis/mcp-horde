@@ -2,13 +2,13 @@
 import fs from "node:fs"
 import path from "node:path"
 import { loadSyntax } from "@mcp-horde/context"
-import { packageVersion, truncateHead } from "@mcp-horde/core"
+import { git, packageVersion, truncateHead } from "@mcp-horde/core"
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js"
 import { z } from "zod"
-import { audit } from "./audit.js"
-import { detectChecks, loadSettings } from "./detect.js"
+import { audit, diffBase } from "./audit.js"
+import { checkScripts, detectChecks, loadSettings, loadSettingsAt } from "./detect.js"
 import { defaultStateDir, gate } from "./gate.js"
 import { logDirFor, logFileFor } from "./run.js"
 
@@ -103,7 +103,12 @@ tool(
     directory,
     base: z.string().optional().describe("Commit or ref the work started from (e.g. the branch point). Without it, only the checks run."),
     checks: z.array(z.string()).optional().describe("Run only these checks (names from verify_detect)."),
-    allowed: z.array(z.string()).optional().describe('Scope: globs (repo-relative) every changed file must match, e.g. ["src/auth/**", "test/auth/**"].'),
+    allowed: z
+      .array(z.string())
+      .optional()
+      .describe(
+        'Scope: globs (repo-relative) every changed file must match, e.g. ["src/auth/**", "test/auth/**"]; narrows horde.json\'s verify.audit.allowed.',
+      ),
     audit: z.boolean().optional().describe("Set false to skip the audit even with a base."),
     fresh: z.boolean().optional().describe("Run again even if this exact tree was already judged."),
     related: z
@@ -163,16 +168,19 @@ tool(
   {
     directory,
     base: z.string().describe("Commit or ref the work started from."),
-    allowed: z.array(z.string()).optional().describe("Scope globs (repo-relative)."),
+    allowed: z.array(z.string()).optional().describe("Scope globs (repo-relative); with horde.json's verify.audit.allowed, a file must match both."),
   },
   async (a) => {
     const d = dir(a.directory)
-    const settings = loadSettings(d)
+    // The rules as they were at base, like verify_gate: the work under audit cannot change them.
+    const settings = await loadSettingsAt(d, await diffBase(await git(d, "rev-parse", "--show-toplevel"), a.base))
     const r = await audit(d, {
       base: a.base,
-      allowed: [...settings.audit.allowed, ...(a.allowed ?? [])],
+      allowed: settings.audit.allowed,
+      scopes: [a.allowed ?? []],
       block: settings.audit.block,
       warn: settings.audit.warn,
+      ruleScripts: checkScripts(await detectChecks(d, settings)),
     })
     const head = `${r.files.length} file${r.files.length === 1 ? "" : "s"} changed, ${r.commits} commit${r.commits === 1 ? "" : "s"} since ${r.base.slice(0, 8)}`
     if (!r.findings.length) return `${head}; no findings.`

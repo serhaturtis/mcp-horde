@@ -2,8 +2,8 @@ import { createHash } from "node:crypto"
 import fs from "node:fs/promises"
 import path from "node:path"
 import { fitSections, formatDuration, git, gitRaw, type Section, splitZ, truncate } from "@mcp-horde/core"
-import { type AuditResult, audit, type Finding } from "./audit.js"
-import { type Check, detectChecks, loadSettings } from "./detect.js"
+import { type AuditResult, audit, diffBase, type Finding } from "./audit.js"
+import { type Check, checkScripts, detectChecks, loadSettings, loadSettingsAt } from "./detect.js"
 import { changedFiles, type Narrowing, planRelated } from "./related.js"
 import { type CheckResult, logDirFor, runChecks } from "./run.js"
 
@@ -12,7 +12,10 @@ export interface GateOptions {
   base?: string
   /** Names of checks to run (default: all detected or configured ones). */
   checks?: string[]
-  /** Scope globs for this run, added to horde.json's `verify.audit.allowed`. */
+  /**
+   * Scope globs for this run (a task's paths). They narrow horde.json's `verify.audit.allowed`:
+   * a changed path must match both lists (each one that is set).
+   */
   allowed?: string[]
   /** Skip the audit (e.g. outside a worktree, where the human's own edits would be audited too). */
   audit?: boolean
@@ -51,20 +54,23 @@ export interface Verdict {
 const cache = new Map<string, Omit<Verdict, "cached" | "text">>()
 const CACHE_LIMIT = 50
 
-/** A key that changes whenever anything a check could see changes. */
+/**
+ * A key that changes whenever anything a check could see changes. Any git error means no key
+ * (never cached): an empty diff standing in for one that failed would match a different tree.
+ */
 async function treeKey(directory: string, extra: unknown): Promise<string | undefined> {
   try {
     const root = await git(directory, "rev-parse", "--show-toplevel")
-    const head = await git(root, "rev-parse", "HEAD").catch(() => "none")
+    const head = await git(root, "rev-parse", "--verify", "HEAD")
     const h = createHash("sha256").update(head).update("\0")
-    h.update(await gitRaw(root, ["-c", "core.quotePath=false", "diff", "--no-ext-diff", "--binary", "HEAD"]).catch(() => ""))
+    h.update(await gitRaw(root, ["-c", "core.quotePath=false", "diff", "--no-ext-diff", "--binary", "HEAD"]))
     for (const p of splitZ(await gitRaw(root, ["-c", "core.quotePath=false", "ls-files", "--others", "--exclude-standard", "-z"]))) {
       const st = await fs.stat(path.join(root, p)).catch(() => undefined)
       h.update(`\0${p}\0${st?.size ?? -1}\0${st?.mtimeMs ?? -1}`)
     }
     return h.update("\0").update(JSON.stringify(extra)).digest("hex")
   } catch {
-    return undefined // not a git repository: never cached
+    return undefined // not a git repository, no commit yet, or git failed: never cached
   }
 }
 
@@ -75,18 +81,19 @@ export function defaultStateDir(env: NodeJS.ProcessEnv = process.env): string {
 
 export async function gate(directory: string, opts: GateOptions = {}): Promise<Verdict> {
   const dir = path.resolve(directory)
-  const settings = loadSettings(dir)
+  // The diff starts where HEAD meets base; the rules are base's, so the work cannot rewrite them.
+  const base = opts.base ? await diffBase(await git(dir, "rev-parse", "--show-toplevel"), opts.base) : undefined
+  const settings = base ? await loadSettingsAt(dir, base) : loadSettings(dir)
   const all = await detectChecks(dir, settings)
   const selected = opts.checks?.length ? pick(all, opts.checks) : all
-  const allowed = [...settings.audit.allowed, ...(opts.allowed ?? [])]
-  const doAudit = opts.audit !== false && !!opts.base
+  const doAudit = opts.audit !== false && !!base
   const budget = opts.budgetChars ?? 1500
-  const relatedMode = !!opts.relatedTo || (!!opts.related && !!opts.base)
+  const relatedMode = !!opts.relatedTo || (!!opts.related && !!base)
   const key = await treeKey(dir, {
-    checks: selected.map((c) => [c.name, c.command, c.cwd]),
-    base: doAudit || relatedMode ? opts.base : null,
-    allowed,
-    a: settings.audit,
+    checks: selected,
+    base: doAudit || relatedMode ? base : null,
+    allowed: opts.allowed ?? [],
+    settings: { ...settings, checks: undefined },
     related: relatedMode ? (opts.relatedTo ?? true) : false,
   })
   const hit = key && !opts.fresh ? cache.get(key) : undefined
@@ -98,7 +105,7 @@ export async function gate(directory: string, opts: GateOptions = {}): Promise<V
   if (relatedMode) {
     const { root, files } = opts.relatedTo
       ? { root: await git(dir, "rev-parse", "--show-toplevel"), files: opts.relatedTo.map((f) => f.replace(/\\/g, "/")) }
-      : await changedFiles(dir, opts.base!)
+      : await changedFiles(dir, base!)
     ;({ plans, untested } = planRelated(root, files, selected))
   }
   const toRun = selected.filter((c) => !plans.get(c)?.skipped).map((c) => ({ ...c, command: plans.get(c)?.command ?? c.command }))
@@ -117,8 +124,19 @@ export async function gate(directory: string, opts: GateOptions = {}): Promise<V
     const r = ran.find((x) => x.name === c.name)
     return r ? [{ ...r, related: plan }] : []
   })
-  const auditResult = doAudit ? await audit(dir, { base: opts.base!, allowed, block: settings.audit.block, warn: settings.audit.warn }) : undefined
+  const auditResult = doAudit
+    ? await audit(dir, {
+        base: base!,
+        allowed: settings.audit.allowed,
+        scopes: [opts.allowed ?? []],
+        block: settings.audit.block,
+        warn: settings.audit.warn,
+        ruleScripts: checkScripts(all),
+      })
+    : undefined
   const blockers = [
+    // Nothing ran, so nothing was judged: that is not a pass.
+    ...(selected.length ? [] : [NO_CHECKS]),
     ...checks.filter((c) => !c.pass).map((c) => `${c.name}: ${summary(c)}`),
     ...(auditResult?.findings.filter((f) => f.severity === "block").map(findingLine) ?? []),
   ]
@@ -142,6 +160,8 @@ export async function gate(directory: string, opts: GateOptions = {}): Promise<V
   return { ...verdict, cached: false, text: render(verdict, budget, false) }
 }
 
+const NO_CHECKS = "no checks to run (configure verify.checks in horde.json)"
+
 function pick(all: Check[], names: string[]): Check[] {
   const unknown = names.filter((n) => !all.some((c) => c.name === n))
   if (unknown.length)
@@ -153,8 +173,9 @@ function summary(c: CheckResult): string {
   if (c.stopped === "timeout") return "timed out"
   if (c.stopped === "cancelled") return "cancelled"
   const n = c.extracted.counts
-  if (n) return [`${n.failed} failed`, n.passed !== undefined && `${n.passed} passed`, n.skipped && `${n.skipped} skipped`].filter(Boolean).join(", ")
-  return `exit ${c.code}`
+  // A failing run with no failed tests failed outside them (a crash, a threshold, a load error).
+  if (n?.failed) return [`${n.failed} failed`, n.passed !== undefined && `${n.passed} passed`, n.skipped && `${n.skipped} skipped`].filter(Boolean).join(", ")
+  return [c.code === null ? "failed to run" : `exit ${c.code}`, n?.passed !== undefined && `${n.passed} passed`].filter(Boolean).join(", ")
 }
 
 function findingLine(f: Finding): string {
@@ -169,14 +190,16 @@ function findingLine(f: Finding): string {
 export function render(v: Omit<Verdict, "cached" | "text">, budget: number, cached = false): string {
   const failed = v.checks.filter((c) => !c.pass)
   const blocking = v.audit?.findings.filter((f) => f.severity === "block") ?? []
+  const noChecks = v.blockers.includes(NO_CHECKS)
   const parts = [
     failed.length && `${failed.length} check${failed.length > 1 ? "s" : ""} failed`,
     blocking.length && `${blocking.length} blocking finding${blocking.length > 1 ? "s" : ""}`,
+    noChecks && "no checks to run",
     v.warnings.length && `${v.warnings.length} warning${v.warnings.length > 1 ? "s" : ""}`,
   ].filter(Boolean)
   const head = `${v.pass ? "PASS" : "FAIL"}${parts.length ? ` · ${parts.join(", ")}` : ""} · ${formatDuration(v.durationMs)}${cached ? " (cached: tree unchanged)" : ""}`
   const sections: Section[] = [{ text: head, required: true }]
-  if (!v.checks.length) sections.push({ text: "no checks found (configure verify.checks in horde.json)", required: true })
+  if (noChecks) sections.push({ text: `✗ ${NO_CHECKS}`, required: true })
   // One status line per check, failing ones first.
   for (const c of [...failed, ...v.checks.filter((x) => x.pass)]) {
     if (c.related?.skipped) {

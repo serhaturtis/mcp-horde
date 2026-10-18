@@ -12,12 +12,16 @@ export interface Finding {
 }
 
 export interface AuditOptions {
-  /** Commit (or ref) the work started from. */
+  /** Commit (or ref) the work started from; the diff starts at its merge-base with HEAD. */
   base: string
   /** Globs (relative to the repository root) every changed path must match; empty = no scope check. */
   allowed?: string[]
+  /** More glob lists a changed path must also match (each non-empty one): scopes narrow each other. */
+  scopes?: string[][]
   block: AuditCategory[]
   warn: AuditCategory[]
+  /** package.json scripts the checks run (see checkScripts): changing one changes what the gate checks. */
+  ruleScripts?: string[]
 }
 
 export interface AuditResult {
@@ -43,17 +47,62 @@ const Q = ["-c", "core.quotePath=false"]
 const MAX_SCAN_BYTES = 1024 * 1024
 const BIG_FILE = 1024 * 1024
 
+/**
+ * A file a test runner runs as a test (not a helper, fixture or conftest.py that merely
+ * lives among the tests).
+ */
+export const isRunnableTest = (p: string) =>
+  /\.(test|spec)\.[cm]?[jt]sx?$/.test(p) ||
+  /(^|\/)__tests__\/.+\.[cm]?[jt]sx?$/.test(p) ||
+  /(^|\/)test_[^/]+\.py$/.test(p) ||
+  /[^/]_test\.(py|go)$/.test(p) ||
+  /(^|\/)tests\/[^/]+\.rs$/.test(p) ||
+  /[^/]Tests?\.(java|kt|cs)$/.test(p)
+
+/** The commit a diff from `base` starts at: where HEAD's history meets base's (base itself when HEAD descends from it). */
+export async function diffBase(root: string, base: string): Promise<string> {
+  const sha = await git(root, "rev-parse", "--verify", "--quiet", `${base}^{commit}`).catch(() => {
+    throw new Error(`base "${base}" is not a commit in ${root}`)
+  })
+  return git(root, "merge-base", sha, "HEAD").catch(() => sha)
+}
+
+/** A path from a diff header, C-quoted by git when it holds control characters, quotes or backslashes. */
+export function unquoteC(p: string): string {
+  if (!p.startsWith('"') || !p.endsWith('"') || p.length < 2) return p
+  const bytes: number[] = []
+  const body = p.slice(1, -1)
+  const simple: Record<string, number> = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '"': 34, "\\": 92 }
+  for (let i = 0; i < body.length; i++) {
+    const c = body[i]!
+    if (c !== "\\") {
+      bytes.push(...Buffer.from(c, "utf8"))
+      continue
+    }
+    const n = body[++i] ?? ""
+    const oct = body.slice(i, i + 3)
+    if (/^[0-7]{3}$/.test(oct)) {
+      bytes.push(Number.parseInt(oct, 8))
+      i += 2
+    } else bytes.push(simple[n] ?? n.charCodeAt(0))
+  }
+  return Buffer.from(bytes).toString("utf8")
+}
+
 /** Assertions in the common test frameworks (counted per occurrence, not per line). */
 const ASSERTION = /\b(assert\w*|expect|should|assertEquals|assertThat|require\.\w+|t\.(Error|Fatal)\w*)\s*[.(!]/g
 const assertions = (lines: string[]) => lines.reduce((n, l) => n + (l.match(ASSERTION)?.length ?? 0), 0)
 
+/** Test-runner calls, never ordinary words: `(?<![.\w$])` keeps `model.fit(` or `outfit(` from matching. */
 const SKIP_MARKERS: [RegExp, string][] = [
-  [/\b(describe|it|test|context|suite)\.only\s*\(/, "focuses tests with .only (all others stop running)"],
-  [/\b(describe|it|test|context|suite)\.skip\s*\(|\bx(it|describe|test)\s*\(/, "skips a test"],
-  [/@pytest\.mark\.(skip|xfail)\b|@unittest\.skip|pytest\.skip\(/, "skips a test"],
+  [/\b(describe|it|test|context|suite)\.only(\.each)?\s*[(`]|(?<![.\w$])f(it|describe)\s*\(/, "focuses tests with .only (all others stop running)"],
+  [/\b(describe|it|test|context|suite|bench)\.(skip|todo)(\.each)?\s*[(`]|\.(skipIf|runIf)\s*\(|(?<![.\w$])x(it|describe|test|context)\s*\(/, "skips a test"],
+  // node:test options and context, mocha's this.skip()
+  [/[{,]\s*(skip|todo)\s*:\s*(true\b|["'`])|\bt\.(skip|todo)\s*\(|\bthis\.skip\s*\(/, "skips a test"],
+  [/@pytest\.mark\.(skip|skipif|xfail)\b|\bpytest\.(skip|xfail)\s*\(|@unittest\.(skip\w*|expectedFailure)\b|\.skipTest\s*\(/, "skips a test"],
   [/\bt\.Skip(Now|f)?\(/, "skips a test"],
-  [/#\[ignore\]/, "ignores a test"],
-  [/\{\s*skip:\s*true\s*\}|\btest\.todo\(/, "skips a test"],
+  [/#\[ignore\b/, "ignores a test"],
+  [/@(Disabled|Ignore)\b/, "disables a test"],
 ]
 
 const SUPPRESSIONS: [RegExp, string][] = [
@@ -72,10 +121,38 @@ const SECRETS: [RegExp, string][] = [
   [/-----BEGIN (RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----/, "a private key"],
   [/\bgh[pousr]_[A-Za-z0-9]{36,}\b|github_pat_[A-Za-z0-9_]{40,}/, "a GitHub token"],
   [/\bxox[baprs]-[A-Za-z0-9-]{10,}/, "a Slack token"],
-  [/\bsk-(ant-|proj-)?[A-Za-z0-9_-]{20,}/, "an API secret key"],
+  // After a known prefix the key body may hold - and _; a bare sk- is followed by base62 only (not sk-some-kebab-name).
+  [/\bsk-(?:ant-[a-z]+\d*-[A-Za-z0-9_-]{20,}|proj-[A-Za-z0-9_-]{20,}|[A-Za-z0-9]{20,}(?![\w-]))/, "an API secret key"],
   [/\bAIza[0-9A-Za-z_-]{35}\b/, "a Google API key"],
-  [/(api[_-]?key|secret|passw(or)?d|token)["']?\s*[:=]\s*["'][^"'\s]{16,}["']/i, "a hard-coded credential"],
+  [/(api[_-]?key|secret|passw(or)?d|token)["']?\s*[:=]\s*["']([^"'\s]{16,})["']/i, "a hard-coded credential"],
 ]
+
+/** Values that stand for a secret rather than being one: templates, placeholders, environment lookups. */
+const PLACEHOLDER = /\$\{|\{\{|^<.*>$|process\.env|os\.environ|getenv|^(x+|\*+|\.+|changeme\w*|your[\w-]*)$/i
+
+/**
+ * A random-looking value: letters and digits or mixed case (punctuation does not count, so
+ * `my_token_name` is a word), and some entropy (not `aaaa1111…`).
+ */
+function randomLooking(v: string): boolean {
+  const classes = [/[a-z]/, /[A-Z]/, /\d/].filter((r) => r.test(v)).length
+  if (classes < 2) return false
+  const freq = new Map<string, number>()
+  for (const c of v) freq.set(c, (freq.get(c) ?? 0) + 1)
+  const bits = [...freq.values()].reduce((h, n) => h - (n / v.length) * Math.log2(n / v.length), 0)
+  return bits >= 3
+}
+
+function secretIn(text: string): string | undefined {
+  for (const [re, what] of SECRETS) {
+    const m = text.match(re)
+    if (!m) continue
+    // The generic assignment rule needs a value that is neither a placeholder nor a word.
+    if (what === "a hard-coded credential" && (PLACEHOLDER.test(m[3] ?? "") || !randomLooking(m[3] ?? ""))) continue
+    return what
+  }
+  return undefined
+}
 
 const LOCKFILES =
   /(^|\/)(package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?|Cargo\.lock|poetry\.lock|uv\.lock|Pipfile\.lock|go\.sum|composer\.lock|Gemfile\.lock)$/
@@ -108,31 +185,53 @@ async function changes(root: string, base: string): Promise<Change[]> {
     if (c && m[1] === "-") c.binary = true
   }
   // Added and removed lines, from a zero-context diff that does not depend on user config.
-  const diff = await gitRaw(root, [...Q, "-c", "color.ui=never", "-c", "diff.noprefix=false", "diff", "--no-ext-diff", "--no-textconv", "-M", "-U0", base])
+  // Fixed a/ b/ prefixes whatever diff.noprefix or diff.mnemonicPrefix say.
+  const diff = await gitRaw(root, [
+    ...Q,
+    "-c",
+    "color.ui=never",
+    "diff",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
+    "-M",
+    "-U0",
+    base,
+  ])
+  const headerPath = (l: string, prefix: string) => {
+    const p = unquoteC(l.slice(4).replace(/\t$/, ""))
+    return p.startsWith(prefix) ? p.slice(prefix.length) : p
+  }
   let current: Change | undefined
   let lineNo = 0
+  // ---/+++ are file headers only between "diff --git" and the file's first hunk; inside a
+  // hunk they are a removed "-- x" or an added "++ y" line.
+  let inHeader = false
   for (const l of diff.split("\n")) {
     if (l.startsWith("diff --git ")) {
       current = undefined
+      inHeader = true
       continue
     }
-    if (l.startsWith("+++ ")) {
-      const p = l.slice(4).replace(/\t$/, "").replace(/^b\//, "")
-      current = p === "/dev/null" ? undefined : byPath.get(p)
+    if (inHeader && l.startsWith("+++ ")) {
+      const p = headerPath(l, "b/")
+      current = l.slice(4) === "/dev/null" ? undefined : byPath.get(p)
       continue
     }
-    if (l.startsWith("--- ")) {
-      const p = l.slice(4).replace(/\t$/, "").replace(/^a\//, "")
+    if (inHeader && l.startsWith("--- ")) {
+      const p = headerPath(l, "a/")
       // A deletion has no "+++ b/…" target: track its removed lines under the old path.
-      if (p !== "/dev/null") current = byPath.get(p) ?? [...byPath.values()].find((c) => c.from === p)
+      if (l.slice(4) !== "/dev/null") current = byPath.get(p) ?? [...byPath.values()].find((c) => c.from === p)
       continue
     }
     const h = l.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/)
     if (h) {
       lineNo = Number(h[1])
+      inHeader = false
       continue
     }
-    if (!current) continue
+    if (!current || inHeader) continue
     if (l.startsWith("+")) current.added.push({ line: lineNo++, text: l.slice(1) })
     else if (l.startsWith("-")) current.removed.push(l.slice(1))
   }
@@ -153,6 +252,74 @@ async function changes(root: string, base: string): Promise<Change[]> {
     byPath.set(p, c)
   }
   return [...byPath.values()]
+}
+
+/** Size of a file at a commit (0 when it did not exist there). */
+async function sizeAt(root: string, rev: string, file: string): Promise<number> {
+  return Number(await git(root, "cat-file", "-s", `${rev}:${file}`).catch(() => "0")) || 0
+}
+
+/** Scripts a detected check runs, by convention, besides the ones the caller names. */
+const RULE_SCRIPTS = ["test", "typecheck", "type-check", "check-types", "tsc", "lint", "check", "build"]
+/** Test-runner configuration files: changing one changes which tests run and how. */
+const RUNNER_CONFIG =
+  /(^|\/)(jest\.config\.[\w.]+|vitest\.(config|workspace)\.[\w.]+|pytest\.ini|tox\.ini|\.mocharc(\.[\w]+)?|karma\.conf(\.[\w]+)?|\.c8rc(\.json)?|\.nycrc(\.[\w]+)?)$/
+
+/** Text of the INI/TOML sections whose header matches `header`. */
+function sections(text: string, header: RegExp): string {
+  let keep = false
+  return text
+    .split("\n")
+    .filter((l) => {
+      if (/^\s*\[/.test(l)) keep = header.test(l.trim())
+      return keep
+    })
+    .join("\n")
+}
+
+/**
+ * Changes to what the gate itself checks with: horde.json's verify section, the package.json
+ * scripts the checks run (and jest's config there), test-runner configs, pytest's sections of
+ * pyproject.toml and setup.cfg. A worker that edits these can make a failing suite pass.
+ */
+async function ruleChanges(root: string, base: string, all: Change[], scripts: string[]): Promise<{ file: string; what: string }[]> {
+  const out: { file: string; what: string }[] = []
+  const before = (f: string) => git(root, "show", `${base}:${f}`).catch(() => "")
+  const after = (f: string) => fs.readFile(path.join(root, f), "utf8").catch(() => "")
+  const json = (t: string) => {
+    try {
+      return (JSON.parse(t) ?? {}) as Record<string, unknown>
+    } catch {
+      return {}
+    }
+  }
+  const differs = (a: unknown, b: unknown) => JSON.stringify(a ?? null) !== JSON.stringify(b ?? null)
+  const names = new Set([...RULE_SCRIPTS, ...scripts])
+  for (const c of all) {
+    const file = c.path
+    const old = c.from ?? c.path
+    if (/(^|\/)horde\.json$/.test(file)) {
+      if (differs(json(await before(old)).verify, json(await after(file)).verify)) out.push({ file, what: "horde.json verify" })
+    } else if (/(^|\/)package\.json$/.test(file)) {
+      const [a, b] = [json(await before(old)), json(await after(file))]
+      const sa = (a.scripts ?? {}) as Record<string, unknown>
+      const sb = (b.scripts ?? {}) as Record<string, unknown>
+      const changed = [...new Set([...Object.keys(sa), ...Object.keys(sb)])].filter(
+        (n) => (names.has(n) || /^(test|lint|typecheck|check)[:-]/.test(n)) && differs(sa[n], sb[n]),
+      )
+      if (changed.length) out.push({ file, what: `package.json scripts ${changed.join(", ")}` })
+      if (differs(a.jest, b.jest)) out.push({ file, what: "package.json jest" })
+    } else if (RUNNER_CONFIG.test(file) || (c.from && RUNNER_CONFIG.test(c.from))) {
+      out.push({ file, what: path.posix.basename(RUNNER_CONFIG.test(file) ? file : c.from!) })
+    } else if (/(^|\/)pyproject\.toml$/.test(file)) {
+      const re = /^\[tool\.pytest/
+      if (sections(await before(old), re) !== sections(await after(file), re)) out.push({ file, what: "pyproject.toml [tool.pytest]" })
+    } else if (/(^|\/)setup\.cfg$/.test(file)) {
+      const re = /^\[tool:pytest\]/
+      if (sections(await before(old), re) !== sections(await after(file), re)) out.push({ file, what: "setup.cfg [tool:pytest]" })
+    }
+  }
+  return out
 }
 
 async function packageJsonDeps(root: string, base: string, file: string) {
@@ -180,9 +347,7 @@ async function packageJsonDeps(root: string, base: string, file: string) {
 /** Audit the work between `base` and the current working tree. */
 export async function audit(directory: string, opts: AuditOptions): Promise<AuditResult> {
   const root = await git(directory, "rev-parse", "--show-toplevel")
-  const base = await git(root, "rev-parse", "--verify", `${opts.base}^{commit}`).catch(() => {
-    throw new Error(`base "${opts.base}" is not a commit in ${root}`)
-  })
+  const base = await diffBase(root, opts.base)
   const all = await changes(root, base)
   const findings: Finding[] = []
   const severityOf = (c: AuditCategory) => (opts.block.includes(c) ? "block" : opts.warn.includes(c) ? "warn" : undefined)
@@ -192,8 +357,9 @@ export async function audit(directory: string, opts: AuditOptions): Promise<Audi
     findings.push({ category, severity: soft ? "warn" : sev, ...f })
   }
 
-  if (opts.allowed?.length) {
-    const inScope = globMatcher(opts.allowed)
+  const scopes = [opts.allowed ?? [], ...(opts.scopes ?? [])].filter((s) => s.length).map((s) => globMatcher(s))
+  if (scopes.length) {
+    const inScope = (p: string) => scopes.every((m) => m(p))
     for (const c of all) {
       if (!inScope(c.path))
         add("scope", {
@@ -206,8 +372,10 @@ export async function audit(directory: string, opts: AuditOptions): Promise<Audi
 
   for (const c of all) {
     const test = isTestPath(c.path)
-    if (c.status === "D" && test) add("tests", { file: c.path, text: "deletes a test file" })
-    if (c.from && isTestPath(c.from) && !test) add("tests", { file: c.from, text: `moves a test file out of the test suite (to ${c.path})` })
+    if (c.status === "D" && (test || isRunnableTest(c.path))) add("tests", { file: c.path, text: "deletes a test file" })
+    // x.test.ts → x.test.ts.bak stays in a test directory but no runner picks it up any more.
+    if (c.from && ((isTestPath(c.from) && !test) || (isRunnableTest(c.from) && !isRunnableTest(c.path))))
+      add("tests", { file: c.from, text: `moves a test file out of the test suite (to ${c.path})` })
     if (test) {
       for (const a of c.added) {
         const hit = SKIP_MARKERS.find(([re]) => re.test(a.text))
@@ -221,14 +389,18 @@ export async function audit(directory: string, opts: AuditOptions): Promise<Audi
     for (const a of c.added) {
       const sup = SUPPRESSIONS.find(([re]) => re.test(a.text))
       if (sup) add("suppressions", { file: c.path, line: a.line, text: sup[1] })
-      const secret = SECRETS.find(([re]) => re.test(a.text))
+      const secret = secretIn(a.text)
       // Name the kind of secret, never the value.
-      if (secret) add("secrets", { file: c.path, line: a.line, text: `adds what looks like ${secret[1]}` })
+      if (secret) add("secrets", { file: c.path, line: a.line, text: `adds what looks like ${secret}` })
     }
     if (c.status !== "D") {
       if (c.binary) add("binaries", { file: c.path, text: "adds or changes a binary file" })
-      const st = await fs.stat(path.join(root, c.path)).catch(() => undefined)
-      if (st?.isFile() && st.size > BIG_FILE) add("binaries", { file: c.path, text: `file is ${(st.size / 1024 / 1024).toFixed(1)} MB` })
+      // Size: new files, or files this change made big; lockfiles are big by nature.
+      const st = LOCKFILES.test(c.path) ? undefined : await fs.stat(path.join(root, c.path)).catch(() => undefined)
+      if (st?.isFile() && st.size > BIG_FILE) {
+        const before = c.status === "A" || c.status === "?" ? 0 : await sizeAt(root, base, c.from ?? c.path)
+        if (before <= BIG_FILE) add("binaries", { file: c.path, text: `file is ${(st.size / 1024 / 1024).toFixed(1)} MB` })
+      }
     }
     // Dependencies.
     if (/(^|\/)package\.json$/.test(c.path) && c.status !== "D") {
@@ -245,6 +417,9 @@ export async function audit(directory: string, opts: AuditOptions): Promise<Audi
         add("dependencies", { file: c.path, text: `adds or changes ${deps.slice(0, 5).join("; ")}${deps.length > 5 ? ` (+${deps.length - 5})` : ""}` })
     } else if (LOCKFILES.test(c.path)) add("dependencies", { file: c.path, text: "updates a lockfile" }, true)
   }
+
+  for (const f of await ruleChanges(root, base, all, opts.ruleScripts ?? []))
+    add("tests", { file: f.file, text: `changes the rules the gate checks with: ${f.what}` })
 
   const commits = Number(await git(root, "rev-list", "--count", `${base}..HEAD`).catch(() => "0"))
   const merges = (await git(root, "rev-list", "--merges", `${base}..HEAD`).catch(() => "")).split("\n").filter(Boolean)

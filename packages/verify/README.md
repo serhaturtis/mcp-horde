@@ -23,7 +23,7 @@ audit: 4 files changed, 0 commits since de5399ad
 
 | Tool | What it does |
 | --- | --- |
-| `verify_gate` | Runs the checks and, given `base`, audits base → working tree. PASS only when every check passed and nothing blocking was found. |
+| `verify_gate` | Runs the checks and, given `base`, audits base → working tree. PASS only when every check passed and nothing blocking was found; no checks at all is a FAIL. |
 | `verify_run` | Runs checks without the audit (e.g. after merging several branches). |
 | `verify_audit` | The audit alone, one line per finding. |
 | `verify_detect` | Which checks would run and where each comes from. |
@@ -39,14 +39,14 @@ audit: 4 files changed, 0 commits since de5399ad
 ! tests: no test covers 1 changed source file(s): src/rate.ts
 ```
 
-- The full suite runs when any changed file is not a source file with a known test (config, manifests, fixtures, untested code), or when the runner cannot take test paths.
-- Runners that can: pytest, vitest, jest, `go test ./...` (narrowed to packages), and `npm test` when the script is a plain vitest or jest call. Other checks (typecheck, lint) always run in full.
+- The full suite runs when any changed file is not a source file with a known test (config, manifests, fixtures, test helpers and `conftest.py`, untested code), when the runner cannot take test paths, when the project uses import aliases (tsconfig/jsconfig `paths`, package.json `imports`, a bundler `alias`), when it is too big for the code map, or when a Python project or Go module is not at the repository root.
+- Runners that can: pytest, vitest, jest (with `--runTestsByPath`), `go test ./...` (narrowed to packages), and `npm test` when the script is a plain vitest or jest call. Other checks (typecheck, lint) always run in full.
 - A test check whose directory has neither changes nor related tests (another package in a monorepo) is skipped.
 - Changed source files that no test covers are a warning, never a blocker.
 
 `@mcp-horde/opencode` gates use related tests by default (`related_only: false` to turn it off). Run the full suite yourself after merging (`verify_run`).
 
-An unchanged tree is never re-run: the key is HEAD, the working-tree diff, untracked files, and the exact checks and audit settings, so polling a gate is free.
+An unchanged tree is never re-run: the key is HEAD, the working-tree diff, untracked files, the base commit, and the exact checks and settings, so polling a gate is free. When git cannot answer, nothing is cached.
 
 ## What the verdict contains
 
@@ -58,28 +58,28 @@ An unchanged tree is never re-run: the key is HEAD, the working-tree diff, untra
 
 Anything else gets a generic excerpt around the first error, or the end of the output. A check that fails without its runner naming a failure (a coverage threshold, a crash, a timeout) still says why. When failures exceed the budget, the verdict says how many were not shown, so counts are never lost.
 
-**Audit** (base → working tree, committed and uncommitted, plus untracked files):
+**Audit** (from where HEAD meets base, `git merge-base base HEAD`, to the working tree: committed and uncommitted, plus untracked files):
 
 | Category | Finds | Default |
 | --- | --- | --- |
-| `scope` | changed files outside the `allowed` globs | block |
-| `tests` | deleted test files, tests moved out of the suite, `.skip`/`.only`/`xit`/`@pytest.mark.skip`/`t.Skip`/`#[ignore]`; removed assertions and rewritten snapshots (always warnings) | block |
-| `secrets` | access keys, private keys, tokens, hard-coded credentials (the value is never printed) | block |
-| `binaries` | binary files, files over 1 MB | block |
+| `scope` | changed files outside the `allowed` globs (a gate's `allowed` and horde.json's `verify.audit.allowed` both apply: a file must match each list that is set) | block |
+| `tests` | deleted test files, tests renamed so no runner picks them up, `.skip`/`.only`/`.todo`/`.skipIf`/`xit`/`fit`/`{ skip: true }`/`this.skip()`/`@pytest.mark.skip`/`skipif`/`xfail`/`t.Skip`/`#[ignore]`/`@Disabled`; changes to the rules the gate checks with (horde.json `verify`, the package.json scripts the checks run, jest/vitest/mocha/karma configs, `pytest.ini`, `tox.ini`, pytest sections of `pyproject.toml`/`setup.cfg`); removed assertions and rewritten snapshots (always warnings) | block |
+| `secrets` | access keys, private keys, tokens, hard-coded credentials that look random (placeholders such as `${…}`, `{{…}}`, `<…>` are not); the value is never printed | block |
+| `binaries` | binary files, new files over 1 MB or files the change made bigger than that (lockfiles excepted) | block |
 | `suppressions` | `@ts-ignore`, lint disables, `# type: ignore`, `# noqa`, casts through `any`, empty `catch`, `except: pass` | warn |
 | `dependencies` | added, removed or changed packages (package.json, requirements, Cargo.toml, pyproject.toml, go.mod), lockfile changes | warn |
 | `git` | merge commits on the branch | warn |
 
 ## Where checks come from
 
-From `horde.json` at the repository root when it defines them; otherwise detected from the nearest project root (walking up from the directory to the repository root):
+From `horde.json` at the repository root when it defines them (with `base`, horde.json as it was at base: the work under judgement cannot change its own rules); otherwise detected from the nearest project root (walking up from the directory to the repository root):
 
 | Found | Checks |
 | --- | --- |
-| `package.json` | `typecheck` (or `type-check`, `check-types`, `tsc`), `lint` (or `check`), `test`; `build` only when there is no typecheck script. npm's placeholder `test` script is ignored. pnpm, yarn and bun are detected from their lockfiles. |
-| `pyproject.toml`, `pytest.ini`, `setup.cfg`, … | mypy and ruff when configured, pytest when configured or a `tests/` directory exists; a local `.venv` is used when present |
-| `Cargo.toml` | `cargo test` |
-| `go.mod` | `go vet ./...`, `go test ./...` |
+| `package.json` | `typecheck` (or `type-check`, `check-types`, `tsc`), `lint` (or `check`), `test`; `build` only when there is no typecheck script. npm's placeholder `test` script is ignored. The package manager comes from `packageManager`, else the nearest lockfile up to the repository root. |
+| `pyproject.toml`, `pytest.ini`, `setup.cfg`, … | mypy and ruff when configured, pytest when configured or there is a `conftest.py` or `test_*.py`/`*_test.py` file; through `uv run`/`poetry run` when there is a `uv.lock`/`poetry.lock` and the tool is installed, else a local `.venv` when present. `PYTHONPATH` is set to the project (`src/` and its root) and `VIRTUAL_ENV` removed. |
+| `Cargo.toml` | `cargo test` (`--workspace` for a workspace) |
+| `go.mod`, `go.work` | `go vet ./...`, `go test ./...` per module (every `use` of a go.work, and nested go.mod modules, as `test:<dir>`) |
 | `Makefile` (only when nothing else is found) | `make lint`, `make check`, `make test` |
 
 ```json
@@ -100,6 +100,8 @@ From `horde.json` at the repository root when it defines them; otherwise detecte
   }
 }
 ```
+
+A category in neither `block` nor `off` warns. Globs take `*`, `**`, `?`, `[a-z]` classes and `{a,b}` alternatives.
 
 Checks run one at a time, in their own process group (killed as a whole on timeout or cancel), with `CI=1` and colour disabled. These inherited variables are removed: `FORCE_COLOR` (some tools treat any value as "force colour on"), `NODE_TEST_CONTEXT` (a `node --test` that inherits it reports to a parent that is not listening and exits 0), `OPENCODE_SERVER_*` and `HORDE_*`.
 

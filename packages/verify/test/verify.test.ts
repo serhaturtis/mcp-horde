@@ -6,7 +6,20 @@ import path from "node:path"
 import { after, describe, test } from "node:test"
 import { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
-import { audit, type Check, detectChecks, gate, globMatcher, isTestPath, loadSettings, narrowCommand } from "../src/lib.js"
+import {
+  audit,
+  type Check,
+  changedFiles,
+  detectChecks,
+  extract,
+  gate,
+  globMatcher,
+  isTestPath,
+  loadSettings,
+  logFileFor,
+  narrowCommand,
+  planRelated,
+} from "../src/lib.js"
 
 const pkg = path.resolve(import.meta.dirname, "..")
 const temps: string[] = []
@@ -144,7 +157,7 @@ describe("audit", () => {
     write(root, {
       "src/app.ts": 'export const app = 1\nconst key = "AKIAABCDEFGHIJKLMNOP"\n',
       "assets/logo.bin": Buffer.from([0, 1, 2, 3, 0, 255]),
-      "scratch/notes.txt": `token = "${"x".repeat(20)}"\n`,
+      "scratch/notes.txt": 'token = "q7Ldf9Xk2Pz0vBn4Rt8w"\n',
     })
     const r = await audit(root, {
       base,
@@ -276,9 +289,10 @@ describe("related tests", () => {
 
   test("runners that take test paths are narrowed; the rest are not", () => {
     assert.equal(narrowCommand(check("pytest -q"), ["tests/test_a.py", "src/a.ts"]), "pytest -q tests/test_a.py")
-    assert.equal(narrowCommand(check("python -m pytest"), ["tests/test a.py"]), 'python -m pytest "tests/test a.py"')
+    assert.equal(narrowCommand(check("python -m pytest"), ["tests/test a.py"]), "python -m pytest 'tests/test a.py'")
+    assert.equal(narrowCommand(check("pytest"), ["tests/it's $x.py"]), "pytest 'tests/it'\\''s $x.py'", "nothing expands inside single quotes")
     assert.equal(narrowCommand(check("npx vitest run"), ["src/a.test.ts"]), "npx vitest run src/a.test.ts")
-    assert.equal(narrowCommand(check("jest --ci"), ["a.test.js"]), "jest --ci a.test.js")
+    assert.equal(narrowCommand(check("jest --ci"), ["a.test.js"]), "jest --ci --runTestsByPath a.test.js", "jest reads bare arguments as patterns")
     assert.equal(narrowCommand(check("go test ./..."), ["internal/calc/calc_test.go", "a_test.go"]), "go test ./internal/calc .")
     assert.equal(narrowCommand(check("go test ./pkg"), ["pkg/a_test.go"]), undefined, "only ./... is replaced")
     assert.equal(narrowCommand(check("jest && echo done"), ["a.test.js"]), undefined)
@@ -309,11 +323,11 @@ describe("related tests", () => {
     write(root, { "src/a.js": "exports.a = 2\n" })
     let { v, log } = await ran()
     assert.match(v.text, /✓ test · ok · \S+ · related tests only \(1 file\)/, v.text)
-    assert.match(log, /ran: src\/a\.test\.js\n/)
+    assert.match(log, /ran: --runTestsByPath src\/a\.test\.js\n/)
 
     write(root, { "src/b.js": "exports.b = 2\n" })
     ;({ v, log } = await ran())
-    assert.match(log, /ran: src\/a\.test\.js test\/b\.test\.js\n/, "naming next to it and in a mirrored test directory")
+    assert.match(log, /ran: --runTestsByPath src\/a\.test\.js test\/b\.test\.js\n/, "naming next to it and in a mirrored test directory")
 
     write(root, { "package.json": '{"name":"x"}' })
     ;({ v, log } = await ran())
@@ -330,6 +344,270 @@ describe("related tests", () => {
     const full = await gate(root, { base, audit: false, stateDir: tmp() })
     assert.match(fs.readFileSync(full.checks[0]!.logFile!, "utf8"), /ran: everything/)
     assert.doesNotMatch(full.text, /related|full suite/)
+  })
+})
+
+describe("fixes", () => {
+  const BLOCK = ["scope", "tests", "secrets", "binaries"] as const
+  const lines = async (root: string, base: string, extra: Partial<Parameters<typeof audit>[1]> = {}) =>
+    (await audit(root, { base, block: [...BLOCK], warn: ["suppressions", "dependencies", "git"], ...extra })).findings.map(
+      (f) => `${f.severity} ${f.category} ${f.file ?? ""}${f.line ? `:${f.line}` : ""} ${f.text}`,
+    )
+
+  test("the gate judges with base's horde.json and flags changes to the rules", async () => {
+    const passing = 'import { test } from "node:test"\ntest("ok", () => {})\n'
+    const { root, base } = repo({
+      "horde.json": JSON.stringify({ verify: { checks: { test: "node --test test/a.test.mjs" } } }),
+      "test/a.test.mjs": passing,
+      "package.json": JSON.stringify({ scripts: { test: "node --test" } }),
+      "pyproject.toml": "[project]\nname='x'\n[tool.pytest.ini_options]\naddopts='-q'\n",
+    })
+    write(root, {
+      "horde.json": JSON.stringify({ verify: { checks: { test: 'node -e "process.exit(0)"' } } }),
+      "test/a.test.mjs": 'import { test } from "node:test"\ntest("ok", () => { throw new Error("broken") })\n',
+      "package.json": JSON.stringify({ name: "x", scripts: { test: "true", build: "tsc" } }),
+      "pyproject.toml": "[project]\nname='y'\n[tool.pytest.ini_options]\naddopts='-q -k nothing'\n",
+      "jest.config.js": "module.exports = {}\n",
+    })
+    const v = await gate(root, { base, stateDir: tmp() })
+    assert.equal(v.pass, false)
+    assert.match(v.text, /✗ test · 1 failed/, "the check from base ran, not the worker's replacement")
+    for (const what of [
+      "horde.json changes the rules the gate checks with: horde.json verify",
+      "package.json changes the rules the gate checks with: package.json scripts test, build",
+      "pyproject.toml changes the rules the gate checks with: pyproject.toml [tool.pytest]",
+      "jest.config.js changes the rules the gate checks with: jest.config.js",
+    ])
+      assert.ok(v.blockers.includes(`tests: ${what}`), `${what} in ${v.blockers.join("\n")}`)
+    assert.ok(!v.blockers.some((b) => /pyproject.*\[project\]/.test(b)), "other pyproject sections are not rules")
+  })
+
+  test("no checks is not a pass", async () => {
+    const { root } = repo({ "README.md": "# x\n" })
+    const v = await gate(root, { stateDir: tmp() })
+    assert.equal(v.pass, false)
+    assert.deepEqual(v.blockers, ["no checks to run (configure verify.checks in horde.json)"])
+    assert.match(v.text, /^FAIL · no checks to run/)
+  })
+
+  test("scope: the call's globs narrow horde.json's", async () => {
+    const { root, base } = repo({
+      "horde.json": JSON.stringify({ verify: { checks: { ok: 'node -e "0"' }, audit: { allowed: ["src/**", "horde.json"] } } }),
+      "src/auth/a.ts": "1\n",
+      "src/other.ts": "1\n",
+    })
+    write(root, { "src/auth/a.ts": "2\n", "src/other.ts": "2\n", "docs/x.md": "x\n" })
+    const v = await gate(root, { base, allowed: ["src/auth/**", "docs/**"], stateDir: tmp() })
+    assert.ok(v.blockers.includes("scope: src/other.ts changes a file outside the allowed scope"), v.text)
+    assert.ok(v.blockers.includes("scope: docs/x.md adds a file outside the allowed scope"), "outside horde.json's scope")
+    assert.ok(!v.blockers.some((b) => b.includes("src/auth/a.ts")))
+  })
+
+  test("the diff starts at the merge-base, and the cache keys the base by its commit", async () => {
+    const { root } = repo({ "a.txt": "a\n", "horde.json": JSON.stringify({ verify: { checks: { ok: 'node -e "0"' } } }) })
+    git(root, "branch", "main-line")
+    git(root, "checkout", "-qb", "work")
+    write(root, { "w.txt": "w\n" })
+    git(root, "add", "-A")
+    git(root, "commit", "-qm", "work")
+    git(root, "checkout", "-q", "main-line")
+    write(root, { "m.txt": "m\n" })
+    git(root, "add", "-A")
+    git(root, "commit", "-qm", "main moved on")
+    git(root, "checkout", "-q", "work")
+    const r = await audit(root, { base: "main-line", block: [], warn: [] })
+    assert.deepEqual(r.files, ["w.txt"], "main's own later commits are not the work's")
+    const stateDir = tmp()
+    assert.equal((await gate(root, { base: "main-line", stateDir })).cached, false)
+    assert.equal((await gate(root, { base: "main-line", stateDir })).cached, true)
+    git(root, "branch", "-f", "main-line", "work")
+    assert.equal((await gate(root, { base: "main-line", stateDir })).cached, false, "the base moved: a different judgement")
+  })
+
+  test("diff parsing: fixed prefixes, headers only before the first hunk, quoted paths", async () => {
+    const { root, base } = repo({ "test/a.test.ts": "-- note\nkeep\n", 'test/we"ird.test.ts': "x\n" })
+    git(root, "config", "diff.mnemonicPrefix", "true")
+    git(root, "config", "diff.noprefix", "true")
+    write(root, { "test/a.test.ts": "++ y\nkeep\ntest.skip('a', () => {})\n", 'test/we"ird.test.ts': "x\nit.only('b', () => {})\n" })
+    const l = await lines(root, base)
+    assert.ok(l.includes("block tests test/a.test.ts:3 skips a test"), l.join("\n"))
+    assert.ok(l.includes('block tests test/we"ird.test.ts:2 focuses tests with .only (all others stop running)'), l.join("\n"))
+  })
+
+  test("tests renamed so no runner picks them up are flagged", async () => {
+    const { root, base } = repo({ "src/x.test.ts": "test('a', () => {})\n", "tests/test_x.py": "def test_a(): pass\n", "tests/conftest.py": "x = 1\n" })
+    git(root, "mv", "src/x.test.ts", "src/x.test.ts.bak")
+    git(root, "mv", "tests/test_x.py", "tests/x_disabled.py")
+    const l = await lines(root, base)
+    assert.ok(
+      l.some((x) => /^block tests src\/x\.test\.ts moves a test file out of the test suite/.test(x)),
+      l.join("\n"),
+    )
+    assert.ok(
+      l.some((x) => /^block tests tests\/test_x\.py moves a test file out of the test suite/.test(x)),
+      l.join("\n"),
+    )
+  })
+
+  test("skip and focus markers across runners, without ordinary words", async () => {
+    const marked = [
+      "@pytest.mark.skipif(sys.platform == 'win32', reason='x')",
+      "@pytest.mark.xfail",
+      "test.skip.each([1])('a', () => {})",
+      "it.skipIf(process.env.CI)('a', () => {})",
+      "test.runIf(false)('a', () => {})",
+      "test.todo('later')",
+      "fit('only this', () => {})",
+      "fdescribe('only these', () => {})",
+      "test('a', { skip: true }, () => {})",
+      "test('b', { todo: 'later' }, () => {})",
+      "  t.skip('not now')",
+      "  this.skip()",
+      '#[ignore = "slow"]',
+      "@Disabled",
+      "@Ignore",
+      "xit('a', () => {})",
+      "xdescribe('a', () => {})",
+      "test.only.each([1])('a', () => {})",
+    ]
+    const ordinary = ["model.fit(x, y)", "const outfit = outfit(1)", "const skip = items.skip(2)", "// we skip: nothing", "xs.fit(3)"]
+    const { root, base } = repo({ "test/a.test.ts": "\n" })
+    write(root, { "test/a.test.ts": `${[...marked, ...ordinary].join("\n")}\n` })
+    const hit = new Set((await audit(root, { base, block: ["tests"], warn: [] })).findings.map((f) => f.line))
+    for (const [i, m] of marked.entries()) assert.ok(hit.has(i + 1), `line ${i + 1}: ${m}`)
+    for (const [i, o] of ordinary.entries()) assert.ok(!hit.has(marked.length + i + 1), `not a marker: ${o}`)
+  })
+
+  test("secrets: placeholders and words are not credentials, sk- needs a key-like body", async () => {
+    const { root, base } = repo({ "a.txt": "\n" })
+    const bad = ['password = "q7Ldf9Xk2Pz0vBn4Rt8w"', 'key = "sk-AbCdEfGhIjKlMnOpQrStUv12"', 'k = "sk-ant-api03-AbCdEfGh_IjKlMnOp-QrStUv12"']
+    const fine = [
+      `password = "\${DATABASE_PASSWORD_VALUE}"`,
+      'token = "{{ secrets.DEPLOY_TOKEN }}"',
+      'api_key = "<your-api-key-goes-here>"',
+      'secret = "xxxxxxxxxxxxxxxxxxxx"',
+      'token = "this_is_a_token_name"',
+      'const cls = "sk-some-long-kebab-case-class-name"',
+    ]
+    write(root, { "a.txt": `${[...bad, ...fine].join("\n")}\n` })
+    const hit = new Set((await audit(root, { base, block: ["secrets"], warn: [] })).findings.map((f) => f.line))
+    for (const [i, b] of bad.entries()) assert.ok(hit.has(i + 1), b)
+    for (const [i, f] of fine.entries()) assert.ok(!hit.has(bad.length + i + 1), f)
+  })
+
+  test("size: new or newly big files only, never lockfiles", async () => {
+    const big = "x".repeat(1024 * 1024 + 10)
+    const { root, base } = repo({ "data/big.txt": big, "src/a.txt": "a\n" })
+    write(root, { "data/big.txt": `${big}more\n`, "src/a.txt": big, "new.txt": big, "package-lock.json": big })
+    const l = (await lines(root, base)).filter((x) => / MB$/.test(x))
+    assert.deepEqual(l.map((x) => x.split(" ")[2]).sort(), ["new.txt", "src/a.txt"])
+  })
+
+  test("audit categories not listed anywhere warn", () => {
+    const { root } = repo({ "horde.json": JSON.stringify({ verify: { audit: { block: ["scope"], off: ["git"] } } }) })
+    const s = loadSettings(root)
+    assert.deepEqual(s.audit.block, ["scope"])
+    assert.deepEqual(s.audit.warn.sort(), ["binaries", "dependencies", "secrets", "suppressions", "tests"])
+  })
+
+  test("detect: Python environment, uv, and pytest only with tests to run", async () => {
+    const { root } = repo({ "pyproject.toml": "[project]\nname='x'\n", "tests/data.json": "{}\n", "src/pkg/__init__.py": "" })
+    assert.deepEqual(await detectChecks(root), [], "a tests/ directory alone is not a pytest suite")
+    write(root, { "tests/test_a.py": "def test_a(): pass\n" })
+    const [t] = await detectChecks(root)
+    assert.equal(t!.name, "test")
+    assert.equal(t!.env?.PYTHONPATH, [path.join(root, "src"), root].join(path.delimiter))
+    assert.deepEqual(t!.stripEnv, ["VIRTUAL_ENV"])
+    const bin = tmp()
+    write(bin, { uv: "#!/bin/sh\n" })
+    fs.chmodSync(path.join(bin, "uv"), 0o755)
+    write(root, { "uv.lock": "" })
+    const saved = process.env.PATH
+    process.env.PATH = `${bin}${path.delimiter}${saved}`
+    try {
+      assert.equal((await detectChecks(root))[0]!.command, "uv run python -m pytest -q")
+    } finally {
+      process.env.PATH = saved
+    }
+  })
+
+  test("detect: cargo workspaces, nested and go.work Go modules, package managers up the tree", async () => {
+    const { root } = repo({
+      "rs/Cargo.toml": "[workspace]\nmembers = ['a']\n",
+      "go/go.mod": "module x\n",
+      "go/tools/gen/go.mod": "module y\n",
+      "gw/go.work": "go 1.22\nuse (\n  ./a // first\n  ./b\n)\n",
+      "gw/a/go.mod": "module a\n",
+      "gw/b/go.mod": "module b\n",
+      "js/pnpm-lock.yaml": "",
+      "js/pkg/package.json": JSON.stringify({ scripts: { test: "vitest" } }),
+      "pm/package.json": JSON.stringify({ packageManager: "yarn@4.1.0", scripts: { lint: "eslint" } }),
+      "pm/package-lock.json": "{}",
+    })
+    assert.equal((await detectChecks(path.join(root, "rs")))[0]!.command, "cargo test --workspace --color never")
+    assert.deepEqual(
+      (await detectChecks(path.join(root, "go"))).map((c) => [c.name, path.relative(root, c.cwd)]),
+      [
+        ["vet", "go"],
+        ["vet:tools/gen", "go/tools/gen"],
+        ["test", "go"],
+        ["test:tools/gen", "go/tools/gen"],
+      ],
+    )
+    assert.deepEqual(
+      (await detectChecks(path.join(root, "gw"))).map((c) => c.name),
+      ["vet:a", "vet:b", "test:a", "test:b"],
+    )
+    assert.equal((await detectChecks(path.join(root, "js", "pkg")))[0]!.command, "pnpm run test", "lockfile found up the tree")
+    assert.equal((await detectChecks(path.join(root, "pm")))[0]!.command, "yarn run lint", "packageManager wins")
+  })
+
+  test("detect: real paths when walking up, never past the repository", async () => {
+    const outer = tmp()
+    write(outer, { "package.json": JSON.stringify({ scripts: { test: "jest" } }) })
+    const { root } = repo({ "sub/readme.txt": "x\n" })
+    fs.symlinkSync(path.join(root, "sub"), path.join(outer, "link"))
+    assert.deepEqual(await detectChecks(path.join(outer, "link")), [])
+  })
+
+  test("related: renames, aliases, non-runnable test files, nested Python projects", async () => {
+    const { root, base } = repo({ "src/a.js": "exports.a = 1\n", "src/a.test.js": "require('./a')\n", "tests/conftest.py": "\n" })
+    git(root, "mv", "src/a.js", "src/b.js")
+    assert.deepEqual((await changedFiles(root, base)).files.sort(), ["src/a.js", "src/b.js"], "both sides of a rename")
+    git(root, "mv", "src/b.js", "src/a.js")
+    const test = (command: string, cwd = root): Check => ({ name: "test", command, kind: "test", cwd, source: "t" })
+    const plan = (files: string[], c = test("npx jest")) => planRelated(root, files, [c]).plans.get(c)!
+    assert.ok(plan(["src/a.js"]).command, "narrowed")
+    assert.match(plan(["tests/conftest.py"]).full ?? "", /without related tests \(tests\/conftest\.py\)/)
+    write(root, { "svc/pyproject.toml": "[tool.pytest.ini_options]\n", "svc/tests/test_app.py": "def test_a(): pass\n" })
+    assert.equal(plan(["svc/tests/test_app.py"], test("pytest", path.join(root, "svc"))).full, "its Python project is not at the repository root")
+    write(root, { "tsconfig.json": '{ "compilerOptions": { "paths": { "@/*": ["src/*"] } } }' })
+    assert.equal(plan(["src/a.js"]).full, "the project uses import aliases")
+  })
+
+  test("extract: failed suites count, Go parents are not doubled; log names do not collide", () => {
+    const jest = "FAIL test/a.test.js\n  ● Test suite failed to run\n\n    SyntaxError: x\n\nTest Suites: 1 failed, 1 total\nTests:       0 total\n"
+    assert.equal(extract(jest, "npx jest").counts?.failed, 1)
+    const vitest = " FAIL  test/a.test.ts [ test/a.test.ts ]\nError: boom\n\n Test Files  1 failed (1)\n      Tests  no tests\n"
+    assert.equal(extract(vitest, "npx vitest run").counts?.failed, 1)
+    const go = [
+      "=== RUN   TestParent",
+      "=== RUN   TestParent/sub",
+      "    a_test.go:10: boom",
+      "--- FAIL: TestParent (0.00s)",
+      "    --- FAIL: TestParent/sub (0.00s)",
+      "        a_test.go:10: boom",
+      "FAIL",
+      "FAIL\tx\t0.01s",
+    ].join("\n")
+    const r = extract(go, "go test ./...")
+    assert.deepEqual(
+      r.failures.map((f) => f.test),
+      ["TestParent/sub"],
+    )
+    assert.equal(r.counts?.failed, 1)
+    assert.notEqual(logFileFor("/l", "test:unit"), logFileFor("/l", "test_unit"))
+    assert.equal(path.basename(logFileFor("/l", "test")), "test.log")
   })
 })
 
