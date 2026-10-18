@@ -576,11 +576,11 @@ describe("opencode MCP server: core behaviour (real opencode, mock LLM)", { time
   })
 
   test("ask: one-shot answers without tools; JSON checked against a schema, with one retry", async () => {
-    assert.match(
-      await h.call("opencode_ask", { prompt: "quick question" }),
-      /^Echo\[none\]: Answer the request below directly[\s\S]*\nquick\n\(mock\/mock · \$0\)$/,
-    )
+    assert.match(await h.call("opencode_ask", { prompt: "quick question" }), /^Echo\[none\]: Answer the request below directly[\s\S]*\n\(mock\/mock · \$0\)$/)
     assert.match(await h.call("opencode_ask", { prompt: "TOOLS?" }), /^Tools:\n/, "no tools are offered")
+    // A provider that refuses tool-less sessions (OpenCode's free tier) gets tools that are all denied.
+    const guarded = await h.call("opencode_ask", { prompt: "FREETIER TOOLS?" })
+    assert.match(guarded, /^Tools: \w+[\s\S]*tools present but denied/, guarded)
     const schema = { type: "object", properties: { verdict: { enum: ["a", "b"] }, score: { type: "integer" } }, required: ["verdict"] }
     assert.match(
       await h.call("opencode_ask", { prompt: 'JSON: {"verdict": "a", "score": 2}', schema }),

@@ -17,8 +17,24 @@ tools:
   "*": false
 ---
 `
+/**
+ * OpenCode's free tier refuses sessions whose agent has no tools at all ("can only be used
+ * from within OpenCode"). This profile keeps the tools but denies everything that writes,
+ * runs or fetches; ask sessions also run with the "deny" policy, so nothing that asks for
+ * permission is ever allowed. Reading files stays possible.
+ */
+export const ASK_GUARDED_AGENT = "horde-ask-guarded"
+export const ASK_GUARDED_PROFILE = `---
+description: mcp-horde one-shot answers (tools denied)
+mode: primary
+permission:
+  edit: deny
+  bash: deny
+  webfetch: deny
+---
+`
 export const ASK_PREAMBLE =
-  "Answer the request below directly from what it contains. You have no tools in this session: do not try to read files, run commands or search. If something you need is missing, say exactly what.\n\n"
+  "Answer the request below directly from what it contains. Do not use tools in this session: do not try to edit files, run commands or search the web. If something you need is missing, say exactly what.\n\n"
 
 export type JsonSchema = {
   type?: string | string[]

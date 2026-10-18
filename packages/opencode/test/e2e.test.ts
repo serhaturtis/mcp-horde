@@ -119,31 +119,9 @@ describe("real model end to end", { skip: !wanted && "set HORDE_E2E_MODEL=free o
     for (const id of ["writer", "isolated"]) await h.call("opencode_dispose", { id, worktree: "discard" })
   })
 
-  test("a one-shot answer, plain and as checked JSON", async (t) => {
-    const plain = await h.call("opencode_ask", { model, prompt: "What is 2 + 3? Answer with the number only." }).catch(async (err: Error) => {
-      if (!(free && /FreeTierError/.test(err.message))) throw err
-      // OpenCode's free tier refuses some sessions as "not from within OpenCode": find out which.
-      const repo = newRepo("freetier")
-      for (const [label, profile] of [
-        ["profile with every tool off", { tools: { "*": false } }],
-        ["profile with webfetch off", { tools: { webfetch: false } }],
-      ] as const) {
-        const out = await h
-          .call("opencode_spawn", {
-            model,
-            directory: repo,
-            isolation: "worktree",
-            profile,
-            prompt: "Reply with exactly one word: PONG",
-            wait: true,
-            timeout_seconds: 120,
-          })
-          .catch((e: Error) => e.message)
-        console.log(`free tier, ${label}: ${/PONG/i.test(out) ? "answers" : (/error: (.*)/.exec(out)?.[1] ?? out).slice(0, 300)}`)
-      }
-      return undefined
-    })
-    if (plain === undefined) return t.skip("OpenCode's free tier refuses ask sessions (FreeTierError); see the log for which profile it refuses")
+  test("a one-shot answer, plain and as checked JSON", async () => {
+    // On the free tier this goes through the tools-denied profile (it refuses tool-less sessions).
+    const plain = await h.call("opencode_ask", { model, prompt: "What is 2 + 3? Answer with the number only." })
     console.log(plain)
     assert.match(plain, /\b5\b/)
     const judged = await h.call("opencode_ask", {

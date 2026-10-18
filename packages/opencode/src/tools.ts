@@ -561,7 +561,7 @@ export function registerTools(server: McpServer, ctx: Context) {
         timeoutMs: (a.timeout_seconds ?? 300) * 1000,
         signal: extra.signal,
       })
-      const meta = `(${formatModel(r.model)} · ${formatUsd(r.cost)}${r.retried ? " · retried once for the schema" : ""})`
+      const meta = `(${formatModel(r.model)} · ${formatUsd(r.cost)}${r.retried ? " · retried once for the schema" : ""}${r.guarded ? " · tools present but denied: this provider refuses tool-less sessions" : ""})`
       return r.json !== undefined ? `${JSON.stringify(r.json, null, 2)}\n${meta}` : `${r.text}\n${meta}`
     },
   )

@@ -16,7 +16,18 @@ import type {
   SessionV2Info,
   V2Event,
 } from "@opencode-ai/sdk/v2"
-import { ASK_AGENT, ASK_PREAMBLE, ASK_PROFILE, extractJson, type JsonSchema, retryPrompt, schemaPrompt, validate } from "./ask.js"
+import {
+  ASK_AGENT,
+  ASK_GUARDED_AGENT,
+  ASK_GUARDED_PROFILE,
+  ASK_PREAMBLE,
+  ASK_PROFILE,
+  extractJson,
+  type JsonSchema,
+  retryPrompt,
+  schemaPrompt,
+  validate,
+} from "./ask.js"
 import type { Backend } from "./backend.js"
 import { deleteSession, releaseDirectory, renameSession } from "./compat.js"
 import type { Config, PermissionPolicy } from "./config.js"
@@ -500,62 +511,77 @@ export class Fleet {
     directory?: string
     timeoutMs?: number
     signal?: AbortSignal
-  }): Promise<{ text: string; json?: unknown; cost: number; model?: ModelRef; retried: boolean }> {
+  }): Promise<{ text: string; json?: unknown; cost: number; model?: ModelRef; retried: boolean; guarded: boolean }> {
     const project = this.resolveDir(input.directory)
-    const dir = path.join(project, ".opencode", "horde-ask")
-    const agentFile = path.join(dir, ".opencode", "agent", `${ASK_AGENT}.md`)
-    if ((await fs.readFile(agentFile, "utf8").catch(() => "")) !== ASK_PROFILE) {
-      await fs.mkdir(path.dirname(agentFile), { recursive: true })
-      await fs.writeFile(agentFile, ASK_PROFILE)
+    // Versioned, so a directory OpenCode opened with older profiles is never reused.
+    const dir = path.join(project, ".opencode", "horde-ask-2")
+    for (const [agent, profile] of [
+      [ASK_AGENT, ASK_PROFILE],
+      [ASK_GUARDED_AGENT, ASK_GUARDED_PROFILE],
+    ] as const) {
+      const file = path.join(dir, ".opencode", "agent", `${agent}.md`)
+      if ((await fs.readFile(file, "utf8").catch(() => "")) !== profile) {
+        await fs.mkdir(path.dirname(file), { recursive: true })
+        await fs.writeFile(file, profile)
+      }
     }
-    await excludeFromGit(project, ".opencode/horde-ask/").catch(() => undefined)
-    const name = `ask-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`
+    await excludeFromGit(project, ".opencode/horde-ask-2/").catch(() => undefined)
     const timeout = input.timeoutMs ?? 300_000
-    const { snapshot } = await this.spawn({
-      prompt: ASK_PREAMBLE + (input.schema ? schemaPrompt(input.prompt, input.schema) : input.prompt),
-      name,
-      model: input.model,
-      variant: input.variant,
-      agent: ASK_AGENT,
-      directory: dir,
-      files: input.files?.map((f) => path.resolve(project, f)),
-      permissions: "deny",
-      questions: "dismiss",
-      limits: { maxSteps: 3 },
-      signal: input.signal,
-    })
-    const answer = async (): Promise<Snapshot> => {
-      const { snapshots, timedOut } = await this.waitFor([snapshot.id], "all", timeout, { signal: input.signal })
-      const snap = snapshots[0]!
-      if (timedOut) throw new Error(`no answer within ${Math.round(timeout / 1000)}s`)
-      if (snap.state !== "idle") throw new Error(`the ask failed: ${snap.error ?? snap.state}`)
-      return snap
+    const once = async (agent: string) => {
+      const name = `ask-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`
+      const { snapshot } = await this.spawn({
+        prompt: ASK_PREAMBLE + (input.schema ? schemaPrompt(input.prompt, input.schema) : input.prompt),
+        name,
+        model: input.model,
+        variant: input.variant,
+        agent,
+        directory: dir,
+        files: input.files?.map((f) => path.resolve(project, f)),
+        permissions: "deny",
+        questions: "dismiss",
+        limits: { maxSteps: 3 },
+        signal: input.signal,
+      })
+      const answer = async (): Promise<Snapshot> => {
+        const { snapshots, timedOut } = await this.waitFor([snapshot.id], "all", timeout, { signal: input.signal })
+        const snap = snapshots[0]!
+        if (timedOut) throw new Error(`no answer within ${Math.round(timeout / 1000)}s`)
+        if (snap.state !== "idle") throw new Error(`the ask failed: ${snap.error ?? snap.state}`)
+        return snap
+      }
+      try {
+        let snap = await answer()
+        let text = snap.lastTurn?.finalText.trim() ?? ""
+        let retried = false
+        let json: unknown
+        if (input.schema) {
+          const check = (t: string) => {
+            const parsed = extractJson(t)
+            return parsed.error ? { errors: [parsed.error] } : { value: parsed.value, errors: validate(parsed.value, input.schema!) }
+          }
+          let result = check(text)
+          if (result.errors.length) {
+            retried = true
+            await this.message(snapshot.id, retryPrompt(result.errors))
+            snap = await answer()
+            text = snap.lastTurn?.finalText.trim() ?? ""
+            result = check(text)
+            if (result.errors.length)
+              throw new Error(`the answer did not match the schema after one retry:\n${result.errors.join("\n")}\nLast answer: ${text.slice(0, 500)}`)
+          }
+          json = result.value
+        }
+        return { text, json, cost: snap.cost, model: snap.model, retried }
+      } finally {
+        await this.dispose(snapshot.id, { deleteSession: true }).catch(() => undefined)
+      }
     }
     try {
-      let snap = await answer()
-      let text = snap.lastTurn?.finalText.trim() ?? ""
-      let retried = false
-      let json: unknown
-      if (input.schema) {
-        const check = (t: string) => {
-          const parsed = extractJson(t)
-          return parsed.error ? { errors: [parsed.error] } : { value: parsed.value, errors: validate(parsed.value, input.schema!) }
-        }
-        let result = check(text)
-        if (result.errors.length) {
-          retried = true
-          await this.message(snapshot.id, retryPrompt(result.errors))
-          snap = await answer()
-          text = snap.lastTurn?.finalText.trim() ?? ""
-          result = check(text)
-          if (result.errors.length)
-            throw new Error(`the answer did not match the schema after one retry:\n${result.errors.join("\n")}\nLast answer: ${text.slice(0, 500)}`)
-        }
-        json = result.value
-      }
-      return { text, json, cost: snap.cost, model: snap.model, retried }
-    } finally {
-      await this.dispose(snapshot.id, { deleteSession: true }).catch(() => undefined)
+      return { ...(await once(ASK_AGENT)), guarded: false }
+    } catch (err) {
+      // OpenCode's free tier refuses tool-less agents; ask again with tools present but denied.
+      if (!/FreeTierError/.test((err as Error).message)) throw err
+      return { ...(await once(ASK_GUARDED_AGENT)), guarded: true }
     }
   }
 

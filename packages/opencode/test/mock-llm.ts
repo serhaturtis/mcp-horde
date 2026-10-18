@@ -9,7 +9,7 @@ import type { AddressInfo } from "node:net"
  *   "STEPS: <n>"    → calls bash `echo step` n times in a row, then answers "DONE"
  *   "ASK: <q>"      → calls the question tool (options Red/Blue), then answers "DONE: <tool output>"
  *   "SLOW"          → streams "Working...." for ~15s
- *   "FAIL400"       → HTTP 400
+ *   "FAIL400"       → HTTP 400; "FREETIER" → HTTP 403 FreeTierError when no tools are offered
  *   "TOOLS?"        → answers with the tool names it was offered
  *   "JSON: <json>"  → answers with that text; "JSON-RETRY" answers prose until told it was not valid; "JSON-NEVER" always prose
  *   anything else   → "Echo[<reasoning_effort>]: <prompt>" (+ " FILE:<name>" for attached files)
@@ -41,6 +41,13 @@ export async function startMockLlm(): Promise<{ url: string; close: () => void; 
           object: "chat.completion",
           choices: [{ index: 0, message: { role: "assistant", content: "Mock title" }, finish_reason: "stop" }],
         }),
+      )
+    }
+    // OpenCode's free tier: refuses agents that offer no tools.
+    if (userText.includes("FREETIER") && !(b.tools ?? []).length) {
+      res.writeHead(403, { "content-type": "application/json" })
+      return void res.end(
+        JSON.stringify({ type: "error", error: { type: "FreeTierError", message: "OpenCode's free tier can only be used from within OpenCode." } }),
       )
     }
     if (userText.includes("FAIL400")) {
