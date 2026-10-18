@@ -16,7 +16,7 @@ import type {
   SessionV2Info,
   V2Event,
 } from "@opencode-ai/sdk/v2"
-import { ASK_AGENT, ASK_PROFILE, extractJson, type JsonSchema, retryPrompt, schemaPrompt, validate } from "./ask.js"
+import { ASK_AGENT, ASK_PREAMBLE, ASK_PROFILE, extractJson, type JsonSchema, retryPrompt, schemaPrompt, validate } from "./ask.js"
 import type { Backend } from "./backend.js"
 import { deleteSession, releaseDirectory, renameSession } from "./compat.js"
 import type { Config, PermissionPolicy } from "./config.js"
@@ -512,7 +512,7 @@ export class Fleet {
     const name = `ask-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`
     const timeout = input.timeoutMs ?? 300_000
     const { snapshot } = await this.spawn({
-      prompt: input.schema ? schemaPrompt(input.prompt, input.schema) : input.prompt,
+      prompt: ASK_PREAMBLE + (input.schema ? schemaPrompt(input.prompt, input.schema) : input.prompt),
       name,
       model: input.model,
       variant: input.variant,

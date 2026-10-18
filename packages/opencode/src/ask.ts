@@ -4,7 +4,11 @@
  * additionalProperties, minItems/maxItems, minimum/maximum, minLength/maxLength).
  */
 
-/** The agent profile ask sessions run with: no tools, answer directly. */
+/**
+ * The agent profile ask sessions run with: no tools. It has no prompt of its own, so
+ * OpenCode's system prompt stays (OpenCode's free tier refuses sessions without it); the
+ * instruction to answer directly travels with the user's prompt instead.
+ */
 export const ASK_AGENT = "horde-ask"
 export const ASK_PROFILE = `---
 description: mcp-horde one-shot answers (no tools)
@@ -12,8 +16,9 @@ mode: primary
 tools:
   "*": false
 ---
-Answer the request directly from what it contains. You have no tools: do not try to read files, run commands or search. If something you need is missing, say exactly what.
 `
+export const ASK_PREAMBLE =
+  "Answer the request below directly from what it contains. You have no tools in this session: do not try to read files, run commands or search. If something you need is missing, say exactly what.\n\n"
 
 export type JsonSchema = {
   type?: string | string[]

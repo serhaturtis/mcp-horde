@@ -26,7 +26,9 @@ export function git(cwd: string, ...args: string[]) {
 
 /** A temp git repo configured to use the mock provider. */
 export function makeRepo(mockUrl: string, extra: Record<string, unknown> = {}) {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "horde-oc-"))
+  // Real paths: macOS's /var → /private/var and Windows' short names (RUNNER~1) would make
+  // the same directory look like two (OpenCode's file snapshots, for one, miss changes).
+  const tmp = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "horde-oc-")))
   const repo = path.join(tmp, "repo")
   fs.mkdirSync(repo)
   fs.writeFileSync(
