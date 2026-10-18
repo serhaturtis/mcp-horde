@@ -4,7 +4,7 @@ import fs from "node:fs"
 import path from "node:path"
 import { after, before, describe, test } from "node:test"
 import { createOpencodeClient } from "@opencode-ai/sdk/v2"
-import { connect, freePort, idOf, isolatedEnv, killTree, type Mock, makeRepo, opencodeBin, stopTree, until } from "./harness.js"
+import { connect, freePort, idOf, isolatedEnv, type Mock, makeRepo, opencodeBin, stopTree, until } from "./harness.js"
 import { startMockLlm } from "./mock-llm.js"
 
 let mock: Mock
@@ -95,6 +95,7 @@ describe("server modes and durability", { timeout: 600_000 }, () => {
       env: { ...process.env, ...isolatedEnv(tmp, repo), OPENCODE_SERVER_PASSWORD: password },
       stdio: ["ignore", "pipe", "pipe"],
       shell: process.platform === "win32",
+      detached: process.platform !== "win32",
     })
     let output = ""
     proc.stdout?.on("data", (c: Buffer) => (output += c.toString()))
@@ -143,7 +144,8 @@ ${output}`)
         await h.close()
       }
     } finally {
-      killTree(proc.pid)
+      // OpenCode can ignore SIGTERM on macOS; a surviving server (and its pipes) would keep this file running.
+      await stopTree(proc)
     }
   })
 
