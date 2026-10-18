@@ -1,7 +1,9 @@
 /**
  * One-shot answers for `opencode_ask`: a tool-less agent profile, and JSON replies checked
- * against a JSON Schema (the common subset: type, properties, required, items, enum,
- * additionalProperties, minItems/maxItems, minimum/maximum, minLength/maxLength).
+ * against a JSON Schema (the common subset: type, properties, required, items, enum, const,
+ * anyOf/oneOf/allOf, additionalProperties, minItems/maxItems, minimum/maximum,
+ * exclusiveMinimum/exclusiveMaximum, minLength/maxLength, pattern, min/maxProperties).
+ * Schemas using anything else are rejected up front (`unsupportedSchema`), never half-checked.
  */
 
 /**
@@ -19,18 +21,28 @@ tools:
 `
 /**
  * OpenCode's free tier refuses sessions whose agent has no tools at all ("can only be used
- * from within OpenCode"). This profile keeps the tools but denies everything that writes,
- * runs or fetches; ask sessions also run with the "deny" policy, so nothing that asks for
- * permission is ever allowed. Reading files stays possible.
+ * from within OpenCode"). This profile keeps the read-only tools (read, grep, glob, list) and
+ * denies every other permission: no edits, shell, subagents, web fetches or searches (rules
+ * are matched last-first, so the catch-all comes first). Ask sessions also run with the
+ * "deny" policy, so nothing that asks for permission is ever allowed.
  */
 export const ASK_GUARDED_AGENT = "horde-ask-guarded"
 export const ASK_GUARDED_PROFILE = `---
-description: mcp-horde one-shot answers (tools denied)
+description: mcp-horde one-shot answers (read-only tools)
 mode: primary
 permission:
+  "*": deny
+  read: allow
+  grep: allow
+  glob: allow
+  list: allow
   edit: deny
   bash: deny
+  task: deny
   webfetch: deny
+  websearch: deny
+  codesearch: deny
+  external_directory: deny
 ---
 `
 export const ASK_PREAMBLE =
@@ -42,18 +54,110 @@ export type JsonSchema = {
   required?: string[]
   items?: JsonSchema
   enum?: unknown[]
+  const?: unknown
+  anyOf?: JsonSchema[]
+  oneOf?: JsonSchema[]
+  allOf?: JsonSchema[]
   additionalProperties?: boolean | JsonSchema
   minItems?: number
   maxItems?: number
+  minProperties?: number
+  maxProperties?: number
   minimum?: number
   maximum?: number
+  exclusiveMinimum?: number
+  exclusiveMaximum?: number
   minLength?: number
   maxLength?: number
+  pattern?: string
   description?: string
+}
+
+/** Keywords that only describe (they never change what conforms). */
+const ANNOTATIONS = new Set(["title", "description", "default", "examples", "$schema", "$id", "$comment", "deprecated", "readOnly", "writeOnly", "format"])
+const NUMBER_KEYWORDS = [
+  "minItems",
+  "maxItems",
+  "minProperties",
+  "maxProperties",
+  "minimum",
+  "maximum",
+  "exclusiveMinimum",
+  "exclusiveMaximum",
+  "minLength",
+  "maxLength",
+]
+const TYPES = new Set(["string", "number", "integer", "boolean", "object", "array", "null"])
+
+/**
+ * Problems that keep `schema` from being checked faithfully: keywords outside the supported
+ * subset ($ref, not, if/then/else, tuple items, patternProperties, …) or malformed values.
+ * Empty when the schema is usable.
+ */
+export function unsupportedSchema(schema: unknown, at = "$"): string[] {
+  if (typeof schema === "boolean") return [`${at}: boolean schemas are not supported; use {} or a typed schema`]
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) return [`${at}: a schema must be an object`]
+  const errors: string[] = []
+  const sub = (v: unknown, path: string) => errors.push(...unsupportedSchema(v, path))
+  for (const [k, v] of Object.entries(schema as Record<string, unknown>)) {
+    if (ANNOTATIONS.has(k) || k.startsWith("x-")) continue
+    switch (k) {
+      case "type": {
+        const list = Array.isArray(v) ? v : [v]
+        if (!list.length || list.some((t) => typeof t !== "string" || !TYPES.has(t)))
+          errors.push(`${at}.type: must be one of ${[...TYPES].join(", ")} (or a list of them)`)
+        break
+      }
+      case "properties":
+        if (!v || typeof v !== "object" || Array.isArray(v)) errors.push(`${at}.properties: must be an object of schemas`)
+        else for (const [name, p] of Object.entries(v)) sub(p, `${at}.properties.${name}`)
+        break
+      case "required":
+        if (!Array.isArray(v) || v.some((r) => typeof r !== "string")) errors.push(`${at}.required: must be a list of property names`)
+        break
+      case "items":
+        if (Array.isArray(v)) errors.push(`${at}.items: tuple schemas (a list of item schemas) are not supported; use one schema for every item`)
+        else sub(v, `${at}.items`)
+        break
+      case "enum":
+        if (!Array.isArray(v) || !v.length) errors.push(`${at}.enum: must be a non-empty list`)
+        break
+      case "const":
+        break
+      case "anyOf":
+      case "oneOf":
+      case "allOf":
+        if (!Array.isArray(v) || !v.length) errors.push(`${at}.${k}: must be a non-empty list of schemas`)
+        else for (const [i, x] of v.entries()) sub(x, `${at}.${k}[${i}]`)
+        break
+      case "additionalProperties":
+        if (typeof v !== "boolean") sub(v, `${at}.additionalProperties`)
+        break
+      case "pattern":
+        if (typeof v !== "string") errors.push(`${at}.pattern: must be a string`)
+        else
+          try {
+            new RegExp(v, "u")
+          } catch (err) {
+            errors.push(`${at}.pattern: not a valid regular expression (${(err as Error).message})`)
+          }
+        break
+      default:
+        if (NUMBER_KEYWORDS.includes(k)) {
+          if (typeof v !== "number" || !Number.isFinite(v)) errors.push(`${at}.${k}: must be a number`)
+        } else
+          errors.push(
+            `${at}.${k}: "${k}" is not supported (supported: type, properties, required, items, enum, const, anyOf, oneOf, allOf, additionalProperties, pattern, ${NUMBER_KEYWORDS.join(", ")})`,
+          )
+    }
+  }
+  return errors
 }
 
 const typeOf = (v: unknown): string =>
   v === null ? "null" : Array.isArray(v) ? "array" : typeof v === "number" ? (Number.isInteger(v) ? "integer" : "number") : typeof v
+
+const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b)
 
 /** Problems with `value` against `schema`, as `path: problem` lines (empty when it conforms). */
 export function validate(value: unknown, schema: JsonSchema, at = "$"): string[] {
@@ -63,14 +167,29 @@ export function validate(value: unknown, schema: JsonSchema, at = "$"): string[]
     const want = Array.isArray(schema.type) ? schema.type : [schema.type]
     if (!want.some((w) => w === t || (w === "number" && t === "integer"))) return [`${at}: expected ${want.join(" or ")}, got ${t}`]
   }
-  if (schema.enum && !schema.enum.some((e) => JSON.stringify(e) === JSON.stringify(value))) errors.push(`${at}: must be one of ${JSON.stringify(schema.enum)}`)
+  if (schema.enum && !schema.enum.some((e) => same(e, value))) errors.push(`${at}: must be one of ${JSON.stringify(schema.enum)}`)
+  if ("const" in schema && !same(schema.const, value)) errors.push(`${at}: must be ${JSON.stringify(schema.const)}`)
+  if (schema.allOf) for (const s of schema.allOf) errors.push(...validate(value, s, at))
+  if (schema.anyOf) {
+    const results = schema.anyOf.map((s) => validate(value, s, at))
+    if (!results.some((r) => !r.length)) errors.push(`${at}: must match at least one of the anyOf schemas (${results.map((r) => r[0]).join("; ")})`)
+  }
+  if (schema.oneOf) {
+    const results = schema.oneOf.map((s) => validate(value, s, at))
+    const matches = results.filter((r) => !r.length).length
+    if (matches === 0) errors.push(`${at}: must match exactly one of the oneOf schemas (${results.map((r) => r[0]).join("; ")})`)
+    else if (matches > 1) errors.push(`${at}: matches ${matches} of the oneOf schemas; it must match exactly one`)
+  }
   if (typeof value === "number") {
     if (schema.minimum !== undefined && value < schema.minimum) errors.push(`${at}: must be at least ${schema.minimum}`)
     if (schema.maximum !== undefined && value > schema.maximum) errors.push(`${at}: must be at most ${schema.maximum}`)
+    if (schema.exclusiveMinimum !== undefined && value <= schema.exclusiveMinimum) errors.push(`${at}: must be greater than ${schema.exclusiveMinimum}`)
+    if (schema.exclusiveMaximum !== undefined && value >= schema.exclusiveMaximum) errors.push(`${at}: must be less than ${schema.exclusiveMaximum}`)
   }
   if (typeof value === "string") {
     if (schema.minLength !== undefined && value.length < schema.minLength) errors.push(`${at}: must have at least ${schema.minLength} characters`)
     if (schema.maxLength !== undefined && value.length > schema.maxLength) errors.push(`${at}: must have at most ${schema.maxLength} characters`)
+    if (schema.pattern !== undefined && !new RegExp(schema.pattern, "u").test(value)) errors.push(`${at}: must match /${schema.pattern}/`)
   }
   if (Array.isArray(value)) {
     if (schema.minItems !== undefined && value.length < schema.minItems) errors.push(`${at}: needs at least ${schema.minItems} items`)
@@ -79,6 +198,9 @@ export function validate(value: unknown, schema: JsonSchema, at = "$"): string[]
   }
   if (t === "object") {
     const obj = value as Record<string, unknown>
+    const count = Object.keys(obj).length
+    if (schema.minProperties !== undefined && count < schema.minProperties) errors.push(`${at}: needs at least ${schema.minProperties} properties`)
+    if (schema.maxProperties !== undefined && count > schema.maxProperties) errors.push(`${at}: allows at most ${schema.maxProperties} properties`)
     for (const k of schema.required ?? []) if (!(k in obj)) errors.push(`${at}.${k}: required`)
     for (const [k, v] of Object.entries(obj)) {
       const sub = schema.properties?.[k]

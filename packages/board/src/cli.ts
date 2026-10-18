@@ -13,9 +13,27 @@ import path from "node:path"
 import { loadTiers } from "@mcp-horde/core"
 import { Board, type Report } from "./board.js"
 import { renderNotes, renderSummary, renderTask } from "./render.js"
-import { watch } from "./watch.js"
+import { printable, watch } from "./watch.js"
 
 type Flags = Record<string, string[]>
+
+/** Flags that take a value: the next word is always the value, even when it starts with "--". */
+const VALUE_FLAGS = new Set([
+  "state",
+  "repo",
+  "interval",
+  "summary",
+  "changed",
+  "tests",
+  "unverified",
+  "question",
+  "decision",
+  "confidence",
+  "paths",
+  "tags",
+  "task",
+  "token",
+])
 
 function parse(argv: string[]): { positional: string[]; flags: Flags } {
   const positional: string[] = []
@@ -23,8 +41,11 @@ function parse(argv: string[]): { positional: string[]; flags: Flags } {
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!
     if (a.startsWith("--")) {
-      const key = a.slice(2)
-      const value = argv[i + 1] !== undefined && !argv[i + 1]!.startsWith("--") ? argv[++i]! : "true"
+      const eq = a.indexOf("=")
+      const key = eq > 0 ? a.slice(2, eq) : a.slice(2)
+      if (!VALUE_FLAGS.has(key)) throw new Error(`unknown flag --${key}`)
+      if (eq < 0 && argv[i + 1] === undefined) throw new Error(`--${key} needs a value`)
+      const value = eq > 0 ? a.slice(eq + 1) : argv[++i]!
       flags[key] = [...(flags[key] ?? []), value]
     } else positional.push(a)
   }
@@ -54,7 +75,7 @@ async function status(args: string[], flags: Flags): Promise<string> {
 
 async function main(argv: string[]): Promise<string> {
   const { positional, flags } = parse(argv)
-  if (positional[0] === "status") return status(positional.slice(1), flags)
+  if (positional[0] === "status") return printable(await status(positional.slice(1), flags))
   if (positional[0] === "watch") {
     const { board, tiers, repo } = await humanBoard(flags)
     const seconds = Number(flags.interval?.[0] ?? 1)
@@ -99,6 +120,8 @@ async function main(argv: string[]): Promise<string> {
     }
     case "finding": {
       need(1, '"the fact"')
+      // Findings reach other workers' briefs: they must say which attempt they come from.
+      if (!flags.task?.[0] || !flags.token?.[0]) throw new Error("finding needs --task <task id> --token <token> (from your brief)")
       const n = await board.finding(args.join(" "), { paths: csv(flags.paths), tags: csv(flags.tags), task: flags.task?.[0], token: flags.token?.[0] })
       return `shared as ${n.id}`
     }

@@ -34,6 +34,8 @@ export interface Attempt {
   outcome?: "accepted" | "failed" | "abandoned"
   note?: string
   cost?: number
+  /** The cost was given by the orchestrator (accept/fail): the runtime's estimate no longer replaces it. */
+  costGiven?: boolean
   /** What the runtime last said about the attempt's agent (opencode_spawn task): for people watching. */
   activity?: { state: string; gate?: string; at: number }
   /** Where the attempt's work lives, when the runtime that started it said so (opencode_spawn task). */
@@ -101,6 +103,7 @@ export interface PlanInput {
 export const LEASE_MS = 30 * 60_000
 const MAX_NOTE = 500
 const MAX_REPORT = 2000
+const MAX_ITEM = 300
 
 // ------------------------------------------------------------------ project
 
@@ -109,15 +112,28 @@ const MAX_REPORT = 2000
  * is the main checkout's real path (git's common directory), so a worker in
  * `horde/<name>` and the orchestrator in the main checkout see one board.
  */
-export async function projectOf(directory: string): Promise<{ root: string; key: string }> {
-  const common = await git(directory, "rev-parse", "--path-format=absolute", "--git-common-dir").catch(() => undefined)
-  const root = common ? path.dirname(common) : path.resolve(directory)
-  const real = fs.realpathSync.native(root)
-  const hash = createHash("sha256")
-    .update(process.platform === "win32" ? real.toLowerCase() : real)
+const digest = (p: string) =>
+  createHash("sha256")
+    .update(process.platform === "win32" ? p.toLowerCase() : p)
     .digest("hex")
     .slice(0, 10)
-  return { root: real, key: `${path.basename(real).replace(/[^\w.-]+/g, "_")}-${hash}` }
+
+export async function projectOf(directory: string): Promise<{ root: string; key: string; legacyKey?: string }> {
+  // The common dir identifies the repository (submodules and bare repositories have their
+  // own, not a ".git" in a parent). Older git has no --path-format: resolve it ourselves.
+  const common =
+    (await git(directory, "rev-parse", "--path-format=absolute", "--git-common-dir").catch(() => undefined)) ??
+    (await git(directory, "rev-parse", "--git-common-dir")
+      .then((c) => path.resolve(directory, c))
+      .catch(() => undefined))
+  const real = fs.realpathSync.native(common ?? path.resolve(directory))
+  const hash = digest(real)
+  // Named after the checkout for the usual layout, after the repository directory otherwise.
+  const root = common && path.basename(real) === ".git" ? path.dirname(real) : real
+  const name = path.basename(root).replace(/\.git$/, "") || "repo"
+  // Boards made before the key moved to the common dir were keyed by the checkout.
+  const legacy = common && path.basename(real) === ".git" ? `${path.basename(root).replace(/[^\w.-]+/g, "_")}-${digest(root)}` : undefined
+  return { root, key: `${name.replace(/[^\w.-]+/g, "_")}-${hash}`, legacyKey: legacy }
 }
 
 export function defaultStateRoot(env: NodeJS.ProcessEnv = process.env): string {
@@ -142,8 +158,17 @@ export class Board {
 
   /** The board for the repository containing `directory`. */
   static async open(directory: string, stateRoot = defaultStateRoot()): Promise<Board> {
-    const { key } = await projectOf(directory)
-    return new Board(path.join(stateRoot, key))
+    const { key, legacyKey } = await projectOf(directory)
+    const dir = path.join(stateRoot, key)
+    const old = legacyKey && path.join(stateRoot, legacyKey)
+    if (old && old !== dir && !fs.existsSync(dir) && fs.existsSync(old)) {
+      try {
+        fs.renameSync(old, dir)
+      } catch {
+        return new Board(old) // another process moved or holds it; keep using it
+      }
+    }
+    return new Board(dir)
   }
 
   private mutate<T>(fn: () => T): Promise<T> {
@@ -190,7 +215,11 @@ export class Board {
       if (!line.trim()) continue
       try {
         const n = JSON.parse(line) as Note
-        byId.set(n.id, { ...byId.get(n.id), ...n })
+        // A forget marks the note; the same note added again afterwards is back.
+        if (n.forgotten) {
+          const prev = byId.get(n.id)
+          if (prev) byId.set(n.id, { ...prev, forgotten: true })
+        } else byId.set(n.id, n)
       } catch {
         // A torn last line from a crash: skip it.
       }
@@ -222,10 +251,11 @@ export class Board {
       const now = Date.now()
       // createdAt orders tasks, so it stays after every existing task even within one millisecond.
       const first = Math.max(now, ...existing.map((t) => t.createdAt + 1))
+      const taken = [...existing]
       const fresh: Task[] = inputs.map((p, i) => {
         if (!p.title?.trim() || !p.goal?.trim()) throw new Error(`task ${i + 1}: title and goal are required`)
-        return {
-          id: this.newId(existing),
+        const t: Task = {
+          id: this.newId(taken),
           title: p.title.trim(),
           goal: p.goal.trim(),
           acceptance: clean(p.acceptance),
@@ -240,6 +270,8 @@ export class Board {
           createdAt: first + i,
           updatedAt: now,
         }
+        taken.push(t)
+        return t
       })
       // Dependencies may name tasks of this plan by title, or any task by id.
       const all = [...existing, ...fresh]
@@ -297,11 +329,8 @@ export class Board {
       if (t.status === "blocked") throw new Error(`${id} is blocked${t.blockedOn ? ` on ${t.blockedOn}` : ""}; unblock it first`)
       const deps = t.deps.filter((d) => this.task(d).status !== "done")
       if (deps.length) throw new Error(`${id} waits for ${deps.join(", ")}`)
-      const prev = t.attempts[t.attempts.length - 1]
-      if (prev && !prev.endedAt) {
-        prev.endedAt = Date.now()
-        prev.outcome = "abandoned"
-      }
+      // The previous worker can no longer report or renew; its locks would only block the new one.
+      this.endAttempt(t, "abandoned")
       attempt = { n: t.attempts.length + 1, agent, tier: t.tier, token: randomBytes(4).toString("hex"), startedAt: Date.now() }
       t.attempts.push(attempt)
       t.status = "claimed"
@@ -332,13 +361,19 @@ export class Board {
     try {
       const root = await git(ws.path, "rev-parse", "--show-toplevel")
       const Q = ["-c", "core.quotePath=false"]
-      const changed = await git(root, ...Q, "diff", "--name-only", ws.base)
+      // Both sides of a rename: a worker that renamed a.ts to b.ts changed both.
+      const changed = await git(root, ...Q, "diff", "--name-only", "--no-renames", ws.base)
       const untracked = await git(root, ...Q, "ls-files", "--others", "--exclude-standard")
       diff = [...new Set(`${changed}\n${untracked}`.split("\n").filter(Boolean))].sort()
     } catch {
       return undefined
     }
-    const norm = (p: string) => normalize(p).replace(/^\.\//, "")
+    // Claims may be absolute paths inside the workspace.
+    const norm = (p: string) => {
+      const abs = p.replace(/\\/g, "/")
+      const prefix = `${ws.path.replace(/\\/g, "/").replace(/\/+$/, "")}/`
+      return normalize(abs.startsWith(prefix) ? abs.slice(prefix.length) : abs).replace(/^\.\//, "")
+    }
     const claimed = [...new Set([...r.filesChanged, ...r.testsAdded].map(norm).filter(Boolean))]
     return {
       claimedNotChanged: claimed.filter((c) => !diff.includes(c)),
@@ -356,18 +391,24 @@ export class Board {
     return this.update(id, (t) => {
       const a = t.attempts.find((x) => x.n === attempt)
       if (!a) throw new Error(`${id} has no attempt ${attempt}`)
-      if (activity.cost !== undefined) a.cost = activity.cost
+      // A cost the orchestrator gave when closing the attempt stays.
+      if (activity.cost !== undefined && !a.costGiven) a.cost = activity.cost
       if (activity.state) a.activity = { state: activity.state, gate: activity.gate, at: Date.now() }
       t.cost = totalCost(t)
     })
   }
 
+  /**
+   * The task is done. Usually after reviewing a worker's report; also for a task the
+   * orchestrator did itself (no live attempt).
+   */
   accept(id: string, opts: { note?: string; cost?: number } = {}): Promise<Task> {
     return this.update(id, (t) => {
-      const a = current(t)
-      if (a && !a.endedAt) Object.assign(a, { endedAt: Date.now(), outcome: "accepted", note: opts.note, cost: opts.cost ?? a.cost })
+      if (t.status === "done") throw new Error(`${id} is already done`)
+      this.endAttempt(t, "accepted", opts.note, opts.cost)
       t.cost = totalCost(t)
       t.status = "done"
+      t.blockedOn = undefined
       this.releaseLocks(id)
       this.event("accept", { task: id })
     })
@@ -376,8 +417,12 @@ export class Board {
   /** The attempt failed: retry (optionally on the next tier), or give up on the task. */
   fail(id: string, opts: { reason: string; retry?: boolean; escalate?: boolean; cost?: number }): Promise<Task> {
     return this.update(id, (t) => {
+      if (t.status === "done") throw new Error(`${id} is done; nothing to fail (board_edit status "open" reopens a task)`)
       const a = current(t)
-      if (a && !a.endedAt) Object.assign(a, { endedAt: Date.now(), outcome: "failed", note: opts.reason, cost: opts.cost ?? a.cost })
+      // Failing again what already failed (a retried call) must not escalate twice.
+      if ((!a || a.endedAt) && opts.retry !== false)
+        throw new Error(`${id} has no running attempt to fail (it is ${t.status}); change its tier with board_edit`)
+      this.endAttempt(t, "failed", opts.reason, opts.cost)
       t.cost = totalCost(t)
       if (opts.escalate) t.tier++
       t.status = opts.retry === false ? "failed" : "open"
@@ -388,6 +433,9 @@ export class Board {
 
   block(id: string, on: string): Promise<Task> {
     return this.update(id, (t) => {
+      if (t.status === "done") throw new Error(`${id} is already done`)
+      // A blocked task's worker cannot report or renew its locks: end its attempt.
+      this.endAttempt(t, "abandoned", `blocked on ${on}`)
       t.status = "blocked"
       t.blockedOn = on
       this.event("block", { task: id, on })
@@ -402,6 +450,7 @@ export class Board {
       if (patch.scope) t.scope = clean(patch.scope)
       if (patch.tier !== undefined) t.tier = patch.tier
       if (patch.status === "open") {
+        this.endAttempt(t, "abandoned", "reopened")
         t.status = "open"
         t.blockedOn = undefined
       }
@@ -455,10 +504,7 @@ export class Board {
       a.seenAt = Date.now()
       if (progress) a.progress = progress.slice(0, MAX_NOTE)
       if (t.status === "claimed") t.status = "working"
-      // Progress renews this attempt's locks.
-      for (const l of this.locks()) {
-        if (l.task === id && l.attempt === a.n) writeJson(this.lockFile(l.path), { ...l, expires: Date.now() + LEASE_MS })
-      }
+      this.renewLocks(id, a)
       if (progress) this.event("progress", { task: id, attempt: a.n, note: a.progress })
     })
   }
@@ -466,42 +512,53 @@ export class Board {
   report(id: string, token: string, r: Partial<Omit<Report, "at" | "attempt">> & { summary: string }): Promise<Task> {
     return this.update(id, (t) => {
       const a = this.worker(t, token)
+      const item = (list?: string[]) => clean(list).map((x) => x.slice(0, MAX_ITEM))
       const report: Report = {
         summary: r.summary.slice(0, MAX_REPORT),
-        filesChanged: clean(r.filesChanged),
-        testsAdded: clean(r.testsAdded),
-        decisions: clean(r.decisions),
-        questions: clean(r.questions),
-        unverifiedClaims: clean(r.unverifiedClaims),
+        filesChanged: item(r.filesChanged),
+        testsAdded: item(r.testsAdded),
+        decisions: item(r.decisions),
+        questions: item(r.questions),
+        unverifiedClaims: item(r.unverifiedClaims),
         confidence: r.confidence ?? "medium",
         at: Date.now(),
         attempt: a.n,
       }
-      // Keep the whole report within the cap: lists are trimmed after the summary.
-      while (JSON.stringify(report).length > MAX_REPORT * 2 && (report.decisions.length || report.filesChanged.length > 20)) {
-        if (report.decisions.length) report.decisions.pop()
-        else report.filesChanged.pop()
+      // Keep the whole report within the cap: the longest list is trimmed first, each to a few
+      // entries at least; files and unverified claims matter most, so they go last.
+      const lists = ["decisions", "questions", "testsAdded", "filesChanged", "unverifiedClaims"] as const
+      while (JSON.stringify(report).length > MAX_REPORT * 2) {
+        const longest = lists.filter((k) => report[k].length > 3).sort((x, y) => report[y].length - report[x].length)[0]
+        if (!longest) break
+        report[longest].pop()
       }
       t.reports.push(report)
       a.seenAt = report.at
+      this.renewLocks(id, a)
       t.status = "review"
       this.event("report", { task: id, attempt: a.n })
     })
   }
 
+  /** A fact a worker shares, attributed to its attempt (checked under the board's lock). */
   finding(text: string, opts: { tags?: string[]; paths?: string[]; task?: string; token?: string } = {}): Promise<Note> {
-    let source: Note["source"]
-    if (opts.task) {
+    return this.addNote("findings.jsonl", text, { tags: opts.tags, paths: opts.paths }, () => {
+      if (!opts.task) return undefined
       const t = this.task(opts.task)
-      source = { task: t.id, attempt: this.worker(t, opts.token ?? "").n }
-    }
-    return this.addNote("findings.jsonl", text, { tags: opts.tags, paths: opts.paths, source })
+      return { task: t.id, attempt: this.worker(t, opts.token ?? "").n }
+    })
   }
 
-  private addNote(file: string, text: string, opts: { tags?: string[]; paths?: string[]; confidence?: Note["confidence"]; source?: Note["source"] }) {
+  private addNote(
+    file: string,
+    text: string,
+    opts: { tags?: string[]; paths?: string[]; confidence?: Note["confidence"]; source?: Note["source"] },
+    sourceOf?: () => Note["source"],
+  ) {
     const body = text.trim().slice(0, MAX_NOTE)
     if (!body) return Promise.reject(new Error("a note needs text"))
     return this.mutate(() => {
+      if (sourceOf) opts = { ...opts, source: sourceOf() }
       // The same fact twice is one note.
       const id = `n-${createHash("sha256").update(body.toLowerCase()).digest("hex").slice(0, 8)}`
       const existing = this.readNotes(file).find((n) => n.id === id)
@@ -524,6 +581,11 @@ export class Board {
       const a = this.worker(t, token)
       const want = clean(paths).map(normalize)
       if (!want.length) throw new Error("lock needs at least one path")
+      // Locks are repository-relative and specific: "**", absolute paths or ".." would lock
+      // everything, or nothing that another worktree's lock could ever overlap.
+      for (const p of want)
+        if (!p || /^(\/|[A-Za-z]:)/.test(p) || p.split("/").includes("..") || !p.replace(/\/?[^/]*[*?[].*$/, ""))
+          throw new Error(`cannot lock "${p}": use a path relative to the repository root, not a pattern for everything`)
       const conflicts = this.locks().filter((l) => !(l.task === id && l.attempt === a.n) && want.some((p) => overlaps(p, l.path)))
       if (conflicts.length) return { ok: false as const, conflicts }
       for (const p of want) writeJson(this.lockFile(p), { path: p, task: id, attempt: a.n, expires: Date.now() + LEASE_MS } satisfies Lock)
@@ -545,6 +607,20 @@ export class Board {
       }
       return n
     })
+  }
+
+  /** End the task's live attempt, if any, and release its locks. */
+  private endAttempt(t: Task, outcome: NonNullable<Attempt["outcome"]>, note?: string, cost?: number) {
+    const a = current(t)
+    if (a && !a.endedAt) {
+      Object.assign(a, { endedAt: Date.now(), outcome, note })
+      if (cost !== undefined) Object.assign(a, { cost, costGiven: true })
+    }
+    this.releaseLocks(t.id)
+  }
+
+  private renewLocks(id: string, a: Attempt) {
+    for (const l of this.locks()) if (l.task === id && l.attempt === a.n) writeJson(this.lockFile(l.path), { ...l, expires: Date.now() + LEASE_MS })
   }
 
   private releaseLocks(id: string) {

@@ -10,7 +10,9 @@ import { killTree, pidAlive } from "@mcp-horde/core"
 import { createOpencodeClient, type OpencodeClient, type V2Event } from "@opencode-ai/sdk/v2"
 import { serverVersion } from "./compat.js"
 import type { Config } from "./config.js"
-import type { Store } from "./state.js"
+import type { ServerRecord, Store } from "./state.js"
+
+/** The shared-server record; `username` is absent in records written before it was stored. */
 
 /** OpenCode versions this server was tested against. Others work but get a warning. */
 export const TESTED_OPENCODE = { major: 1, minor: 19 }
@@ -60,6 +62,12 @@ export class Backend {
         }
         warnings.push(`${config.url} is used without a password; any local process can drive it. Set OPENCODE_SERVER_PASSWORD on both sides.`)
       }
+      const target = new URL(config.url)
+      if (config.password && target.protocol === "http:" && !isLoopback(target.hostname) && !config.allowInsecure) {
+        warnings.push(
+          `${config.url} uses plain http to a non-loopback host: the password is sent in clear text with every request. Use https (or a tunnel), or set HORDE_OPENCODE_ALLOW_INSECURE=1 to silence this.`,
+        )
+      }
       const client = connect(config.url, config.username, config.password)
       const version = await health(client, config.url)
       return Backend.ready(
@@ -72,9 +80,11 @@ export class Backend {
     if (config.serverMode === "shared") {
       const bin = resolveBinary(config.bin)
       const { client, info } = await store.lock("server", async (): Promise<{ client: OpencodeClient; info: ServerInfo }> => {
-        const known = store.server // read fresh: another process may have started one
+        const known: ServerRecord | undefined = store.server // read fresh: another process may have started one
         if (known) {
-          const client = connect(known.url, config.username, known.password)
+          // The server checks the username it was started with, which may differ from ours.
+          const username = known.username ?? config.username
+          const client = connect(known.url, username, known.password)
           const probe = await probeHealth(client)
           if (probe.ok) {
             if (known.bin && known.bin !== bin.command) {
@@ -87,7 +97,7 @@ export class Backend {
                 mode: "shared" as const,
                 key: "local",
                 version: probe.version,
-                username: config.username,
+                username,
                 password: known.password,
                 pid: known.pid,
                 warnings,
@@ -105,16 +115,17 @@ export class Backend {
               `The recorded shared OpenCode server at ${known.url} (pid ${known.pid}) is not responding. Stop it with opencode_server stop, then retry.`,
             )
           }
-          store.setServer(undefined) // gone: start a new one
+          forgetShared(store, known) // gone: start a new one
         }
         const password = config.password ?? randomBytes(24).toString("hex")
         const { url, pid } = await spawnShared(config, store.dir, password)
         const client = connect(url, config.username, password)
         const version = await health(client, url)
-        store.setServer({ url, password, pid, startedAt: Date.now(), bin: bin.command, version })
+        const record: ServerRecord = { url, password, pid, startedAt: Date.now(), bin: bin.command, version, username: config.username }
+        store.setServer(record)
         return { client, info: { url, mode: "shared" as const, key: "local", version, username: config.username, password, pid, warnings } }
       })
-      info.passwordFile = writePasswordFile(store.dir, info.password!)
+      info.passwordFile = writePasswordFile(passwordFilePath(store.dir, "shared", info.url), info.password!)
       return Backend.ready(client, info, config)
     }
 
@@ -122,6 +133,11 @@ export class Backend {
     const { url, proc } = await spawnPrivate(config, password)
     const client = connect(url, config.username, password)
     const version = await health(client, url)
+    // One file per private server, removed when this process exits (stale ones of dead processes are swept).
+    sweepPrivatePasswordFiles(store.dir)
+    const passwordFile = writePasswordFile(passwordFilePath(store.dir, "private", url), password)
+    process.once("exit", () => fs.rmSync(passwordFile, { force: true }))
+    proc.once("exit", () => fs.rmSync(passwordFile, { force: true }))
     return Backend.ready(
       client,
       {
@@ -131,7 +147,7 @@ export class Backend {
         version,
         username: config.username,
         password,
-        passwordFile: writePasswordFile(store.dir, password),
+        passwordFile,
         pid: proc.pid,
         warnings,
       },
@@ -221,12 +237,14 @@ export async function stopServer(config: Config, store: Store, backend?: Backend
     return `Stopped the private OpenCode server (${backend.info.url}). Running agents were stopped with it.`
   }
   return store.lock("server", async () => {
-    const known = store.server
+    const known: ServerRecord | undefined = store.server
     if (!known) return "No shared OpenCode server is recorded."
-    const probe = await probeHealth(connect(known.url, config.username, known.password))
-    store.setServer(undefined)
-    if (!probe.ok) {
-      return `The recorded shared server (${known.url}, pid ${known.pid}) is not answering with its password, so nothing was killed (the pid may belong to another process now). The record was cleared.`
+    const probe = await probeHealth(connect(known.url, known.username ?? config.username, known.password))
+    forgetShared(store, known)
+    // A server that times out while its pid lives is ours, hung: the record's URL was its port.
+    const hung = !probe.ok && probe.timedOut && pidAlive(known.pid)
+    if (!probe.ok && !hung) {
+      return `The recorded shared server (${known.url}, pid ${known.pid}) is not answering with its password (${probe.reason || "no answer"}), so nothing was killed (the pid may belong to another process now). The record was cleared.`
     }
     killTree(known.pid, true)
     const deadline = Date.now() + 5_000
@@ -238,8 +256,29 @@ export async function stopServer(config: Config, store: Store, backend?: Backend
         // already gone
       }
     }
-    return `Stopped the shared OpenCode server (pid ${known.pid}, ${known.url}). Running agents were stopped with it.`
+    const left = pidAlive(known.pid) ? ` Warning: pid ${known.pid} is still alive; kill it by hand.` : ""
+    if (hung) {
+      return `The shared OpenCode server (pid ${known.pid}, ${known.url}) was not responding, so it was killed and its record cleared. Running agents were stopped with it.${left}`
+    }
+    return `Stopped the shared OpenCode server (pid ${known.pid}, ${known.url}). Running agents were stopped with it.${left}`
   })
+}
+
+/** Drop the shared-server record and its password file. */
+function forgetShared(store: Store, known: ServerRecord) {
+  store.setServer(undefined)
+  fs.rmSync(passwordFilePath(store.dir, "shared", known.url), { force: true })
+}
+
+/** Whether the recorded shared server answers its (v2) health check with its password; never starts one. */
+export async function sharedServerAlive(config: Config, known: ServerRecord, timeoutMs = 2_000): Promise<boolean> {
+  const client = connect(known.url, known.username ?? config.username, known.password)
+  try {
+    const res = await client.v2.health.get({ signal: AbortSignal.timeout(timeoutMs) })
+    return res.data?.healthy === true
+  } catch {
+    return false
+  }
 }
 
 export function isLoopback(host: string): boolean {
@@ -276,13 +315,18 @@ async function probeHealth(client: OpencodeClient, timeoutMs = 5_000): Promise<P
       ok: false,
       version: "",
       reachable: status !== undefined,
-      timedOut: false,
+      // The SDK reports a timed-out request as an error result, not by throwing.
+      timedOut: status === undefined && isTimeout(res.error),
       reason: status === 401 ? "unauthorized (wrong OPENCODE_SERVER_PASSWORD or USERNAME?)" : `HTTP ${status ?? "error"}: ${describe(res.error)}`,
     }
   } catch (err) {
-    const name = (err as { name?: string }).name
-    return { ok: false, version: "", reachable: false, timedOut: name === "TimeoutError" || name === "AbortError", reason: describe(err) }
+    return { ok: false, version: "", reachable: false, timedOut: isTimeout(err), reason: describe(err) }
   }
+}
+
+function isTimeout(err: unknown): boolean {
+  const name = (err as { name?: string } | undefined)?.name
+  return name === "TimeoutError" || name === "AbortError" || /timed? ?out|aborted due to timeout/i.test(describe(err))
 }
 
 async function health(client: OpencodeClient, url: string): Promise<string> {
@@ -307,10 +351,32 @@ function describe(error: unknown): string {
   return JSON.stringify(error)
 }
 
-function writePasswordFile(dir: string, password: string): string {
-  const file = path.join(dir, "server-password")
+/**
+ * Where a server's password is kept for `opencode attach`: one file per server, so a private
+ * server never overwrites another's (by port; private ones also by the pid of the MCP process that owns them).
+ */
+export function passwordFilePath(dir: string, mode: "shared" | "private", url: string): string {
+  const port = new URL(url).port
+  return path.join(dir, mode === "private" ? `server-password-private-${process.pid}-${port}` : `server-password-shared-${port}`)
+}
+
+function writePasswordFile(file: string, password: string): string {
   fs.writeFileSync(file, password, { mode: 0o600 })
+  // writeFileSync keeps the mode of an existing file.
+  fs.chmodSync(file, 0o600)
   return file
+}
+
+/** Remove the password files of private servers whose MCP process is gone (killed before it could clean up). */
+function sweepPrivatePasswordFiles(dir: string) {
+  try {
+    for (const f of fs.readdirSync(dir)) {
+      const pid = Number(/^server-password-private-(\d+)-\d+$/.exec(f)?.[1])
+      if (pid && pid !== process.pid && !pidAlive(pid)) fs.rmSync(path.join(dir, f), { force: true })
+    }
+  } catch {
+    // best effort
+  }
 }
 
 /** The configured directory, or home if it does not exist (the error then comes from spawn, not launch). */
@@ -380,7 +446,7 @@ async function spawnShared(config: Config, stateDir: string, password: string): 
     const bin = resolveBinary(config.bin)
     const proc = spawn(bin.command, serveArgs(port), {
       cwd: workingDir(config),
-      env: { ...process.env, OPENCODE_SERVER_PASSWORD: password },
+      env: { ...process.env, OPENCODE_SERVER_USERNAME: config.username, OPENCODE_SERVER_PASSWORD: password },
       stdio: ["ignore", log, log],
       detached: true,
       windowsHide: true,
@@ -435,7 +501,7 @@ async function spawnPrivate(config: Config, password: string) {
   const proc = spawn(process.execPath, [...supervisor, String(process.pid), resolveBinary(config.bin).command, ...serveArgs(port)], {
     // Our own directory, so loader flags resolve; the supervisor starts OpenCode in the agent directory.
     cwd: fileURLToPath(new URL(".", import.meta.url)),
-    env: { ...process.env, OPENCODE_SERVER_PASSWORD: password, HORDE_SUPERVISED_CWD: workingDir(config) },
+    env: { ...process.env, OPENCODE_SERVER_USERNAME: config.username, OPENCODE_SERVER_PASSWORD: password, HORDE_SUPERVISED_CWD: workingDir(config) },
     // stdin stays open as a lifeline: the supervisor stops OpenCode when it closes.
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,

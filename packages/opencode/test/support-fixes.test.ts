@@ -1,0 +1,322 @@
+import assert from "node:assert/strict"
+import { execFileSync, spawn } from "node:child_process"
+import fs from "node:fs"
+import net from "node:net"
+import os from "node:os"
+import path from "node:path"
+import { after, describe, test } from "node:test"
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
+import type { PermissionV2Request } from "@opencode-ai/sdk/v2"
+import { ASK_GUARDED_PROFILE, unsupportedSchema, validate } from "../src/ask.js"
+import { passwordFilePath, stopServer } from "../src/backend.js"
+import { type Config, inProject, loadConfig } from "../src/config.js"
+import type { Snapshot } from "../src/fleet.js"
+import { makeHooks, permissionMessage } from "../src/hooks.js"
+import { Store } from "../src/state.js"
+import { attachCommand, renderSnapshot } from "../src/tools.js"
+import { apply, currentTurn, type DurableEvent, emptyTrack } from "../src/tracker.js"
+import { anchoredPattern, commitAll, createWorktree, excludeFromGit, removeWorktree } from "../src/worktree.js"
+import { connect, git, pkg } from "./harness.js"
+
+let seq = 0
+const ev = (type: string, data: Record<string, unknown> = {}): DurableEvent => ({
+  type: `session.next.${type}`,
+  durable: { seq: ++seq },
+  data: { timestamp: 1000 + seq, sessionID: "ses_x", ...data },
+})
+
+const tmps: string[] = []
+const tmpDir = () => {
+  const d = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "horde-fix-")))
+  tmps.push(d)
+  return d
+}
+after(() => {
+  for (const d of tmps) fs.rmSync(d, { recursive: true, force: true })
+})
+
+const repo = () => {
+  const dir = path.join(tmpDir(), "repo")
+  fs.mkdirSync(dir)
+  fs.writeFileSync(path.join(dir, "README.md"), "# r\n")
+  git(dir, "init", "-q")
+  git(dir, "add", ".")
+  git(dir, "commit", "-qm", "init")
+  return dir
+}
+
+const perm: PermissionV2Request = { id: "per_1", sessionID: "ses_x", action: "bash", resources: ["npm install x"], save: ["npm install *"] }
+
+describe("permission requests", () => {
+  test("the dialog and the snapshot show what 'always' saves", () => {
+    assert.match(permissionMessage("a", "/w", perm), /"Always" saves: npm install \*/)
+    const snap = {
+      id: "ses_x",
+      state: "needs_input",
+      steps: 0,
+      cost: 0,
+      tokens: { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
+      limits: {},
+      policy: "ask",
+      questionPolicy: "ask",
+      directory: "/w",
+      children: [],
+      pending: { permissions: [perm], questions: [] },
+      unreported: [],
+    } as unknown as Snapshot
+    assert.match(renderSnapshot(snap), /needs permission per_1: bash \["npm install x"\] \(always saves \["npm install \*"\]\)/)
+  })
+
+  test("only an explicit once/always approves; anything else goes to the caller", async () => {
+    let answer: unknown
+    const server = {
+      server: {
+        elicitInput: async (req: { message: string }) => {
+          assert.match(req.message, /Always" saves/)
+          return answer
+        },
+        getClientCapabilities: () => ({ elicitation: {} }),
+      },
+    } as unknown as McpServer
+    const hooks = makeHooks(server, { elicitTimeoutMs: 1000, channel: false } as Config)
+    const ask = (a: unknown) => {
+      answer = a
+      return hooks.askPermission({ id: "ses_x", directory: "/w" } as Snapshot, perm, new AbortController().signal)
+    }
+    assert.equal((await ask({ action: "accept", content: { decision: "once" } }))?.reply, "once")
+    assert.equal((await ask({ action: "accept", content: { decision: "always" } }))?.reply, "always")
+    assert.deepEqual(await ask({ action: "accept", content: { decision: "reject", message: "no" } }), { reply: "reject", message: "no" })
+    assert.equal(await ask({ action: "accept", content: {} }), undefined)
+    assert.equal(await ask({ action: "accept", content: { decision: "yes please" } }), undefined)
+    assert.equal(await ask({ action: "cancel" }), undefined)
+    assert.equal((await ask({ action: "decline" }))?.reply, "reject")
+  })
+})
+
+describe("tracker fixes", () => {
+  test("a prompt after a turn that died before running a step starts a new turn", () => {
+    const t = emptyTrack()
+    apply(t, ev("prompted", { messageID: "msg_1", prompt: { text: "first" } }))
+    apply(t, ev("prompt.admitted", { messageID: "msg_2", prompt: { text: "second" } }))
+    apply(t, ev("prompted", { messageID: "msg_2", prompt: { text: "second" } }))
+    assert.equal(t.turns.length, 2)
+    assert.match(t.turns[0]!.failure ?? "", /stopped before running a step/)
+    assert.equal(currentTurn(t)!.prompt, "second")
+  })
+
+  test("steers between steps, and prompts picked up back to back, stay in the turn", () => {
+    const t = emptyTrack()
+    apply(t, ev("prompted", { messageID: "msg_1", prompt: { text: "a" } }))
+    apply(t, ev("prompted", { messageID: "msg_2", prompt: { text: "b" }, delivery: "steer" }))
+    apply(t, ev("step.started"))
+    apply(t, ev("step.ended", { finish: "tool-calls" }))
+    apply(t, ev("prompted", { messageID: "msg_3", prompt: { text: "c" }, delivery: "steer" }))
+    assert.equal(t.turns.length, 1)
+    assert.equal(currentTurn(t)!.prompt, "a\n[steer] b\n[steer] c")
+  })
+
+  test("a steer picked up first does not drop an earlier queued prompt", () => {
+    const t = emptyTrack()
+    apply(t, ev("prompted", { messageID: "msg_1", prompt: { text: "a" } }))
+    apply(t, ev("step.started"))
+    apply(t, ev("prompt.admitted", { messageID: "msg_q", prompt: { text: "later" }, delivery: "queue" }))
+    apply(t, ev("prompt.admitted", { messageID: "msg_s", prompt: { text: "now" }, delivery: "steer" }))
+    apply(t, ev("step.ended", { finish: "tool-calls" }))
+    apply(t, ev("prompted", { messageID: "msg_s", prompt: { text: "now" }, delivery: "steer" }))
+    assert.deepEqual([...t.admitted.keys()], ["msg_q"])
+  })
+
+  test("the context estimate leaves out reasoning", () => {
+    const t = emptyTrack()
+    apply(t, ev("prompted", { messageID: "msg_1", prompt: { text: "a" } }))
+    apply(t, ev("step.started"))
+    apply(t, ev("step.ended", { finish: "stop", tokens: { input: 100, output: 10, reasoning: 1000, cache: { read: 5, write: 0 } } }))
+    assert.equal(t.context, 115)
+  })
+
+  test("a revert to an unknown message keeps the turns, or cuts them by message order", () => {
+    const build = () => {
+      const t = emptyTrack()
+      for (const n of [1, 3, 5]) {
+        apply(t, ev("prompted", { messageID: `msg_0${n}`, prompt: { text: `t${n}` } }))
+        apply(t, ev("step.started", { assistantMessageID: `msg_0${n + 1}` }))
+        apply(t, ev("step.ended", { finish: "stop" }))
+      }
+      return t
+    }
+    const known = build()
+    apply(known, ev("revert.committed", { messageID: "msg_04" }))
+    assert.equal(known.turns.length, 2)
+    const ordered = build()
+    apply(ordered, ev("revert.committed", { messageID: "msg_03x" }))
+    assert.equal(ordered.turns.length, 2, "cut after the turns that started before the boundary")
+    const unknown = build()
+    apply(unknown, ev("revert.committed", { messageID: "weird-id" }))
+    assert.equal(unknown.turns.length, 3, "an unplaceable boundary keeps every turn")
+  })
+})
+
+describe("ask schemas", () => {
+  test("unsupported keywords are rejected, common combinators work", () => {
+    assert.deepEqual(unsupportedSchema({ type: "object", properties: { a: { enum: ["x"] } }, required: ["a"] }), [])
+    assert.match(unsupportedSchema({ $ref: "#/x" }).join("\n"), /\$ref.*not supported/)
+    assert.match(unsupportedSchema({ type: "array", items: [{ type: "string" }] }).join("\n"), /tuple/)
+    assert.match(unsupportedSchema({ properties: { a: { not: {} } } }).join("\n"), /\$\.properties\.a\.not/)
+    assert.match(unsupportedSchema({ pattern: "(" }).join("\n"), /not a valid regular expression/)
+    assert.deepEqual(validate("b", { anyOf: [{ const: "a" }, { const: "b" }] }), [])
+    assert.equal(validate("c", { anyOf: [{ const: "a" }, { const: "b" }] }).length, 1)
+    assert.match(validate(2, { oneOf: [{ type: "integer" }, { type: "number" }] }).join(), /matches 2/)
+    assert.match(validate("ab", { pattern: "^a$" }).join(), /must match/)
+    assert.deepEqual(validate({ a: 1 }, { allOf: [{ required: ["a"] }, { properties: { a: { type: "integer" } } }] }), [])
+  })
+
+  test("the guarded profile allows read-only tools only", () => {
+    assert.match(ASK_GUARDED_PROFILE, /"\*": deny/)
+    for (const t of ["read", "grep", "glob", "list"]) assert.match(ASK_GUARDED_PROFILE, new RegExp(`\\n {2}${t}: allow`))
+    for (const t of ["bash", "edit", "task", "webfetch", "websearch", "codesearch"]) assert.match(ASK_GUARDED_PROFILE, new RegExp(`\\n {2}${t}: deny`))
+  })
+})
+
+describe("server support", () => {
+  test("the attach command quotes the password file, with a PowerShell variant", () => {
+    assert.equal(attachCommand("http://h:1", "/a b/it's"), `OPENCODE_SERVER_PASSWORD="$(cat '/a b/it'\\''s')" opencode attach http://h:1`)
+    assert.match(
+      attachCommand("http://h:1", "C:\\x y\\pw", "me", "win32"),
+      /^\$env:OPENCODE_SERVER_USERNAME = 'me'; \$env:OPENCODE_SERVER_PASSWORD = Get-Content -Raw 'C:\\x y\\pw'; opencode attach/,
+    )
+  })
+
+  test("password files are per server", () => {
+    assert.notEqual(passwordFilePath("/s", "shared", "http://127.0.0.1:1"), passwordFilePath("/s", "private", "http://127.0.0.1:1"))
+    assert.notEqual(passwordFilePath("/s", "shared", "http://127.0.0.1:1"), passwordFilePath("/s", "shared", "http://127.0.0.1:2"))
+  })
+
+  test("agents belong to the session's project by directory or worktree checkout", () => {
+    assert.ok(inProject({ directory: "/p/sub" }, "/p"))
+    assert.ok(inProject({ directory: "/wt/x", worktree: { repo: "/p" } }, "/p"))
+    assert.ok(!inProject({ directory: "/other" }, "/p"))
+    assert.ok(!inProject({ directory: "/p2" }, "/p"))
+  })
+
+  test("stopping a recorded shared server that hangs kills it instead of just forgetting it", {
+    skip: process.platform === "win32" ? "POSIX process groups" : false,
+  }, async () => {
+    const dir = tmpDir()
+    const store = new Store(dir)
+    // Accepts connections, never answers: the health probe times out.
+    const sockets: net.Socket[] = []
+    const hung = net.createServer((s) => void sockets.push(s))
+    await new Promise<void>((r) => hung.listen(0, "127.0.0.1", () => r()))
+    const port = (hung.address() as net.AddressInfo).port
+    const proc = spawn("sleep", ["300"], { detached: true, stdio: "ignore" })
+    try {
+      store.setServer({ url: `http://127.0.0.1:${port}`, password: "pw", pid: proc.pid!, startedAt: Date.now() })
+      const exited = new Promise((r) => proc.once("exit", r))
+      const text = await stopServer(loadConfig({ HORDE_OPENCODE_STATE_DIR: dir } as NodeJS.ProcessEnv), store)
+      assert.match(text, /was not responding, so it was killed/)
+      await exited
+      assert.equal(store.server, undefined)
+    } finally {
+      for (const s of sockets) s.destroy()
+      hung.close()
+      try {
+        process.kill(-proc.pid!, "SIGKILL")
+      } catch {
+        // gone
+      }
+    }
+  })
+
+  test("the supervisor stops OpenCode's whole process group", { skip: process.platform === "win32" ? "POSIX process groups" : false }, async () => {
+    const dir = tmpDir()
+    const pidFile = path.join(dir, "grandchild")
+    const sup = spawn(
+      process.execPath,
+      ["--import", "tsx", path.join(pkg, "src/supervisor.ts"), String(process.pid), "sh", "-c", `sleep 300 & echo $! > '${pidFile}'; wait`],
+      { cwd: pkg, stdio: ["pipe", "ignore", "inherit"] },
+    )
+    try {
+      const deadline = Date.now() + 20_000
+      while (!fs.existsSync(pidFile) || !fs.readFileSync(pidFile, "utf8").trim()) {
+        if (Date.now() > deadline) throw new Error("the grandchild never started")
+        await new Promise((r) => setTimeout(r, 100))
+      }
+      const grandchild = Number(fs.readFileSync(pidFile, "utf8").trim())
+      const exited = new Promise((r) => sup.once("exit", r))
+      sup.kill("SIGTERM")
+      await exited
+      const gone = Date.now() + 5_000
+      let alive = true
+      while (alive && Date.now() < gone) {
+        try {
+          process.kill(grandchild, 0)
+          await new Promise((r) => setTimeout(r, 100))
+        } catch {
+          alive = false
+        }
+      }
+      assert.equal(alive, false, "the tool process OpenCode started was stopped too")
+    } finally {
+      sup.kill("SIGKILL")
+    }
+  })
+
+  test("a bad configuration does not stop the MCP handshake; tools report it", async () => {
+    const dir = tmpDir()
+    const h = await connect({ HORDE_OPENCODE_PERMISSIONS: "maybe", HORDE_OPENCODE_STATE_DIR: path.join(dir, "state"), HORDE_OPENCODE_DIRECTORY: dir })
+    try {
+      await assert.rejects(h.call("opencode_status"), /misconfigured: HORDE_OPENCODE_PERMISSIONS must be one of/)
+      await assert.rejects(h.call("opencode_server", { action: "info" }), /misconfigured/)
+    } finally {
+      await h.close()
+    }
+  })
+})
+
+describe("worktree fixes", () => {
+  test("exclude patterns are anchored at the directory's place in the repository", async () => {
+    assert.equal(anchoredPattern("", ".opencode/x"), "/.opencode/x")
+    assert.equal(anchoredPattern("sub/dir/", "/.opencode/x"), "/sub/dir/.opencode/x")
+    assert.equal(anchoredPattern("a*b/", "x"), "/a\\*b/x")
+    const r = repo()
+    const sub = path.join(r, "pkg", "app")
+    fs.mkdirSync(path.join(sub, ".opencode", "agent"), { recursive: true })
+    fs.writeFileSync(path.join(sub, ".opencode", "agent", "horde-a.md"), "x")
+    fs.mkdirSync(path.join(r, ".opencode", "agent"), { recursive: true })
+    fs.writeFileSync(path.join(r, ".opencode", "agent", "horde-top.md"), "x")
+    await excludeFromGit(sub, ".opencode/agent/horde-*.md")
+    const status = git(r, "status", "--porcelain", "--untracked-files=all")
+    assert.doesNotMatch(status, /pkg\/app\/\.opencode/)
+    assert.match(status, /^\?\? \.opencode\/agent\/horde-top\.md$/m, "only the directory's own files are excluded")
+  })
+
+  test("linked paths are not carried into the baseline; branch deletion is reported truthfully", async () => {
+    const r = repo()
+    fs.mkdirSync(path.join(r, "data"))
+    fs.writeFileSync(path.join(r, "data", "big.bin"), "x")
+    fs.writeFileSync(path.join(r, "notes.txt"), "carried")
+    const { worktree } = await createWorktree(r, "lnk", { rootDir: path.join(tmpDir(), "wt"), includeUncommitted: true, link: ["data"] })
+    assert.ok(worktree.baseline)
+    const files = git(worktree.root, "show", "--name-only", "--format=", worktree.baseline!)
+    assert.match(files, /notes\.txt/)
+    assert.doesNotMatch(files, /data\//)
+    // A branch that is checked out elsewhere cannot be deleted: say so.
+    const other = path.join(tmpDir(), "other")
+    git(r, "worktree", "remove", "--force", worktree.root)
+    git(r, "worktree", "add", other, worktree.branch)
+    const text = await removeWorktree({ ...worktree, root: path.join(tmpDir(), "gone") }, "lnk", true)
+    assert.match(text, /could not delete branch horde\/lnk/)
+    assert.doesNotMatch(text, /deleted branch/)
+  })
+
+  test("commits need both user.name and user.email, else the fallback identity is used", async () => {
+    const r = repo()
+    git(r, "config", "user.email", "only@mail")
+    git(r, "config", "user.name", "")
+    const root = path.join(tmpDir(), "wt")
+    const { worktree } = await createWorktree(r, "ident", { rootDir: root, includeUncommitted: false, link: [] })
+    fs.writeFileSync(path.join(worktree.root, "f.txt"), "x")
+    assert.match((await commitAll(worktree, "work")) ?? "", /committed/)
+    assert.equal(execFileSync("git", ["log", "-1", "--format=%an"], { cwd: worktree.root }).toString().trim(), "mcp-horde")
+  })
+})

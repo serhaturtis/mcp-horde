@@ -1,6 +1,7 @@
+import { randomBytes } from "node:crypto"
 import fs from "node:fs"
 import path from "node:path"
-import { SELF as PROCESS, pidAlive, readJson, withLock, writeAtomic } from "@mcp-horde/core"
+import { SELF as PROCESS, pidAlive, readJson, sleepSync, withLock, writeAtomic } from "@mcp-horde/core"
 import type { PermissionPolicy } from "./config.js"
 import type { Worktree } from "./worktree.js"
 
@@ -26,7 +27,11 @@ export interface GateConfig {
   audit: boolean
   /** Scope globs (repo-relative) for the audit. */
   allowed?: string[]
-  /** Gate runs per task before the failure is reported (each failure is sent back to the agent first). */
+  /**
+   * Gate runs per instruction, the first one included. A failing run with rounds left is sent
+   * back to the agent to fix (so there are at most maxRounds − 1 fix rounds); the failure of the
+   * last run is the result.
+   */
   maxRounds: number
   /** Run only the tests related to the agent's changes when that is safe (default true; absent in older records). */
   related?: boolean
@@ -37,6 +42,11 @@ export interface GateConfig {
 export interface GateState {
   /** Gate runs since the last instruction from the caller. */
   round: number
+  /**
+   * Start seq of a turn whose gate was superseded (the tree changed under it by a sync or a
+   * revert): it is not gated again; the next turn is.
+   */
+  superseded?: number
   verdict?: {
     /** Start seq of the turn this verdict judged. */
     turn: number
@@ -63,6 +73,10 @@ export interface AgentRecord {
   agentFile?: string
   createdAt: number
   owner?: Owner
+  /** When the owner last confirmed it is alive (its heartbeat); a stale one means a dead owner. */
+  ownerSeen?: number
+  /** Not spawned by this server (e.g. started in the TUI): nothing is answered on a human's behalf. */
+  adopted?: boolean
   /** Finished turns starting at or before this history seq have been reported to the caller. */
   reportedSeq: number
   /** When the caller last received this agent's news. */
@@ -91,15 +105,25 @@ export interface ServerRecord {
   /** Binary and version the server was started with, to warn about upgrades. */
   bin?: string
   version?: string
+  /** Basic-auth user the server was started with. */
+  username?: string
 }
 
 /** This process, as an agent owner. */
 export const SELF: Owner = { ...PROCESS }
 
-/** Whether the owner process is still running (on this host). */
-export function ownerAlive(owner: Owner | undefined): boolean {
+/** An owner whose heartbeat is older than this is gone (or its PID was reused). */
+export const OWNER_STALE_MS = 2 * 60_000
+
+/**
+ * Whether the owner process is still running. A record with a heartbeat (`seen`) is alive only
+ * while the heartbeat is fresh, so a reused PID or a process on another host is not mistaken for
+ * a live owner; older records fall back to the PID check (on this host).
+ */
+export function ownerAlive(owner: Owner | undefined, seen?: number, now = Date.now()): boolean {
   if (!owner) return false
   if (owner.token === SELF.token) return true
+  if (seen !== undefined && now - seen > OWNER_STALE_MS) return false
   if (owner.host !== SELF.host) return true // cannot check another host; assume alive
   return pidAlive(owner.pid)
 }
@@ -173,6 +197,20 @@ export class Store {
     fs.rmSync(this.agentFile(id), { force: true })
   }
 
+  /**
+   * Take a record over for `owner` if it is still claimable when re-read under the claim lock,
+   * so two processes never both claim the same orphan. Undefined when it is not (any more).
+   */
+  claim(id: string, owner: Owner, claimable: (r: AgentRecord) => boolean): AgentRecord | undefined {
+    return this.lockSync("claim", () => {
+      const r = this.get(id)
+      if (!r || !claimable(r)) return undefined
+      const claimed = { ...r, owner, ownerSeen: Date.now() }
+      this.put(claimed)
+      return claimed
+    })
+  }
+
   // ------------------------------------------------------------- server
 
   get server(): ServerRecord | undefined {
@@ -193,5 +231,68 @@ export class Store {
    */
   lock<T>(name: string, fn: () => Promise<T>, timeoutMs = 120_000): Promise<T> {
     return withLock(this.dir, name, fn, timeoutMs)
+  }
+
+  /**
+   * The same lock (same file, same takeover rules), held synchronously for a short critical
+   * section such as a read-check-write of one record. Throws when it cannot be had in time.
+   */
+  lockSync<T>(name: string, fn: () => T, timeoutMs = 1_000): T {
+    const file = path.join(this.dir, `${name}.lock`)
+    const mine = JSON.stringify({ pid: process.pid, host: PROCESS.host, token: randomBytes(8).toString("hex") })
+    const deadline = Date.now() + timeoutMs
+    for (;;) {
+      try {
+        fs.writeFileSync(file, mine, { flag: "wx", mode: 0o600 })
+        break
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err
+      }
+      let content: string
+      let age: number
+      try {
+        content = fs.readFileSync(file, "utf8")
+        age = Date.now() - fs.statSync(file).mtimeMs
+      } catch {
+        continue // released between our attempts
+      }
+      let holder: { pid?: number; host?: string } | undefined
+      try {
+        holder = JSON.parse(content)
+      } catch {
+        holder = undefined
+      }
+      const dead = holder?.pid ? holder.host === PROCESS.host && !pidAlive(holder.pid) : age > 5_000
+      if (dead || age > 30_000) {
+        const tomb = `${file}.stale.${process.pid}.${randomBytes(4).toString("hex")}`
+        try {
+          fs.renameSync(file, tomb)
+          if (fs.readFileSync(tomb, "utf8") === content) fs.rmSync(tomb, { force: true })
+          else {
+            // A fresh lock was moved by mistake: put it back unless someone took the lock meanwhile.
+            try {
+              fs.linkSync(tomb, file)
+            } catch {
+              // Taken meanwhile (or no hard links): the newer holder wins.
+            }
+            fs.rmSync(tomb, { force: true })
+          }
+        } catch {
+          // Another contender took it over first.
+        }
+        continue
+      }
+      if (Date.now() > deadline) throw new Error(`timed out waiting for ${file} (held by ${content})`)
+      sleepSync(20)
+    }
+    try {
+      return fn()
+    } finally {
+      try {
+        if (fs.readFileSync(file, "utf8") === mine) fs.rmSync(file, { force: true })
+      } catch {
+        // Already gone.
+      }
+    }
   }
 }

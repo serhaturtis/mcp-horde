@@ -39,6 +39,14 @@ export function questionAnswers(req: QuestionV2Request, content: Record<string, 
   })
 }
 
+/** The permission dialog text: what is asked, on what, and what "always" would save. */
+export function permissionMessage(agent: string, directory: string, req: PermissionV2Request): string {
+  const lines = [`OpenCode agent "${agent}" wants permission: ${req.action}`, truncate(req.resources.join("\n"), 1500)]
+  if (req.save?.length) lines.push(`"Always" saves: ${truncate(req.save.join(", "), 500)} (for every later session of this project)`)
+  lines.push(`(in ${directory})`)
+  return lines.join("\n")
+}
+
 /** Bridges fleet events to the MCP client: elicitation dialogs and channel pushes. */
 export function makeHooks(server: McpServer, config: Config): Hooks {
   const label = (s: Snapshot) => s.name ?? s.id
@@ -54,7 +62,7 @@ export function makeHooks(server: McpServer, config: Config): Hooks {
     async askPermission(snap: Snapshot, req: PermissionV2Request, signal: AbortSignal) {
       const res = await server.server.elicitInput(
         {
-          message: `OpenCode agent "${label(snap)}" wants permission: ${req.action}\n${truncate(req.resources.join("\n"), 1500)}\n(in ${snap.directory})`,
+          message: permissionMessage(label(snap), snap.directory, req),
           requestedSchema: {
             type: "object",
             properties: {
@@ -63,7 +71,7 @@ export function makeHooks(server: McpServer, config: Config): Hooks {
                 title: "Allow?",
                 oneOf: [
                   { const: "once", title: "Allow once" },
-                  { const: "always", title: "Always allow this pattern" },
+                  { const: "always", title: req.save?.length ? `Always allow ${truncate(req.save.join(", "), 200)}` : "Always allow this pattern" },
                   { const: "reject", title: "Reject" },
                 ],
               },
@@ -76,7 +84,9 @@ export function makeHooks(server: McpServer, config: Config): Hooks {
       )
       if (res.action === "accept") {
         const decision = res.content?.decision
-        const reply = decision === "always" || decision === "reject" ? decision : "once"
+        // Approve only on an explicit choice; anything else goes to the calling model.
+        if (decision !== "once" && decision !== "always" && decision !== "reject") return undefined
+        const reply = decision
         const message = typeof res.content?.message === "string" && res.content.message ? res.content.message : undefined
         return { reply, message }
       }

@@ -108,3 +108,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     elicitTimeoutMs: int(env.HORDE_OPENCODE_DIALOG_TIMEOUT, 600, "HORDE_OPENCODE_DIALOG_TIMEOUT") * 1000,
   }
 }
+
+/**
+ * Whether an agent belongs to the project rooted at `root`: its directory, or the main
+ * checkout of its worktree, is inside it.
+ */
+export function inProject(record: { directory: string; worktree?: { repo: string } }, root: string): boolean {
+  const within = (dir: string) => {
+    const rel = path.relative(path.resolve(root), path.resolve(dir))
+    return rel === "" || (rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel))
+  }
+  return within(record.directory) || (record.worktree !== undefined && within(record.worktree.repo))
+}

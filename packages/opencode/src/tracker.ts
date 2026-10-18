@@ -38,7 +38,7 @@ export interface Track {
   /** Last durable sequence number applied. */
   seq: number
   /** Prompts admitted but not yet picked up by the agent loop. */
-  admitted: Map<string, { at: number; seq: number; text: string }>
+  admitted: Map<string, { at: number; seq: number; text: string; delivery?: string }>
   /** A turn is open from `prompted` until a final step end, a failure or an interrupt. */
   inLoop: boolean
   stepOpen: boolean
@@ -53,6 +53,8 @@ export interface Track {
   lastEventAt: number
   lastPromptedAt: number
   lastPromptedSeq: number
+  /** Seq of the latest `step.started`, to tell a live turn from one that died before running a step. */
+  lastStepSeq?: number
   /** Context window in use after the latest step (its prompt plus its output), in tokens. */
   context?: number
   /** Compactions so far (each resets the context). */
@@ -132,19 +134,38 @@ export function apply(t: Track, e: DurableEvent, estimate?: CostEstimator): void
 
   switch (e.type) {
     case "session.next.prompt.admitted":
-      t.admitted.set(str(d.messageID), { at, seq, text: str((d.prompt as { text?: unknown } | undefined)?.text) })
+      t.admitted.set(str(d.messageID), {
+        at,
+        seq,
+        text: str((d.prompt as { text?: unknown } | undefined)?.text),
+        ...(typeof d.delivery === "string" ? { delivery: d.delivery } : {}),
+      })
       break
     case "session.next.prompted": {
       const id = str(d.messageID)
       const admittedAt = t.admitted.get(id)?.at ?? at
       const admittedSeq = t.admitted.get(id)?.seq ?? seq
+      const delivery = typeof d.delivery === "string" ? d.delivery : t.admitted.get(id)?.delivery
       t.admitted.delete(id)
-      // Anything admitted before this prompt and still not picked up was superseded.
-      for (const [k, v] of t.admitted) if (v.at < admittedAt) t.admitted.delete(k)
+      // Anything of the same delivery mode admitted before this prompt and still not picked up was
+      // superseded. Steers are picked up between steps and queued prompts after the turn, so a
+      // steer picked up first says nothing about an earlier queued prompt.
+      for (const [k, v] of t.admitted)
+        if (v.at < admittedAt && (v.delivery === undefined || delivery === undefined || v.delivery === delivery)) t.admitted.delete(k)
+      const previousPromptSeq = t.lastPromptedSeq
       t.lastPromptedAt = at
       t.lastPromptedSeq = seq
       const text = str((d.prompt as { text?: unknown } | undefined)?.text)
-      const steering = t.inLoop && turn && !turn.endedAt && !turn.interrupted && !turn.failure
+      const open = t.inLoop && turn && !turn.endedAt && !turn.interrupted && !turn.failure
+      // A live turn ran a step since its last prompt, or is picking up a batch of prompts (OpenCode
+      // publishes them back to back). Otherwise the loop died before running one (e.g. the server
+      // stopped mid-turn) and this prompt starts a new turn instead of steering into a dead one.
+      const live = (t.lastStepSeq ?? 0) > previousPromptSeq || seq === previousPromptSeq + 1
+      if (open && !live) {
+        turn.failure = "the turn stopped before running a step (the OpenCode server may have restarted)"
+        turn.endedAt = at
+      }
+      const steering = open && live
       if (steering) {
         // Steered into a running turn: same turn, remember the extra instruction.
         turn.prompt = `${turn.prompt}\n[steer] ${text}`
@@ -158,6 +179,7 @@ export function apply(t: Track, e: DurableEvent, estimate?: CostEstimator): void
     }
     case "session.next.step.started":
       t.stepOpen = true
+      t.lastStepSeq = seq
       if (turn && typeof d.assistantMessageID === "string" && !turn.messageIDs?.includes(d.assistantMessageID)) turn.messageIDs?.push(d.assistantMessageID)
       if (d.model && typeof d.model === "object") t.model = d.model as Track["model"]
       if (typeof d.agent === "string") t.agent = d.agent
@@ -182,7 +204,9 @@ export function apply(t: Track, e: DurableEvent, estimate?: CostEstimator): void
       t.stepCosts.push({ at, cost })
       if (t.stepCosts.length > MAX_STEP_COSTS) t.stepCosts.shift()
       for (const k of Object.keys(step) as (keyof Tokens)[]) t.tokens[k] += step[k]
-      const used = step.input + step.cacheRead + step.cacheWrite + step.output + step.reasoning
+      // What the next step resends: this step's prompt and its answer. Reasoning is not carried
+      // over between steps by most providers, so it does not count against the window.
+      const used = step.input + step.cacheRead + step.cacheWrite + step.output
       if (used) t.context = used
       // "tool-calls" means the loop continues with another step.
       if (str(d.finish) !== "tool-calls") endTurn(t, at)
@@ -190,9 +214,7 @@ export function apply(t: Track, e: DurableEvent, estimate?: CostEstimator): void
     }
     case "session.next.revert.committed": {
       // Everything after the boundary message is gone: drop the turns that started after it.
-      const boundary = str(d.messageID)
-      const keep = t.turns.findIndex((x) => x.messageIDs?.includes(boundary))
-      t.turns.splice(keep + 1)
+      revertTurns(t, str(d.messageID))
       t.inLoop = false
       t.stepOpen = false
       t.openTools.clear()
@@ -247,6 +269,27 @@ export function apply(t: Track, e: DurableEvent, estimate?: CostEstimator): void
       break
     }
   }
+}
+
+/**
+ * Drop what a revert to `boundary` (kept; everything after it is gone) removed. A boundary in
+ * no known turn is placed by message order (OpenCode's message ids sort by creation); one that
+ * cannot be placed keeps every turn rather than forgetting them all.
+ */
+function revertTurns(t: Track, boundary: string) {
+  if (!boundary) return
+  const at = t.turns.findIndex((x) => x.messageIDs?.includes(boundary))
+  if (at >= 0) {
+    const turn = t.turns[at]!
+    const ids = turn.messageIDs ?? []
+    turn.messageIDs = ids.slice(0, ids.indexOf(boundary) + 1)
+    t.turns.splice(at + 1)
+    return
+  }
+  const sortable = (id: string | undefined) => !!id && /^msg_[0-9A-Za-z]+$/.test(id)
+  if (!sortable(boundary) || !t.turns.every((x) => sortable(x.messageIDs?.[0]))) return
+  const keep = t.turns.filter((x) => x.messageIDs![0]! <= boundary).length
+  t.turns.splice(keep)
 }
 
 function endTurn(t: Track, at: number) {

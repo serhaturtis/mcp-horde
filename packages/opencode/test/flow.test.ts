@@ -121,7 +121,7 @@ describe("the horde flow: board, workers, gates (real opencode, mock LLM)", { ti
 
     // What a's worker learned is in c's brief.
     const brief = await boardCall("board_brief", { id: c, agent: "wc" })
-    assert.match(brief, /## Findings from other workers[\s\S]*modules export named constants \(c\.js\)/)
+    assert.match(brief, /## Findings from other workers[\s\S]*modules export named constants \(c\.js; from t-\w+\)/)
     const done = await h.call("opencode_spawn", {
       prompt: brief,
       name: "wc",

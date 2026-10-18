@@ -20,7 +20,23 @@ const child = spawn(bin, args, {
   windowsHide: true,
   // A resolved .exe needs no shell; only fall back to one for .cmd/.bat shims.
   shell: isWindows && /\.(cmd|bat)$/i.test(bin),
+  // Its own process group on POSIX, so stopping it also stops what it started (tool shells, LSPs, MCP servers).
+  detached: !isWindows,
 })
+
+/** Signal OpenCode's whole process group (falls back to the process itself). */
+const signalGroup = (signal: NodeJS.Signals) => {
+  if (!child.pid) return
+  try {
+    process.kill(-child.pid, signal)
+  } catch {
+    try {
+      child.kill(signal)
+    } catch {
+      // already gone
+    }
+  }
+}
 
 let stopping = false
 const stop = () => {
@@ -30,14 +46,22 @@ const stop = () => {
     spawnSync("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true })
     return
   }
-  child.kill("SIGTERM")
+  signalGroup("SIGTERM")
   // Escalate if it does not shut down.
   setTimeout(() => {
-    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL")
+    if (child.exitCode === null && child.signalCode === null) signalGroup("SIGKILL")
   }, 5_000).unref()
 }
 
 child.on("exit", (code, signal) => {
+  // Leftovers of the group (tools OpenCode started) must not outlive it.
+  if (!isWindows && child.pid) {
+    try {
+      process.kill(-child.pid, "SIGKILL")
+    } catch {
+      // nothing left
+    }
+  }
   const signals: Record<string, number> = { SIGHUP: 1, SIGINT: 2, SIGKILL: 9, SIGTERM: 15 }
   process.exit(code ?? (signal ? 128 + (signals[signal] ?? 1) : 1))
 })

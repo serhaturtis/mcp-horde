@@ -23,12 +23,21 @@ const CONTEXT_SHARE = 0.6
 export function renderBrief(board: Board, t: Task, a: Attempt, budgetTokens = 6000, repo?: string): string {
   const cmd = workerCommand(board.dir)
   const id = t.id
-  const notes = (ns: Note[], title: string, caveat: string) =>
-    ns.length ? `## ${title}\n${caveat}\n${list(ns.slice(0, 12).map((n) => `${n.text}${n.paths.length ? ` (${n.paths.join(", ")})` : ""}`))}` : ""
+  const from = (n: Note) => (n.source ? `from ${n.source.task}` : undefined)
+  const notes = (ns: Note[], title: string, caveat: string, attributed = false) =>
+    ns.length
+      ? `## ${title}\n${caveat}\n${list(
+          ns.slice(0, 12).map((n) => {
+            const where = [...n.paths, ...(attributed ? [from(n) ?? "unattributed"] : [])]
+            return `${n.text}${where.length ? ` (${where.join("; ")})` : ""}`
+          }),
+        )}`
+      : ""
   const memory = board.memory({ paths: t.scope, query: `${t.title} ${t.goal}` })
   const findings = board.findings({ paths: t.scope }).filter((n) => n.source?.task !== id)
-  const sections: Section[] = [
-    { text: `# Task ${id}: ${t.title}\n\n${t.goal}`, required: true },
+  // The goal is the only required part that can be long: cut it to what the other required
+  // parts leave, so the reporting commands are never the thing that is cut.
+  const fixed: Section[] = [
     {
       text: `## Done means\n${t.acceptance.length ? list(t.acceptance) : "- The goal above is met and the project's checks pass."}\nYour work may also be checked mechanically when you finish (tests, typecheck, lint, and a review of your diff). Do not skip, delete or weaken tests, and do not silence errors to make checks pass.`,
       required: true,
@@ -53,10 +62,21 @@ export function renderBrief(board: Board, t: Task, a: Attempt, budgetTokens = 60
       ].join("\n"),
       required: true,
     },
+  ]
+  const maxChars = budgetTokens * 4
+  const fixedChars = fixed.reduce((n, f) => n + f.text.length + 2, 0)
+  const head = `# Task ${id}: ${t.title}\n\n`
+  const goal = `${head}${truncate(t.goal, Math.max(400, maxChars - fixedChars - head.length - 200))}`
+  const sections: Section[] = [
+    { text: goal, required: true },
+    ...fixed,
     { text: notes(memory, "Project notes", "From earlier tasks; they may be outdated.") },
-    { text: notes(findings, "Findings from other workers", "Shared during this work; check before relying on them.") },
+    { text: notes(findings, "Findings from other workers", "Shared during this work; check before relying on them.", true) },
   ].filter((s) => s.text)
-  const brief = fitSections(sections, budgetTokens * 4, "\n\n")
+  // Required parts over a tiny budget are kept whole rather than cut.
+  const required = sections.filter((s) => s.required)
+  const brief =
+    required.reduce((n, s) => n + s.text.length + 2, 0) > maxChars ? required.map((s) => s.text).join("\n\n") : fitSections(sections, maxChars, "\n\n")
   if (!repo) return brief
   const left = Math.min(Math.floor(budgetTokens * CONTEXT_SHARE), budgetTokens - estimateTokens(brief) - 50)
   if (left < 300) return brief
@@ -127,7 +147,10 @@ export function renderSummary(board: Board, budgetChars = 1500, now = Date.now()
   for (const t of by("blocked"))
     sections.push({ text: `blocked ${t.id} "${t.title}" on ${t.blockedOn ?? "?"}`, group: "blocked", omitted: (n) => `blocked … ${n} more` })
   for (const t of by("failed")) sections.push({ text: `failed  ${t.id} "${t.title}"`, group: "failed", omitted: (n) => `failed … ${n} more` })
-  if (ready.length) sections.push({ text: `next    ${ready.map((t) => `${t.id} "${truncate(t.title, 50)}"`).join(", ")}`, required: true })
+  if (ready.length) {
+    const shown = ready.slice(0, 8).map((t) => `${t.id} "${truncate(t.title, 50)}"`)
+    sections.push({ text: `next    ${shown.join(", ")}${ready.length > 8 ? `, +${ready.length - 8} more` : ""}`, required: true })
+  }
   const waiting = by("open").filter((t) => !ready.includes(t))
   if (waiting.length) sections.push({ text: `waiting ${waiting.map((t) => `${t.id} (on ${t.deps.join(", ")})`).join(", ")}` })
   const locks = board.locks(now)

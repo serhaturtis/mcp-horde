@@ -270,7 +270,8 @@ describe("opencode MCP server: core behaviour (real opencode, mock LLM)", { time
     const parent = idOf(parentOut)
     // OpenCode's v2 runner has no subagent tool yet; create the child the way the legacy task tool does.
     const info = await h.call("opencode_server", { action: "info" })
-    const [, file, url] = info.match(/OPENCODE_SERVER_PASSWORD="\$\(cat (\S+)\)" opencode attach (\S+)/)!
+    const [, posixFile, winFile, url] = info.match(/(?:OPENCODE_SERVER_PASSWORD="\$\(cat '([^']+)'\)"|Get-Content -Raw '([^']+)';) opencode attach (\S+)/)!
+    const file = posixFile ?? winFile
     const password = fs.readFileSync(file!, "utf8")
     assert.doesNotMatch(info, new RegExp(password), "the password itself is never printed")
     const oc = createOpencodeClient({ baseUrl: url, headers: { Authorization: `Basic ${Buffer.from(`opencode:${password}`).toString("base64")}` } })
@@ -578,9 +579,11 @@ describe("opencode MCP server: core behaviour (real opencode, mock LLM)", { time
   test("ask: one-shot answers without tools; JSON checked against a schema, with one retry", async () => {
     assert.match(await h.call("opencode_ask", { prompt: "quick question" }), /^Echo\[none\]: Answer the request below directly[\s\S]*\n\(mock\/mock · \$0\)$/)
     assert.match(await h.call("opencode_ask", { prompt: "TOOLS?" }), /^Tools:\n/, "no tools are offered")
-    // A provider that refuses tool-less sessions (OpenCode's free tier) gets tools that are all denied.
+    // A provider that refuses tool-less sessions (OpenCode's free tier) gets the read-only tools only.
     const guarded = await h.call("opencode_ask", { prompt: "FREETIER TOOLS?" })
-    assert.match(guarded, /^Tools: \w+[\s\S]*tools present but denied/, guarded)
+    assert.match(guarded, /^Tools: \w+[\s\S]*read-only tools offered/, guarded)
+    const offered = guarded.match(/^Tools: (.*)$/m)![1]!.split(",")
+    for (const tool of offered) assert.ok(["read", "grep", "glob", "list", "invalid"].includes(tool), `unexpected tool offered: ${tool} (${guarded})`)
     const schema = { type: "object", properties: { verdict: { enum: ["a", "b"] }, score: { type: "integer" } }, required: ["verdict"] }
     assert.match(
       await h.call("opencode_ask", { prompt: 'JSON: {"verdict": "a", "score": 2}', schema }),

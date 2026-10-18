@@ -3,12 +3,13 @@ import { loadSyntax } from "@mcp-horde/context"
 import { packageVersion } from "@mcp-horde/core"
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
-import { Backend, stopServer } from "./backend.js"
-import { loadConfig } from "./config.js"
+import { Backend, sharedServerAlive, stopServer } from "./backend.js"
+import { type Config, inProject, loadConfig } from "./config.js"
 import { Fleet } from "./fleet.js"
 import { makeHooks } from "./hooks.js"
-import { Store } from "./state.js"
+import { ownerAlive, Store } from "./state.js"
 import { INSTRUCTIONS, registerTools } from "./tools.js"
+import { repoRoot } from "./worktree.js"
 
 const VERSION = packageVersion(import.meta.url)
 
@@ -17,15 +18,33 @@ process.on("unhandledRejection", (err) => {
   process.stderr.write(`[mcp-horde/opencode] unhandled rejection: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`)
 })
 
-const config = loadConfig()
-const store = new Store(config.stateDir)
+// A bad environment or horde.json must not kill the server before the handshake: the
+// error is returned by every tool call instead, and fixing horde.json takes effect on
+// the next call (environment variables need a restart).
+let loaded: { config: Config; store: Store } | undefined
+const load = (): { config: Config; store: Store } => {
+  if (loaded) return loaded
+  try {
+    const config = loadConfig()
+    loaded = { config, store: new Store(config.stateDir) }
+    return loaded
+  } catch (err) {
+    throw new Error(`mcp-horde/opencode is misconfigured: ${err instanceof Error ? err.message : String(err)}`)
+  }
+}
+try {
+  load()
+} catch (err) {
+  process.stderr.write(`[mcp-horde/opencode] ${(err as Error).message}\n`)
+}
+
 const server = new McpServer(
   { name: "opencode", version: VERSION },
   {
     instructions: INSTRUCTIONS,
     // Claude Code "channels" (research preview): lets us push a message into the
     // session when an agent settles. Harmless for clients that ignore it.
-    capabilities: config.channel ? { experimental: { "claude/channel": {} } } : {},
+    capabilities: loaded?.config.channel ? { experimental: { "claude/channel": {} } } : {},
   },
 )
 
@@ -50,6 +69,7 @@ const getBackend = async (): Promise<Backend> => {
     if (current && !current.dead) return current
     reset()
   }
+  const { config, store } = load()
   const started = Backend.start(config, store)
   backend = started
   started.then(
@@ -64,6 +84,7 @@ const getBackend = async (): Promise<Backend> => {
 const getFleet = async (): Promise<Fleet> => {
   const b = await getBackend()
   if (!fleet) {
+    const { config, store } = load()
     fleet = Promise.resolve(new Fleet(b, config, store, makeHooks(server, config)))
   }
   return fleet
@@ -73,8 +94,10 @@ registerTools(server, {
   fleet: getFleet,
   backend: getBackend,
   peekFleet: () => fleet,
+  peekBackend: () => backend,
   clientName: () => server.server.getClientVersion()?.name,
   stop: async () => {
+    const { config, store } = load()
     const b = await backend?.catch(() => undefined)
     const text = await stopServer(config, store, b)
     if (!config.url) reset()
@@ -98,11 +121,16 @@ await server.connect(new StdioServerTransport())
 
 // Reconnect to agents left running by a previous process (shared server) so
 // policies, limits and notifications keep working without a tool call. Only
-// when that server is still alive: never start one before a tool needs it.
-const known = config.url ? undefined : store.server
-if (known && config.serverMode === "shared") {
-  const auth = `Basic ${Buffer.from(`${config.username}:${known.password}`).toString("base64")}`
-  void fetch(`${known.url}/global/health`, { headers: { Authorization: auth }, signal: AbortSignal.timeout(2000) })
-    .then((res) => (res.ok ? getFleet() : undefined))
-    .catch(() => undefined)
-}
+// when that server is still alive (never start one before a tool needs it), and
+// only when an agent of this session's project lost its owner: other projects'
+// agents are taken over by their own sessions, or when a call touches them.
+void (async () => {
+  if (!loaded || loaded.config.url || loaded.config.serverMode !== "shared") return
+  const { config, store } = loaded
+  const known = store.server
+  if (!known) return
+  const root = await repoRoot(config.directory).catch(() => config.directory)
+  const orphans = store.agents("local").filter((r) => !ownerAlive(r.owner, r.ownerSeen) && inProject(r, root))
+  if (!orphans.length) return
+  if (await sharedServerAlive(config, known)) await getFleet()
+})().catch(() => undefined)

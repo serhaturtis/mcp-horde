@@ -15,6 +15,8 @@ import { Store } from "../src/state.js"
 import { price } from "../src/tools.js"
 import { apply, costSince, currentTurn, type DurableEvent, emptyTrack, isInterruptMessage, latestTool, turnsSince } from "../src/tracker.js"
 import { branchSlug, validateLink } from "../src/worktree.js"
+// Fixes from the support-module audit (hooks, tracker, worktree, backend, supervisor, ask, config).
+import "./support-fixes.test.js"
 
 let seq = 0
 const ev = (type: string, data: Record<string, unknown> = {}): DurableEvent => ({

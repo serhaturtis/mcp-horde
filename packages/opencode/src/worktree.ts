@@ -127,7 +127,7 @@ export async function createWorktree(directory: string, name: string, opts: Work
   try {
     if (opts.includeUncommitted) {
       opts.onProgress?.("carrying over uncommitted changes")
-      const carried = await carryUncommitted(repo, root, notes)
+      const carried = await carryUncommitted(repo, root, notes, links)
       if (carried) {
         // Snapshot them so diffs and merges only contain the agent's own work.
         await git(root, "add", "-A")
@@ -190,7 +190,7 @@ export async function createWorktree(directory: string, name: string, opts: Work
   return { worktree, notes }
 }
 
-/** Stream `git diff HEAD` into `git apply` in the worktree (no size limit). */
+/** Stream `git diff HEAD` into `git apply` in the worktree (no size limit). Settles once both processes have closed. */
 function pipePatch(repo: string, root: string): Promise<boolean> {
   return new Promise((resolve, reject) => {
     const diff = spawn("git", [...DIFF, "--binary", "--src-prefix=a/", "--dst-prefix=b/", "HEAD"], {
@@ -200,30 +200,54 @@ function pipePatch(repo: string, root: string): Promise<boolean> {
     })
     const apply = spawn("git", ["apply", "--binary", "--whitespace=nowarn", "-"], { cwd: root, env: GIT_ENV, stdio: ["pipe", "ignore", "pipe"] })
     let any = false
-    let err = ""
+    let diffErr = ""
+    let applyErr = ""
+    let failure: Error | undefined
     diff.stdout.on("data", (c: Buffer) => {
       if (c.length) any = true
     })
+    // git apply may exit before reading everything (it refuses an empty patch, or fails early):
+    // the resulting EPIPE is reported through apply's exit code, not as a crash.
+    apply.stdin.on("error", () => undefined)
     diff.stdout.pipe(apply.stdin)
-    diff.stderr.on("data", (c: Buffer) => (err += c.toString()))
-    apply.stderr.on("data", (c: Buffer) => (err += c.toString()))
-    let diffCode: number | null = null
-    diff.on("error", reject)
-    apply.on("error", reject)
+    diff.stderr.on("data", (c: Buffer) => (diffErr += c.toString()))
+    apply.stderr.on("data", (c: Buffer) => (applyErr += c.toString()))
+    const codes: { diff?: number | null; apply?: number | null } = {}
+    const settle = () => {
+      if (!("diff" in codes) || !("apply" in codes)) return
+      if (failure) return reject(failure)
+      // A clean checkout gives an empty diff, which git apply refuses: nothing to carry.
+      if (!any && codes.diff === 0) return resolve(false)
+      // An apply that stopped early also breaks diff's pipe: its own error is the one that matters.
+      if (any && codes.apply !== 0) return reject(new Error(`could not apply your uncommitted changes in the worktree: ${applyErr.trim()}`))
+      if (codes.diff !== 0) return reject(new Error(`git diff failed (exit ${codes.diff}): ${diffErr.trim()}`))
+      resolve(any)
+    }
+    const onError = (which: "diff" | "apply") => (err: Error) => {
+      failure ??= err
+      // A process that failed to start never emits close.
+      if (!(which in codes)) {
+        codes[which] = null
+        // Without its partner the other one would wait forever (on input, or on a full pipe).
+        if (which === "diff") apply.stdin.end()
+        else diff.kill()
+        settle()
+      }
+    }
+    diff.on("error", onError("diff"))
+    apply.on("error", onError("apply"))
     diff.on("close", (code) => {
-      diffCode = code
+      codes.diff = code
+      settle()
     })
     apply.on("close", (code) => {
-      if (diffCode !== 0 && diffCode !== null) return reject(new Error(`git diff failed: ${err.trim()}`))
-      // A clean checkout gives an empty diff, which git apply refuses: nothing to carry.
-      if (!any) return resolve(false)
-      if (code !== 0) return reject(new Error(`could not apply your uncommitted changes in the worktree: ${err.trim()}`))
-      resolve(any)
+      codes.apply = code
+      settle()
     })
   })
 }
 
-async function carryUncommitted(repo: string, root: string, notes: string[]): Promise<string | undefined> {
+async function carryUncommitted(repo: string, root: string, notes: string[], links: string[] = []): Promise<string | undefined> {
   const parts: string[] = []
   // git apply ignores gitlink (submodule pointer) changes; say so instead of dropping them silently.
   const raw = await git(repo, "diff", "--no-ext-diff", "--raw", "HEAD").catch(() => "")
@@ -236,7 +260,10 @@ async function carryUncommitted(repo: string, root: string, notes: string[]): Pr
   let bytes = 0
   let skippedRepos = 0
   let capped = false
+  // Linked paths are symlinked afterwards and never committed: do not copy them into the baseline.
+  const linked = (rel: string) => links.some((l) => rel === l || rel === `${l}/` || rel.startsWith(`${l}/`))
   for (const rel of entries) {
+    if (linked(rel)) continue
     // A nested repository shows up as "dir/": copying it would embed its .git.
     if (rel.endsWith("/")) {
       skippedRepos++
@@ -278,23 +305,41 @@ async function runSetup(command: string, cwd: string, signal?: AbortSignal, onPr
   throw new Error(`worktree setup \`${command}\` ${why}:\n${r.output.slice(-4000)}`)
 }
 
-/** Hide files we generate (agent profiles, links) from git in every worktree of the repo. */
+/**
+ * Hide files we generate (agent profiles, links) from git in every worktree of the repo.
+ * `pattern` is relative to `directory` (a leading "/" is optional): the exclude file is read
+ * from the repository top, so the pattern is anchored at the directory's place in the repo.
+ */
 export async function excludeFromGit(directory: string, pattern: string) {
   const excludeFile = await git(directory, "rev-parse", "--git-path", "info/exclude")
     .then((p) => path.resolve(directory, p))
     .catch(() => undefined)
   if (!excludeFile) return
+  const prefix = await git(directory, "rev-parse", "--show-prefix").catch(() => "")
+  pattern = anchoredPattern(prefix, pattern)
   const current = await fs.readFile(excludeFile, "utf8").catch(() => "")
   if (current.split(/\r?\n/).includes(pattern)) return
   await fs.mkdir(path.dirname(excludeFile), { recursive: true })
   await fs.appendFile(excludeFile, `${current && !current.endsWith("\n") ? "\n" : ""}${pattern}\n`)
 }
 
+/** An exclude pattern relative to a directory `prefix` ("sub/dir/" from `git rev-parse --show-prefix`), anchored at the repo top. */
+export function anchoredPattern(prefix: string, pattern: string): string {
+  // Directory names are literal: escape glob characters git would interpret.
+  const dir = prefix.replace(/^\/+|\/+$/g, "").replace(/[\\*?[]/g, "\\$&")
+  const rel = pattern.replace(/^\/+/, "")
+  return `/${dir ? `${dir}/` : ""}${rel}`
+}
+
+/** Commits need both: git refuses to commit with only one of them set (and no way to guess the other). */
 async function hasIdentity(cwd: string) {
-  return git(cwd, "config", "user.email").then(
-    (v) => v !== "",
-    () => false,
-  )
+  const get = (key: string) =>
+    git(cwd, "config", key).then(
+      (v) => v !== "",
+      () => false,
+    )
+  const [name, email] = await Promise.all([get("user.name"), get("user.email")])
+  return name && email
 }
 
 /** An in-progress merge, rebase, cherry-pick or revert in the checkout at `cwd`, if any. */
@@ -521,8 +566,10 @@ export async function removeWorktree(wt: Worktree, name: string, discard: boolea
     return notes.join("\n")
   }
   if (ahead === 0) {
-    await git(wt.repo, "branch", "-D", wt.branch).catch(() => undefined)
-    notes.push(`deleted branch ${wt.branch} (no agent commits)`)
+    await git(wt.repo, "branch", "-D", wt.branch).then(
+      () => notes.push(`deleted branch ${wt.branch} (no agent commits)`),
+      (err: Error) => notes.push(`could not delete branch ${wt.branch} (no agent commits): ${err.message.split("\n")[0]}`),
+    )
   } else {
     notes.push(`kept branch ${wt.branch} (${ahead} agent commit(s))`)
   }

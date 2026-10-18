@@ -57,6 +57,17 @@ describe("trusted commands", () => {
     assert.ok(isTrustedCommand(`${cmd} task t-1a2b c0ffee12`))
     assert.ok(isTrustedCommand(`${cmd} report t-1a2b c0ffee12 --summary "Added the limiter; it's per IP" --changed "a.ts,b.ts" --confidence high`))
     assert.ok(isTrustedCommand(`${cmd} finding 'the cache key includes the user id' --paths src/cache.ts`))
+    assert.ok(isTrustedCommand(`${cmd} task t-1a2b c0ffee12`, { state }), "the worker's own board")
+  })
+
+  test("only the worker's own board, no flag in place of the directory, no control characters", () => {
+    assert.equal(isTrustedCommand(`${workerCommand("/home/u/repo/src")} finding x`, { state }), false, "another directory")
+    const prefix = cmd.slice(0, cmd.indexOf(" --state"))
+    assert.equal(isTrustedCommand(`${prefix} --state --x task status`), false, "a flag where the board directory goes")
+    assert.equal(isTrustedCommand(`${cmd} report t-1 tok --summary '\x1b]0;pwned\x07'`), false, "escape sequences")
+    assert.equal(isTrustedCommand(`${cmd} progress t-1 tok "line\rover"`), false, "carriage return")
+    assert.equal(isTrustedCommand(`${cmd} status`), false)
+    assert.equal(isTrustedCommand(`${cmd} watch`), false)
   })
 
   test("anything that could run something else is not", () => {
@@ -382,5 +393,104 @@ describe("MCP server", () => {
     } finally {
       await client.close()
     }
+  })
+})
+
+describe("board rules found in review", () => {
+  test("notes forgotten and added again come back; findings from the CLI need their attempt", async () => {
+    const board = new Board(tmp())
+    const n = await board.remember("use pnpm")
+    await board.forget(n.id)
+    assert.equal(board.memory().length, 0)
+    await board.remember("use pnpm")
+    assert.deepEqual(
+      board.memory().map((x) => x.text),
+      ["use pnpm"],
+    )
+    assert.throws(() => sh(`${workerCommand(board.dir)} finding "unattributed fact"`, tmp()), /finding needs --task/)
+  })
+
+  test("a new attempt frees the old one's locks; closing twice is refused; block ends the attempt", async () => {
+    const board = new Board(tmp())
+    const t = (await board.plan([{ title: "x", goal: "y" }])).tasks[0]!
+    const first = await board.assign(t.id)
+    assert.deepEqual(await board.lock(t.id, first.attempt.token, ["src/x.ts"]), { ok: true })
+    const second = await board.assign(t.id)
+    assert.deepEqual(await board.lock(t.id, second.attempt.token, ["src/x.ts"]), { ok: true }, "not blocked by its own task's old lock")
+    await board.fail(t.id, { reason: "nope", escalate: true })
+    await assert.rejects(board.fail(t.id, { reason: "retried call", escalate: true }), /no running attempt/)
+    assert.equal(board.task(t.id).tier, 1, "escalated once")
+    const third = await board.assign(t.id)
+    await board.lock(t.id, third.attempt.token, ["src/y.ts"])
+    await board.block(t.id, "a decision")
+    assert.equal(board.task(t.id).attempts[2]!.outcome, "abandoned")
+    assert.equal(board.locks().length, 0, "a blocked task holds no locks")
+    await board.edit(t.id, { status: "open" })
+    await board.accept(t.id, { cost: 0.5 })
+    assert.equal(board.task(t.id).blockedOn, undefined)
+    await assert.rejects(board.accept(t.id), /already done/)
+    await assert.rejects(board.fail(t.id, { reason: "late" }), /is done/)
+  })
+
+  test("locks are specific paths; reports are capped item by item; renames count on both sides", async () => {
+    const root = repo()
+    const board = await Board.open(root, tmp())
+    const t = (await board.plan([{ title: "x", goal: "y" }])).tasks[0]!
+    const { attempt } = await board.assign(t.id)
+    for (const bad of ["**", "/etc/passwd", "../other", "*"]) await assert.rejects(board.lock(t.id, attempt.token, [bad]), /cannot lock/, bad)
+    const long = "q".repeat(5000)
+    await board.report(t.id, attempt.token, { summary: "s", questions: Array.from({ length: 40 }, (_, i) => `${i}${long}`) })
+    const r = board.task(t.id).reports[0]!
+    assert.ok(JSON.stringify(r).length <= 4000, String(JSON.stringify(r).length))
+    assert.ok(r.questions.every((q) => q.length <= 300))
+    // A rename reported as both paths is not a false claim.
+    fs.writeFileSync(path.join(root, "a.ts"), "export const a = 1\n")
+    git(root, "add", "a.ts")
+    git(root, "commit", "-qm", "a")
+    const base = git(root, "rev-parse", "HEAD")
+    const t2 = (await board.plan([{ title: "rename", goal: "z" }])).tasks[0]!
+    const a2 = (await board.assign(t2.id)).attempt
+    await board.bindWorkspace(t2.id, a2.token, { path: root, base })
+    git(root, "mv", "a.ts", "b.ts")
+    await board.report(t2.id, a2.token, { summary: "renamed", filesChanged: ["a.ts", path.join(root, "b.ts")] })
+    assert.deepEqual((await board.checkReport(t2.id))?.claimedNotChanged, [])
+  })
+
+  test("CLI flag values may start with dashes; the brief always keeps its reporting commands", async () => {
+    const board = new Board(tmp())
+    const t = (await board.plan([{ title: "x", goal: "g".repeat(20_000) }])).tasks[0]!
+    const { attempt } = await board.assign(t.id)
+    const brief = renderBrief(board, board.task(t.id), attempt, 500)
+    assert.match(brief, / report t-\w+ \w+ --summary/)
+    sh(`${workerCommand(board.dir)} report ${t.id} ${attempt.token} --summary "--dry-run is now the default"`, tmp())
+    assert.equal(board.task(t.id).reports[0]!.summary, "--dry-run is now the default")
+    assert.throws(() => sh(`${workerCommand(board.dir)} report ${t.id} ${attempt.token} --bogus x --summary y`, tmp()), /unknown flag --bogus/)
+  })
+
+  test("watch keeps the selected task across reorders and never draws wider than the terminal", async () => {
+    const board = new Board(tmp())
+    const { tasks } = await board.plan([
+      { title: "A".repeat(60), goal: "x" },
+      { title: "B", goal: "y" },
+    ])
+    const state = { selected: 1, selectedId: tasks[1]!.id }
+    const before = renderWatch(board, state, { width: 50, height: 12 })
+    assert.equal(before.order[before.selected], tasks[1]!.id)
+    // B goes to review and moves to the top of the list: the selection follows it.
+    const { attempt } = await board.assign(tasks[1]!.id)
+    await board.report(tasks[1]!.id, attempt.token, { summary: "\x1b[2Jdone\r" })
+    const after = renderWatch(board, state, { width: 50, height: 12 })
+    assert.equal(after.order[after.selected], tasks[1]!.id)
+    assert.ok(
+      after.lines.every((l) => l.length <= 50),
+      after.lines.join("\n"),
+    )
+    const detail = renderWatch(
+      board,
+      { selected: 0, detail: { id: tasks[1]!.id, text: renderTask(board.task(tasks[1]!.id), "full"), scroll: 999 } },
+      { width: 50, height: 12 },
+    )
+    assert.ok(detail.scroll < 999, "the scroll is clamped")
+    assert.ok(!detail.lines.join("").includes("\x1b[2J"), "worker text cannot drive the terminal")
   })
 })

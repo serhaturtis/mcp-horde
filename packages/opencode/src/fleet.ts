@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto"
+import { existsSync } from "node:fs"
 import fs from "node:fs/promises"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
@@ -30,7 +31,7 @@ import {
 } from "./ask.js"
 import type { Backend } from "./backend.js"
 import { deleteSession, releaseDirectory, renameSession } from "./compat.js"
-import type { Config, PermissionPolicy } from "./config.js"
+import { type Config, inProject, type PermissionPolicy } from "./config.js"
 import { type Detail, inputSummary, renderTranscript } from "./render.js"
 import { type AgentRecord, type GateConfig, type Limits, ownerAlive, SELF, type Store } from "./state.js"
 import { apply, type CostEstimator, costSince, currentTurn, type DurableEvent, emptyTrack, latestTool, type Track, type Turn, turnsSince } from "./tracker.js"
@@ -59,6 +60,12 @@ const DORMANT_REFRESH_MS = 10 * 60_000
 const CHILD_SCAN_MS = 30_000
 /** A child session with no activity for this long is no longer polled. */
 const CHILD_COOL_MS = 60_000
+/** Any single OpenCode request a refresh, a tick or a wait makes gets this long. */
+const REQUEST_MS = 30_000
+/** A whole background tick (all due refreshes) gets this long before the next may start. */
+const TICK_MS = 120_000
+/** How often the owner's heartbeat is written into its records. */
+const HEARTBEAT_MS = 30_000
 
 export interface Pending {
   permissions: PermissionV2Request[]
@@ -107,6 +114,8 @@ export interface GateView {
   maxRounds: number
   /** The latest verdict, compact. */
   text?: string
+  /** retrying: the gate failed and its fix waits for a running slot (the running limit is reached). */
+  queued?: boolean
 }
 
 /** A gate that has not decided yet: the agent is not done, whatever its session says. */
@@ -210,20 +219,62 @@ interface Live {
   queued?: Promise<void>
   /** A gate run in flight, for the turn that started at `turn`. */
   gating?: { turn: number; abort: AbortController }
+  /** Prompts being sent right now: a gate must not start on the turn they are about to supersede. */
+  sending: number
+  /** Operations on the worktree or session (merge, sync, revert, compact) that a gate must not overlap. */
+  holdGate: number
+  /** A gate failure whose fix prompt waits for a running slot (sent from the monitor tick). */
+  fix?: { turn: number; round: number; text: string }
+  /**
+   * We interrupted while a prompt we sent was not in history yet (so its turn could not be
+   * stopped): the turn it starts is interrupted as soon as it shows up.
+   */
+  stopSent?: { gen: number; at: number }
+  /** Local time each admitted prompt was first seen, for grace windows independent of the server's clock. */
+  admittedSeen: Map<string, number>
+  /** Local time history last grew. */
+  lastNewEventAt: number
+  /** The board of the agent's repository: the only one its trusted commands may name. */
+  boardDir?: string
   /** The last activity written to the board (task-bound agents). */
   activity?: { key: string; write: Promise<void> }
 }
 
 type Res<T> = { data?: T; error?: unknown; response?: Response }
 
+/** OpenCode answered a request with success but without the body the caller needs. */
+export class EmptyResponseError extends Error {
+  override name = "EmptyResponseError"
+}
+
+/** Throw on an error response; for calls whose answer is not used. */
+function check(res: Res<unknown>, what: string) {
+  if (res.error === undefined && (res.response?.ok ?? true)) return
+  const e = res.error as { message?: string } | undefined
+  const detail = e?.message ?? (e ? JSON.stringify(e) : `HTTP ${res.response?.status}`)
+  throw new Error(`${what} failed: ${detail}`)
+}
+
+/** The answer of a successful request; throws on an error response and on a missing body. */
 function unwrap<T>(res: Res<T>, what: string): T {
-  if (res.error !== undefined || res.data === undefined) {
-    if (res.response?.ok && res.data === undefined) return undefined as T
-    const e = res.error as { message?: string } | undefined
-    const detail = e?.message ?? (e ? JSON.stringify(e) : `HTTP ${res.response?.status}`)
-    throw new Error(`${what} failed: ${detail}`)
-  }
+  check(res, what)
+  if (res.data === undefined || res.data === null)
+    throw new EmptyResponseError(`${what} failed: OpenCode answered HTTP ${res.response?.status ?? "?"} without a body`)
   return res.data
+}
+
+/** Request options that give up after `ms` (the SDK passes them to fetch). */
+function timed(ms = REQUEST_MS): { signal: AbortSignal } {
+  return { signal: AbortSignal.timeout(ms) }
+}
+
+/** Settle with `p`, or reject after `ms` (the work itself is not cancelled). */
+function within<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${what} did not finish within ${Math.round(ms / 1000)}s`)), ms)
+  })
+  return Promise.race([p, timeout]).finally(() => clearTimeout(timer))
 }
 
 export function parseModel(spec: string, variant?: string): ModelRef {
@@ -260,14 +311,18 @@ export function defaultQuestionPolicy(p: PermissionPolicy): QuestionPolicy {
 export function withScope(profile: Profile, scope: Scope): Profile {
   if (!scope.paths.length) throw new Error("scope.paths needs at least one path or glob")
   const rules: Record<string, string> = { "*": scope.outside ?? "deny" }
-  for (const p of scope.paths) {
-    const glob = p.replace(/\\/g, "/").replace(/^\.\//, "")
-    rules[glob.endsWith("/") ? `${glob}**` : glob] = "allow"
-  }
+  for (const glob of scopeGlobs(scope.paths)) rules[glob] = "allow"
   return { ...profile, permission: { ...profile.permission, edit: rules } }
 }
 
-/** Drop undefined values, so a partial update never erases other fields. */
+/** Scope paths as repo-relative globs ("src/" covers everything under src). */
+export function scopeGlobs(paths: string[]): string[] {
+  return paths.map((p) => {
+    const glob = p.replace(/\\/g, "/").replace(/^\.\//, "")
+    return glob.endsWith("/") ? `${glob}**` : glob
+  })
+}
+
 /** Turn a caller's gate request into stored settings (audit defaults to on only in a worktree). */
 export async function gateConfig(input: GateInput | undefined, directory: string, worktree: boolean, current?: GateConfig): Promise<GateConfig | undefined> {
   if (input === undefined) return current
@@ -296,6 +351,7 @@ export function gateFeedback(round: number, maxRounds: number, verdict: string):
   ].join("\n")
 }
 
+/** Drop undefined values, so a partial update never erases other fields. */
 export function defined<T extends object>(o: T): Partial<T> {
   return Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined)) as Partial<T>
 }
@@ -310,6 +366,9 @@ export class Fleet {
   private readonly wakeups = new Set<() => void>()
   /** Spawns in progress, counted against the running limit. */
   private reserved = 0
+  /** Names of spawns in progress, taken until their record is stored. */
+  private readonly reservedNames = new Set<string>()
+  private lastHeartbeat = 0
   private monitor?: NodeJS.Timeout
   private monitoring = false
   private closed = false
@@ -328,7 +387,10 @@ export class Fleet {
         // Never let a bug here break the event stream.
       }
     })
-    this.monitor = setInterval(() => void this.tick(), POLL_MS)
+    this.monitor = setInterval(() => {
+      this.heartbeat()
+      void this.tick()
+    }, POLL_MS)
     this.monitor.unref()
   }
 
@@ -336,18 +398,68 @@ export class Fleet {
   close() {
     this.closed = true
     if (this.monitor) clearInterval(this.monitor)
-    for (const d of this.liveDialogs()) d.abort()
     for (const l of this.live.values()) {
+      l.gating?.abort.abort()
+      l.gating = undefined
+      l.fix = undefined
+      for (const d of l.dialogs.values()) d.abort()
       try {
-        this.store.update(l.record.id, { owner: undefined })
+        this.store.update(l.record.id, { owner: undefined, ownerSeen: undefined })
       } catch {
         // best effort
       }
     }
+    this.live.clear()
+    this.childToRoot.clear()
+    this.wake()
   }
 
-  private *liveDialogs() {
-    for (const l of this.live.values()) yield* l.dialogs.values()
+  /**
+   * Tell other MCP processes we still drive our agents (a stale heartbeat reads as a dead
+   * owner), and let go of any agent another process claimed meanwhile.
+   */
+  private heartbeat(now = Date.now()) {
+    if (this.closed || now - this.lastHeartbeat < HEARTBEAT_MS) return
+    this.lastHeartbeat = now
+    try {
+      // Under the claim lock, so a claim and our heartbeat never interleave on one record.
+      this.store.lockSync(
+        "claim",
+        () => {
+          for (const l of [...this.live.values()]) {
+            try {
+              const r = this.store.get(l.record.id)
+              if (r?.owner && r.owner.token !== SELF.token) this.dropLive(l.record.id)
+              else if (r) this.store.put({ ...r, ownerSeen: now })
+            } catch {
+              // Persistence is best effort.
+            }
+          }
+        },
+        200, // never hold up the event loop for long: a missed beat is retried on the next tick
+      )
+    } catch {
+      this.lastHeartbeat = 0 // lock busy: try again on the next tick
+    }
+  }
+
+  private rootCache?: string
+
+  /** The repository (or directory) this server works in: orphaned agents in it are claimed on sight. */
+  private get projectRoot(): string {
+    if (this.rootCache) return this.rootCache
+    let dir = path.resolve(this.config.directory)
+    for (;;) {
+      if (existsSync(path.join(dir, ".git"))) break
+      const up = path.dirname(dir)
+      if (up === dir) {
+        dir = path.resolve(this.config.directory)
+        break
+      }
+      dir = up
+    }
+    this.rootCache = dir
+    return dir
   }
 
   private get serverKey() {
@@ -361,13 +473,13 @@ export class Fleet {
   // ---------------------------------------------------------------- catalog
 
   async models(directory?: string): Promise<ModelV2Info[]> {
-    const dir = directory ?? this.config.directory
+    const dir = this.resolveDir(directory)
     const cached = this.modelCache.get(dir)
     if (cached && Date.now() - cached.at < 60_000) return cached.models
     let models: ModelV2Info[] = []
     // A directory OpenCode has not opened yet answers with an empty catalog at first.
     for (let i = 0; i < 20; i++) {
-      models = unwrap(await this.api.model.list({ location: { directory: dir } }), "listing models").data
+      models = unwrap(await this.api.model.list({ location: { directory: dir } }, timed()), "listing models").data
       if (models.length) break
       await sleep(250)
     }
@@ -392,7 +504,7 @@ export class Fleet {
 
   /** Rules saved by "always" answers for the project containing `directory`. */
   async savedPermissions(directory?: string): Promise<{ project: string; rules: PermissionSavedInfo[] }> {
-    const dir = directory ?? this.config.directory
+    const dir = this.resolveDir(directory)
     const loc = unwrap(await this.api.location.get({ location: { directory: dir } }), "locating the project")
     const rules = unwrap(await this.api.permission.saved.list({ projectID: loc.project.id }), "listing saved permissions").data
     return { project: loc.project.directory, rules }
@@ -402,12 +514,12 @@ export class Fleet {
     const { rules } = await this.savedPermissions(directory)
     const rule = rules.find((r) => r.id === id)
     if (!rule) throw new Error(`no saved permission ${id} for this project${rules.length ? `; saved: ${rules.map((r) => r.id).join(", ")}` : ""}`)
-    unwrap(await this.api.permission.saved.remove({ id }), "removing the saved permission")
+    check(await this.api.permission.saved.remove({ id }), "removing the saved permission")
     return rule
   }
 
   async agents(directory?: string): Promise<AgentV2Info[]> {
-    const dir = directory ?? this.config.directory
+    const dir = this.resolveDir(directory)
     let agents: AgentV2Info[] = []
     for (let i = 0; i < 20; i++) {
       agents = unwrap(await this.api.agent.list({ location: { directory: dir } }), "listing agents").data
@@ -492,7 +604,13 @@ export class Fleet {
     if (this.config.maxRunning > 0) await this.refreshUnknown()
     const release = this.reserve()
     try {
-      return input.task ? await this.spawnTask(input, input.task) : await this.spawnReserved(input)
+      if (input.task) return await this.spawnTask(input, input.task)
+      const checked = await this.checkSpawn(input)
+      try {
+        return await this.startSpawn(input, checked)
+      } finally {
+        checked.release()
+      }
     } finally {
       release()
     }
@@ -516,7 +634,7 @@ export class Fleet {
   }): Promise<{ text: string; json?: unknown; cost: number; model?: ModelRef; retried: boolean; guarded: boolean }> {
     const project = this.resolveDir(input.directory)
     // Versioned, so a directory OpenCode opened with older profiles is never reused.
-    const dir = path.join(project, ".opencode", "horde-ask-2")
+    const dir = path.join(project, ".opencode", "horde-ask-3")
     for (const [agent, profile] of [
       [ASK_AGENT, ASK_PROFILE],
       [ASK_GUARDED_AGENT, ASK_GUARDED_PROFILE],
@@ -527,7 +645,7 @@ export class Fleet {
         await fs.writeFile(file, profile)
       }
     }
-    await excludeFromGit(project, ".opencode/horde-ask-2/").catch(() => undefined)
+    await excludeFromGit(project, ".opencode/horde-ask-3/").catch(() => undefined)
     const timeout = input.timeoutMs ?? 300_000
     const once = async (agent: string) => {
       const name = `ask-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`
@@ -546,8 +664,9 @@ export class Fleet {
       })
       const answer = async (): Promise<Snapshot> => {
         const { snapshots, timedOut } = await this.waitFor([snapshot.id], "all", timeout, { signal: input.signal })
-        const snap = snapshots[0]!
-        if (timedOut) throw new Error(`no answer within ${Math.round(timeout / 1000)}s`)
+        const snap = snapshots[0]
+        if (input.signal?.aborted) throw new Error("cancelled")
+        if (timedOut || !snap) throw new Error(`no answer within ${Math.round(timeout / 1000)}s`)
         if (snap.state !== "idle") throw new Error(`the ask failed: ${snap.error ?? snap.state}`)
         return snap
       }
@@ -557,17 +676,20 @@ export class Fleet {
         let retried = false
         let json: unknown
         if (input.schema) {
-          const check = (t: string) => {
+          const judge = (t: string) => {
             const parsed = extractJson(t)
             return parsed.error ? { errors: [parsed.error] } : { value: parsed.value, errors: validate(parsed.value, input.schema!) }
           }
-          let result = check(text)
+          let result = judge(text)
           if (result.errors.length) {
             retried = true
-            await this.message(snapshot.id, retryPrompt(result.errors))
+            // Straight to the session: this ask already holds its running slot's worth of work.
+            const live = await this.get(snapshot.id)
+            await this.untilInactive(live)
+            await this.sendPrompt(live, retryPrompt(result.errors), { files: [], inlined: [] })
             snap = await answer()
             text = snap.lastTurn?.finalText.trim() ?? ""
-            result = check(text)
+            result = judge(text)
             if (result.errors.length)
               throw new Error(`the answer did not match the schema after one retry:\n${result.errors.join("\n")}\nLast answer: ${text.slice(0, 500)}`)
           }
@@ -597,60 +719,110 @@ export class Fleet {
     const directory = this.resolveDir(input.directory)
     const board = await Board.open(directory)
     const name = input.name ?? taskId
-    // Without an explicit model, the task's tier picks one from horde.json "tiers".
-    const tier = input.model ? undefined : tierModel(board.task(taskId).tier, loadTiers(directory), taskId)
-    const { task, attempt } = await board.assign(taskId, name)
-    const extra = input.prompt.trim()
-    const prompt = `${renderBrief(board, task, attempt, 6000, directory)}${extra ? `\n\n## Additional instructions\n${extra}` : ""}`
-    let result: { snapshot: Snapshot; notes: string[] }
-    try {
-      result = await this.spawnReserved({
-        ...input,
-        prompt,
-        name,
-        model: input.model ?? tier?.model,
-        variant: input.model ? input.variant : (input.variant ?? tier?.variant),
-        isolation: input.isolation ?? "worktree",
-        gate: input.gate ?? (task.scope.length ? { allowed: task.scope } : true),
-      })
-    } catch (err) {
-      await board.fail(taskId, { reason: `the agent could not start: ${(err as Error).message}` }).catch(() => undefined)
-      throw err
+    const current = board.task(taskId)
+    // A task whose attempt an agent of ours is still working on is that agent's, until it stops.
+    const open = current.attempts[current.attempts.length - 1]
+    if (open && !open.endedAt) {
+      const holder =
+        [...this.live.values()].find((l) => l.record.task?.id === taskId && l.record.task.attempt === open.n) ??
+        (open.workspace?.session ? this.live.get(open.workspace.session) : undefined)
+      if (holder) {
+        await this.refresh(holder).catch(() => undefined)
+        if (this.live.get(holder.record.id) === holder && this.working(holder))
+          throw new Error(`${taskId} is being worked by ${holder.record.name ?? holder.record.id}; wait, interrupt or dispose it first`)
+      }
     }
-    const snap = result.snapshot
-    const wt = snap.worktree
-    const base = wt ? workStart(wt) : await git(snap.directory, "rev-parse", "HEAD").catch(() => "HEAD")
-    await board.bindWorkspace(taskId, attempt.token, { path: snap.directory, base, session: snap.id }).catch(() => undefined)
-    this.updateRecord(snap.id, { task: { id: task.id, title: task.title, attempt: attempt.n } })
-    return {
-      snapshot: await this.snapshot(snap.id),
-      notes: [
-        `working ${task.id} "${task.title}" (attempt ${attempt.n}${tier ? `, ${tierLabel(task.tier, loadTiers(directory))}` : ""}); its report lands on the board`,
-        ...result.notes,
-      ],
+    // Without an explicit model, the task's tier picks one from horde.json "tiers".
+    const tier = input.model ? undefined : tierModel(current.tier, loadTiers(directory), taskId)
+    const effective: SpawnInput = {
+      ...input,
+      name,
+      model: input.model ?? tier?.model,
+      variant: input.model ? input.variant : (input.variant ?? tier?.variant),
+      isolation: input.isolation ?? "worktree",
+      gate: input.gate ?? (current.scope.length ? { allowed: current.scope } : true),
+    }
+    // Everything that can be checked is checked before the board records an attempt.
+    const checked = await this.checkSpawn(effective)
+    try {
+      const { task, attempt } = await board.assign(taskId, name)
+      const extra = input.prompt.trim()
+      const prompt = `${renderBrief(board, task, attempt, 6000, directory)}${extra ? `\n\n## Additional instructions\n${extra}` : ""}`
+      let result: { snapshot: Snapshot; notes: string[] }
+      try {
+        result = await this.startSpawn({ ...effective, prompt }, checked)
+      } catch (err) {
+        await board.fail(taskId, { reason: `the agent could not start: ${(err as Error).message}` }).catch(() => undefined)
+        throw err
+      }
+      const snap = result.snapshot
+      const wt = snap.worktree
+      const base = wt ? workStart(wt) : await git(snap.directory, "rev-parse", "HEAD").catch(() => "HEAD")
+      await board.bindWorkspace(taskId, attempt.token, { path: snap.directory, base, session: snap.id }).catch(() => undefined)
+      this.updateRecord(snap.id, { task: { id: task.id, title: task.title, attempt: attempt.n } })
+      return {
+        snapshot: await this.snapshot(snap.id),
+        notes: [
+          `working ${task.id} "${task.title}" (attempt ${attempt.n}${tier ? `, ${tierLabel(task.tier, loadTiers(directory))}` : ""}); its report lands on the board`,
+          ...result.notes,
+        ],
+      }
+    } finally {
+      checked.release()
     }
   }
 
-  private async spawnReserved(input: SpawnInput): Promise<{ snapshot: Snapshot; notes: string[] }> {
-    let directory = this.resolveDir(input.directory)
+  /**
+   * Check a spawn before anything is created: directory, name (taken here until the record is
+   * stored, so concurrent spawns cannot both get it), option conflicts, model, variant and
+   * profile, attachments.
+   *
+   * Models and profiles are checked against the directory the caller named, also for a worktree
+   * (which does not exist yet): the worktree is a checkout of the same repository, carrying its
+   * uncommitted changes by default, so OpenCode reads the same project and global config there.
+   */
+  private async checkSpawn(input: SpawnInput): Promise<{ directory: string; model?: ModelRef; prepared: Prepared; release: () => void }> {
+    const directory = this.resolveDir(input.directory)
     const stat = await fs.stat(directory).catch(() => undefined)
     if (!stat?.isDirectory()) throw new Error(`directory does not exist: ${directory}`)
     if (input.name) {
       if (!/^[A-Za-z0-9._-]{1,64}$/.test(input.name)) throw new Error("name may only contain letters, digits, '.', '_' and '-' (max 64)")
       this.syncStore()
-      const taken = this.findByName(input.name) ?? this.store.agents(this.serverKey).find((r) => r.name === input.name)
+      const taken = this.reservedNames.has(input.name) || this.findByName(input.name) || this.store.agents(this.serverKey).some((r) => r.name === input.name)
       if (taken) throw new Error(`an agent named "${input.name}" already exists; pick another name or dispose it`)
     }
-    if (input.profile && input.agent) throw new Error("pass either agent (an existing profile) or profile (a custom one), not both")
-    if (input.scope && input.agent) throw new Error("scope builds a custom profile; it cannot be combined with agent (use profile for tool switches)")
-    if (input.scope && input.isolation !== "worktree") throw new Error('scope needs isolation "worktree" (a per-agent profile only loads in a fresh directory)')
-    const model = input.model ? parseModel(input.model, input.variant) : undefined
-    if (!model && input.variant) throw new Error("variant requires model (pick one with opencode_models)")
-    if (model) await this.validateModel(model, directory)
-    if (input.agent) await this.validateAgent(input.agent, directory)
-    // Read attachments before anything is created, so a typo fails cleanly.
-    const prepared = await prepareFiles(input.files ?? [], directory)
+    const name = input.name
+    if (name) this.reservedNames.add(name)
+    let held = !!name
+    const release = () => {
+      if (held && name) this.reservedNames.delete(name)
+      held = false
+    }
+    try {
+      if (input.profile && input.agent) throw new Error("pass either agent (an existing profile) or profile (a custom one), not both")
+      if (input.scope && input.agent) throw new Error("scope builds a custom profile; it cannot be combined with agent (use profile for tool switches)")
+      if (input.scope && input.isolation !== "worktree")
+        throw new Error('scope needs isolation "worktree" (a per-agent profile only loads in a fresh directory)')
+      if (input.scope && !input.scope.paths.length) throw new Error("scope.paths needs at least one path or glob")
+      const model = input.model ? parseModel(input.model, input.variant) : undefined
+      if (!model && input.variant) throw new Error("variant requires model (pick one with opencode_models)")
+      if (model) await this.validateModel(model, directory)
+      if (input.agent) await this.validateAgent(input.agent, directory)
+      // Read attachments before anything is created, so a typo fails cleanly.
+      const prepared = await prepareFiles(input.files ?? [], directory)
+      return { directory, model, prepared, release }
+    } catch (err) {
+      release()
+      throw err
+    }
+  }
 
+  private async startSpawn(
+    input: SpawnInput,
+    checked: { directory: string; model?: ModelRef; prepared: Prepared },
+  ): Promise<{ snapshot: Snapshot; notes: string[] }> {
+    let directory = checked.directory
+    const { model, prepared } = checked
     const notes: string[] = []
     const name = input.name ?? `agent-${Date.now().toString(36)}${randomBytes(2).toString("hex")}`
     let worktree: Worktree | undefined
@@ -671,7 +843,6 @@ export class Fleet {
         worktree = made.worktree
         notes.push(...made.notes)
         directory = worktree.path
-        // Re-resolve attachments relative to the worktree (they were checked in the original directory).
       }
       if (input.signal?.aborted) throw new Error("cancelled")
       let agent = input.agent
@@ -688,6 +859,12 @@ export class Fleet {
       sessionId = session.id
       await renameSession(this.backend.client, session.id, directory, `horde: ${name}`)
       const policy = input.permissions ?? this.config.defaultPermissions
+      // A gate on a scoped agent audits against the scope unless told otherwise.
+      let gate = input.gate
+      if (input.scope && gate !== undefined && gate !== false) {
+        const o = gate === true ? {} : gate
+        if (!o.allowed) gate = { ...o, allowed: scopeGlobs(input.scope.paths) }
+      }
       const record: AgentRecord = {
         id: session.id,
         name: input.name ?? name,
@@ -701,8 +878,9 @@ export class Fleet {
         scope: input.scope,
         createdAt: Date.now(),
         owner: SELF,
+        ownerSeen: Date.now(),
         reportedSeq: 0,
-        gate: await gateConfig(input.gate, directory, !!worktree),
+        gate: await gateConfig(gate, directory, !!worktree),
       }
       this.store.put(record)
       const live = this.adoptRecord(record)
@@ -800,17 +978,17 @@ export class Fleet {
   ): Promise<Snapshot> {
     const live = await this.get(ref)
     const id = live.record.id
-    // A new instruction is a new task for the gate: cancel a run in flight and start counting rounds again.
-    live.gating?.abort.abort()
     await this.refresh(live)
     if (this.config.maxRunning > 0) await this.refreshUnknown()
     // Waking a settled agent takes a running slot.
     const waking = !!live.state && SETTLED.has(live.state) && live.state !== "needs_input"
     const release = waking ? this.reserve() : () => undefined
+    let delivery = opts.delivery
     try {
       // After an interrupt OpenCode may still be winding the old loop down; a
       // steer sent now would be parked in that loop instead of starting a turn.
-      if (waking) await this.untilInactive(live)
+      // If it does not wind down in time, queue the message: it runs after that loop.
+      if (waking && !(await this.untilInactive(live))) delivery = "queue"
       const session = await this.session(id)
       const directory = session.location.directory
       const prepared = await prepareFiles(opts.files ?? [], directory)
@@ -823,11 +1001,11 @@ export class Fleet {
             : undefined
         if (!model) throw new Error("variant requires model: the agent's model is not known yet; pass model too")
         await this.validateModel(model, directory)
-        unwrap(await this.api.session.switchModel({ sessionID: id, model }), "switching model")
+        check(await this.api.session.switchModel({ sessionID: id, model }), "switching model")
       }
       if (opts.agent) {
         await this.validateAgent(opts.agent, directory)
-        unwrap(await this.api.session.switchAgent({ sessionID: id, agent: opts.agent }), "switching agent")
+        check(await this.api.session.switchAgent({ sessionID: id, agent: opts.agent }), "switching agent")
       }
       const patch: Partial<AgentRecord> = {}
       if (opts.permissions) {
@@ -838,8 +1016,13 @@ export class Fleet {
       if (opts.limits) patch.limits = { ...live.record.limits, ...defined(opts.limits) }
       if (opts.gate !== undefined) patch.gate = await gateConfig(opts.gate, directory, !!live.record.worktree, live.record.gate)
       if (live.record.gate || patch.gate) patch.gateState = { round: 0 }
+      // A new instruction is a new task for the gate: cancel a run in flight (only now that the
+      // message is going out) and start counting rounds again.
+      live.gating?.abort.abort()
+      live.gating = undefined
+      live.fix = undefined
       if (Object.keys(patch).length) this.updateRecord(id, patch)
-      await this.sendPrompt(live, text, prepared, opts.delivery)
+      await this.sendPrompt(live, text, prepared, delivery)
     } finally {
       release()
     }
@@ -848,19 +1031,27 @@ export class Fleet {
 
   private async sendPrompt(live: Live, text: string, prepared: Prepared, delivery?: "steer" | "queue") {
     const body = prepared.inlined.length ? `${text}\n\n${prepared.inlined.join("\n\n")}` : text
-    unwrap(
-      await this.api.session.prompt({
-        sessionID: live.record.id,
-        prompt: { text: body, ...(prepared.files.length ? { files: prepared.files } : {}) },
-        delivery: delivery ?? "steer",
-      }),
-      "sending prompt",
-    )
+    // History up to here predates the prompt; a refresh during the call may read further.
+    const seq = live.track.seq
+    live.sending++
+    try {
+      check(
+        await this.api.session.prompt({
+          sessionID: live.record.id,
+          prompt: { text: body, ...(prepared.files.length ? { files: prepared.files } : {}) },
+          delivery: delivery ?? "steer",
+        }),
+        "sending prompt",
+      )
+    } finally {
+      live.sending--
+    }
     // Any refresh that started before this point must not publish its (now stale) state.
     live.gen++
     live.state = "running"
     live.liveText = ""
-    live.sent = { at: Date.now(), seq: live.track.seq }
+    live.sent = { at: Date.now(), seq }
+    live.stopSent = undefined
     this.updateRecord(live.record.id, { interruptedSeq: undefined, stopReason: undefined, pauseAfterStep: undefined })
   }
 
@@ -868,10 +1059,11 @@ export class Fleet {
     const live = await this.get(ref)
     const id = live.record.id
     // Stopping an agent stops its checks too; the gate is decided (cancelled) so it does not start again.
-    if (live.gating) {
-      const turn = live.gating.turn
-      live.gating.abort.abort()
+    if (live.gating || live.fix) {
+      const turn = live.gating?.turn ?? live.fix!.turn
+      live.gating?.abort.abort()
       live.gating = undefined
+      live.fix = undefined
       const round = live.record.gateState?.round ?? 0
       this.updateRecord(id, {
         gateState: {
@@ -893,9 +1085,12 @@ export class Fleet {
 
   private async interruptNow(live: Live, reason: string) {
     const tree = [live.record.id, ...live.children]
-    await Promise.all(tree.map((sid) => this.api.session.interrupt({ sessionID: sid }).catch(() => undefined)))
+    await Promise.all(tree.map((sid) => this.api.session.interrupt({ sessionID: sid }, timed()).catch(() => undefined)))
     this.updateRecord(live.record.id, { interruptedSeq: live.track.seq, pauseAfterStep: undefined, stopReason: reason })
+    // A prompt we sent that history does not show yet escaped this interrupt: stop its turn when it shows up.
+    if (live.sent) live.stopSent = { gen: live.gen, at: Date.now() }
     live.sent = undefined
+    live.fix = undefined
     // Settled by us, not by a refresh: record it as news for the next wait.
     if (!live.state || !SETTLED.has(live.state)) {
       live.liveText = ""
@@ -936,14 +1131,14 @@ export class Fleet {
   }
 
   private async replyPermission(p: PermissionV2Request, reply: "once" | "always" | "reject", message?: string) {
-    unwrap(
+    check(
       await this.api.session.permission.reply({ sessionID: p.sessionID, requestID: p.id, reply, ...(message ? { message } : {}) }),
       "replying to permission",
     )
   }
 
   private async answerQuestion(q: QuestionV2Request, answers: string[][]) {
-    unwrap(await this.api.session.question.reply({ sessionID: q.sessionID, requestID: q.id, questionV2Reply: { answers } }), "answering question")
+    check(await this.api.session.question.reply({ sessionID: q.sessionID, requestID: q.id, questionV2Reply: { answers } }), "answering question")
   }
 
   /** Rejecting a question halts the agent in OpenCode, so "dismiss" answers it instead. */
@@ -955,15 +1150,29 @@ export class Fleet {
   }
 
   private async rejectQuestion(q: QuestionV2Request) {
-    unwrap(await this.api.session.question.reject({ sessionID: q.sessionID, requestID: q.id }), "rejecting question")
+    check(await this.api.session.question.reject({ sessionID: q.sessionID, requestID: q.id }), "rejecting question")
   }
 
   async dispose(ref: string, opts: { worktree?: "keep" | "remove" | "discard"; deleteSession?: boolean }): Promise<string> {
     const live = await this.get(ref)
+    const notes: string[] = []
+    // No gate from here on: the agent is going away.
+    live.holdGate++
+    live.gating?.abort.abort()
+    live.gating = undefined
+    live.fix = undefined
+    try {
+      return await this.disposeHeld(live, opts, notes)
+    } catch (err) {
+      // Still tracked (e.g. leftovers could not be committed safely): gates may run again.
+      live.holdGate--
+      throw err
+    }
+  }
+
+  private async disposeHeld(live: Live, opts: { worktree?: "keep" | "remove" | "discard"; deleteSession?: boolean }, notes: string[]): Promise<string> {
     const id = live.record.id
     const name = live.record.name ?? id
-    const notes: string[] = []
-    live.gating?.abort.abort()
     await this.refresh(live).catch(() => undefined)
     if (live.state === "running" || live.state === "needs_input") {
       await this.interruptNow(live, "disposed")
@@ -1014,13 +1223,21 @@ export class Fleet {
     if (!wt) throw new Error(`${name} does not run in a worktree (spawn with isolation "worktree")`)
     if (action === "diff") return worktreeDiff(wt, opts.maxChars ?? 20_000)
     await this.refresh(live)
-    if (this.working(live) && live.state !== "needs_input") throw new Error(`${name} is still running; wait for it or interrupt it first`)
-    if (action === "commit") return (await commitAll(wt, `horde: work from ${name}`)) ?? "nothing to commit"
+    // Only a diff while it works: its tree is changing, and a request it waits on may be answered any moment.
+    if (this.working(live))
+      throw new Error(
+        `${name} is ${live.state === "needs_input" ? "waiting for an answer (opencode_respond)" : "still running"}; wait for it or interrupt it first (only diff works meanwhile)`,
+      )
+    if (action === "commit") return (await this.withoutGate(live, () => commitAll(wt, `horde: work from ${name}`))) ?? "nothing to commit"
     if (action === "sync") {
-      const synced = await syncWorktree(wt, name)
+      const synced = await this.withoutGate(live, async () => {
+        const out = await syncWorktree(wt, name)
+        // The gate's base moved with the branch: the finished turn was judged on the old tree, and
+        // is not judged again (that is the next turn's job, once the agent was told to re-check).
+        if (out.worktree) this.updateRecord(live.record.id, { worktree: out.worktree, gateState: this.supersededGate(live) })
+        return out
+      })
       if (synced.worktree) {
-        // The gate's base moved with the branch; its verdict is about the old tree.
-        this.updateRecord(live.record.id, { worktree: synced.worktree, gateState: undefined })
         const task = live.record.task
         if (task) {
           const board = await Board.open(wt.repo).catch(() => undefined)
@@ -1030,9 +1247,10 @@ export class Fleet {
             await board.bindWorkspace(task.id, a.token, { ...a.workspace, base: workStart(synced.worktree) }).catch(() => undefined)
         }
       }
-      return `${synced.text}${synced.worktree ? "\nMessage the agent to re-run its checks on the updated code (a gate runs when it finishes)." : ""}`
+      const next = live.record.gate ? " The gate does not re-run by itself; it judges the turn that message starts." : ""
+      return `${synced.text}${synced.worktree ? `\nMessage the agent to re-run its checks on the updated code.${next}` : ""}`
     }
-    const result = await mergeWorktree(wt, name, opts.strategy ?? "merge")
+    const result = await this.withoutGate(live, () => mergeWorktree(wt, name, opts.strategy ?? "merge"))
     if (!result.merged || result.merged === wt.merged) return result.text
     this.updateRecord(live.record.id, { worktree: { ...wt, merged: result.merged } })
     if (opts.check === false) return result.text
@@ -1046,24 +1264,49 @@ export class Fleet {
     }
   }
 
+  /**
+   * Run an operation on the agent's tree or session with no gate overlapping it: a gate in
+   * flight is cancelled (it runs again afterwards for a turn that still has no verdict) and none
+   * starts until the operation is done.
+   */
+  private async withoutGate<T>(live: Live, fn: () => Promise<T>): Promise<T> {
+    live.holdGate++
+    live.gating?.abort.abort()
+    live.gating = undefined
+    try {
+      return await fn()
+    } finally {
+      live.holdGate--
+      if (this.live.get(live.record.id) === live) void this.refresh(live).catch(() => undefined)
+    }
+  }
+
+  /** Gate state after the tree changed under a judged turn: that turn counts as judged; the next one is gated. */
+  private supersededGate(live: Live): AgentRecord["gateState"] {
+    const turn = currentTurn(live.track)
+    return turn ? { round: 0, superseded: turn.startSeq } : undefined
+  }
+
   // --------------------------------------------------------------- reading
 
   async session(id: string): Promise<SessionV2Info> {
     return unwrap(await this.api.session.get({ sessionID: id }), `loading session ${id}`).data
   }
 
-  private async untilInactive(live: Live, timeoutMs = 10_000) {
+  /** Wait for the agent's loop to wind down. False when it is still active at the deadline. */
+  private async untilInactive(live: Live, timeoutMs = 10_000): Promise<boolean> {
     const tree = [live.record.id, ...live.hotChildren.keys()]
     const deadline = Date.now() + timeoutMs
     while (Date.now() < deadline) {
       const active = await this.activeSet().catch(() => undefined)
-      if (!active || !tree.some((sid) => active.has(sid))) return
+      if (!active || !tree.some((sid) => active.has(sid))) return true
       await sleep(100)
     }
+    return false
   }
 
   private async activeSet(): Promise<Set<string>> {
-    const res = unwrap(await this.api.session.active(), "listing active sessions")
+    const res = unwrap(await this.api.session.active(timed()), "listing active sessions")
     return new Set(Object.keys(res.data))
   }
 
@@ -1098,17 +1341,26 @@ export class Fleet {
     const id = live.record.id
     const gen = live.gen
     const before = live.state
-    const sessionRes = await this.api.session.get({ sessionID: id })
+    const sessionRes = await this.api.session.get({ sessionID: id }, timed())
     if (sessionRes.response?.status === 404) {
       this.forget(id)
-      throw new Error(`session ${id} no longer exists on the OpenCode server (deleted?); stopped tracking it`)
+      const wt = live.record.worktree
+      throw new Error(
+        `session ${id} no longer exists on the OpenCode server (deleted?); stopped tracking it${wt ? `. Its worktree is left as it was: ${wt.path} (branch ${wt.branch} in ${wt.repo}); merge or remove it with git` : ""}`,
+      )
     }
     live.session = unwrap(sessionRes, `loading session ${id}`).data
 
     // Durable history since the last seq we applied.
     const replaying = !live.loaded
     const turnsBefore = live.track.turns.length ? currentTurn(live.track)!.startSeq : -1
+    const seqBefore = live.track.seq
     await this.readHistory(id, live.track, live.session.location.directory)
+    // Grace windows run on local receive times, so a skewed server clock cannot shorten or stretch them.
+    const seenAt = Date.now()
+    if (live.track.seq !== seqBefore || replaying) live.lastNewEventAt = seenAt
+    for (const mid of live.track.admitted.keys()) if (!live.admittedSeen.has(mid)) live.admittedSeen.set(mid, seenAt)
+    for (const mid of live.admittedSeen.keys()) if (!live.track.admitted.has(mid)) live.admittedSeen.delete(mid)
     const sent = live.sent
     if (sent && (live.track.lastPromptedSeq > sent.seq || [...live.track.admitted.values()].some((a) => a.seq > sent.seq))) live.sent = undefined
     const turn = currentTurn(live.track)
@@ -1134,24 +1386,45 @@ export class Fleet {
     }
     const tree = [id, ...hot]
     const [perms, questions] = await Promise.all([
-      Promise.all(tree.map(async (sid) => unwrap(await this.api.session.permission.list({ sessionID: sid }), "listing permissions").data)),
-      Promise.all(tree.map(async (sid) => unwrap(await this.api.session.question.list({ sessionID: sid }), "listing questions").data)),
+      Promise.all(tree.map(async (sid) => unwrap(await this.api.session.permission.list({ sessionID: sid }, timed()), "listing permissions").data)),
+      Promise.all(tree.map(async (sid) => unwrap(await this.api.session.question.list({ sessionID: sid }, timed()), "listing questions").data)),
     ])
+    if (this.closed) return
     live.pending = { permissions: perms.flat(), questions: questions.flat() }
     this.pruneRequestSets(live)
     await this.approveTrusted(live)
 
+    // A prompt that escaped an interrupt (sent, not yet in history) has shown up: its turn is stopped too.
+    const stop = live.stopSent
+    const marker0 = live.record.interruptedSeq
+    if (stop && (stop.gen !== live.gen || marker0 === undefined || Date.now() - stop.at > START_GRACE_MS)) live.stopSent = undefined
+    else if (stop && marker0 !== undefined) {
+      const cur0 = currentTurn(live.track)
+      const escaped = Math.max(
+        ...[...live.track.admitted.values()].map((a) => a.seq).filter((q) => q > marker0),
+        cur0 && cur0.startSeq > marker0 ? cur0.admittedSeq : 0,
+      )
+      if (escaped > marker0) {
+        live.stopSent = undefined
+        this.updateRecord(id, { interruptedSeq: escaped })
+      }
+    }
+
     if (live.record.pauseAfterStep && !live.track.inLoop) this.updateRecord(id, { pauseAfterStep: undefined })
+    else if (live.record.pauseAfterStep && !live.track.stepOpen && !live.track.openTools.size && live.gen === gen) {
+      // Between steps (seen by polling, without the event stream): this is the pause point.
+      await this.interruptNow(live, live.record.stopReason ?? "paused after step")
+    }
     // Interrupting before the loop picked up the prompt is a no-op in OpenCode, so
     // the turn may start afterwards: stop it again once it does.
     const marker = live.record.interruptedSeq
     const cur = currentTurn(live.track)
     if (marker !== undefined && cur && live.track.inLoop && cur.startSeq > marker && cur.admittedSeq <= marker && live.gen === gen) {
-      await Promise.all([id, ...live.hotChildren.keys()].map((sid) => this.api.session.interrupt({ sessionID: sid }).catch(() => undefined)))
+      await Promise.all([id, ...live.hotChildren.keys()].map((sid) => this.api.session.interrupt({ sessionID: sid }, timed()).catch(() => undefined)))
     }
     live.lastRefresh = Date.now()
     // A prompt was sent while we were reading: our view predates it.
-    if (live.gen !== gen) return
+    if (live.gen !== gen || this.closed) return
 
     const { state, error } = this.derive(live, active)
     live.state = state
@@ -1172,7 +1445,7 @@ export class Fleet {
     if (!this.modelCache.has(directory)) await this.models(directory).catch(() => undefined)
     const estimate = this.estimator(directory)
     for (let page = 0; page < 1000; page++) {
-      const res = unwrap(await this.api.session.history({ sessionID, after: track.seq, limit: 100 }), "reading session history")
+      const res = unwrap(await this.api.session.history({ sessionID, after: track.seq, limit: 100 }, timed()), "reading session history")
       for (const e of res.data as DurableEvent[]) apply(track, e, estimate)
       if (res.data.length < 100) break
     }
@@ -1187,9 +1460,18 @@ export class Fleet {
     const turn = currentTurn(live.track)
     const view = { round: gs.round, maxRounds: cfg.maxRounds, text: v?.text }
     if (live.gating) return { ...view, state: "running", round: gs.round + 1 }
-    if (v && turn && v.turn === turn.startSeq) return { ...view, state: v.final ? (v.pass ? "pass" : "fail") : "retrying" }
+    // A fix waiting for a running slot is still a fix round.
+    if (live.fix && v && !v.final) return { ...view, state: "retrying", queued: true }
+    // The tree changed under this turn (sync, revert): it is not judged again.
+    if (turn && gs.superseded === turn.startSeq) return undefined
+    if (v && turn && v.turn === turn.startSeq && v.final) return { ...view, state: v.pass ? "pass" : "fail" }
     if (this.gateTurn(live)) return { ...view, state: "pending" }
-    if (v && !v.final) return { ...view, state: "retrying" }
+    if (v && !v.final) {
+      // Retrying only while the agent works on the fix; a fix round that stopped (interrupted,
+      // failed, or a turn with nothing to judge) leaves the last failing verdict as the result.
+      if (this.working(live)) return { ...view, state: "retrying" }
+      return { ...view, state: "fail", text: `${v.text}\n(the fix round stopped: the agent is ${live.state}${live.error ? `: ${live.error}` : ""})` }
+    }
     return undefined
   }
 
@@ -1204,15 +1486,23 @@ export class Fleet {
   private maybeGate(live: Live) {
     const turn = this.gateTurn(live)
     // Never while a prompt is on its way: the finished turn is about to be superseded.
-    if (!turn || live.gating || live.sent) return
+    if (!turn || live.gating || live.sent || live.sending || live.holdGate || live.fix || this.closed) return
     const gs = live.record.gateState ?? { round: 0 }
-    if (gs.verdict?.turn === turn.startSeq) return
+    if (gs.superseded === turn.startSeq) return
+    if (gs.verdict?.turn === turn.startSeq) {
+      // A failure whose fix never went out (it was queued when this process stopped): send it now.
+      if (!gs.verdict.final) {
+        live.fix = { turn: turn.startSeq, round: gs.round, text: gs.verdict.text }
+        void this.deliverFix(live)
+      }
+      return
+    }
     const abort = new AbortController()
     live.gating = { turn: turn.startSeq, abort }
     void this.runGateFor(live, turn.startSeq, abort).finally(() => {
       if (live.gating?.abort === abort) live.gating = undefined
       this.wake()
-      void this.refresh(live).catch(() => undefined)
+      if (!this.closed && this.live.get(live.record.id) === live) void this.refresh(live).catch(() => undefined)
     })
   }
 
@@ -1238,21 +1528,63 @@ export class Fleet {
     } catch (err) {
       text = `the gate could not run: ${(err as Error).message}`
     }
-    // A new instruction (or dispose) superseded this run: its verdict is about an old task.
-    if (abort.signal.aborted || !this.live.has(id)) return
-    if (live.sent || live.track.lastPromptedSeq > turn || currentTurn(live.track)?.startSeq !== turn) return
+    // A new instruction (or dispose, or shutdown) superseded this run: its verdict is about an old task.
+    if (this.closed || abort.signal.aborted || this.live.get(id) !== live) return
+    if (live.sent || live.sending || live.track.lastPromptedSeq > turn || currentTurn(live.track)?.startSeq !== turn) return
     const final = pass || round >= cfg.maxRounds || text.startsWith("the gate could not run")
     this.updateRecord(id, { gateState: { round, verdict: { turn, pass, final, text, at: Date.now() } } })
     if (!final) {
-      await this.sendPrompt(live, gateFeedback(round, cfg.maxRounds, text), { files: [], inlined: [] }).catch((err: Error) => {
-        // The agent could not be told: report the failure instead of waiting forever.
-        this.updateRecord(id, {
-          gateState: {
-            round,
-            verdict: { turn, pass, final: true, text: `${text}\n(could not send the failure back to the agent: ${err.message})`, at: Date.now() },
+      // The fix round wakes the agent: it waits for a running slot like any other wake-up.
+      live.fix = { turn, round, text }
+      await this.deliverFix(live)
+    }
+  }
+
+  /** Send a queued gate failure back to its agent once a running slot is free (else it stays queued for the next tick). */
+  private async deliverFix(live: Live) {
+    const fix = live.fix
+    if (!fix) return
+    const id = live.record.id
+    const v = live.record.gateState?.verdict
+    // Superseded meanwhile (a new message, an interrupt, a dispose): drop it.
+    if (
+      this.closed ||
+      this.live.get(id) !== live ||
+      live.sent ||
+      live.sending ||
+      v?.turn !== fix.turn ||
+      v.final ||
+      currentTurn(live.track)?.startSeq !== fix.turn
+    ) {
+      live.fix = undefined
+      return
+    }
+    let release: () => void
+    try {
+      release = this.reserve()
+    } catch {
+      return
+    }
+    live.fix = undefined
+    try {
+      await this.sendPrompt(live, gateFeedback(fix.round, live.record.gate?.maxRounds ?? fix.round, fix.text), { files: [], inlined: [] })
+    } catch (err) {
+      // The agent could not be told: report the failure instead of waiting forever.
+      this.updateRecord(id, {
+        gateState: {
+          round: fix.round,
+          verdict: {
+            turn: fix.turn,
+            pass: false,
+            final: true,
+            text: `${fix.text}\n(could not send the failure back to the agent: ${(err as Error).message})`,
+            at: Date.now(),
           },
-        })
+        },
       })
+    } finally {
+      release()
+      this.wake()
     }
   }
 
@@ -1314,7 +1646,7 @@ export class Fleet {
       return { state: "error", error: "the prompt was sent but OpenCode never recorded it; check the OpenCode server log" }
     }
     if (t.admitted.size) {
-      const newest = Math.max(...[...t.admitted.values()].map((a) => a.at))
+      const newest = Math.max(...[...t.admitted.keys()].map((mid) => live.admittedSeen.get(mid) ?? now))
       if (now - newest < (t.totalSteps ? START_GRACE_MS : FIRST_START_GRACE_MS)) return { state: "running" }
       return { state: "error", error: "the prompt was accepted but the agent never started on it; check the OpenCode server log" }
     }
@@ -1322,7 +1654,7 @@ export class Fleet {
     // e.g. a rejected question: OpenCode interrupts the tool and halts the loop.
     if (turn?.interrupted) return { state: "interrupted", error: turn.failure }
     if (t.inLoop) {
-      if (now - t.lastEventAt < GRACE_MS) return { state: "running" }
+      if (now - live.lastNewEventAt < GRACE_MS) return { state: "running" }
       return {
         state: "error",
         error:
@@ -1335,13 +1667,23 @@ export class Fleet {
 
   /**
    * Board commands from a brief (`horde … report t-x <token> …`) are horde
-   * plumbing: approve exactly those, whatever the agent's policy, so reporting
-   * never waits on a human. Anything else, including a board command with a
-   * chained shell command, goes through the normal policy.
+   * plumbing: approve exactly those, for this agent's own repository's board
+   * only, whatever the agent's policy, so reporting never waits on a human.
+   * Anything else, including a board command with a chained shell command, goes
+   * through the normal policy. Never for adopted sessions: nothing is answered
+   * on a human's behalf.
    */
   private async approveTrusted(live: Live) {
-    for (const p of live.pending.permissions) {
-      if (live.handled.has(p.id) || p.action !== "bash" || !p.resources.length || !p.resources.every((r) => isTrustedCommand(r))) continue
+    if (live.record.adopted) return
+    const asks = live.pending.permissions.filter((p) => !live.handled.has(p.id) && p.action === "bash" && p.resources.length)
+    if (!asks.length) return
+    live.boardDir ??= await Board.open(live.record.worktree?.repo ?? live.record.directory)
+      .then((b) => b.dir)
+      .catch(() => undefined)
+    const state = live.boardDir
+    if (!state) return
+    for (const p of asks) {
+      if (!p.resources.every((r) => isTrustedCommand(r, { state }))) continue
       live.handled.add(p.id)
       await this.replyPermission(p, "once").catch(() => live.handled.delete(p.id))
     }
@@ -1456,7 +1798,7 @@ export class Fleet {
   private async scanChildren(live: Live) {
     live.lastChildScan = Date.now()
     const directory = live.session?.location.directory ?? live.record.directory
-    const res = unwrap(await this.api.session.list({ directory, limit: 100, order: "desc" }), "listing sessions")
+    const res = unwrap(await this.api.session.list({ directory, limit: 100, order: "desc" }, timed()), "listing sessions")
     const tree = new Set([live.record.id, ...live.children])
     // Parents are listed after children in desc order; loop until no new descendants appear.
     let grew = true
@@ -1554,26 +1896,29 @@ export class Fleet {
     await this.refresh(live)
     if (live.state === "running" || live.state === "needs_input")
       throw new Error(`${live.record.name ?? live.record.id} is ${live.state}; compact it once it is idle (opencode_wait, or opencode_interrupt first)`)
-    const before = live.track.compactions
-    const res = await this.api.session.compact({ sessionID: live.record.id })
-    if (res.error !== undefined || !res.response?.ok) {
-      const message = (res.error as { message?: string } | undefined)?.message ?? `HTTP ${res.response?.status}`
-      // OpenCode 1.19 answers 503 "Session compact is not available yet" (the legacy summarize does not touch v2 sessions).
-      if (/not available/i.test(message))
-        throw new Error(
-          `this OpenCode server cannot compact v2 sessions yet (${message}). To continue with a fresh context, dispose the agent keeping its worktree and spawn a new one there with a summary of the task so far.`,
-        )
-      unwrap(res, "compacting the session")
-    }
-    // The summary is written by the model; wait for it to land.
-    const deadline = Date.now() + 120_000
-    while (Date.now() < deadline) {
-      await this.refresh(live)
-      if (live.track.compactions > before && !live.track.inLoop) break
-      await sleep(250)
-    }
-    if (live.track.compactions <= before) throw new Error("OpenCode accepted the compaction but did not finish it within 2 minutes")
-    return this.build(live)
+    return this.withoutGate(live, async () => {
+      const before = live.track.compactions
+      const res = await this.api.session.compact({ sessionID: live.record.id })
+      if (res.error !== undefined || !res.response?.ok) {
+        const e = res.error as { message?: string } | undefined
+        const message = e?.message ?? (e ? JSON.stringify(e) : `HTTP ${res.response?.status}`)
+        // OpenCode 1.19 answers 503 "Session compact is not available yet" (the legacy summarize does not touch v2 sessions).
+        if (/not available/i.test(message))
+          throw new Error(
+            `this OpenCode server cannot compact v2 sessions yet (${message}). To continue with a fresh context, dispose the agent keeping its worktree and spawn a new one there with a summary of the task so far.`,
+          )
+        throw new Error(`compacting the session failed: ${message}`)
+      }
+      // The summary is written by the model; wait for it to land.
+      const deadline = Date.now() + 120_000
+      while (Date.now() < deadline) {
+        await this.refresh(live)
+        if (live.track.compactions > before && !live.track.inLoop) break
+        await sleep(250)
+      }
+      if (live.track.compactions <= before) throw new Error("OpenCode accepted the compaction but did not finish it within 2 minutes")
+      return this.build(live)
+    })
   }
 
   /**
@@ -1590,6 +1935,14 @@ export class Fleet {
     const name = live.record.name ?? live.record.id
     if (live.state === "running" || live.state === "needs_input")
       throw new Error(`${name} is ${live.state}; revert it once it is idle (opencode_wait, or opencode_interrupt first)`)
+    return this.withoutGate(live, () => this.revertIdle(live, name, opts))
+  }
+
+  private async revertIdle(
+    live: Live,
+    name: string,
+    opts: { turns?: number; to?: string },
+  ): Promise<{ snapshot: Snapshot; files: { path: string; status: string }[]; turns: number }> {
     const sessionID = live.record.id
     // The conversation in order, oldest first.
     const conversation = async () => {
@@ -1635,11 +1988,15 @@ export class Fleet {
       await sleep(250)
       messages = await conversation()
     }
-    const staged = unwrap(await this.api.session.revert.stage({ sessionID, messageID: boundary, files: true }), "staging the revert").data
-    unwrap(await this.api.session.revert.commit({ sessionID }), "committing the revert")
+    // Staging may answer without a body (204); then the restored files are not known.
+    const stageRes = await this.api.session.revert.stage({ sessionID, messageID: boundary, files: true })
+    check(stageRes, "staging the revert")
+    const staged = (stageRes.data as { data?: { files?: { path: string; status?: string }[] } } | undefined)?.data ?? {}
+    check(await this.api.session.revert.commit({ sessionID }), "committing the revert")
     await this.refresh(live)
-    // The gate judged work that no longer exists.
-    this.updateRecord(sessionID, { gateState: undefined, reportedSeq: live.track.seq })
+    // The gate judged work that no longer exists, and what is left was judged before: the
+    // current turn is not gated again; the agent's next turn is.
+    this.updateRecord(sessionID, { gateState: this.supersededGate(live), reportedSeq: live.track.seq })
     return { snapshot: this.build(live), files: (staged.files ?? []).map((f) => ({ path: f.path, status: f.status ?? "modified" })), turns: undone }
   }
 
@@ -1753,9 +2110,28 @@ export class Fleet {
     const ids = [...new Set(lives.map((l) => l.record.id))]
     const start = Date.now()
     const deadline = start + timeoutMs
+    let last: Snapshot[] = []
     for (;;) {
-      const active = await this.activeSet()
-      const results = await Promise.allSettled(ids.map((id) => this.snapshot(id, active)))
+      // One round of reads, given up at the deadline or on abort even if a request hangs.
+      const round = await this.untilDeadline(
+        (async () => {
+          const active = await this.activeSet()
+          return Promise.allSettled(ids.map((id) => this.snapshot(id, active)))
+        })(),
+        deadline,
+        opts.signal,
+      )
+      if (!round.done) {
+        // What we knew last, as of the previous round; nothing new is marked as reported.
+        return {
+          snapshots: last.length ? last : ids.flatMap((id) => (this.live.get(id) ? [this.build(this.live.get(id)!)] : [])),
+          news: new Set(),
+          errors: ["the agents' status could not be read before the wait ended (the OpenCode server is not answering)"],
+          timedOut: true,
+          nothingToWaitFor: false,
+        }
+      }
+      const results = round.value
       const snaps = results.filter((r): r is PromiseFulfilledResult<Snapshot> => r.status === "fulfilled").map((r) => r.value)
       const errors = results.flatMap((r, i) => (r.status === "rejected" ? [`${ids[i]}: ${(r.reason as Error).message}`] : []))
       // An idle agent is not done while its gate is undecided; anything needing attention still surfaces.
@@ -1771,9 +2147,37 @@ export class Fleet {
         await Promise.all(lives.filter((l) => settled.some((s) => s.id === l.record.id)).map((l) => this.recordTaskActivity(l)))
         return { snapshots: snaps, news: new Set(news.map((s) => s.id)), errors, timedOut, nothingToWaitFor: done && news.length === 0 && mode === "any" }
       }
+      last = snaps
       opts.onTick?.(snaps, Date.now() - start)
       await this.sleepUntilWoken(Math.min(this.backend.streaming ? 2_000 : 1_000, deadline - Date.now()), opts.signal)
     }
+  }
+
+  /** `p`'s value, unless the deadline passes or the signal aborts first. */
+  private untilDeadline<T>(p: Promise<T>, deadline: number, signal?: AbortSignal): Promise<{ done: true; value: T } | { done: false }> {
+    return new Promise((resolve, reject) => {
+      const stop = () => {
+        clearTimeout(timer)
+        signal?.removeEventListener("abort", stop)
+        resolve({ done: false })
+      }
+      // A round that is already late still gets a moment, so a responsive server is always read once.
+      const timer = setTimeout(stop, Math.max(1_000, deadline - Date.now()))
+      if (signal?.aborted) return stop()
+      signal?.addEventListener("abort", stop)
+      p.then(
+        (value) => {
+          clearTimeout(timer)
+          signal?.removeEventListener("abort", stop)
+          resolve({ done: true, value })
+        },
+        (err) => {
+          clearTimeout(timer)
+          signal?.removeEventListener("abort", stop)
+          reject(err)
+        },
+      )
+    })
   }
 
   private sleepUntilWoken(ms: number, signal?: AbortSignal): Promise<void> {
@@ -1797,6 +2201,7 @@ export class Fleet {
   // ---------------------------------------------------------------- events
 
   private onEvent(e: V2Event) {
+    if (this.closed) return
     const raw = e as { type: string; data?: Record<string, unknown>; properties?: Record<string, unknown> }
     const d = raw.data ?? raw.properties ?? {}
     if (raw.type === "session.created") {
@@ -1855,15 +2260,24 @@ export class Fleet {
     this.monitoring = true
     try {
       if (this.backend.dead) return
+      // Gate fixes that wait for a running slot.
+      for (const l of [...this.live.values()]) if (l.fix) await this.deliverFix(l).catch(() => undefined)
       const now = Date.now()
       const due = [...this.live.values()].filter((l) => {
         if (!l.loaded || this.working(l)) return true
-        const recent = now - l.track.lastEventAt < 60 * 60_000
+        const recent = now - l.lastNewEventAt < 60 * 60_000
         return now - l.lastRefresh > (recent ? SETTLED_REFRESH_MS : DORMANT_REFRESH_MS)
       })
       if (!due.length) return
-      const active = await this.activeSet()
-      await Promise.all(due.map((l) => this.refresh(l, active).catch(() => undefined)))
+      // Every request has its own timeout; this bounds the whole round too, so one stuck agent cannot stop monitoring.
+      await within(
+        (async () => {
+          const active = await this.activeSet()
+          await Promise.all(due.map((l) => this.refresh(l, active).catch(() => undefined)))
+        })(),
+        TICK_MS,
+        "a background refresh",
+      )
       this.wake()
     } catch {
       // Server unreachable; try again next tick.
@@ -1893,6 +2307,10 @@ export class Fleet {
       settledAt: 0,
       gen: 0,
       turnSeen: new Map(),
+      sending: 0,
+      holdGate: 0,
+      admittedSeen: new Map(),
+      lastNewEventAt: Date.now(),
     }
     this.live.set(record.id, live)
     return live
@@ -1912,8 +2330,10 @@ export class Fleet {
       limits: {},
       createdAt: Date.now(),
       owner: SELF,
+      ownerSeen: Date.now(),
       reportedSeq: 0,
       adoptPending: true,
+      adopted: true,
     }
     this.store.put(record)
     return this.adoptRecord(record)
@@ -1932,16 +2352,29 @@ export class Fleet {
    * Load records for this server: ours, plus orphaned ones whose owner process
    * is gone (claimed). Drop agents whose record disappeared (disposed elsewhere).
    */
-  private syncStore() {
+  private syncStore(ref?: string) {
+    if (this.closed) return
     const records = this.store.agents(this.serverKey)
-    const ids = new Set(records.map((r) => r.id))
-    for (const id of [...this.live.keys()]) if (!ids.has(id)) this.dropLive(id)
+    const byId = new Map(records.map((r) => [r.id, r]))
+    for (const id of [...this.live.keys()]) {
+      const r = byId.get(id)
+      // Disposed elsewhere, or claimed by another process (ours looked dead to it).
+      if (!r || (r.owner && r.owner.token !== SELF.token)) this.dropLive(id)
+    }
+    // Ours, or orphaned: its owner process is gone, or its heartbeat stopped.
+    const claimable = (r: AgentRecord) => r.owner?.token === SELF.token || !ownerAlive(r.owner, r.ownerSeen)
     for (const r of records) {
-      if (this.live.has(r.id) || this.gone.has(r.id)) continue
-      if (r.owner?.token !== SELF.token && ownerAlive(r.owner)) continue // another MCP session drives it
-      const claimed = { ...r, owner: SELF }
-      this.store.put(claimed)
-      this.adoptRecord(claimed)
+      if (this.live.has(r.id) || this.gone.has(r.id) || !claimable(r)) continue
+      // Orphans of other projects are left alone unless asked for by id or name.
+      if (r.owner?.token !== SELF.token && !inProject(r, this.projectRoot) && ref !== r.id && ref !== r.name) continue
+      let claimed: AgentRecord | undefined
+      try {
+        // Re-read under the claim lock: another process may have claimed it since we listed it.
+        claimed = this.store.claim(r.id, SELF, claimable)
+      } catch {
+        continue // the lock is busy; try again on the next sync
+      }
+      if (claimed) this.adoptRecord(claimed)
     }
   }
 
@@ -1982,7 +2415,7 @@ export class Fleet {
   async get(ref: string): Promise<Live> {
     let live = this.findByName(ref) ?? this.live.get(ref)
     if (live) return live
-    this.syncStore()
+    this.syncStore(ref)
     live = this.findByName(ref) ?? this.live.get(ref)
     if (live) return live
     const foreign = this.store.agents(this.serverKey).find((r) => r.id === ref || r.name === ref)
@@ -2013,9 +2446,12 @@ interface Prepared {
   inlined: string[]
 }
 
+/** Text attachments are inlined up to this size. */
+const INLINE_LIMIT = 256 * 1024
+
 /**
- * Text files are inlined (many providers reject text/plain file parts);
- * binary files (images, PDFs) are attached for models that accept them.
+ * Text files are inlined (many providers reject text/plain file parts), so a text file over
+ * the inline limit is refused; binary files (images, PDFs) are attached for models that accept them.
  */
 async function prepareFiles(paths: string[], directory: string): Promise<Prepared> {
   const out: Prepared = { files: [], inlined: [] }
@@ -2025,7 +2461,12 @@ async function prepareFiles(paths: string[], directory: string): Promise<Prepare
       throw new Error(`attachment not found: ${abs}`)
     })
     const isText = !buf.subarray(0, 8192).includes(0)
-    if (isText && buf.length <= 256 * 1024) out.inlined.push(`<file path="${path.relative(directory, abs) || abs}">\n${buf.toString("utf8")}\n</file>`)
+    const rel = path.relative(directory, abs) || abs
+    if (isText && buf.length > INLINE_LIMIT)
+      throw new Error(
+        `attachment ${rel} is a ${Math.ceil(buf.length / 1024)} KB text file; text attachments are inlined into the prompt and limited to ${INLINE_LIMIT / 1024} KB. Attach an excerpt, or tell the agent the path so it reads the file itself.`,
+      )
+    if (isText) out.inlined.push(`<file path="${rel}">\n${buf.toString("utf8")}\n</file>`)
     else out.files.push({ uri: pathToFileURL(abs).href, name: path.basename(abs) })
   }
   return out

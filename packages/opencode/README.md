@@ -10,7 +10,7 @@ It is built on OpenCode's **v2 server API** (`/api/*`, through `@opencode-ai/sdk
 | --- | --- |
 | Discover models (with context size, price and effort variants) and agent profiles | `opencode_models`, `opencode_agents` |
 | Spawn an agent with its own model, effort (`variant`), profile, instructions, directory, limits and permission policy | `opencode_spawn` |
-| Get a one-shot answer from any model, with no tools and nothing left behind (classify, summarize a log or diff, judge candidates); with a JSON Schema, a checked JSON answer | `opencode_ask` |
+| Get a one-shot answer from any model, with no tools and nothing left behind (classify, summarize a log or diff, judge candidates); with a JSON Schema, a checked JSON answer (the common subset: `type`, `properties`, `required`, `items`, `enum`, `const`, `anyOf`/`oneOf`/`allOf`, `additionalProperties`, `pattern`, length/size/range bounds; schemas using anything else, such as `$ref`, are refused). Waits 300 s in Claude Code, 50 s elsewhere, unless `timeout_seconds` says otherwise | `opencode_ask` |
 | Give an agent a custom profile (tool allow/deny list, step cap) | `opencode_spawn` `profile` |
 | Run agents in parallel without collisions, each in its own git worktree and branch | `opencode_spawn` `isolation: "worktree"` |
 | Confine an agent's file edits to some paths: OpenCode refuses the rest (`outside: "deny"`) or asks you (`"ask"`, whatever the permission policy) | `opencode_spawn` `scope` (worktree only; `bash` writes are caught by the gate's audit instead) |
@@ -29,7 +29,7 @@ It is built on OpenCode's **v2 server API** (`/api/*`, through `@opencode-ai/sdk
 | See and remove the rules OpenCode saved from "always" answers | `opencode_permissions` |
 | Read transcripts (also as MCP resources: `opencode://agents/{id}/transcript`) | `opencode_output` |
 | Clean up | `opencode_dispose` |
-| Watch agents live in the OpenCode TUI | `opencode_server info` prints the `opencode attach` command (it reads the password from a file, so the password never enters the model's context) |
+| Watch agents live in the OpenCode TUI | `opencode_server info` prints the `opencode attach` command (it reads the password from the server's password file, so the password never enters the model's context; a PowerShell variant on Windows) |
 | Stop the shared server | `opencode_server stop` (the next call starts a fresh one) |
 
 Agents are OpenCode sessions. You can address them by `name` or by `ses_…` id. A session started elsewhere (for example in the OpenCode TUI) is listed by `opencode_status include_untracked:true` and adopted when you pass its id; adopted sessions get the cautious `ask` policy, so this server never auto-approves a human's session. A subagent's id resolves to its root agent.
@@ -48,7 +48,7 @@ Agents are OpenCode sessions. You can address them by `name` or by `ses_…` id.
 
 When OpenCode needs approval (shell commands, edits outside the project, …), the agent's policy decides what happens:
 
-- `user` (default): the **human** is asked in an MCP elicitation dialog, the way Claude Code asks about its own subagents. If the client can't show form dialogs, the dialog is dismissed, fails, or goes unanswered for `HORDE_OPENCODE_DIALOG_TIMEOUT` seconds, the request goes to the calling model as `needs_input` (and `opencode_respond` can still answer while a dialog is open).
+- `user` (default): the **human** is asked in an MCP elicitation dialog, the way Claude Code asks about its own subagents. The dialog (and the `needs_input` line) shows the patterns an "always" answer would save. Only an explicit "Allow once" or "Always" approves. If the client can't show form dialogs, the dialog is dismissed, fails, comes back without a decision, or goes unanswered for `HORDE_OPENCODE_DIALOG_TIMEOUT` seconds, the request goes to the calling model as `needs_input` (and `opencode_respond` can still answer while a dialog is open).
 - `ask`: the calling model answers with `opencode_respond` (`once`, `always`, `reject`).
 - `allow` / `deny`: approve or reject automatically.
 
@@ -78,7 +78,7 @@ Workers briefed by [`@mcp-horde/board`](../board) report through a CLI they run 
 
 Each agent can have per-turn safety limits: `max_steps`, `max_cost_usd`, `timeout_minutes`. When one is reached, the agent is interrupted and the reason is reported. Costs include the agent's subagents. OpenCode 1.19's v2 runner reports every step as free, so costs are computed from the model's pricing in the catalog (a model without pricing costs $0 and `max_cost_usd` cannot trip). Setting limits with `opencode_message` changes only the limits you pass.
 
-Limits are enforced by an MCP server process. With a shared server, an agent keeps working after every MCP process exits, and its limits are only checked again when one starts (it catches up at startup).
+Limits are enforced by an MCP server process. With a shared server, an agent keeps working after every MCP process exits, and its limits are only checked again when one takes it over (an MCP process starting in the agent's project reconnects at startup and catches up; others when a call touches the server).
 
 The server also caps how many agents can work at once: `opencode.maxRunning` in the project's `horde.json`, overridden by `HORDE_OPENCODE_MAX_RUNNING` (default 8, `0` = unlimited). There is no spending limit unless you set `max_cost_usd`.
 
@@ -145,8 +145,16 @@ The model, effort, profile, directory, policies and limits are chosen by the cal
 | `HORDE_OPENCODE_MAX_RUNNING` | `horde.json` `opencode.maxRunning`, else `8` | Maximum number of agents working at once (`0` = unlimited). |
 | `HORDE_OPENCODE_CHANNEL` | off | Push Claude Code channel notifications (`1`/`true`/`yes`/`on`, any case). |
 | `HORDE_OPENCODE_DIALOG_TIMEOUT` | `600` | Seconds a permission or question dialog waits for the human before the request goes to the calling model. |
-| `HORDE_OPENCODE_STATE_DIR` | `~/.local/state/mcp-horde/opencode` | One record per agent (`agents/<id>.json`), the shared-server record and its password file (all mode 0600). |
+| `HORDE_OPENCODE_STATE_DIR` | `~/.local/state/mcp-horde/opencode` | One record per agent (`agents/<id>.json`), the shared-server record, and one password file per server (`server-password-shared-<port>`, removed when the shared server is stopped; `server-password-private-<pid>-<port>`, removed when its MCP process exits). All mode 0600. |
 | `HORDE_OPENCODE_WORKTREE_DIR` | `~/.local/share/mcp-horde/worktrees` | Where isolated worktrees go. |
+
+An invalid variable or `horde.json` does not keep the server from starting: every tool call answers with the error instead (a fixed `horde.json` is picked up by the next call; variables need a restart).
+
+### Security
+
+- **Workers can see the server password.** `opencode serve` takes its password only from the `OPENCODE_SERVER_PASSWORD` environment variable (OpenCode 1.19 has no flag or file for it), and OpenCode passes its environment on to the tools it runs. A worker's `bash` commands can therefore read the password and call the server's API, for example to answer its own permission requests. Treat permission policies as guard rails against mistakes, not as a boundary against a hostile model; run untrusted work in a container or VM. (Worktree `setup` commands do get the variable stripped.)
+- **Plain http.** Basic auth over `http://` to a non-loopback `HORDE_OPENCODE_URL` sends the password in clear text; the server warns about it (in `opencode_status` and `opencode_server info`) unless `HORDE_OPENCODE_ALLOW_INSECURE=1`. Use https or a tunnel.
+- **Stopping the shared server** only kills the recorded pid when the server answers with its recorded password, or when it does not answer at all while that pid is alive (a hung server); anything else just clears the record.
 
 ## Example (Claude Code orchestrating DeepSeek and Kimi)
 

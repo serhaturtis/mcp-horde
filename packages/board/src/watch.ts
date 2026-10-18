@@ -13,6 +13,8 @@ import { renderTask } from "./render.js"
 export interface WatchState {
   /** Index of the selected task in the list. */
   selected: number
+  /** The selected task, kept across refreshes that reorder the list (wins over `selected`). */
+  selectedId?: string
   /** A task's full view instead of the list, scrolled by `scroll` lines. */
   detail?: { id: string; text: string; scroll: number; check?: ReportCheck }
 }
@@ -21,6 +23,18 @@ export interface Frame {
   lines: string[]
   /** Task ids in list order, for moving the selection. */
   order: string[]
+  /** The selection and detail scroll as drawn (clamped). */
+  selected: number
+  scroll: number
+}
+
+/**
+ * Text from the board as it may reach a terminal: workers wrote some of it, and escape
+ * sequences or carriage returns in it could rewrite the screen. Newlines and tabs stay.
+ */
+export function printable(s: string): string {
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: removing control characters is the point.
+  return s.replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "")
 }
 
 export interface FrameOptions {
@@ -47,7 +61,11 @@ const COLORS: Record<Task["status"], string> = {
 const paint = (on: boolean, code: string, s: string) => (on && code !== "0" ? `\x1b[${code}m${s}\x1b[0m` : s)
 
 /** Fit `s` into exactly `n` columns. */
-const cell = (s: string, n: number) => (n <= 0 ? "" : s.length > n ? `${s.slice(0, Math.max(0, n - 1))}…` : s.padEnd(n))
+const cell = (s: string, n: number) => {
+  if (n <= 0) return ""
+  const p = printable(s).replace(/[\n\t]/g, " ")
+  return p.length > n ? `${p.slice(0, Math.max(0, n - 1))}…` : p.padEnd(n)
+}
 
 const clock = (t: number) => new Date(t).toTimeString().slice(0, 8)
 
@@ -74,15 +92,23 @@ export function renderWatch(board: Board, state: WatchState, opts: FrameOptions)
   const height = Math.max(10, opts.height)
   const tasks = board.tasks().sort((a, b) => ORDER.indexOf(a.status) - ORDER.indexOf(b.status) || a.createdAt - b.createdAt)
   const order = tasks.map((t) => t.id)
+  const at = state.selectedId ? order.indexOf(state.selectedId) : -1
+  const selected = Math.min(Math.max(0, at >= 0 ? at : state.selected), Math.max(0, order.length - 1))
   const counts = ORDER.map((s) => [s, tasks.filter((t) => t.status === s).length] as const).filter(([, n]) => n)
   const cost = tasks.reduce((n, t) => n + t.cost, 0)
   const left = (c: boolean) =>
     `horde · ${opts.title ?? "board"} · ${tasks.length ? counts.map(([s, n]) => paint(c, COLORS[s], `${n} ${s}`)).join(", ") : "no tasks"}${cost ? ` · ${formatUsd(cost)}` : ""}`
   const right = clock(now)
-  const header = `${left(color)}${" ".repeat(Math.max(1, width - left(false).length - right.length))}${right}`
+  // Never wider than the terminal: a wrapped header would scroll every frame.
+  const plainLeft = left(false)
+  const header =
+    plainLeft.length + right.length + 1 <= width ? `${left(color)}${" ".repeat(width - plainLeft.length - right.length)}${right}` : cell(plainLeft, width)
 
   if (state.detail) {
-    const body = state.detail.text.split("\n").flatMap((l) => wrap(l, width))
+    const body = printable(state.detail.text)
+      .replace(/\t/g, "  ")
+      .split("\n")
+      .flatMap((l) => wrap(l, width))
     const room = height - 3
     const scroll = Math.max(0, Math.min(state.detail.scroll, body.length - room))
     return {
@@ -94,12 +120,14 @@ export function renderWatch(board: Board, state: WatchState, opts: FrameOptions)
         hint(color, "↑↓ scroll · esc back · q quit"),
       ],
       order,
+      selected,
+      scroll,
     }
   }
 
   // Columns: marker, id, status, title, tier, agent, cost. Narrow terminals drop tier and agent.
   const wide = width >= 110
-  const w = { id: 9, status: 9, tier: wide ? 24 : 0, agent: width >= 80 ? 30 : 0, cost: 8 }
+  const w = { id: 9, status: 9, tier: wide ? 24 : 0, agent: width >= 80 ? 30 : 0, cost: width >= 60 ? 8 : 0 }
   const titleW = Math.max(12, width - 2 - w.id - w.status - w.tier - w.agent - w.cost - 1)
   const head = paint(
     color,
@@ -107,10 +135,10 @@ export function renderWatch(board: Board, state: WatchState, opts: FrameOptions)
     `  ${cell("TASK", w.id)}${cell("STATUS", w.status)}${cell("TITLE", titleW)} ${cell("TIER", w.tier)}${cell("AGENT", w.agent)}${cell("COST", w.cost)}`,
   )
   const rows = tasks.map((t, i) => {
-    const mark = i === state.selected ? "▸ " : "  "
+    const mark = i === selected ? "▸ " : "  "
     const line = `${mark}${cell(t.id, w.id)}${paint(color, COLORS[t.status], cell(t.status, w.status))}${cell(t.title, titleW)} ${cell(w.tier ? tierLabel(t.tier, opts.tiers ?? []) : "", w.tier)}${cell(agentCell(t, now), w.agent)}${cell(t.cost ? formatUsd(t.cost) : "", w.cost)}`
     // Reverse video for the selection, kept on across the status color's reset.
-    return i === state.selected && color ? `\x1b[7m${line.split("\x1b[0m").join("\x1b[0m\x1b[7m")}\x1b[0m` : line
+    return i === selected && color ? `\x1b[7m${line.split("\x1b[0m").join("\x1b[0m\x1b[7m")}\x1b[0m` : line
   })
 
   const locks = board.locks(now)
@@ -120,7 +148,7 @@ export function renderWatch(board: Board, state: WatchState, opts: FrameOptions)
   const room = height - 3 - footer.length
   // The list gets what it needs (scrolled to keep the selection visible); events get the rest.
   const listRoom = Math.max(3, Math.min(rows.length + 1, room - Math.min(events.length + 1, 6)))
-  const first = Math.max(0, Math.min(state.selected - listRoom + 2, rows.length - (listRoom - 1)))
+  const first = Math.max(0, Math.min(selected - listRoom + 2, rows.length - (listRoom - 1)))
   const list = tasks.length ? [head, ...rows.slice(first, first + listRoom - 1)] : ["  The board is empty: plan tasks with board_plan."]
   const eventRoom = room - list.length - 1
   const recent = eventRoom > 1 && events.length ? ["", paint(color, "2", "recent"), ...events.slice(-(eventRoom - 1)).map((e) => cell(e, width))] : []
@@ -128,6 +156,8 @@ export function renderWatch(board: Board, state: WatchState, opts: FrameOptions)
   return {
     lines: [header, ...list, ...recent, ...pad(height - 2 - used), ...footer, hint(color, tasks.length ? "↑↓ select · enter details · q quit" : "q quit")],
     order,
+    selected,
+    scroll: 0,
   }
 }
 
@@ -176,6 +206,8 @@ export function recentEvents(dir: string, max: number): string[] {
   return out.slice(-max)
 }
 
+const SIGNALS: NodeJS.Signals[] = ["SIGINT", "SIGTERM", "SIGHUP"]
+
 export interface WatchOptions {
   title?: string
   tiers?: Tier[]
@@ -203,7 +235,9 @@ export async function watch(board: Board, opts: WatchOptions = {}): Promise<void
       if (state.detail) state.detail.text = renderTask(board.task(state.detail.id), "full", Date.now(), state.detail.check, opts.tiers)
       const frame = renderWatch(board, state, { ...size(), tiers: opts.tiers, title: opts.title, color })
       order = frame.order
-      state.selected = Math.min(state.selected, Math.max(0, order.length - 1))
+      state.selected = frame.selected
+      state.selectedId = order[frame.selected]
+      if (state.detail) state.detail.scroll = frame.scroll
       out.write(`\x1b[H${frame.lines.map((l) => `${l}\x1b[K`).join("\n")}\x1b[J`)
     } catch (err) {
       out.write(`\x1b[H\x1b[Jcannot read the board: ${(err as Error).message}`)
@@ -214,13 +248,25 @@ export async function watch(board: Board, opts: WatchOptions = {}): Promise<void
   process.stdin.resume()
   const timer = setInterval(draw, opts.intervalMs ?? 1000)
   out.on("resize", draw)
+  let done = false
+  // However the process ends, the terminal gets its screen and cursor back.
+  const restore = () => {
+    if (!done) out.write("\x1b[?25h\x1b[?1049l")
+    done = true
+  }
+  process.once("exit", restore)
+  let opening: string | undefined
   await new Promise<void>((resolve) => {
     const quit = () => {
+      if (done) return
       clearInterval(timer)
+      out.off("resize", draw)
       process.stdin.setRawMode(false)
       process.stdin.pause()
       process.stdin.off("data", onKey)
-      out.write("\x1b[?25h\x1b[?1049l")
+      for (const sig of SIGNALS) process.off(sig, quit)
+      restore()
+      process.off("exit", restore)
       resolve()
     }
     const onKey = (data: Buffer) => {
@@ -237,19 +283,27 @@ export async function watch(board: Board, opts: WatchOptions = {}): Promise<void
       else if (down) state.selected = Math.min(order.length - 1, state.selected + 1)
       else if (k === "\r" && order[state.selected]) {
         const id = order[state.selected]!
+        opening = id
         void board
           .checkReport(id)
           .catch(() => undefined)
           .then((check) => {
+            // Quit, moved on or opened another meanwhile: this answer is stale.
+            if (done || opening !== id || state.detail) return
+            opening = undefined
             state.detail = { id, text: "", scroll: 0, check }
             draw()
           })
         return
       }
+      if (up || down) {
+        state.selectedId = order[state.selected]
+        opening = undefined
+      }
       draw()
     }
     process.stdin.on("data", onKey)
-    process.once("SIGTERM", quit)
+    for (const sig of SIGNALS) process.once(sig, quit)
     draw()
   })
 }

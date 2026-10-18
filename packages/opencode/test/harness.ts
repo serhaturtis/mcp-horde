@@ -194,5 +194,7 @@ export function isolatedEnv(tmp: string, repo: string): Record<string, string> {
     XDG_STATE_HOME: path.join(tmp, "xdg-state"),
     XDG_CACHE_HOME: path.join(tmp, "xdg-cache"),
     XDG_CONFIG_HOME: path.join(tmp, "xdg-config"),
+    // The fleet trusts board commands only for the agent's own repository's board.
+    HORDE_BOARD_STATE_DIR: path.join(tmp, "board-state"),
   }
 }

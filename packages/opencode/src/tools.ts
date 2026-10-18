@@ -2,7 +2,7 @@ import { formatTokens, formatUsd, indent, oneLine, truncate, truncateHead } from
 import { type McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js"
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js"
 import { z } from "zod"
-import type { JsonSchema } from "./ask.js"
+import { type JsonSchema, unsupportedSchema } from "./ask.js"
 import type { Backend } from "./backend.js"
 import { POLICIES } from "./config.js"
 import type { Fleet, GateView, Snapshot } from "./fleet.js"
@@ -20,6 +20,8 @@ export interface Context {
   backend: () => Promise<Backend>
   /** The fleet if it is already running (never starts a server). */
   peekFleet: () => Promise<Fleet> | undefined
+  /** The backend if one is already connected (never starts a server). */
+  peekBackend?: () => Promise<Backend> | undefined
   /** Stop the server for the current mode and drop the cached connection. */
   stop: () => Promise<string>
   /** Name of the connected MCP client, to pick sensible defaults. */
@@ -131,7 +133,7 @@ const GATE_STATE: Record<GateView["state"], string> = {
 
 function renderGate(g: GateView): string {
   const rounds = `round ${Math.max(1, g.round)}/${g.maxRounds}`
-  const head = `  gate: ${GATE_STATE[g.state]} (${rounds})`
+  const head = `  gate: ${g.state === "retrying" && g.queued ? "failed; fix queued (waiting for a running slot)" : GATE_STATE[g.state]} (${rounds})`
   // A pass is one line; a final failure carries its verdict (already compact) so the caller can act.
   if (g.state === "fail" && g.text) return `${head}\n${indent(g.text, "    ")}`
   if (g.state === "pass" && g.text) return `${head} · ${g.text.split("\n")[0]!.replace(/^PASS · /, "")}`
@@ -168,7 +170,7 @@ export function renderSnapshot(s: Snapshot, opts: { resultChars?: number; mode?:
   if (s.gate) lines.push(renderGate(s.gate))
   for (const p of s.pending.permissions) {
     lines.push(
-      `  needs permission ${p.id}${p.sessionID !== s.id ? ` (subagent ${p.sessionID})` : ""}: ${p.action} ${JSON.stringify(p.resources)} → opencode_respond once|always|reject`,
+      `  needs permission ${p.id}${p.sessionID !== s.id ? ` (subagent ${p.sessionID})` : ""}: ${p.action} ${JSON.stringify(p.resources)}${p.save?.length ? ` (always saves ${JSON.stringify(p.save)})` : ""} → opencode_respond once|always|reject`,
     )
   }
   for (const q of s.pending.questions) {
@@ -191,6 +193,21 @@ export function renderSnapshot(s: Snapshot, opts: { resultChars?: number; mode?:
     }
   }
   return lines.join("\n")
+}
+
+/**
+ * The `opencode attach` command that reads the password from its file (so the password never
+ * enters the conversation): POSIX shell, or PowerShell on Windows.
+ */
+export function attachCommand(url: string, passwordFile: string, username = "opencode", platform = process.platform): string {
+  if (platform === "win32") {
+    const ps = (v: string) => `'${v.replace(/'/g, "''")}'`
+    const user = username !== "opencode" ? `$env:OPENCODE_SERVER_USERNAME = ${ps(username)}; ` : ""
+    return `${user}$env:OPENCODE_SERVER_PASSWORD = Get-Content -Raw ${ps(passwordFile)}; opencode attach ${url}  (PowerShell)`
+  }
+  const sh = (v: string) => `'${v.replace(/'/g, `'\\''`)}'`
+  const user = username !== "opencode" ? `OPENCODE_SERVER_USERNAME=${sh(username)} ` : ""
+  return `${user}OPENCODE_SERVER_PASSWORD="$(cat ${sh(passwordFile)})" opencode attach ${url}`
 }
 
 /** Progress notifications for long single operations (e.g. worktree setup). */
@@ -219,6 +236,16 @@ function progress(extra: Extra) {
 }
 
 export function registerTools(server: McpServer, ctx: Context) {
+  // Warnings of the connected backend, if any. Never starts or reconnects one, and never fails:
+  // a successful call must not turn into an error because the server went away meanwhile.
+  const backendWarnings = async (): Promise<string[]> => {
+    try {
+      const b = await ctx.peekBackend?.()
+      return b && !b.dead ? b.info.warnings : []
+    } catch {
+      return []
+    }
+  }
   const tool = <S extends z.ZodRawShape>(
     name: string,
     description: string,
@@ -233,8 +260,8 @@ export function registerTools(server: McpServer, ctx: Context) {
       try {
         const fleet = await ctx.fleet()
         const text = await run(args, fleet, extra)
-        const warnings = (await ctx.backend()).info.warnings
-        return ok(warnings.length && name === "opencode_status" ? `${text}\n\n⚠ ${warnings.join("\n⚠ ")}` : text)
+        const warnings = name === "opencode_status" ? await backendWarnings() : []
+        return ok(warnings.length ? `${text}\n\n⚠ ${warnings.join("\n⚠ ")}` : text)
       } catch (err) {
         return fail(err)
       }
@@ -548,9 +575,21 @@ export function registerTools(server: McpServer, ctx: Context) {
         .optional()
         .describe('JSON Schema for the answer, e.g. {"type":"object","properties":{"verdict":{"enum":["a","b"]}},"required":["verdict"]}.'),
       directory: z.string().optional().describe("Project whose OpenCode config (providers) applies; default the server's directory."),
-      timeout_seconds: timeout.optional(),
+      timeout_seconds: z
+        .number()
+        .int()
+        .min(1)
+        .max(3600)
+        .optional()
+        .describe(
+          "Max seconds to wait for the answer (default 300 in Claude Code, which keeps long calls alive; 50 elsewhere, to stay under the usual 60 s client timeout). The ask is abandoned on timeout.",
+        ),
     },
     async (a, fleet, extra) => {
+      if (a.schema) {
+        const problems = unsupportedSchema(a.schema)
+        if (problems.length) throw new Error(`schema uses what opencode_ask cannot check:\n${problems.join("\n")}`)
+      }
       const r = await fleet.ask({
         prompt: a.prompt,
         model: a.model,
@@ -558,10 +597,10 @@ export function registerTools(server: McpServer, ctx: Context) {
         files: a.files,
         schema: a.schema as JsonSchema | undefined,
         directory: a.directory,
-        timeoutMs: (a.timeout_seconds ?? 300) * 1000,
+        timeoutMs: (a.timeout_seconds ?? Math.min(defaultWait(ctx), 300)) * 1000,
         signal: extra.signal,
       })
-      const meta = `(${formatModel(r.model)} · ${formatUsd(r.cost)}${r.retried ? " · retried once for the schema" : ""}${r.guarded ? " · tools present but denied: this provider refuses tool-less sessions" : ""})`
+      const meta = `(${formatModel(r.model)} · ${formatUsd(r.cost)}${r.retried ? " · retried once for the schema" : ""}${r.guarded ? " · read-only tools offered: this provider refuses tool-less sessions" : ""})`
       return r.json !== undefined ? `${JSON.stringify(r.json, null, 2)}\n${meta}` : `${r.text}\n${meta}`
     },
   )
@@ -666,7 +705,7 @@ export function registerTools(server: McpServer, ctx: Context) {
         const i = b.info
         // Never echo the password into the conversation: point at where it is.
         const attach = i.passwordFile
-          ? `OPENCODE_SERVER_PASSWORD="$(cat ${i.passwordFile})" opencode attach ${i.url}`
+          ? attachCommand(i.url, i.passwordFile, i.username)
           : i.password
             ? `opencode attach ${i.url}  (with your OPENCODE_SERVER_PASSWORD set)`
             : `opencode attach ${i.url}`
