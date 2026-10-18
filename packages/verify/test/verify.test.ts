@@ -526,8 +526,10 @@ describe("fixes", () => {
     assert.equal(t!.env?.PYTHONPATH, [path.join(root, "src"), root].join(path.delimiter))
     assert.deepEqual(t!.stripEnv, ["VIRTUAL_ENV"])
     const bin = tmp()
-    write(bin, { uv: "#!/bin/sh\n" })
-    fs.chmodSync(path.join(bin, "uv"), 0o755)
+    // Windows finds executables by extension (PATHEXT).
+    const uv = process.platform === "win32" ? "uv.cmd" : "uv"
+    write(bin, { [uv]: process.platform === "win32" ? "@echo off\r\n" : "#!/bin/sh\n" })
+    fs.chmodSync(path.join(bin, uv), 0o755)
     write(root, { "uv.lock": "" })
     const saved = process.env.PATH
     process.env.PATH = `${bin}${path.delimiter}${saved}`
@@ -553,7 +555,7 @@ describe("fixes", () => {
     })
     assert.equal((await detectChecks(path.join(root, "rs")))[0]!.command, "cargo test --workspace --color never")
     assert.deepEqual(
-      (await detectChecks(path.join(root, "go"))).map((c) => [c.name, path.relative(root, c.cwd)]),
+      (await detectChecks(path.join(root, "go"))).map((c) => [c.name, path.relative(root, c.cwd).replace(/\\/g, "/")]),
       [
         ["vet", "go"],
         ["vet:tools/gen", "go/tools/gen"],
