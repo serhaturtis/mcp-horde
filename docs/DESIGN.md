@@ -1,6 +1,6 @@
 # mcp-horde: system design
 
-Status: October 2026. Built: `@mcp-horde/opencode`, `@mcp-horde/core`, `@mcp-horde/verify`, gates in `opencode` (M0, M1), `@mcp-horde/board` with its worker CLI, and the `horde` Claude Code plugin with its orchestration skill (M2). Planned: the M2 end-to-end mock run and everything from M3 on.
+Status: October 2026. Built: `@mcp-horde/opencode`, `@mcp-horde/core`, `@mcp-horde/verify`, gates in `opencode` (M0, M1), `@mcp-horde/board` with its worker CLI, and the `horde` Claude Code plugin with its orchestration skill (M2). Planned: everything from M3 on.
 
 ## 1. What this is for
 
@@ -370,7 +370,7 @@ Each goes into a `probe/` script in the relevant package, like the probes used w
 | --- | --- | --- |
 | **M0** ✓ `compat.ts` boundary + v2 health + `dev`-tag CI job | the v2 policy enforced in code | small, and it keeps every later milestone honest |
 | **M1** ✓ `core` + `verify` + gates in `opencode` | mechanical verdicts; self-fixing workers (related-test selection moves to M3 with `context`) | the biggest trust and token win, and it needs no worker-side mounts |
-| **M2** `board` (both modes) + config injection + playbook v1 | shared task graph, reports, findings, memory; the procedure | turns ad-hoc delegation into a tracked workflow |
+| **M2** ✓ `board` (MCP for the orchestrator, an auto-approved CLI for workers) + the `horde` plugin with its skill | shared task graph, reports, findings, memory; the procedure, proven end to end by a mock run (`opencode/test/flow.test.ts`) | turns ad-hoc delegation into a tracked workflow |
 | **M3** `context` v1 + `board_brief` composition | precise briefs; related-test mapping for gates | closes most of the quality gap for fast models |
 | **M4** `opencode_ask`, `scope`, `worktree sync`, `opencode_compact`, `opencode_revert`, `opencode_permissions`, `opencode_spawn { task }` | one-shot calls and judging; scope enforcement; conflict handling; context and undo for long tasks; fewer calls | refinements once the loop works end to end |
 | **M5** tree-sitter `context`, `board` TUI, plugin packaging, npm publish | depth and distribution | after the shape is proven |

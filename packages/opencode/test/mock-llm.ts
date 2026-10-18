@@ -5,7 +5,7 @@ import type { AddressInfo } from "node:net"
  * A tiny OpenAI-compatible chat completions server scripted by the latest user prompt:
  *   "TOOL: <cmd>"   → calls bash with <cmd>, then answers "DONE: <tool output>"
  *   "CALL: <tool> {json}" → calls any offered tool with those arguments, then answers "DONE: <tool output>"
- *   a board brief    → runs its "First:" command, then its report command, then answers
+ *   a board brief    → runs its "First:" command, its RUN: lines, shares its FINDING:, reports, then answers
  *   "STEPS: <n>"    → calls bash `echo step` n times in a row, then answers "DONE"
  *   "ASK: <q>"      → calls the question tool (options Red/Blue), then answers "DONE: <tool output>"
  *   "SLOW"          → streams "Working...." for ~15s
@@ -78,19 +78,28 @@ export async function startMockLlm(): Promise<{ url: string; close: () => void; 
       if (toolResults < Number(steps[1])) return callTool("bash", { command: `echo step ${toolResults + 1}`, description: "step" })
       return say("DONE")
     }
-    // A board brief: run its first command, then its report command, like a cooperative worker.
+    // A board brief: like a cooperative worker, read the task, run the goal's "RUN: <cmd>" lines,
+    // share its "FINDING: <text> @ <path>" line, then report.
     if (userText.includes("## Reporting (required)")) {
       const lines = userText.split("\n")
-      const first = lines
-        .find((l) => l.includes("- First:"))
-        ?.split("- First:")[1]
-        ?.trim()
-      const report = lines
-        .find((l) => / report t-\w+ \w+ --summary /.test(l))
-        ?.trim()
-        .replace(/--summary "[^"]*"/, '--summary "mock work done"')
-      if (toolResults === 0 && first) return callTool("bash", { command: first, description: "read the task" })
-      if (toolResults === 1 && report) return callTool("bash", { command: report, description: "report" })
+      const after = (marker: string) => {
+        const l = lines.find((x) => x.includes(marker))
+        return l?.slice(l.indexOf(marker) + marker.length).trim()
+      }
+      const finding = lines
+        .find((l) => l.startsWith("FINDING: "))
+        ?.slice(9)
+        .split(" @ ")
+      const steps = [
+        after("- First:"),
+        ...lines.filter((l) => l.startsWith("RUN: ")).map((l) => l.slice(5).trim()),
+        finding && after("- A fact other workers need:")?.replace('"the fact"', `"${finding[0]}"`).replace('"src/x.ts"', `"${finding[1]}"`),
+        lines
+          .find((l) => / report t-\w+ \w+ --summary /.test(l))
+          ?.trim()
+          .replace(/--summary "[^"]*"/, '--summary "mock work done"'),
+      ].filter((c): c is string => !!c)
+      if (toolResults < steps.length) return callTool("bash", { command: steps[toolResults]!, description: `step ${toolResults + 1}` })
       return say(`DONE: reported. ${textOf(last).slice(0, 200)}`)
     }
     if (last?.role === "tool") return say(`DONE: ${textOf(last).slice(0, 400)}`)

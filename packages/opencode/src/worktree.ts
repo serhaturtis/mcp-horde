@@ -224,6 +224,8 @@ function pipePatch(repo: string, root: string): Promise<boolean> {
     })
     apply.on("close", (code) => {
       if (diffCode !== 0 && diffCode !== null) return reject(new Error(`git diff failed: ${err.trim()}`))
+      // A clean checkout gives an empty diff, which git apply refuses: nothing to carry.
+      if (!any) return resolve(false)
       if (code !== 0) return reject(new Error(`could not apply your uncommitted changes in the worktree: ${err.trim()}`))
       resolve(any)
     })
