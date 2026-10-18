@@ -42,7 +42,10 @@ describe("the horde flow: board, workers, gates (real opencode, mock LLM)", { ti
     mock = await startMockLlm()
     ;({ tmp, repo } = makeRepo(mock.url))
     fs.writeFileSync(path.join(repo, "check.js"), CHECK)
-    fs.writeFileSync(path.join(repo, "horde.json"), JSON.stringify({ verify: { checks: { exports: "node check.js" } } }))
+    fs.writeFileSync(
+      path.join(repo, "horde.json"),
+      JSON.stringify({ verify: { checks: { exports: "node check.js" } }, tiers: [{ model: "mock/mock", variant: "low" }, { model: "mock/pricey" }] }),
+    )
     git(repo, "add", ".")
     git(repo, "commit", "-qm", "checks")
     h = await connect({ ...isolatedEnv(tmp, repo), HORDE_OPENCODE_MAX_RUNNING: "4", HORDE_BOARD_STATE_DIR: path.join(tmp, "board-state") })
@@ -87,7 +90,9 @@ describe("the horde flow: board, workers, gates (real opencode, mock LLM)", { ti
 
     // Two workers at once, each working a board task: brief, worktree and a gate on its scope come with it.
     const spawned = await h.call("opencode_spawn", { task: a, name: "wa", permissions: "allow" })
-    assert.match(spawned, new RegExp(`working ${a} "Module a" \\(attempt 1\\)[\\s\\S]*\\(worktree, branch horde/wa\\)\\n {2}task: ${a} "Module a"`), spawned)
+    assert.match(spawned, new RegExp(`working ${a} "Module a" \\(attempt 1, tier 0 \\(mock/mock low\\)\\)`), spawned)
+    assert.match(spawned, /model: mock\/mock \[low\]/, "the tier picked the model")
+    assert.match(spawned, new RegExp(`\\(worktree, branch horde/wa\\)\\n {2}task: ${a} "Module a"`), spawned)
     await h.call("opencode_spawn", { task: b, name: "wb", permissions: "allow" })
     await assert.rejects(h.call("opencode_spawn", { task: c, name: "early" }), new RegExp(`${c} waits for`))
     const settled = await h.call("opencode_wait", { ids: ["wa", "wb"], mode: "all", timeout_seconds: 240 })
@@ -131,5 +136,21 @@ describe("the horde flow: board, workers, gates (real opencode, mock LLM)", { ti
     await boardCall("board_accept", { id: c })
     assert.match(await boardCall("board_summary"), /^3 tasks: 3 done/)
     assert.ok(fs.existsSync(path.join(repo, "c.js")))
+  })
+
+  test("escalation moves a task to the next model tier, and past the last tier it is the orchestrator's", async () => {
+    const planned = await boardCall("board_plan", { tasks: [{ title: "Hard one", goal: "Something difficult." }] })
+    const id = planned.match(/^(t-\w+) "Hard one"/m)![1]!
+    assert.match(await boardCall("board_next"), new RegExp(`${id} "Hard one" · tier 0 \\(mock/mock low\\)`))
+    await h.call("opencode_spawn", { task: id, name: "hard-0", wait: true, timeout_seconds: 60 })
+    assert.match(await boardCall("board_fail", { id, reason: "gate failed twice", escalate: true }), /is open, now at tier 1 \(mock\/pricey\)/)
+    assert.match(await h.call("opencode_spawn", { task: id, name: "hard-1", wait: true, timeout_seconds: 60 }), /model: mock\/pricey/)
+    // The attempt's spend reached the board without anyone passing it.
+    assert.match(await boardCall("board_task", { id }), /tier 1 \(mock\/pricey\) · \$\d/)
+    assert.match(await boardCall("board_fail", { id, reason: "still failing", escalate: true }), /now at tier 2 \(past the last model tier: yours\)/)
+    await assert.rejects(h.call("opencode_spawn", { task: id, name: "hard-2" }), /past the last of the 2 tier\(s\) in horde\.json: the last tier is you/)
+    // An explicit model always wins.
+    assert.match(await h.call("opencode_spawn", { task: id, name: "hard-me", model: "mock/mock", wait: true, timeout_seconds: 60 }), /model: mock\/mock/)
+    for (const n of ["hard-0", "hard-1", "hard-me"]) await h.call("opencode_dispose", { id: n, worktree: "discard" })
   })
 })

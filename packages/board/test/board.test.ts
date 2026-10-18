@@ -191,6 +191,22 @@ describe("board", () => {
     assert.match(renderBrief(board, board.task(docs!.id), docsAttempt.attempt), /Findings from other workers[\s\S]*session middleware/)
   })
 
+  test("attempt costs are recorded as they accrue and summed per task", async () => {
+    const board = new Board(tmp())
+    const t = (await board.plan([{ title: "x", goal: "y" }])).tasks[0]!
+    const first = await board.assign(t.id)
+    await board.recordCost(t.id, first.attempt.n, 0.5)
+    assert.equal(board.task(t.id).cost, 0.5)
+    await board.fail(t.id, { reason: "nope" })
+    const second = await board.assign(t.id)
+    await board.recordCost(t.id, second.attempt.n, 0.25)
+    await board.recordCost(t.id, second.attempt.n, 0.75)
+    assert.equal(board.task(t.id).cost, 1.25)
+    await board.accept(t.id, {})
+    assert.equal(board.task(t.id).attempts[1]!.cost, 0.75, "accept keeps the recorded cost")
+    await assert.rejects(board.recordCost(t.id, 9, 1), /has no attempt 9/)
+  })
+
   test("a new attempt invalidates the old token; failing can escalate the tier or give up", async () => {
     const board = new Board(tmp())
     const t = (await board.plan([{ title: "x", goal: "y" }])).tasks[0]!

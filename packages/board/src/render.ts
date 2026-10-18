@@ -1,5 +1,5 @@
 import { openProject, pack } from "@mcp-horde/context"
-import { estimateTokens, fitSections, formatUsd, type Section, truncate } from "@mcp-horde/core"
+import { estimateTokens, fitSections, formatUsd, type Section, type Tier, tierLabel, truncate } from "@mcp-horde/core"
 import { type Attempt, type Board, current, LEASE_MS, type Note, type ReportCheck, type Task } from "./board.js"
 import { workerCommand } from "./command.js"
 
@@ -134,9 +134,9 @@ export function renderSummary(board: Board, budgetChars = 1500, now = Date.now()
   return fitSections(sections, budgetChars)
 }
 
-export function renderTask(t: Task, detail: "brief" | "full" = "brief", now = Date.now(), check?: ReportCheck): string {
+export function renderTask(t: Task, detail: "brief" | "full" = "brief", now = Date.now(), check?: ReportCheck, tiers: Tier[] = []): string {
   const lines = [
-    `${t.id} "${t.title}" — ${t.status}${t.blockedOn ? ` on ${t.blockedOn}` : ""} · tier ${t.tier}${t.cost ? ` · ${formatUsd(t.cost)}` : ""}${attemptLine(t, now)}`,
+    `${t.id} "${t.title}" — ${t.status}${t.blockedOn ? ` on ${t.blockedOn}` : ""} · ${tierLabel(t.tier, tiers)}${t.cost ? ` · ${formatUsd(t.cost)}` : ""}${attemptLine(t, now)}`,
   ]
   if (t.deps.length) lines.push(`deps: ${t.deps.join(", ")}`)
   if (t.scope.length) lines.push(`scope: ${t.scope.join(", ")}`)

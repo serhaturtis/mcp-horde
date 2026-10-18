@@ -315,7 +315,7 @@ export function registerTools(server: McpServer, ctx: Context) {
         .string()
         .optional()
         .describe(
-          'A board task id (board_plan): the agent gets its brief (goal, done criteria, scope, code context, reporting commands), the attempt is recorded on the board, and isolation defaults to "worktree" with a gate on the task\'s scope. Replaces board_brief + passing the brief by hand.',
+          'A board task id (board_plan): the agent gets its brief (goal, done criteria, scope, code context, reporting commands), the attempt is recorded on the board, isolation defaults to "worktree" with a gate on the task\'s scope, and without model the task\'s tier picks one from horde.json "tiers". Replaces board_brief + passing the brief by hand.',
         ),
       name: z.string().optional().describe("Unique short name to address it by (letters, digits, . _ -). With task: defaults to the task id."),
       model: z.string().optional().describe('"provider/model" from opencode_models, chosen for this task. Omitted = OpenCode\'s configured default.'),

@@ -4,7 +4,20 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { describe, test } from "node:test"
-import { fitSections, formatDuration, loadHordeFile, readJson, runCommand, splitZ, truncate, withLock, writeJson } from "@mcp-horde/core"
+import {
+  fitSections,
+  formatDuration,
+  loadHordeFile,
+  loadTiers,
+  readJson,
+  runCommand,
+  splitZ,
+  tierLabel,
+  tierModel,
+  truncate,
+  withLock,
+  writeJson,
+} from "@mcp-horde/core"
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), "horde-core-"))
 const node = `"${process.execPath}"`
@@ -163,5 +176,22 @@ describe("horde.json", () => {
     assert.throws(() => loadHordeFile(repo), /not valid JSON/)
     fs.writeFileSync(path.join(repo, "horde.json"), "[1]")
     assert.throws(() => loadHordeFile(repo), /JSON object/)
+  })
+
+  test("model tiers: validated, labelled, and the last tier is the orchestrator's", () => {
+    const repo = tmp()
+    fs.mkdirSync(path.join(repo, ".git"))
+    assert.deepEqual(loadTiers(repo), [])
+    assert.equal(tierModel(3, [], "t-1"), undefined, "no tiers: the caller picks the model")
+    fs.writeFileSync(path.join(repo, "horde.json"), JSON.stringify({ tiers: ["deepseek/deepseek-chat", { model: "moonshot/kimi-k2", variant: "high" }] }))
+    const tiers = loadTiers(repo)
+    assert.deepEqual(tiers, [{ model: "deepseek/deepseek-chat" }, { model: "moonshot/kimi-k2", variant: "high" }])
+    assert.equal(tierLabel(1, tiers), "tier 1 (moonshot/kimi-k2 high)")
+    assert.equal(tierLabel(2, tiers), "tier 2 (past the last model tier: yours)")
+    assert.equal(tierLabel(2, []), "tier 2")
+    assert.deepEqual(tierModel(0, tiers, "t-1"), { model: "deepseek/deepseek-chat" })
+    assert.throws(() => tierModel(2, tiers, "t-1"), /t-1 is at tier 2, past the last of the 2 tier\(s\) in horde\.json: the last tier is you/)
+    fs.writeFileSync(path.join(repo, "horde.json"), JSON.stringify({ tiers: [{ model: "no-provider" }] }))
+    assert.throws(() => loadTiers(repo), /"tiers"\[0\] needs "model": "provider\/model"/)
   })
 })

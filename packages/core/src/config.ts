@@ -53,3 +53,50 @@ export function packageVersion(moduleUrl: string): string {
     return "0.0.0"
   }
 }
+
+/** One model tier: what a task at this tier runs on. Tier 0 is the cheapest. */
+export interface Tier {
+  /** "provider/model", as opencode_models lists it. */
+  model: string
+  /** Effort variant, e.g. "high". */
+  variant?: string
+}
+
+/**
+ * `horde.json` → `tiers`: the models tasks run on, cheapest first. A task's tier indexes
+ * this list; escalating a task moves it to the next one. Past the last tier, the
+ * orchestrator does the work itself. Empty when there is no list.
+ */
+export function loadTiers(directory: string): Tier[] {
+  const { file, data } = loadHordeFile(directory)
+  const raw = data.tiers
+  if (raw === undefined) return []
+  const where = `${file}: "tiers"`
+  if (!Array.isArray(raw)) throw new Error(`${where} must be an array of { "model": "provider/model", "variant"?: "…" }`)
+  return raw.map((t, i) => {
+    const entry = typeof t === "string" ? { model: t } : t
+    if (!entry || typeof entry !== "object" || typeof (entry as Tier).model !== "string" || !/^[^/\s]+\/\S+$/.test((entry as Tier).model))
+      throw new Error(`${where}[${i}] needs "model": "provider/model"`)
+    const { model, variant } = entry as Tier
+    if (variant !== undefined && typeof variant !== "string") throw new Error(`${where}[${i}].variant must be a string`)
+    return variant ? { model, variant } : { model }
+  })
+}
+
+/** "tier 1 (deepseek/deepseek-chat high)", or just "tier 1" without a model for it. */
+export function tierLabel(tier: number, tiers: Tier[]): string {
+  const t = tiers[tier]
+  if (t) return `tier ${tier} (${t.model}${t.variant ? ` ${t.variant}` : ""})`
+  return tiers.length && tier >= tiers.length ? `tier ${tier} (past the last model tier: yours)` : `tier ${tier}`
+}
+
+/** The model for a task's tier, or an error that says what to do when there is none. */
+export function tierModel(tier: number, tiers: Tier[], task: string): Tier | undefined {
+  if (!tiers.length) return undefined
+  const t = tiers[tier]
+  if (!t)
+    throw new Error(
+      `${task} is at tier ${tier}, past the last of the ${tiers.length} tier(s) in horde.json: the last tier is you. Do it yourself, pass a model, or add a tier.`,
+    )
+  return t
+}

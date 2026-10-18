@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import path from "node:path"
-import { packageVersion } from "@mcp-horde/core"
+import { loadTiers, packageVersion, tierLabel } from "@mcp-horde/core"
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js"
@@ -71,7 +71,7 @@ tool(
           acceptance: strings.optional().describe("Observable criteria; the gate checks what it can, you check the rest."),
           scope: strings.optional().describe('Paths or globs the task may change, e.g. ["src/auth/**", "test/auth/**"].'),
           deps: strings.optional().describe("Task ids, or titles of tasks in this plan, that must be done first."),
-          tier: z.number().int().min(0).optional().describe("Starting model tier (index into your tiers; default 0, the cheapest)."),
+          tier: z.number().int().min(0).optional().describe('Starting model tier: an index into horde.json "tiers" (default 0, the cheapest).'),
           parent: z.string().optional().describe("Grouping, e.g. the feature this belongs to."),
         }),
       )
@@ -87,10 +87,11 @@ tool(
   "board_next",
   "Tasks that are ready to start: open, with every dependency done.",
   { directory, limit: z.number().int().min(1).max(50).optional() },
-  async (a, board) => {
+  async (a, board, repo) => {
     const ready = board.ready().slice(0, a.limit ?? 10)
+    const tiers = loadTiers(repo)
     return ready.length
-      ? ready.map((t) => `${t.id} "${t.title}" · tier ${t.tier}${t.scope.length ? ` · ${t.scope.join(", ")}` : ""}`).join("\n")
+      ? ready.map((t) => `${t.id} "${t.title}" · ${tierLabel(t.tier, tiers)}${t.scope.length ? ` · ${t.scope.join(", ")}` : ""}`).join("\n")
       : "Nothing is ready."
   },
   true,
@@ -118,7 +119,11 @@ tool(
     directory,
     id,
     note: z.string().optional(),
-    cost: z.number().min(0).optional().describe("Cost of this attempt in USD (from the agent's status), for the totals."),
+    cost: z
+      .number()
+      .min(0)
+      .optional()
+      .describe("Cost of this attempt in USD, for the totals. Agents spawned with opencode_spawn task record theirs automatically; pass it only to override."),
   },
   async (a, board) => {
     const t = await board.accept(a.id, { note: a.note, cost: a.cost })
@@ -129,7 +134,7 @@ tool(
 
 tool(
   "board_fail",
-  "Close the current attempt as failed. By default the task is reopened for another attempt; escalate raises its tier (use the next, stronger model); retry false gives the task up.",
+  'Close the current attempt as failed. By default the task is reopened for another attempt; escalate raises its tier, so its next spawn runs on the next, stronger model of horde.json "tiers" (past the last tier, it is yours to do); retry false gives the task up.',
   {
     directory,
     id,
@@ -138,9 +143,9 @@ tool(
     retry: z.boolean().optional(),
     cost: z.number().min(0).optional(),
   },
-  async (a, board) => {
+  async (a, board, repo) => {
     const t = await board.fail(a.id, { reason: a.reason, escalate: a.escalate, retry: a.retry, cost: a.cost })
-    return `${t.id} is ${t.status}${t.status === "open" ? ` (tier ${t.tier})` : ""}.`
+    return `${t.id} is ${t.status}${t.status === "open" ? `, now at ${tierLabel(t.tier, loadTiers(repo))}` : ""}.`
   },
 )
 
@@ -180,7 +185,7 @@ tool(
   "board_task",
   "One task: status, attempt, and the latest worker report (what changed, tests added, unverified claims, questions), checked against the attempt's actual diff when its worktree is known. detail full adds the goal, acceptance and every attempt.",
   { directory, id, detail: z.enum(["brief", "full"]).optional() },
-  async (a, board) => renderTask(board.task(a.id), a.detail, Date.now(), await board.checkReport(a.id)),
+  async (a, board, repo) => renderTask(board.task(a.id), a.detail, Date.now(), await board.checkReport(a.id), loadTiers(repo)),
   true,
 )
 

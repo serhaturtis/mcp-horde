@@ -3,7 +3,7 @@ import fs from "node:fs/promises"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
 import { Board, isTrustedCommand, renderBrief } from "@mcp-horde/board"
-import { git, oneLine } from "@mcp-horde/core"
+import { git, loadTiers, oneLine, tierLabel, tierModel } from "@mcp-horde/core"
 import { gate as runGate, defaultStateDir as verifyStateDir } from "@mcp-horde/verify"
 import type {
   AgentV2Info,
@@ -595,6 +595,8 @@ export class Fleet {
     const directory = this.resolveDir(input.directory)
     const board = await Board.open(directory)
     const name = input.name ?? taskId
+    // Without an explicit model, the task's tier picks one from horde.json "tiers".
+    const tier = input.model ? undefined : tierModel(board.task(taskId).tier, loadTiers(directory), taskId)
     const { task, attempt } = await board.assign(taskId, name)
     const extra = input.prompt.trim()
     const prompt = `${renderBrief(board, task, attempt, 6000, directory)}${extra ? `\n\n## Additional instructions\n${extra}` : ""}`
@@ -604,6 +606,8 @@ export class Fleet {
         ...input,
         prompt,
         name,
+        model: input.model ?? tier?.model,
+        variant: input.model ? input.variant : (input.variant ?? tier?.variant),
         isolation: input.isolation ?? "worktree",
         gate: input.gate ?? (task.scope.length ? { allowed: task.scope } : true),
       })
@@ -618,7 +622,10 @@ export class Fleet {
     this.updateRecord(snap.id, { task: { id: task.id, title: task.title, attempt: attempt.n } })
     return {
       snapshot: await this.snapshot(snap.id),
-      notes: [`working ${task.id} "${task.title}" (attempt ${attempt.n}); its report lands on the board`, ...result.notes],
+      notes: [
+        `working ${task.id} "${task.title}" (attempt ${attempt.n}${tier ? `, ${tierLabel(task.tier, loadTiers(directory))}` : ""}); its report lands on the board`,
+        ...result.notes,
+      ],
     }
   }
 
@@ -960,6 +967,7 @@ export class Fleet {
       await this.interruptNow(live, "disposed")
       notes.push("interrupted the running turn")
     }
+    await this.recordTaskCost(live)
     // Commit a worktree's leftovers before anything is deleted (throws if that is not safe).
     if (live.record.worktree && opts.worktree === "remove") {
       const committed = await commitAll(live.record.worktree, `horde: uncommitted work from ${name}`)
@@ -1252,6 +1260,19 @@ export class Fleet {
     live.lastPushKey = key
     // Agents found already settled at startup are not news.
     if (!first) this.hooks.settled(this.build(live))
+    void this.recordTaskCost(live)
+  }
+
+  /** Put a task-bound agent's spend so far on its board attempt (cost tracking only, no limits). */
+  private async recordTaskCost(live: Live) {
+    const task = live.record.task
+    if (!task) return
+    const cost = this.build(live).cost
+    if (!cost) return
+    const board = await Board.open(live.record.worktree?.repo ?? live.record.directory).catch(() => undefined)
+    const a = board?.task(task.id).attempts.find((x) => x.n === task.attempt)
+    if (!board || !a || a.cost === cost) return
+    await board.recordCost(task.id, task.attempt, cost).catch(() => undefined)
   }
 
   private derive(live: Live, active: Set<string>): { state: AgentState; error?: string } {
@@ -1720,6 +1741,8 @@ export class Fleet {
       if (done || timedOut) {
         // Mark what the caller is about to see (news only: a timeout shows no other results).
         if (opts.markReported !== false) for (const s of done ? settled : news) this.markReported(s)
+        // The board has a settled task's spend before the caller accepts or fails it.
+        await Promise.all(lives.filter((l) => settled.some((s) => s.id === l.record.id)).map((l) => this.recordTaskCost(l)))
         return { snapshots: snaps, news: new Set(news.map((s) => s.id)), errors, timedOut, nothingToWaitFor: done && news.length === 0 && mode === "any" }
       }
       opts.onTick?.(snaps, Date.now() - start)
