@@ -1,0 +1,57 @@
+{
+  "name": "@mcp-horde/context",
+  "version": "0.1.0",
+  "description": "MCP server that gives agents precise code context instead of exploration: a project map, definitions and call sites, imports, the tests that cover a file, and budgeted context packs for briefs.",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "code-search",
+    "context",
+    "agents",
+    "claude-code"
+  ],
+  "type": "module",
+  "bin": {
+    "mcp-horde-context": "dist/index.js"
+  },
+  "exports": {
+    ".": {
+      "source": "./src/lib.ts",
+      "types": "./dist/lib.d.ts",
+      "default": "./dist/lib.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/serhaturtis/mcp-horde.git",
+    "directory": "packages/context"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.test.json",
+    "test": "node --conditions=source --import tsx --test --test-concurrency=1 test/context.test.ts",
+    "prepublishOnly": "npm run build",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@mcp-horde/core": "^0.1.0",
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

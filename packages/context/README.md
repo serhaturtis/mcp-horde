@@ -1,0 +1,67 @@
+# @mcp-horde/context
+
+An MCP server that gives agents precise code context instead of exploration. Fast, cheap models are weakest at finding their way around a large codebase and spend most of their tokens doing it; the orchestrator should not spend its own tokens doing it for them either.
+
+There is no index to build and nothing to keep in sync: every answer comes from the current files (git's file list, so `.gitignore` applies), with small caches keyed by file content. No native dependencies.
+
+## Tools
+
+| Tool | What it answers |
+| --- | --- |
+| `context_map` | The project at a glance: directories with file counts, languages and tests; manifests, entry points (package.json `main`/`bin`/`exports` mapped back to sources, conventional names), test directories, and the project's instruction files (`CLAUDE.md`, `AGENTS.md`, `CONTRIBUTING.md`; listed, not inlined). |
+| `context_find` | `kind: "text"` lines containing the query, `"definition"` symbols whose name matches, `"reference"` whole-word uses outside definitions. Literal and smart-case, or `/regex/`. One `path:line  text` per hit. |
+| `context_symbol` | A definition's signature, doc comment and extent, plus its call sites (a count and the first ones). |
+| `context_file` | An excerpt with line numbers: a line range, only the named symbols' definitions, or the whole file when it fits (otherwise its outline and its head). |
+| `context_imports` | Project files a file imports, or the files importing it. |
+| `context_tests_for` | The tests that cover files: named after them (next to them, or in a mirrored `test/`, `tests/`, `__tests__/`, `src/test/java/…` tree), importing them (also through re-exporting `index`/`lib` files and workspace package names), Go package tests, Rust inline `#[cfg(test)]` modules. |
+| `context_pack` | A budgeted context section for a worker's brief (below). |
+
+```text
+context_symbol name:"Add"
+function Add (exported) — internal/calc/calc.go:4-6
+  func Add(a, b int) int
+  │ Add adds.
+  1 use elsewhere:
+    cmd/demo/main.go:8  func main() { fmt.Println(calc.Add(1, 2)) }
+```
+
+## Context packs
+
+`context_pack { goal, scope, files?, symbols?, budget_tokens }` assembles what a worker needs to start, in priority order, trimmed to the budget with a note for whatever did not fit:
+
+1. **The scoped files**, ranked by how much they mention the goal: whole when small, otherwise their outline plus the lines that mention the task.
+2. **Definitions of symbols the goal names** (`backticked`, camelCase, PascalCase or snake_case words), wherever they are defined.
+3. **The tests that cover the scope**, or a note that there are none.
+4. **The project's conventions**: the first 60 lines of each instruction file.
+
+`@mcp-horde/board` appends a pack to every brief (`board_brief`), within the brief's budget; the orchestrator does not have to call this itself.
+
+## Languages
+
+Definitions and imports come from language-aware patterns for TypeScript/JavaScript, Python, Go, Rust, Java, Kotlin and C#: functions, classes, methods, interfaces, types, enums, top-level variables; block extents by braces or indentation; doc comments and docstrings. Import resolution covers relative TS/JS imports (including ESM `.js` specifiers for `.ts` sources and directory `index` files), workspace packages by name (an exports `source` condition, or the source twin of `main`/`types`), Python relative and absolute modules (root, `src/` and `lib/` layouts), Go packages under the module path, Rust `mod` and `use crate::…`, and Java/Kotlin packages. C# namespaces are not mapped to files.
+
+## Configuration
+
+`horde.json` at the repository root:
+
+```json
+{ "context": { "ignore": ["fixtures/", "**/*.generated.ts"], "entrypoints": ["scripts/seed.ts"] } }
+```
+
+`ignore` extends `.gitignore`; `entrypoints` are always listed by `context_map`.
+
+## Setup
+
+```sh
+claude mcp add context -- node /path/to/mcp-horde/packages/context/dist/index.js
+```
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `HORDE_CONTEXT_DIRECTORY` | current directory | Default project directory (each tool also takes `directory`). |
+
+## Known limits
+
+- **Patterns, not a parser.** Ordinary code is read accurately; unusual formatting (a signature split oddly across lines, macros generating definitions) can be missed. Tree-sitter based extraction is planned (milestone M5 in [`docs/DESIGN.md`](../../docs/DESIGN.md)).
+- **References are textual.** `context_symbol` counts whole-word uses, so a different symbol with the same name is counted too.
+- **Large repositories:** listing stops at 50,000 files and files over 1 MB are not read; narrow searches with `paths`.

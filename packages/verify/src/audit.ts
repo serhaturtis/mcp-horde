@@ -1,6 +1,6 @@
 import fs from "node:fs/promises"
 import path from "node:path"
-import { git, gitRaw, splitZ } from "@mcp-horde/core"
+import { git, gitRaw, globMatcher, isTestPath, splitZ } from "@mcp-horde/core"
 import type { AuditCategory } from "./detect.js"
 
 export interface Finding {
@@ -43,13 +43,6 @@ const Q = ["-c", "core.quotePath=false"]
 const MAX_SCAN_BYTES = 1024 * 1024
 const BIG_FILE = 1024 * 1024
 
-export const isTestPath = (p: string) =>
-  /(^|\/)(__tests__|tests?|spec)\//.test(p) ||
-  /\.(test|spec)\.[cm]?[jt]sx?$/.test(p) ||
-  /(^|\/)test_[^/]+\.py$/.test(p) ||
-  /_test\.(go|py)$/.test(p) ||
-  /(^|\/)tests\/[^/]+\.rs$/.test(p)
-
 /** Assertions in the common test frameworks (counted per occurrence, not per line). */
 const ASSERTION = /\b(assert\w*|expect|should|assertEquals|assertThat|require\.\w+|t\.(Error|Fatal)\w*)\s*[.(!]/g
 const assertions = (lines: string[]) => lines.reduce((n, l) => n + (l.match(ASSERTION)?.length ?? 0), 0)
@@ -86,28 +79,6 @@ const SECRETS: [RegExp, string][] = [
 
 const LOCKFILES =
   /(^|\/)(package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?|Cargo\.lock|poetry\.lock|uv\.lock|Pipfile\.lock|go\.sum|composer\.lock|Gemfile\.lock)$/
-
-/** Minimal gitignore-style globs: `**`, `*`, `?`; a trailing `/` means the whole directory; no slash matches at any depth. */
-export function globMatcher(globs: string[]): (p: string) => boolean {
-  const res = globs.map((g) => {
-    let pat = g.replace(/\\/g, "/").replace(/^\.\//, "").replace(/^\//, "")
-    if (pat.endsWith("/")) pat += "**"
-    const anyDepth = !pat.includes("/")
-    let re = ""
-    for (let i = 0; i < pat.length; i++) {
-      const c = pat[i]!
-      if (c === "*" && pat[i + 1] === "*") {
-        re += pat[i + 2] === "/" ? "(?:.*/)?" : ".*"
-        i += pat[i + 2] === "/" ? 2 : 1
-      } else if (c === "*") re += "[^/]*"
-      else if (c === "?") re += "[^/]"
-      else re += c.replace(/[.+^${}()|[\]\\]/g, "\\$&")
-    }
-    // A directory pattern also covers everything below it.
-    return new RegExp(`^${anyDepth ? "(?:.*/)?" : ""}${re}(?:/.*)?$`)
-  })
-  return (p) => res.some((r) => r.test(p))
-}
 
 async function changes(root: string, base: string): Promise<Change[]> {
   const byPath = new Map<string, Change>()
