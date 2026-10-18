@@ -1624,10 +1624,14 @@ export class Fleet {
       boundary = ids[at - 1]!
       undone = n
     }
-    // OpenCode records a step's file snapshot shortly after the step ends; revert only once the
-    // turns being undone have theirs, or it would find no changes to restore.
+    // OpenCode records a step's file snapshot shortly after the step ends (the fields can be
+    // missing altogether until then); revert only once the turns being undone have theirs, or
+    // it would find no changes to restore. A session that records no snapshots (outside git)
+    // is not waited for.
     const after = (ms: typeof messages) => ms.slice(ms.findIndex((m) => m.id === boundary) + 1)
-    for (let i = 0; i < 40 && after(messages).some((m) => m.type === "assistant" && m.snapshot?.start && !m.snapshot.end); i++) {
+    const recording = (ms: typeof messages) => ms.some((m) => m.snapshot?.start || m.snapshot?.end)
+    const pending = (ms: typeof messages) => recording(ms) && after(ms).some((m) => m.type === "assistant" && !m.snapshot?.end)
+    for (let i = 0; i < 40 && pending(messages); i++) {
       await sleep(250)
       messages = await conversation()
     }
