@@ -137,8 +137,17 @@ function renderGate(g: GateView): string {
   return head
 }
 
+const kilo = (n: number) => (n >= 1000 ? `${Math.round(n / 1000)}k` : String(n))
+
 export function renderSnapshot(s: Snapshot, opts: { resultChars?: number; mode?: "news" | "last" } = {}): string {
-  const stats = [`${s.steps} steps`, formatUsd(s.cost), `${formatTokens(s.tokens.input + s.tokens.output + s.tokens.reasoning)} tok`].join(" · ")
+  const ctxUse = s.context?.used
+    ? `ctx ${kilo(s.context.used)}${s.context.limit ? `/${kilo(s.context.limit)} (${Math.round((100 * s.context.used) / s.context.limit)}%)` : ""}`
+    : s.context?.compactions
+      ? "ctx compacted"
+      : undefined
+  const stats = [`${s.steps} steps`, formatUsd(s.cost), `${formatTokens(s.tokens.input + s.tokens.output + s.tokens.reasoning)} tok`, ctxUse]
+    .filter(Boolean)
+    .join(" · ")
   const lines = [`◆ ${s.name ? `${s.name} (${s.id})` : s.id} — ${s.state.toUpperCase()} · ${stats}`]
   if (s.title && !s.title.startsWith("New session") && !s.title.startsWith("horde: ")) lines.push(`  title: ${s.title}`)
   const lim = [
@@ -500,6 +509,48 @@ export function registerTools(server: McpServer, ctx: Context) {
       const snap = await fleet.message(a.id, a.message ?? fallback)
       if (a.wait) return waitAndRender(fleet, [snap.id], "all", a.timeout_seconds, extra, 8000)
       return `Resumed.\n${renderSnapshot(snap)}`
+    },
+  )
+
+  tool(
+    "opencode_compact",
+    "Compact an idle agent's conversation: OpenCode replaces it with a summary and the agent carries on from there with most of its context window free. Use it before messaging an agent whose context is nearly full (status shows ctx %) instead of spawning a new one; its files and worktree are untouched.",
+    { id: z.string().describe("Agent id or name.") },
+    async (a, fleet) => renderSnapshot(await fleet.compact(a.id), { mode: "last" }),
+  )
+
+  tool(
+    "opencode_revert",
+    "Undo an idle agent's last turn(s): OpenCode restores the files those turns changed and removes them from the conversation, so the agent's context matches its files. Cheaper than discarding a worktree when one bad turn spoiled a good run; message the agent afterwards with better instructions.",
+    {
+      id: z.string().describe("Agent id or name."),
+      turns: z.number().int().min(1).max(50).optional().describe("How many of the latest turns to undo (default 1)."),
+      to: z.string().optional().describe("Instead: keep everything up to this message id and undo the rest."),
+    },
+    async (a, fleet) => {
+      const r = await fleet.revert(a.id, { turns: a.turns, to: a.to })
+      const files = r.files.length ? r.files.map((f) => `${f.path} (${f.status})`).join(", ") : "no file changes"
+      return `Reverted ${r.turns} turn(s); restored: ${files}.\n\n${renderSnapshot(r.snapshot, { mode: "last" })}`
+    },
+  )
+
+  tool(
+    "opencode_permissions",
+    'Rules OpenCode saved when a permission was answered "always" (they apply to every later session of the project, the human\'s TUI included). List them, or remove one to make OpenCode ask again.',
+    {
+      action: z.enum(["list", "remove"]).optional().describe("Default list."),
+      id: z.string().optional().describe("The rule to remove (from the list)."),
+      directory: z.string().optional().describe("Project directory (default: the server's)."),
+    },
+    async (a, fleet) => {
+      if (a.action === "remove") {
+        if (!a.id) throw new Error("remove needs the rule's id (see action list)")
+        const r = await fleet.removeSavedPermission(a.id, a.directory)
+        return `Removed ${r.id}: ${r.action} ${JSON.stringify(r.resource)}. OpenCode asks again next time.`
+      }
+      const { project, rules } = await fleet.savedPermissions(a.directory)
+      if (!rules.length) return `No saved permissions for ${project}.`
+      return `${rules.length} saved permission(s) for ${project}:\n${rules.map((r) => `${r.id}  ${r.action} ${JSON.stringify(r.resource)}`).join("\n")}`
     },
   )
 

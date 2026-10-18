@@ -8,7 +8,7 @@ It is built on OpenCode's **v2 server API** (`/api/*`, through `@opencode-ai/sdk
 
 | Capability | Tool |
 | --- | --- |
-| Discover models, effort variants and agent profiles | `opencode_models`, `opencode_agents` |
+| Discover models (with context size, price and effort variants) and agent profiles | `opencode_models`, `opencode_agents` |
 | Spawn an agent with its own model, effort (`variant`), profile, instructions, directory, limits and permission policy | `opencode_spawn` |
 | Give an agent a custom profile (tool allow/deny list, step cap) | `opencode_spawn` `profile` |
 | Run agents in parallel without collisions, each in its own git worktree and branch | `opencode_spawn` `isolation: "worktree"` |
@@ -20,6 +20,9 @@ It is built on OpenCode's **v2 server API** (`/api/*`, through `@opencode-ai/sdk
 | Resume an interrupted or failed agent (refused while it is still running) | `opencode_resume` |
 | Answer permission prompts and questions | `opencode_respond`, or the human answers them in a dialog |
 | Review and merge an isolated agent's work | `opencode_worktree` (`diff`, `commit`, `merge`) |
+| Undo a bad turn: OpenCode restores the files it changed and drops it from the conversation | `opencode_revert` (`turns`, or `to: <message id>`) |
+| See how full an agent's context window is (`ctx 71k/128k (55%)` in every status) and compact it | `opencode_status`, `opencode_compact` (needs an OpenCode with v2 compaction; 1.19 answers "not available yet") |
+| See and remove the rules OpenCode saved from "always" answers | `opencode_permissions` |
 | Read transcripts (also as MCP resources: `opencode://agents/{id}/transcript`) | `opencode_output` |
 | Clean up | `opencode_dispose` |
 | Watch agents live in the OpenCode TUI | `opencode_server info` prints the `opencode attach` command (it reads the password from a file, so the password never enters the model's context) |

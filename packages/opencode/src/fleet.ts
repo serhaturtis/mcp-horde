@@ -5,7 +5,17 @@ import { pathToFileURL } from "node:url"
 import { isTrustedCommand } from "@mcp-horde/board"
 import { git, oneLine } from "@mcp-horde/core"
 import { gate as runGate, defaultStateDir as verifyStateDir } from "@mcp-horde/verify"
-import type { AgentV2Info, ModelRef, ModelV2Info, PermissionV2Request, QuestionV2Request, SessionMessage, SessionV2Info, V2Event } from "@opencode-ai/sdk/v2"
+import type {
+  AgentV2Info,
+  ModelRef,
+  ModelV2Info,
+  PermissionSavedInfo,
+  PermissionV2Request,
+  QuestionV2Request,
+  SessionMessage,
+  SessionV2Info,
+  V2Event,
+} from "@opencode-ai/sdk/v2"
 import type { Backend } from "./backend.js"
 import { deleteSession, releaseDirectory, renameSession } from "./compat.js"
 import type { Config, PermissionPolicy } from "./config.js"
@@ -65,6 +75,8 @@ export interface Snapshot {
   steps: number
   cost: number
   tokens: Track["tokens"]
+  /** Context window use after the latest step, and the model's window when the catalog knows it. */
+  context?: { used: number; limit?: number; compactions: number }
   children: string[]
   /** Present when the agent has a gate. */
   gate?: GateView
@@ -332,6 +344,22 @@ export class Fleet {
       const p = tiers[tiers.length - 1] ?? info.cost[0]!
       return (tok.input * p.input + (tok.output + tok.reasoning) * p.output + tok.cacheRead * p.cache.read + tok.cacheWrite * p.cache.write) / 1_000_000
     }
+  }
+
+  /** Rules saved by "always" answers for the project containing `directory`. */
+  async savedPermissions(directory?: string): Promise<{ project: string; rules: PermissionSavedInfo[] }> {
+    const dir = directory ?? this.config.directory
+    const loc = unwrap(await this.api.location.get({ location: { directory: dir } }), "locating the project")
+    const rules = unwrap(await this.api.permission.saved.list({ projectID: loc.project.id }), "listing saved permissions").data
+    return { project: loc.project.directory, rules }
+  }
+
+  async removeSavedPermission(id: string, directory?: string): Promise<PermissionSavedInfo> {
+    const { rules } = await this.savedPermissions(directory)
+    const rule = rules.find((r) => r.id === id)
+    if (!rule) throw new Error(`no saved permission ${id} for this project${rules.length ? `; saved: ${rules.map((r) => r.id).join(", ")}` : ""}`)
+    unwrap(await this.api.permission.saved.remove({ id }), "removing the saved permission")
+    return rule
   }
 
   async agents(directory?: string): Promise<AgentV2Info[]> {
@@ -1255,9 +1283,104 @@ export class Fleet {
       steps,
       cost,
       tokens,
+      context: this.contextOf(live),
       children: [...live.children],
       gate: this.gateView(live),
     }
+  }
+
+  private contextOf(live: Live): Snapshot["context"] {
+    const { track } = live
+    if (track.context === undefined) return track.compactions ? { used: 0, compactions: track.compactions } : undefined
+    const model = live.session?.model ?? track.model
+    const dir = live.session?.location.directory ?? live.record.directory
+    const info = model && this.modelCache.get(dir)?.models.find((m) => m.providerID === model.providerID && m.id === model.id)
+    return { used: track.context, limit: info?.limit.context || undefined, compactions: track.compactions }
+  }
+
+  /**
+   * Compact an idle agent's conversation: OpenCode summarizes it and continues from the
+   * summary, so a long task can go on in a small context window. The files are untouched.
+   */
+  async compact(ref: string): Promise<Snapshot> {
+    const live = await this.get(ref)
+    await this.refresh(live)
+    if (live.state === "running" || live.state === "needs_input")
+      throw new Error(`${live.record.name ?? live.record.id} is ${live.state}; compact it once it is idle (opencode_wait, or opencode_interrupt first)`)
+    const before = live.track.compactions
+    const res = await this.api.session.compact({ sessionID: live.record.id })
+    if (res.error !== undefined || !res.response?.ok) {
+      const message = (res.error as { message?: string } | undefined)?.message ?? `HTTP ${res.response?.status}`
+      // OpenCode 1.19 answers 503 "Session compact is not available yet" (the legacy summarize does not touch v2 sessions).
+      if (/not available/i.test(message))
+        throw new Error(
+          `this OpenCode server cannot compact v2 sessions yet (${message}). To continue with a fresh context, dispose the agent keeping its worktree and spawn a new one there with a summary of the task so far.`,
+        )
+      unwrap(res, "compacting the session")
+    }
+    // The summary is written by the model; wait for it to land.
+    const deadline = Date.now() + 120_000
+    while (Date.now() < deadline) {
+      await this.refresh(live)
+      if (live.track.compactions > before && !live.track.inLoop) break
+      await sleep(250)
+    }
+    if (live.track.compactions <= before) throw new Error("OpenCode accepted the compaction but did not finish it within 2 minutes")
+    return this.build(live)
+  }
+
+  /**
+   * Undo an idle agent's last turns: OpenCode restores the files those turns changed and
+   * removes their messages, so the agent's context matches its files again. `to` reverts
+   * to just after a given message instead.
+   */
+  async revert(
+    ref: string,
+    opts: { turns?: number; to?: string } = {},
+  ): Promise<{ snapshot: Snapshot; files: { path: string; status: string }[]; turns: number }> {
+    const live = await this.get(ref)
+    await this.refresh(live)
+    const name = live.record.name ?? live.record.id
+    if (live.state === "running" || live.state === "needs_input")
+      throw new Error(`${name} is ${live.state}; revert it once it is idle (opencode_wait, or opencode_interrupt first)`)
+    const sessionID = live.record.id
+    // The conversation in order, oldest first.
+    const ids: string[] = []
+    let cursor: string | undefined
+    for (let page = 0; page < 50; page++) {
+      const res = unwrap(
+        await this.api.session.messages(cursor ? { sessionID, limit: 200, cursor } : { sessionID, order: "asc", limit: 200 }),
+        "reading the conversation",
+      ) as {
+        data: { id: string }[]
+        cursor?: { next?: string }
+      }
+      ids.push(...res.data.map((m) => m.id))
+      cursor = res.cursor?.next
+      if (!cursor || !res.data.length) break
+    }
+    let boundary = opts.to
+    let undone = 0
+    if (boundary) {
+      if (!ids.includes(boundary)) throw new Error(`no message ${boundary} in ${name}'s conversation`)
+      undone = live.track.turns.filter((t) => (t.messageIDs?.[0] ? ids.indexOf(t.messageIDs[0]) > ids.indexOf(boundary!) : false)).length
+    } else {
+      const n = opts.turns ?? 1
+      const turns = live.track.turns
+      if (n < 1 || n > turns.length) throw new Error(`${name} has ${turns.length} turn(s) on record; cannot revert ${n}`)
+      const prompt = turns[turns.length - n]!.messageIDs?.[0]
+      const at = prompt ? ids.indexOf(prompt) : -1
+      if (at < 0) throw new Error("cannot find where that turn starts in the conversation (an older OpenCode history); pass to: <message id>")
+      if (at === 0) throw new Error(`that would undo ${name}'s first turn, leaving nothing; dispose the agent (and its worktree) instead`)
+      boundary = ids[at - 1]!
+      undone = n
+    }
+    const staged = unwrap(await this.api.session.revert.stage({ sessionID, messageID: boundary, files: true }), "staging the revert").data
+    unwrap(await this.api.session.revert.commit({ sessionID }), "committing the revert")
+    await this.refresh(live)
+    // The gate judged work that no longer exists.
+    this.updateRecord(sessionID, { gateState: undefined, reportedSeq: live.track.seq })
+    return { snapshot: this.build(live), files: (staged.files ?? []).map((f) => ({ path: f.path, status: f.status ?? "modified" })), turns: undone }
   }
 
   async snapshot(ref: string, active?: Set<string>): Promise<Snapshot> {

@@ -39,7 +39,13 @@ export function makeRepo(mockUrl: string, extra: Record<string, unknown> = {}) {
           name: "Mock",
           options: { baseURL: mockUrl, apiKey: "x" },
           models: {
-            mock: { name: "Mock", tool_call: true, reasoning: true, variants: { high: { reasoningEffort: "high" }, low: { reasoningEffort: "low" } } },
+            mock: {
+              name: "Mock",
+              tool_call: true,
+              reasoning: true,
+              limit: { context: 100_000, output: 8_000 },
+              variants: { high: { reasoningEffort: "high" }, low: { reasoningEffort: "low" } },
+            },
             other: { name: "Other mock", tool_call: true },
             // $1.50 per mock step (10 input + 5 output tokens), for cost limits.
             pricey: { name: "Pricey mock", tool_call: true, cost: { input: 100_000, output: 100_000 } },

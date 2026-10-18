@@ -178,6 +178,13 @@ describe("opencode MCP server: core behaviour (real opencode, mock LLM)", { time
     const done = await h.call("opencode_wait", { ids: ["asker"], timeout_seconds: 60 })
     assert.match(done, /IDLE[\s\S]*DONE/)
     assert.equal(fs.readFileSync(path.join(repo, "approved.txt"), "utf8").trim(), "approved")
+    // "always" saved a rule for the project; it can be listed and removed.
+    const saved = await h.call("opencode_permissions")
+    assert.match(saved, /1 saved permission\(s\) for .*:\n(\S+) {2}bash "/, saved)
+    const rule = saved.match(/\n(\S+) {2}bash/)![1]!
+    assert.match(await h.call("opencode_permissions", { action: "remove", id: rule }), new RegExp(`Removed ${rule}: bash`))
+    assert.match(await h.call("opencode_permissions"), /No saved permissions/)
+    await assert.rejects(h.call("opencode_permissions", { action: "remove", id: "nope" }), /no saved permission nope/)
 
     const denied = await h.call("opencode_spawn", { prompt: "TOOL: echo nope > denied.txt", permissions: "deny", wait: true, timeout_seconds: 60 })
     assert.match(denied, /IDLE/)
@@ -454,6 +461,34 @@ describe("opencode MCP server: core behaviour (real opencode, mock LLM)", { time
     const req = blocked.match(/needs permission (per_\w+)/)![1]!
     await h.call("opencode_respond", { id: "chained", request_id: req, decision: "reject" })
     assert.equal(board.task(other.id).attempts[0]!.seenAt, undefined, "the untrusted command never ran")
+  })
+
+  test("context use shows in status; compaction where the server supports it", async () => {
+    const first = await h.call("opencode_spawn", { prompt: "remember the word kiwi", name: "long", wait: true, timeout_seconds: 60 })
+    assert.match(first, /long .*— IDLE · 1 steps · .* · ctx 15\/100k \(0%\)/, first)
+    // OpenCode 1.19 cannot compact v2 sessions yet (503); when it can, the agent carries on from a summary.
+    const compacted = await h.call("opencode_compact", { id: "long" }).catch((err: Error) => err.message)
+    if (/cannot compact v2 sessions yet/.test(compacted)) assert.match(compacted, /dispose the agent keeping its worktree and spawn a new one/)
+    else assert.match(compacted, /long .*— IDLE · .* · ctx compacted/, compacted)
+    await h.call("opencode_spawn", { prompt: "SLOW", name: "busy-compact" })
+    await assert.rejects(h.call("opencode_compact", { id: "busy-compact" }), /busy-compact is running; compact it once it is idle/)
+    await h.call("opencode_interrupt", { id: "busy-compact" })
+  })
+
+  test("revert: the last turn's files and messages are undone; the agent carries on from before it", async () => {
+    await h.call("opencode_spawn", { prompt: "hello", name: "undo", permissions: "allow", wait: true, timeout_seconds: 60 })
+    const bad = await h.call("opencode_message", { id: "undo", message: "TOOL: echo oops > oops.txt", wait: true, timeout_seconds: 60 })
+    assert.match(bad, /IDLE/)
+    assert.ok(fs.existsSync(path.join(repo, "oops.txt")))
+    const out = await h.call("opencode_revert", { id: "undo" })
+    assert.match(out, /^Reverted 1 turn\(s\); restored: oops\.txt \(deleted\)\./, out)
+    assert.ok(!fs.existsSync(path.join(repo, "oops.txt")), "the file is gone")
+    const before = mock.requests.length
+    assert.match(await h.call("opencode_message", { id: "undo", message: "and now?", wait: true, timeout_seconds: 60 }), /Echo\[none\]: and now\?/)
+    const sent = JSON.stringify((mock.requests[before] as { messages: unknown[] }).messages)
+    assert.ok(sent.includes("hello") && !sent.includes("oops"), "the reverted turn is not in the model's context")
+    await assert.rejects(h.call("opencode_revert", { id: "undo", turns: 2 }), /undo undo's first turn, leaving nothing/)
+    await assert.rejects(h.call("opencode_revert", { id: "undo", turns: 9 }), /has 2 turn\(s\) on record; cannot revert 9/)
   })
 
   test("channel notifications are pushed when agents settle", async () => {

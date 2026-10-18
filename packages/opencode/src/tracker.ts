@@ -30,6 +30,8 @@ export interface Turn {
   endedAt?: number
   failure?: string
   interrupted?: boolean
+  /** Messages of this turn, in order: its prompt(s) and the assistant's messages. */
+  messageIDs?: string[]
 }
 
 export interface Track {
@@ -51,6 +53,10 @@ export interface Track {
   lastEventAt: number
   lastPromptedAt: number
   lastPromptedSeq: number
+  /** Context window in use after the latest step (its prompt plus its output), in tokens. */
+  context?: number
+  /** Compactions so far (each resets the context). */
+  compactions: number
   /** Model and agent profile of the latest step (the session may not record them). */
   model?: { id: string; providerID: string; variant?: string }
   agent?: string
@@ -77,6 +83,7 @@ export function emptyTrack(): Track {
     cost: 0,
     tokens: { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
     stepCosts: [],
+    compactions: 0,
     lastEventAt: 0,
     lastPromptedAt: 0,
     lastPromptedSeq: 0,
@@ -141,8 +148,9 @@ export function apply(t: Track, e: DurableEvent, estimate?: CostEstimator): void
       if (steering) {
         // Steered into a running turn: same turn, remember the extra instruction.
         turn.prompt = `${turn.prompt}\n[steer] ${text}`
+        if (id) turn.messageIDs?.push(id)
       } else {
-        t.turns.push({ startSeq: seq, startedAt: at, admittedAt, admittedSeq, prompt: text, finalText: "", steps: 0, cost: 0 })
+        t.turns.push({ startSeq: seq, startedAt: at, admittedAt, admittedSeq, prompt: text, finalText: "", steps: 0, cost: 0, messageIDs: id ? [id] : [] })
         if (t.turns.length > MAX_TURNS) t.turns.shift()
       }
       t.inLoop = true
@@ -150,6 +158,7 @@ export function apply(t: Track, e: DurableEvent, estimate?: CostEstimator): void
     }
     case "session.next.step.started":
       t.stepOpen = true
+      if (turn && typeof d.assistantMessageID === "string" && !turn.messageIDs?.includes(d.assistantMessageID)) turn.messageIDs?.push(d.assistantMessageID)
       if (d.model && typeof d.model === "object") t.model = d.model as Track["model"]
       if (typeof d.agent === "string") t.agent = d.agent
       t.totalSteps++
@@ -173,10 +182,26 @@ export function apply(t: Track, e: DurableEvent, estimate?: CostEstimator): void
       t.stepCosts.push({ at, cost })
       if (t.stepCosts.length > MAX_STEP_COSTS) t.stepCosts.shift()
       for (const k of Object.keys(step) as (keyof Tokens)[]) t.tokens[k] += step[k]
+      const used = step.input + step.cacheRead + step.cacheWrite + step.output + step.reasoning
+      if (used) t.context = used
       // "tool-calls" means the loop continues with another step.
       if (str(d.finish) !== "tool-calls") endTurn(t, at)
       break
     }
+    case "session.next.revert.committed": {
+      // Everything after the boundary message is gone: drop the turns that started after it.
+      const boundary = str(d.messageID)
+      const keep = t.turns.findIndex((x) => x.messageIDs?.includes(boundary))
+      t.turns.splice(keep + 1)
+      t.inLoop = false
+      t.stepOpen = false
+      t.openTools.clear()
+      break
+    }
+    case "session.next.compaction.ended":
+      t.compactions++
+      t.context = undefined
+      break
     case "session.next.step.failed": {
       t.stepOpen = false
       t.openTools.clear()
