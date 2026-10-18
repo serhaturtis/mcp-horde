@@ -12,6 +12,7 @@ It is built on OpenCode's **v2 server API** (`/api/*`, through `@opencode-ai/sdk
 | Spawn an agent with its own model, effort (`variant`), profile, instructions, directory, limits and permission policy | `opencode_spawn` |
 | Give an agent a custom profile (tool allow/deny list, step cap) | `opencode_spawn` `profile` |
 | Run agents in parallel without collisions, each in its own git worktree and branch | `opencode_spawn` `isolation: "worktree"` |
+| Confine an agent's file edits to some paths: OpenCode refuses the rest (`outside: "deny"`) or asks you (`"ask"`, whatever the permission policy) | `opencode_spawn` `scope` (worktree only; `bash` writes are caught by the gate's audit instead) |
 | Check an agent's work mechanically when it finishes, and send failures back to it to fix | `opencode_spawn` / `opencode_message` `gate` |
 | Work a task from [`@mcp-horde/board`](../board): the board's brief as the prompt, a worktree and a gate on the task's scope, the attempt (and its worktree) recorded on the board | `opencode_spawn` `task` |
 | Get notified when agents finish | `opencode_wait` (returns each result once), or channel push (below) |

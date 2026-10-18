@@ -108,6 +108,14 @@ export interface Profile {
   /** Hard cap on agent-loop steps per turn, enforced by OpenCode. */
   steps?: number
   description?: string
+  /** OpenCode permission rules, e.g. { edit: { "src/**": "allow", "*": "deny" } }. */
+  permission?: Record<string, string | Record<string, string>>
+}
+
+/** Paths an agent may edit; everything else is refused ("deny") or asked about ("ask"). */
+export interface Scope {
+  paths: string[]
+  outside?: "deny" | "ask"
 }
 
 export interface SpawnInput {
@@ -129,6 +137,8 @@ export interface SpawnInput {
   limits?: Limits
   files?: string[]
   gate?: GateInput
+  /** Edits outside these paths are refused by OpenCode (needs isolation "worktree"). */
+  scope?: Scope
   signal?: AbortSignal
   onProgress?: (message: string) => void
 }
@@ -226,6 +236,21 @@ export function unsupportedReason(m: ModelV2Info): string | undefined {
 
 export function defaultQuestionPolicy(p: PermissionPolicy): QuestionPolicy {
   return p === "user" ? "user" : p === "ask" ? "ask" : "dismiss"
+}
+
+/**
+ * A profile whose edits are confined to the scope: OpenCode's `edit` permission (its edit,
+ * write and patch tools) as a glob map, the scope's paths allowed and everything else
+ * `outside`. OpenCode applies the last matching rule, so the catch-all comes first.
+ */
+export function withScope(profile: Profile, scope: Scope): Profile {
+  if (!scope.paths.length) throw new Error("scope.paths needs at least one path or glob")
+  const rules: Record<string, string> = { "*": scope.outside ?? "deny" }
+  for (const p of scope.paths) {
+    const glob = p.replace(/\\/g, "/").replace(/^\.\//, "")
+    rules[glob.endsWith("/") ? `${glob}**` : glob] = "allow"
+  }
+  return { ...profile, permission: { ...profile.permission, edit: rules } }
 }
 
 /** Drop undefined values, so a partial update never erases other fields. */
@@ -507,6 +532,8 @@ export class Fleet {
       if (taken) throw new Error(`an agent named "${input.name}" already exists; pick another name or dispose it`)
     }
     if (input.profile && input.agent) throw new Error("pass either agent (an existing profile) or profile (a custom one), not both")
+    if (input.scope && input.agent) throw new Error("scope builds a custom profile; it cannot be combined with agent (use profile for tool switches)")
+    if (input.scope && input.isolation !== "worktree") throw new Error('scope needs isolation "worktree" (a per-agent profile only loads in a fresh directory)')
     const model = input.model ? parseModel(input.model, input.variant) : undefined
     if (!model && input.variant) throw new Error("variant requires model (pick one with opencode_models)")
     if (model) await this.validateModel(model, directory)
@@ -538,8 +565,9 @@ export class Fleet {
       }
       if (input.signal?.aborted) throw new Error("cancelled")
       let agent = input.agent
-      if (input.profile) {
-        const made = await this.writeProfile(directory, name, input.profile)
+      const profile = input.scope ? withScope(input.profile ?? {}, input.scope) : input.profile
+      if (profile) {
+        const made = await this.writeProfile(directory, name, profile)
         agent = made.agent
         agentFile = made.file
       }
@@ -560,6 +588,7 @@ export class Fleet {
         worktree,
         limits: defined(input.limits ?? {}),
         agentFile,
+        scope: input.scope,
         createdAt: Date.now(),
         owner: SELF,
         reportedSeq: 0,
@@ -616,6 +645,16 @@ export class Fleet {
       ...(profile.steps ? [`steps: ${profile.steps}`] : []),
       ...(profile.tools && Object.keys(profile.tools).length
         ? ["tools:", ...Object.entries(profile.tools).map(([k, v]) => `  ${JSON.stringify(k)}: ${v}`)]
+        : []),
+      ...(profile.permission && Object.keys(profile.permission).length
+        ? [
+            "permission:",
+            ...Object.entries(profile.permission).flatMap(([action, rule]) =>
+              typeof rule === "string"
+                ? [`  ${JSON.stringify(action)}: ${rule}`]
+                : [`  ${JSON.stringify(action)}:`, ...Object.entries(rule).map(([glob, v]) => `    ${JSON.stringify(glob)}: ${v}`)],
+            ),
+          ]
         : []),
       "---",
       "",
@@ -1189,6 +1228,11 @@ export class Fleet {
     }
     for (const p of live.pending.permissions) {
       if (live.handled.has(p.id) || live.handedToCaller.has(p.id)) continue
+      // An edit outside a scope with outside "ask" is the orchestrator's call, whatever the policy.
+      if (record.scope?.outside === "ask" && p.action === "edit") {
+        this.handToCaller(live, p.id)
+        continue
+      }
       if (record.policy === "allow" || record.policy === "deny") {
         live.handled.add(p.id)
         await this.replyPermission(

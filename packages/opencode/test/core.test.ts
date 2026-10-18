@@ -391,7 +391,14 @@ describe("opencode MCP server: core behaviour (real opencode, mock LLM)", { time
   })
 
   test("worktree sync: the agent's work is replayed onto what was merged since; conflicts abort cleanly", async () => {
-    await h.call("opencode_spawn", { prompt: "TOOL: echo mine > synced-mine.txt", name: "syncer", isolation: "worktree", permissions: "allow", wait: true, timeout_seconds: 60 })
+    await h.call("opencode_spawn", {
+      prompt: "TOOL: echo mine > synced-mine.txt",
+      name: "syncer",
+      isolation: "worktree",
+      permissions: "allow",
+      wait: true,
+      timeout_seconds: 60,
+    })
     fs.writeFileSync(path.join(repo, "synced-theirs.txt"), "theirs\n")
     git(repo, "add", "synced-theirs.txt")
     git(repo, "commit", "-qm", "someone else's work")
@@ -405,15 +412,65 @@ describe("opencode MCP server: core behaviour (real opencode, mock LLM)", { time
     assert.equal(fs.readFileSync(path.join(repo, "synced-mine.txt"), "utf8").trim(), "mine")
     await h.call("opencode_dispose", { id: "syncer", worktree: "remove" })
 
-    await h.call("opencode_spawn", { prompt: "TOOL: echo agent > sync-clash.txt", name: "clasher", isolation: "worktree", permissions: "allow", wait: true, timeout_seconds: 60 })
+    await h.call("opencode_spawn", {
+      prompt: "TOOL: echo agent > sync-clash.txt",
+      name: "clasher",
+      isolation: "worktree",
+      permissions: "allow",
+      wait: true,
+      timeout_seconds: 60,
+    })
     fs.writeFileSync(path.join(repo, "sync-clash.txt"), "main\n")
     git(repo, "add", "sync-clash.txt")
     git(repo, "commit", "-qm", "clash")
     const before = git(repo, "rev-parse", "horde/clasher")
-    await assert.rejects(h.call("opencode_worktree", { id: "clasher", action: "sync" }), /failed and was aborted; the worktree is unchanged[\s\S]*sync-clash\.txt/)
+    await assert.rejects(
+      h.call("opencode_worktree", { id: "clasher", action: "sync" }),
+      /failed and was aborted; the worktree is unchanged[\s\S]*sync-clash\.txt/,
+    )
     // The agent's leftovers were committed first; nothing was rebased.
     assert.equal(git(repo, "rev-parse", "horde/clasher~1"), before)
     await h.call("opencode_dispose", { id: "clasher", worktree: "discard" })
+  })
+
+  test("scope: edits inside the scope go through, edits outside are refused by OpenCode", async () => {
+    const inside = await h.call("opencode_spawn", {
+      prompt: 'CALL: write {"path": "scoped/in.txt", "content": "inside"}',
+      name: "scoped",
+      isolation: "worktree",
+      permissions: "allow",
+      scope: { paths: ["scoped/**"] },
+      wait: true,
+      timeout_seconds: 60,
+    })
+    const dir = inside.match(/dir: (\S+) \(worktree/)![1]!
+    assert.equal(fs.readFileSync(path.join(dir, "scoped/in.txt"), "utf8"), "inside")
+    const outside = await h.call("opencode_message", {
+      id: "scoped",
+      message: 'CALL: write {"path": "elsewhere.txt", "content": "outside"}',
+      wait: true,
+      timeout_seconds: 60,
+    })
+    assert.ok(!fs.existsSync(path.join(dir, "elsewhere.txt")), "the out-of-scope write was refused")
+    await h.call("opencode_dispose", { id: "scoped", worktree: "discard" })
+    // outside "ask": the out-of-scope edit comes to the caller even under the "allow" policy.
+    const asking = await h.call("opencode_spawn", {
+      prompt: 'CALL: write {"path": "elsewhere.txt", "content": "outside"}',
+      name: "scoped-ask",
+      isolation: "worktree",
+      permissions: "allow",
+      scope: { paths: ["scoped/**"], outside: "ask" },
+      wait: true,
+      timeout_seconds: 60,
+    })
+    assert.match(asking, /scoped-ask .*— NEEDS_INPUT[\s\S]*needs permission (per_\w+): edit/, asking)
+    const req = asking.match(/needs permission (per_\w+): edit/)![1]!
+    await h.call("opencode_respond", { id: "scoped-ask", request_id: req, decision: "once" })
+    assert.match(await h.call("opencode_wait", { ids: ["scoped-ask"], timeout_seconds: 60 }), /IDLE/)
+    const askDir = asking.match(/dir: (\S+) \(worktree/)![1]!
+    assert.equal(fs.readFileSync(path.join(askDir, "elsewhere.txt"), "utf8"), "outside", "approved by the caller")
+    await h.call("opencode_dispose", { id: "scoped-ask", worktree: "discard" })
+    await assert.rejects(h.call("opencode_spawn", { prompt: "x", scope: { paths: ["a/**"] } }), /scope needs isolation "worktree"/)
   })
 
   test("gates: a failing check goes back to the agent, which fixes it; the caller only hears the outcome", async () => {

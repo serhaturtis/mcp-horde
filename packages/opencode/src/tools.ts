@@ -350,6 +350,18 @@ export function registerTools(server: McpServer, ctx: Context) {
       limits: limits.optional(),
       files: files.optional(),
       gate: gate.optional(),
+      scope: z
+        .object({
+          paths: z.array(z.string()).min(1).describe('Paths or globs relative to the repository root, e.g. ["src/auth/**", "test/auth/**"].'),
+          outside: z
+            .enum(["deny", "ask"])
+            .optional()
+            .describe('"deny" (default): OpenCode refuses edits elsewhere and tells the agent; "ask": they become permission requests.'),
+        })
+        .optional()
+        .describe(
+          "Confine the agent's file edits (edit/write/patch tools) to these paths. Needs isolation \"worktree\". bash can still write files: the gate's audit catches that.",
+        ),
       wait: z.boolean().optional().describe("Block until it settles. Default false."),
       timeout_seconds: timeout.optional(),
     },
@@ -377,6 +389,7 @@ export function registerTools(server: McpServer, ctx: Context) {
         limits: limitsIn(a.limits),
         files: a.files,
         gate: gateIn(a.gate),
+        scope: a.scope,
         signal: extra.signal,
         onProgress: progressMessage(extra),
       })

@@ -77,6 +77,8 @@ export interface AgentRecord {
   pauseAfterStep?: boolean
   gate?: GateConfig
   gateState?: GateState
+  /** Paths its edits are confined to (enforced by its profile). */
+  scope?: { paths: string[]; outside?: "deny" | "ask" }
   /** The board task this agent works (opencode_spawn task). */
   task?: { id: string; title: string; attempt: number }
 }
