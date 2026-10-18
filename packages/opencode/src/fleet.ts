@@ -1549,20 +1549,22 @@ export class Fleet {
       throw new Error(`${name} is ${live.state}; revert it once it is idle (opencode_wait, or opencode_interrupt first)`)
     const sessionID = live.record.id
     // The conversation in order, oldest first.
-    const ids: string[] = []
-    let cursor: string | undefined
-    for (let page = 0; page < 50; page++) {
-      const res = unwrap(
-        await this.api.session.messages(cursor ? { sessionID, limit: 200, cursor } : { sessionID, order: "asc", limit: 200 }),
-        "reading the conversation",
-      ) as {
-        data: { id: string }[]
-        cursor?: { next?: string }
+    const conversation = async () => {
+      const out: { id: string; type?: string; snapshot?: { start?: string; end?: string } }[] = []
+      let cursor: string | undefined
+      for (let page = 0; page < 50; page++) {
+        const res = unwrap(
+          await this.api.session.messages(cursor ? { sessionID, limit: 200, cursor } : { sessionID, order: "asc", limit: 200 }),
+          "reading the conversation",
+        ) as { data: typeof out; cursor?: { next?: string } }
+        out.push(...res.data)
+        cursor = res.cursor?.next
+        if (!cursor || !res.data.length) break
       }
-      ids.push(...res.data.map((m) => m.id))
-      cursor = res.cursor?.next
-      if (!cursor || !res.data.length) break
+      return out
     }
+    let messages = await conversation()
+    const ids = messages.map((m) => m.id)
     let boundary = opts.to
     let undone = 0
     if (boundary) {
@@ -1578,6 +1580,13 @@ export class Fleet {
       if (at === 0) throw new Error(`that would undo ${name}'s first turn, leaving nothing; dispose the agent (and its worktree) instead`)
       boundary = ids[at - 1]!
       undone = n
+    }
+    // OpenCode records a step's file snapshot shortly after the step ends; revert only once the
+    // turns being undone have theirs, or it would find no changes to restore.
+    const after = (ms: typeof messages) => ms.slice(ms.findIndex((m) => m.id === boundary) + 1)
+    for (let i = 0; i < 40 && after(messages).some((m) => m.type === "assistant" && m.snapshot?.start && !m.snapshot.end); i++) {
+      await sleep(250)
+      messages = await conversation()
     }
     const staged = unwrap(await this.api.session.revert.stage({ sessionID, messageID: boundary, files: true }), "staging the revert").data
     unwrap(await this.api.session.revert.commit({ sessionID }), "committing the revert")
