@@ -1,0 +1,51 @@
+{
+  "name": "@mcp-horde/review",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Checks a worker's work against its task's acceptance criteria: builds a review from the board task and its worktree diff, has a model answer each criterion with cited lines, and verifies every citation against the diff.",
+  "license": "MIT",
+  "keywords": [
+    "mcp",
+    "agents",
+    "code-review",
+    "acceptance-criteria",
+    "claude-code",
+    "opencode"
+  ],
+  "type": "module",
+  "exports": {
+    ".": {
+      "source": "./src/lib.ts",
+      "types": "./dist/lib.d.ts",
+      "default": "./dist/lib.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/serhaturtis/mcp-horde.git",
+    "directory": "packages/review"
+  },
+  "scripts": {
+    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.test.json",
+    "test": "node --conditions=source --import tsx --test --test-concurrency=1 test/review.test.ts"
+  },
+  "dependencies": {
+    "@mcp-horde/board": "^0.1.0",
+    "@mcp-horde/context": "^0.1.0",
+    "@mcp-horde/core": "^0.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

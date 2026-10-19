@@ -3,8 +3,9 @@ import { existsSync } from "node:fs"
 import fs from "node:fs/promises"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
-import { Board, isTrustedCommand, renderBrief } from "@mcp-horde/board"
-import { git, loadTiers, oneLine, tierLabel, tierModel } from "@mcp-horde/core"
+import { Board, current, isTrustedCommand, renderBrief } from "@mcp-horde/board"
+import { formatUsd, git, loadTiers, oneLine, tierLabel, tierModel } from "@mcp-horde/core"
+import { checkVerdicts, collectReview, disagreements, REVIEW_SCHEMA, renderVerdicts, reviewPrompt, type Verdict } from "@mcp-horde/review"
 import { gate as runGate, defaultStateDir as verifyStateDir } from "@mcp-horde/verify"
 import type {
   AgentV2Info,
@@ -588,7 +589,7 @@ export class Fleet {
     }
   }
 
-  private resolveDir(dir?: string): string {
+  resolveDir(dir?: string): string {
     return path.resolve(this.config.directory, dir ?? ".")
   }
 
@@ -614,6 +615,62 @@ export class Fleet {
     } finally {
       release()
     }
+  }
+
+  /**
+   * An acceptance review of a task's latest attempt: a model judges each criterion from the
+   * attempt's worktree diff and must cite its lines; citations are checked against the diff
+   * (an unfounded "met" becomes "unclear"). With several models, where they disagree is
+   * listed. The first model's outcome is kept on the attempt. By default the reviewer is the
+   * cheapest tier model other than the one that did the work.
+   */
+  async review(input: {
+    id: string
+    directory?: string
+    models?: string[]
+    path?: string
+    base?: string
+    maxDiffChars?: number
+    timeoutMs?: number
+    signal?: AbortSignal
+  }): Promise<string> {
+    const repo = this.resolveDir(input.directory)
+    const board = await Board.open(repo)
+    const attempt = current(board.task(input.id))
+    const override = input.path ? { path: this.resolveDir(input.path), base: input.base ?? "HEAD" } : undefined
+    const r = await collectReview(board, input.id, { override, maxDiffChars: input.maxDiffChars })
+    const worker = attempt?.model
+    const models = input.models?.length ? input.models : [loadTiers(repo).find((t) => t.model !== worker)?.model]
+    const results: { model: string; verdicts: Verdict[]; cost: number }[] = []
+    for (const model of models) {
+      const answer = await this.ask({
+        prompt: reviewPrompt(r),
+        model,
+        schema: REVIEW_SCHEMA as unknown as JsonSchema,
+        directory: repo,
+        timeoutMs: input.timeoutMs,
+        signal: input.signal,
+      })
+      results.push({
+        model: answer.model ? `${answer.model.providerID}/${answer.model.id}` : "default model",
+        verdicts: checkVerdicts(r, answer.json),
+        cost: answer.cost,
+      })
+    }
+    const first = results[0]!
+    if (attempt && !override)
+      await board.recordReview(input.id, attempt.n, {
+        model: first.model,
+        met: first.verdicts.filter((v) => v.status === "met").length,
+        notMet: first.verdicts.filter((v) => v.status === "not_met").length,
+        total: first.verdicts.length,
+        at: Date.now(),
+      })
+    const parts = results.map((x) => renderVerdicts(r, x.verdicts, x.model))
+    const disputes = results.slice(1).flatMap((x) => disagreements(first, x))
+    const cost = results.reduce((n, x) => n + x.cost, 0)
+    const same = worker && results.some((x) => x.model === worker) ? `\n(reviewed by the model that did the work: a different one catches more)` : ""
+    return `${parts.join("\n\n")}${results.length > 1 ? `\n\n${disputes.length ? `Reviewers disagree on:\n${disputes.join("\n")}` : "Reviewers agree on every criterion."}` : ""}\n(${formatUsd(cost)})${same}`
   }
 
   /**

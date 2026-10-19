@@ -130,6 +130,21 @@ export async function startMockLlm(): Promise<{ url: string; close: () => void; 
       })
     }
     if (userText.includes("TOOLS?")) return say(`Tools: ${(b.tools ?? []).map((t) => t.function.name).join(",")}`)
+    // An acceptance review: criterion 1 met with a real line of the change, criterion 2 "met"
+    // with a line that is not in it (the reviewer must downgrade it), the rest not met.
+    if (userText.includes("# Acceptance criteria") && userText.includes("# The change")) {
+      const file = /^=== (\S+)$/m.exec(userText)?.[1] ?? "none"
+      const line = Number(/^L(\d+) \+/m.exec(userText)?.[1] ?? 1)
+      const count = (/# Acceptance criteria\n([\s\S]*?)\n\n/.exec(userText)?.[1] ?? "").split("\n").filter((l) => /^\d+\. /.test(l)).length
+      const verdicts = Array.from({ length: count }, (_, i) =>
+        i === 0
+          ? { criterion: 1, status: "met", evidence: [{ file, line }], note: "done" }
+          : i === 1
+            ? { criterion: 2, status: "met", evidence: [{ file, line: 9999 }], note: "trust me" }
+            : { criterion: i + 1, status: "not_met", evidence: [], note: "missing" },
+      )
+      return say(JSON.stringify({ verdicts }))
+    }
     // JSON answers: "JSON: <json>" says it; "JSON-RETRY" says prose until told it was not valid.
     const everything = msgs
       .filter((m) => m.role === "user")

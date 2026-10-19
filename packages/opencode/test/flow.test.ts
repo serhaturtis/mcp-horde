@@ -110,6 +110,12 @@ describe("the horde flow: board, workers, gates (real opencode, mock LLM)", { ti
       assert.match(report, /mock work done/)
       // The mock reports the brief's example file names: the board catches the mismatch with the diff.
       assert.match(report, /⚠ claimed but not in the diff: a\.ts, b\.ts, a\.test\.ts\n {2}⚠ in the diff but not in the report: [ab]\.js/, report)
+      // The acceptance review reads the attempt's worktree; the default reviewer is another tier's model.
+      if (task === a) {
+        const review = await h.call("review_task", { id: task })
+        assert.match(review, /^review t-\w+ "Module a" by mock\/pricey: 1\/1 met\n✓ 1\. a\.js exports a — a\.js:1\n/, review)
+        assert.match(await boardCall("board_task", { id: task }), /review 1\/1 met by mock\/pricey/)
+      }
       // The merged checkout is checked too, not just each worker's branch.
       assert.match(await h.call("opencode_worktree", { id: name, action: "merge" }), /merged 1 commit[\s\S]*your checkout after the merge: PASS/)
       await h.call("opencode_dispose", { id: name, worktree: "remove" })

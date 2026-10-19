@@ -98,8 +98,11 @@ function attemptLine(t: Task, now: number): string {
   if (!a) return ""
   const who = a.agent ? `agent ${a.agent}${a.model ? ` on ${a.model}${a.variant ? ` [${a.variant}]` : ""}` : ""}, ` : ""
   const seen = a.seenAt ? `last seen ${ago(a.seenAt, now)}` : "worker not seen yet"
+  const reviewed = a.review
+    ? `review ${a.review.met}/${a.review.total} met${a.review.notMet ? ` (${a.review.notMet} not met)` : ""} by ${a.review.model}, `
+    : ""
   const doing = a.activity && !a.endedAt ? `${a.activity.state}${a.activity.gate ? `, gate ${a.activity.gate}` : ""}, ` : ""
-  return ` (${who}attempt ${a.n}, ${doing}${seen}${a.progress ? `: "${truncate(a.progress, 80)}"` : ""})`
+  return ` (${who}attempt ${a.n}, ${reviewed}${doing}${seen}${a.progress ? `: "${truncate(a.progress, 80)}"` : ""})`
 }
 
 /** One screen for the orchestrator: what is running, what needs a decision, what is next. */

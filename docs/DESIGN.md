@@ -1,6 +1,6 @@
 # mcp-horde: system design
 
-Status: October 2026. Built: `@mcp-horde/opencode`, `@mcp-horde/core`, `@mcp-horde/verify`, gates in `opencode` (M0, M1), `@mcp-horde/board` with its worker CLI, the `horde` Claude Code plugin with its orchestration skill (M2), `@mcp-horde/context` with code context in briefs and related-test gates (M3), and the M4 refinements (one-shot asks, scopes, worktree sync, revert, saved permissions, task-bound spawns that check reports against the diff; compaction waits on OpenCode), and the integration pass after it (model tiers from `horde.json`, attempt costs recorded on the board automatically, checks on the main checkout after every merge, `opencode.maxRunning` in `horde.json`, `horde status` for humans), and M5 (tree-sitter definitions in `context`, `horde watch`). The milestones in §12 are complete; since then: `@mcp-horde/ledger` (§4.7), starting tiers learned from the boards' history.
+Status: October 2026. Built: `@mcp-horde/opencode`, `@mcp-horde/core`, `@mcp-horde/verify`, gates in `opencode` (M0, M1), `@mcp-horde/board` with its worker CLI, the `horde` Claude Code plugin with its orchestration skill (M2), `@mcp-horde/context` with code context in briefs and related-test gates (M3), and the M4 refinements (one-shot asks, scopes, worktree sync, revert, saved permissions, task-bound spawns that check reports against the diff; compaction waits on OpenCode), and the integration pass after it (model tiers from `horde.json`, attempt costs recorded on the board automatically, checks on the main checkout after every merge, `opencode.maxRunning` in `horde.json`, `horde status` for humans), and M5 (tree-sitter definitions in `context`, `horde watch`). The milestones in §12 are complete; since then: `@mcp-horde/ledger` (§4.7), starting tiers learned from the boards' history, and `@mcp-horde/review` (§4.8), acceptance reviews with checked citations.
 
 ## 1. What this is for
 
@@ -263,6 +263,10 @@ The board already records every attempt's task (kind of work, scope), tier, mode
 - `ledger_stats { by: model | tier | kind | area | repo, all_repos?, since_days? }`: accepted/attempts, mean gate rounds, cost per accepted task (failed attempts' spend counts against the accepted ones), and a drift warning when a model's last 10 attempts pass clearly less often than its history.
 
 Read-only over the boards (a library plus a small server; no store of its own), so it is always consistent with them. The playbook calls `ledger_suggest { apply: true }` right after `board_plan`.
+
+### 4.8 `@mcp-horde/review` (built after M5)
+
+The gate proves the code builds and its tests pass; it cannot tell whether the change does what the task asked, so the orchestrator still read reports and diffs. `review_task { id, models? }` (in `opencode`, which owns the models; the logic is the `review` library) gives each acceptance criterion to a cheap model with the attempt's worktree diff (new-file line numbers, touched definitions, a budget that lists what it leaves out) and asks for met / not met / unclear with cited lines, as checked JSON through `opencode_ask`. Every citation is then checked against the lines the diff shows: a "met" without a real line becomes "unclear", invented citations are dropped and counted, a skipped criterion is "unclear". The default reviewer is the cheapest tier model other than the worker's; several models cross-check and list disagreements. The first reviewer's outcome is kept on the attempt and shown by `board_task`.
 
 ## 5. Configuration: one `horde.json`
 

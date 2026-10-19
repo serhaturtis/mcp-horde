@@ -606,6 +606,31 @@ export function registerTools(server: McpServer, ctx: Context) {
   )
 
   tool(
+    "review_task",
+    'Check a board task\'s latest attempt against its acceptance criteria: a model reads the attempt\'s worktree diff and answers each criterion met / not met / unclear, citing the lines that show it; every citation is checked against the diff, so a "met" without real evidence becomes "unclear". The gate proves the code builds and its tests pass; this asks whether it does what the task asked. Default reviewer: the cheapest tier model other than the worker\'s. Two models cross-check each other and list where they disagree. The outcome is kept on the attempt (board_task shows it).',
+    {
+      id: z.string().describe("Board task id, e.g. t-3fa2 (its latest attempt's worktree is reviewed)."),
+      directory: z.string().optional().describe("Repository of the board (default: the server's directory)."),
+      models: z.array(z.string()).max(3).optional().describe('Reviewer models, "provider/model" (default: one, chosen as described).'),
+      path: z.string().optional().describe("Review this checkout instead of the attempt's worktree (with base)."),
+      base: z.string().optional().describe("With path: the commit the change starts from (default HEAD: uncommitted changes)."),
+      max_diff_chars: z.number().int().min(2000).max(400_000).optional().describe("Diff budget (default 60000); files beyond it are listed as not reviewed."),
+      timeout_seconds: z.number().int().min(1).max(3600).optional().describe("Max seconds per reviewer (default 300 in Claude Code, 50 elsewhere)."),
+    },
+    async (a, fleet, extra) =>
+      fleet.review({
+        id: a.id,
+        directory: a.directory,
+        models: a.models,
+        path: a.path,
+        base: a.base,
+        maxDiffChars: a.max_diff_chars,
+        timeoutMs: (a.timeout_seconds ?? Math.min(defaultWait(ctx), 300)) * 1000,
+        signal: extra.signal,
+      }),
+  )
+
+  tool(
     "opencode_compact",
     "Compact an idle agent's conversation: OpenCode replaces it with a summary and the agent carries on from there with most of its context window free. Use it before messaging an agent whose context is nearly full (status shows ctx %) instead of spawning a new one; its files and worktree are untouched.",
     { id: z.string().describe("Agent id or name.") },

@@ -39,6 +39,8 @@ export interface Attempt {
   /** The model that worked it ("provider/model", plus variant), when the runtime said so. */
   model?: string
   variant?: string
+  /** The latest acceptance review of the attempt's change (review_task). */
+  review?: { model: string; met: number; notMet: number; total: number; at: number }
   /** What the runtime last said about the attempt's agent (opencode_spawn task): for people watching. */
   activity?: { state: string; gate?: string; at: number }
   /** Where the attempt's work lives, when the runtime that started it said so (opencode_spawn task). */
@@ -399,6 +401,16 @@ export class Board {
       if (activity.state) a.activity = { state: activity.state, gate: activity.gate, at: Date.now() }
       if (activity.model) Object.assign(a, { model: activity.model, variant: activity.variant })
       t.cost = totalCost(t)
+    })
+  }
+
+  /** Keep the outcome of an acceptance review on the attempt it judged. */
+  recordReview(id: string, attempt: number, review: NonNullable<Attempt["review"]>): Promise<Task> {
+    return this.update(id, (t) => {
+      const a = t.attempts.find((x) => x.n === attempt)
+      if (!a) throw new Error(`${id} has no attempt ${attempt}`)
+      a.review = review
+      this.event("review", { task: id, attempt, met: `${review.met}/${review.total}` })
     })
   }
 
