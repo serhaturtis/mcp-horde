@@ -81,5 +81,7 @@ describe("plugin bundles", { timeout: 300_000 }, () => {
     assert.match(await context("context_find", { query: "add", kind: "definition" }), /^util\.js:1 {2}/)
     // The bundle finds its grammars next to it.
     assert.match(await context("context_map"), /Definitions from: tree-sitter$/m)
+    const ledger = await server("ledger", { HORDE_LEDGER_DIRECTORY: repo, HORDE_BOARD_STATE_DIR: path.join(tmp, "ledger-board") })
+    assert.match(await ledger("ledger_stats"), /No closed attempts/)
   })
 })

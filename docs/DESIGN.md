@@ -1,6 +1,6 @@
 # mcp-horde: system design
 
-Status: October 2026. Built: `@mcp-horde/opencode`, `@mcp-horde/core`, `@mcp-horde/verify`, gates in `opencode` (M0, M1), `@mcp-horde/board` with its worker CLI, the `horde` Claude Code plugin with its orchestration skill (M2), `@mcp-horde/context` with code context in briefs and related-test gates (M3), and the M4 refinements (one-shot asks, scopes, worktree sync, revert, saved permissions, task-bound spawns that check reports against the diff; compaction waits on OpenCode), and the integration pass after it (model tiers from `horde.json`, attempt costs recorded on the board automatically, checks on the main checkout after every merge, `opencode.maxRunning` in `horde.json`, `horde status` for humans), and M5 (tree-sitter definitions in `context`, `horde watch`). The milestones in §12 are complete.
+Status: October 2026. Built: `@mcp-horde/opencode`, `@mcp-horde/core`, `@mcp-horde/verify`, gates in `opencode` (M0, M1), `@mcp-horde/board` with its worker CLI, the `horde` Claude Code plugin with its orchestration skill (M2), `@mcp-horde/context` with code context in briefs and related-test gates (M3), and the M4 refinements (one-shot asks, scopes, worktree sync, revert, saved permissions, task-bound spawns that check reports against the diff; compaction waits on OpenCode), and the integration pass after it (model tiers from `horde.json`, attempt costs recorded on the board automatically, checks on the main checkout after every merge, `opencode.maxRunning` in `horde.json`, `horde status` for humans), and M5 (tree-sitter definitions in `context`, `horde watch`). The milestones in §12 are complete; since then: `@mcp-horde/ledger` (§4.7), starting tiers learned from the boards' history.
 
 ## 1. What this is for
 
@@ -254,6 +254,15 @@ Distribution and procedure. A plugin directory with:
 - A worker brief template (the fixed part `board_brief` emits), kept here so humans can read and tune it.
 
 The playbook also explains the tier table users edit (`horde.json` `tiers`, §5).
+
+### 4.7 `@mcp-horde/ledger` (built after M5)
+
+The board already records every attempt's task (kind of work, scope), tier, model (recorded by `opencode` for task-bound spawns), gate rounds, cost and outcome; nothing read that history back, so tiers were chosen by guesswork. The ledger closes principle 4 ("cheap first, escalate on evidence") with measured evidence:
+
+- `ledger_suggest { ids? | draft?, apply? }`: the cheapest tier that similar work has not shown to fail. Similar work: the same area of the same repository (scope directories, two levels), then the same kind (test, fix, refactor, docs, build, feature, from the title/goal); other repositories count by kind at half weight. A tier is skipped only when similar work passed on it under 40% of the time with at least two weighted attempts; otherwise tier 0 stands. `apply` raises untried tasks' tiers, never lowers them. History is matched to today's tiers by model.
+- `ledger_stats { by: model | tier | kind | area | repo, all_repos?, since_days? }`: accepted/attempts, mean gate rounds, cost per accepted task (failed attempts' spend counts against the accepted ones), and a drift warning when a model's last 10 attempts pass clearly less often than its history.
+
+Read-only over the boards (a library plus a small server; no store of its own), so it is always consistent with them. The playbook calls `ledger_suggest { apply: true }` right after `board_plan`.
 
 ## 5. Configuration: one `horde.json`
 

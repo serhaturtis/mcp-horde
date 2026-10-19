@@ -96,7 +96,7 @@ export function renderBrief(board: Board, t: Task, a: Attempt, budgetTokens = 60
 function attemptLine(t: Task, now: number): string {
   const a = current(t)
   if (!a) return ""
-  const who = a.agent ? `agent ${a.agent}, ` : ""
+  const who = a.agent ? `agent ${a.agent}${a.model ? ` on ${a.model}${a.variant ? ` [${a.variant}]` : ""}` : ""}, ` : ""
   const seen = a.seenAt ? `last seen ${ago(a.seenAt, now)}` : "worker not seen yet"
   const doing = a.activity && !a.endedAt ? `${a.activity.state}${a.activity.gate ? `, gate ${a.activity.gate}` : ""}, ` : ""
   return ` (${who}attempt ${a.n}, ${doing}${seen}${a.progress ? `: "${truncate(a.progress, 80)}"` : ""})`

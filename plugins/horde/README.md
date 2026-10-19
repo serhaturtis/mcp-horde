@@ -2,7 +2,7 @@
 
 Bundles the horde for Claude Code:
 
-- **MCP servers:** `opencode` (workers), `board` (tasks, briefs, reports), `verify` (checks and audits) and `context` (code search and the code context in briefs). They ship in `servers/` as self-contained bundles and start with `node`: no npm install, no build step.
+- **MCP servers:** `opencode` (workers), `board` (tasks, briefs, reports), `verify` (checks and audits), `context` (code search and the code context in briefs) and `ledger` (which model to start each task on, learned from past attempts). They ship in `servers/` as self-contained bundles and start with `node`: no npm install, no build step.
 - **Skill `/horde:horde`:** the procedure Claude follows: plan small tasks with observable acceptance criteria and scopes, spawn a worker per task (briefed from the board, in a worktree, behind a gate), read the gate verdict and the worker's report (checked against its diff) instead of its transcript, then merge and accept, or fail and escalate to a stronger tier.
 
 ```text

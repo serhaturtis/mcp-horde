@@ -24,6 +24,7 @@ const entries = {
   cli: "packages/board/src/cli.ts",
   verify: "packages/verify/src/index.ts",
   context: "packages/context/src/index.ts",
+  ledger: "packages/ledger/src/index.ts",
 }
 
 async function bundle(dir) {

@@ -36,6 +36,9 @@ export interface Attempt {
   cost?: number
   /** The cost was given by the orchestrator (accept/fail): the runtime's estimate no longer replaces it. */
   costGiven?: boolean
+  /** The model that worked it ("provider/model", plus variant), when the runtime said so. */
+  model?: string
+  variant?: string
   /** What the runtime last said about the attempt's agent (opencode_spawn task): for people watching. */
   activity?: { state: string; gate?: string; at: number }
   /** Where the attempt's work lives, when the runtime that started it said so (opencode_spawn task). */
@@ -387,13 +390,14 @@ export class Board {
    * e.g. opencode for a task-bound agent). The task's cost is the sum over its attempts.
    */
   /** The runtime's view of an attempt's agent: its spend so far, state and gate (tracking only, no limits). */
-  recordActivity(id: string, attempt: number, activity: { cost?: number; state?: string; gate?: string }): Promise<Task> {
+  recordActivity(id: string, attempt: number, activity: { cost?: number; state?: string; gate?: string; model?: string; variant?: string }): Promise<Task> {
     return this.update(id, (t) => {
       const a = t.attempts.find((x) => x.n === attempt)
       if (!a) throw new Error(`${id} has no attempt ${attempt}`)
       // A cost the orchestrator gave when closing the attempt stays.
       if (activity.cost !== undefined && !a.costGiven) a.cost = activity.cost
       if (activity.state) a.activity = { state: activity.state, gate: activity.gate, at: Date.now() }
+      if (activity.model) Object.assign(a, { model: activity.model, variant: activity.variant })
       t.cost = totalCost(t)
     })
   }

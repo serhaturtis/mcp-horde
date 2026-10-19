@@ -21,6 +21,8 @@ You plan and judge; workers do the typing. Your context is the scarce resource: 
 - `scope`: the paths it may change (they also choose the brief's code context). Tasks that can run in parallel must not overlap; heed the plan's overlap warnings by adding a dependency or narrowing a scope.
 - `deps`: what must be merged first.
 
+Then `ledger_suggest { apply: true }`: each new task starts on the cheapest tier that similar past work has not shown to fail (it only ever raises a tier, and says why). Now and then, `ledger_stats` shows which models earn their cost and warns when one starts failing more often.
+
 ## 2. Run each ready task
 
 For each task from `board_next` (it shows each task's tier; several in parallel, within the running limit: `opencode.maxRunning` in `horde.json`, default 8):

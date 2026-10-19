@@ -1619,11 +1619,14 @@ export class Fleet {
     if (!task || !live.state) return Promise.resolve()
     const s = this.build(live)
     const gate = s.gate && `${s.gate.state} ${Math.max(1, s.gate.round)}/${s.gate.maxRounds}`
-    const key = JSON.stringify([s.cost.toFixed(6), s.state, gate])
+    // The model that worked the attempt: what the ledger learns tiers from.
+    const model = s.model ? `${s.model.providerID}/${s.model.id}` : undefined
+    const variant = s.model?.variant && s.model.variant !== "default" ? s.model.variant : undefined
+    const key = JSON.stringify([s.cost.toFixed(6), s.state, gate, model, variant])
     if (live.activity?.key === key) return live.activity.write
     const write = (async () => {
       const board = await Board.open(live.record.worktree?.repo ?? live.record.directory).catch(() => undefined)
-      await board?.recordActivity(task.id, task.attempt, { cost: s.cost || undefined, state: s.state, gate }).catch(() => undefined)
+      await board?.recordActivity(task.id, task.attempt, { cost: s.cost || undefined, state: s.state, gate, model, variant }).catch(() => undefined)
     })()
     live.activity = { key, write }
     return write

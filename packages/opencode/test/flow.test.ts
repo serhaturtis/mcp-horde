@@ -148,7 +148,7 @@ describe("the horde flow: board, workers, gates (real opencode, mock LLM)", { ti
     assert.match(await h.call("opencode_spawn", { task: id, name: "hard-1", wait: true, timeout_seconds: 60 }), /model: mock\/pricey/)
     // The attempt's spend reached the board without anyone passing it.
     // The attempt's state and gate are there too, from the fleet.
-    assert.match(await boardCall("board_task", { id }), /tier 1 \(mock\/pricey\) · \$\d.*\(agent hard-1, attempt 2, idle, /)
+    assert.match(await boardCall("board_task", { id }), /tier 1 \(mock\/pricey\) · \$\d.*\(agent hard-1 on mock\/pricey, attempt 2, idle, /)
     assert.match(await boardCall("board_fail", { id, reason: "still failing", escalate: true }), /now at tier 2 \(past the last model tier: yours\)/)
     await assert.rejects(h.call("opencode_spawn", { task: id, name: "hard-2" }), /past the last of the 2 tier\(s\) in horde\.json: the last tier is you/)
     // An explicit model always wins.
