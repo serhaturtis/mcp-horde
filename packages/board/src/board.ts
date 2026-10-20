@@ -166,14 +166,18 @@ export class Board {
     const { key, legacyKey } = await projectOf(directory)
     const dir = path.join(stateRoot, key)
     const old = legacyKey && path.join(stateRoot, legacyKey)
-    if (old && old !== dir && !fs.existsSync(dir) && fs.existsSync(old)) {
-      try {
-        fs.renameSync(old, dir)
-      } catch {
-        return new Board(old) // another process moved or holds it; keep using it
+    if (old && old !== dir) {
+      // Another process may be migrating the same legacy board. Retry only while the old
+      // directory is still there and the new one is not; whichever exists when we stop wins.
+      for (let i = 0; i < 3 && !fs.existsSync(dir) && fs.existsSync(old); i++) {
+        try {
+          fs.renameSync(old, dir)
+        } catch {
+          // lost the race (or could not move it): re-check instead of assuming we won
+        }
       }
     }
-    return new Board(dir)
+    return new Board(old && !fs.existsSync(dir) && fs.existsSync(old) ? old : dir)
   }
 
   private mutate<T>(fn: () => T): Promise<T> {
@@ -397,7 +401,7 @@ export class Board {
       const a = t.attempts.find((x) => x.n === attempt)
       if (!a) throw new Error(`${id} has no attempt ${attempt}`)
       // A cost the orchestrator gave when closing the attempt stays.
-      if (activity.cost !== undefined && !a.costGiven) a.cost = activity.cost
+      if (activity.cost !== undefined && !a.costGiven) a.cost = Math.max(a.cost ?? 0, activity.cost)
       if (activity.state) a.activity = { state: activity.state, gate: activity.gate, at: Date.now() }
       if (activity.model) Object.assign(a, { model: activity.model, variant: activity.variant })
       t.cost = totalCost(t)
@@ -600,7 +604,7 @@ export class Board {
       // Locks are repository-relative and specific: "**", absolute paths or ".." would lock
       // everything, or nothing that another worktree's lock could ever overlap.
       for (const p of want)
-        if (!p || /^(\/|[A-Za-z]:)/.test(p) || p.split("/").includes("..") || !p.replace(/\/?[^/]*[*?[].*$/, ""))
+        if (!p || p === "." || /^(\/|[A-Za-z]:)/.test(p) || p.split("/").includes("..") || !p.replace(/\/?[^/]*[*?[].*$/, ""))
           throw new Error(`cannot lock "${p}": use a path relative to the repository root, not a pattern for everything`)
       const conflicts = this.locks().filter((l) => !(l.task === id && l.attempt === a.n) && want.some((p) => overlaps(p, l.path)))
       if (conflicts.length) return { ok: false as const, conflicts }

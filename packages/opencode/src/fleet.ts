@@ -1681,10 +1681,14 @@ export class Fleet {
     const variant = s.model?.variant && s.model.variant !== "default" ? s.model.variant : undefined
     const key = JSON.stringify([s.cost.toFixed(6), s.state, gate, model, variant])
     if (live.activity?.key === key) return live.activity.write
-    const write = (async () => {
-      const board = await Board.open(live.record.worktree?.repo ?? live.record.directory).catch(() => undefined)
-      await board?.recordActivity(task.id, task.attempt, { cost: s.cost || undefined, state: s.state, gate, model, variant }).catch(() => undefined)
-    })()
+    // Board writes take a file lock; serialise them so a later (higher-cost) snapshot cannot be
+    // overtaken by an earlier one. A failed write does not block the next.
+    const write = (live.activity?.write ?? Promise.resolve())
+      .catch(() => undefined)
+      .then(async () => {
+        const board = await Board.open(live.record.worktree?.repo ?? live.record.directory).catch(() => undefined)
+        await board?.recordActivity(task.id, task.attempt, { cost: s.cost || undefined, state: s.state, gate, model, variant }).catch(() => undefined)
+      })
     live.activity = { key, write }
     return write
   }
@@ -1839,7 +1843,7 @@ export class Fleet {
     // Only the turn that is running now: an ended turn's totals must not stop a new prompt.
     if (!turn || turn.endedAt !== undefined || !track.inLoop) return
     // Already stopping it, or a prompt we sent is not in history yet (the open turn is the old one).
-    if (record.interruptedSeq !== undefined || live.sent || live.limitedTurn === turn.startSeq) return
+    if (record.interruptedSeq !== undefined || live.sent || live.sending || live.limitedTurn === turn.startSeq) return
     const { maxSteps, maxCostUsd, timeoutMinutes } = record.limits
     const started = live.turnSeen.get(turn.startSeq) ?? turn.startedAt
     let childCost = 0
@@ -2508,6 +2512,8 @@ interface Prepared {
 
 /** Text attachments are inlined up to this size. */
 const INLINE_LIMIT = 256 * 1024
+/** Never read a whole attachment into memory past this; providers reject huge parts anyway. */
+const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
 
 /**
  * Text files are inlined (many providers reject text/plain file parts), so a text file over
@@ -2517,11 +2523,17 @@ async function prepareFiles(paths: string[], directory: string): Promise<Prepare
   const out: Prepared = { files: [], inlined: [] }
   for (const f of paths) {
     const abs = path.resolve(directory, f)
-    const buf = await fs.readFile(abs).catch(() => {
-      throw new Error(`attachment not found: ${abs}`)
-    })
-    const isText = !buf.subarray(0, 8192).includes(0)
     const rel = path.relative(directory, abs) || abs
+    const st = await fs.stat(abs).catch(() => undefined)
+    if (!st?.isFile()) throw new Error(`attachment not found: ${abs}`)
+    if (st.size > MAX_ATTACHMENT_BYTES)
+      throw new Error(`attachment ${rel} is ${(st.size / (1024 * 1024)).toFixed(1)} MB; attachments are limited to ${MAX_ATTACHMENT_BYTES / (1024 * 1024)} MB`)
+    const buf = await fs.readFile(abs)
+    if (buf.length > MAX_ATTACHMENT_BYTES)
+      throw new Error(
+        `attachment ${rel} is ${(buf.length / (1024 * 1024)).toFixed(1)} MB; attachments are limited to ${MAX_ATTACHMENT_BYTES / (1024 * 1024)} MB`,
+      )
+    const isText = !buf.subarray(0, 8192).includes(0)
     if (isText && buf.length > INLINE_LIMIT)
       throw new Error(
         `attachment ${rel} is a ${Math.ceil(buf.length / 1024)} KB text file; text attachments are inlined into the prompt and limited to ${INLINE_LIMIT / 1024} KB. Attach an excerpt, or tell the agent the path so it reads the file itself.`,

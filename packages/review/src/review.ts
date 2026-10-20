@@ -19,7 +19,7 @@ export interface ReviewInput {
   diff: string
   /** Lines of the new files the diff shows (added or context), by file: what may be cited. */
   shown: Map<string, Set<number>>
-  /** Files the diff could not show within the budget. */
+  /** Files the review could not show (too large, binary, or over the budget). */
   omitted: string[]
   /** Definitions the change touches, one line each ("src/a.ts: function foo (12-40)"). */
   touched: string[]
@@ -82,12 +82,19 @@ export async function collectReview(
   // New files the worker has not committed yet are part of its change too.
   const untracked = splitZ(await gitRaw(root, [...Q, "ls-files", "--others", "--exclude-standard", "-z"]))
   let extra = ""
+  const skipped: string[] = []
   for (const f of untracked) {
     const abs = path.join(root, f)
     const st = fs.statSync(abs, { throwIfNoEntry: false })
-    if (!st?.isFile() || st.size > MAX_UNTRACKED) continue
+    if (!st?.isFile() || st.size > MAX_UNTRACKED) {
+      skipped.push(f)
+      continue
+    }
     const text = fs.readFileSync(abs, "utf8")
-    if (text.includes("\0")) continue
+    if (text.includes("\0")) {
+      skipped.push(f)
+      continue
+    }
     const lines = text.replace(/\n$/, "").split("\n")
     extra += `diff --git a/${f} b/${f}\nnew file\n--- /dev/null\n+++ b/${f}\n@@ -0,0 +1,${lines.length} @@\n${lines.map((l) => `+${l}`).join("\n")}\n`
   }
@@ -101,7 +108,7 @@ export async function collectReview(
       if ([...lines].some((l) => l >= d.line && l <= d.end)) touched.push(`${file}: ${d.kind} ${d.name} (${d.line}-${d.end})`)
   }
   const criteria = task.acceptance.length ? task.acceptance : [`The goal is met: ${truncate(task.goal, 400)}`]
-  return { task, criteria, diff, shown, omitted, touched: touched.slice(0, 60), workspace }
+  return { task, criteria, diff, shown, omitted: [...new Set([...omitted, ...skipped])], touched: touched.slice(0, 60), workspace }
 }
 
 /** The diff with new-file line numbers, within a budget; which lines it shows, and which it changes. */
@@ -110,6 +117,7 @@ export function renderDiff(raw: string, maxChars: number) {
   const changed = new Map<string, Set<number>>()
   const files: { file: string; text: string }[] = []
   let file: string | undefined
+  let oldFile: string | undefined
   let out: string[] = []
   let newLine = 0
   let inHunk = false
@@ -121,18 +129,24 @@ export function renderDiff(raw: string, maxChars: number) {
     if (line.startsWith("diff --git ")) {
       flush()
       file = undefined
+      oldFile = undefined
       inHunk = false
       continue
     }
     // Headers only before a file's first hunk: a removed "-- x" line is not a header.
     if (!inHunk && line.startsWith("+++ ")) {
-      file = line === "+++ /dev/null" ? undefined : line.slice(4).replace(/^b\//, "")
-      if (file) out.push(`=== ${file}`)
+      if (line === "+++ /dev/null") {
+        // A deleted file has no new side to cite; show it by name instead of dropping it.
+        file = oldFile
+        if (file) out.push(`=== ${file} (deleted)`)
+      } else {
+        file = line.slice(4).replace(/^b\//, "")
+        if (file) out.push(`=== ${file}`)
+      }
       continue
     }
     if (!inHunk && line.startsWith("--- ")) {
-      // A deleted file: shown by name, nothing to cite in it.
-      if (line !== "--- /dev/null") out.push(`=== ${line.slice(4).replace(/^a\//, "")} (old side)`)
+      if (line !== "--- /dev/null") oldFile = line.slice(4).replace(/^a\//, "")
       continue
     }
     const h = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@(.*)$/.exec(line)
@@ -195,7 +209,7 @@ export function reviewPrompt(r: ReviewInput): string {
     r.touched.length ? `# Definitions the change touches\n${r.touched.join("\n")}\n` : "",
     `# The change (L<n> is the line number in the new file; + added, - removed)`,
     r.diff || "(no changes)",
-    r.omitted.length ? `\n(not shown, too large for this review: ${r.omitted.join(", ")})` : "",
+    r.omitted.length ? `\n(not shown in this review: ${r.omitted.join(", ")})` : "",
   ]
     .filter((x) => x !== "")
     .join("\n")
@@ -254,7 +268,7 @@ export function renderVerdicts(r: ReviewInput, verdicts: Verdict[], model: strin
     const where = v.evidence.length ? ` — ${cite(v.evidence)}` : ""
     return `${MARK[v.status]} ${v.criterion}. ${truncate(v.text, 120)}${where}${v.note ? `\n    ${v.note}` : ""}`
   })
-  const tail = r.omitted.length ? `\n(not reviewed, too large: ${r.omitted.join(", ")})` : ""
+  const tail = r.omitted.length ? `\n(not reviewed: ${r.omitted.join(", ")})` : ""
   return `${head}\n${lines.join("\n")}${tail}`
 }
 

@@ -67,6 +67,7 @@ describe("ledger", () => {
     await history(board, "Refactor the timer", ["src/core/**"], "mid/kimi", true, 0.3, 1)
     await history(board, "Add tests for api", ["test/api/**"], "cheap/flash", true)
     const outcomes = outcomesOf(board, "repo")
+    assert.equal(suggest({ title: "Refactor the locks", scope: ["src/core/locks/**"] }, outcomes, [], "repo"), undefined, "no tiers listed: no tier to suggest")
     const s = suggest({ title: "Refactor the locks", scope: ["src/core/locks/**"] }, outcomes, tiers, "repo")
     assert.equal(s?.tier, 1)
     assert.equal(s?.model, "mid/kimi")

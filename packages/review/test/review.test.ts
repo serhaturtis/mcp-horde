@@ -120,6 +120,22 @@ describe("review", () => {
     assert.ok(tight.shown.has("small.ts") && !tight.shown.has("big.sql"))
   })
 
+  test("a deleted file is named instead of vanishing from the review", async () => {
+    const { repo, board, id } = await fixture()
+    fs.rmSync(path.join(repo, "src", "login.ts"))
+    const r = await collectReview(board, id)
+    assert.match(r.diff, /=== src\/login\.ts \(deleted\)/)
+    assert.equal(r.shown.get("src/login.ts"), undefined)
+  })
+
+  test("an untracked file too large to show is listed as not shown", async () => {
+    const { repo, board, id } = await fixture()
+    fs.writeFileSync(path.join(repo, "src", "huge.txt"), "x".repeat(200_001))
+    const r = await collectReview(board, id)
+    assert.deepEqual(r.omitted, ["src/huge.txt"])
+    assert.match(reviewPrompt(r), /not shown in this review: src\/huge\.txt/)
+  })
+
   test("a task without a recorded workspace needs a path", async () => {
     const board = new Board(tmp())
     const t = (await board.plan([{ title: "x", goal: "y" }])).tasks[0]!

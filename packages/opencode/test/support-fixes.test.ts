@@ -15,7 +15,7 @@ import { makeHooks, permissionMessage } from "../src/hooks.js"
 import { Store } from "../src/state.js"
 import { attachCommand, renderSnapshot } from "../src/tools.js"
 import { apply, currentTurn, type DurableEvent, emptyTrack } from "../src/tracker.js"
-import { anchoredPattern, commitAll, createWorktree, excludeFromGit, removeWorktree } from "../src/worktree.js"
+import { anchoredPattern, commitAll, createWorktree, excludeFromGit, removeWorktree, syncWorktree, workStart } from "../src/worktree.js"
 import { connect, git, pkg } from "./harness.js"
 
 let seq = 0
@@ -307,6 +307,66 @@ describe("worktree fixes", () => {
     const text = await removeWorktree({ ...worktree, root: path.join(tmpDir(), "gone") }, "lnk", true)
     assert.match(text, /could not delete branch horde\/lnk/)
     assert.doesNotMatch(text, /deleted branch/)
+  })
+
+  test("secret-looking untracked files are not carried into the baseline", async () => {
+    const r = repo()
+    fs.writeFileSync(path.join(r, ".env"), "TOKEN=super-secret\n")
+    fs.writeFileSync(path.join(r, ".env.example"), "TOKEN=\n")
+    fs.writeFileSync(path.join(r, "notes.txt"), "carried")
+    const { worktree, notes } = await createWorktree(r, "secret", {
+      rootDir: path.join(tmpDir(), "wt"),
+      includeUncommitted: true,
+      link: [],
+    })
+    assert.equal(fs.existsSync(path.join(worktree.root, ".env")), false)
+    assert.equal(fs.existsSync(path.join(worktree.root, ".env.example")), true)
+    assert.match(notes.join("\n"), /secret-looking untracked file/)
+    const files = git(worktree.root, "show", "--name-only", "--format=", worktree.baseline!)
+    assert.match(files, /\.env\.example/)
+    assert.doesNotMatch(files, /^\.env$/m)
+  })
+
+  test("sync refuses a branch with merge commits instead of dropping merge-only changes", async () => {
+    const r = repo()
+    const { worktree } = await createWorktree(r, "merges", {
+      rootDir: path.join(tmpDir(), "wt"),
+      includeUncommitted: false,
+      link: [],
+    })
+    git(worktree.root, "checkout", "-q", "-b", "side")
+    fs.writeFileSync(path.join(worktree.root, "side.txt"), "s\n")
+    git(worktree.root, "add", "-A")
+    git(worktree.root, "commit", "-qm", "side")
+    git(worktree.root, "checkout", "-q", worktree.branch)
+    git(worktree.root, "merge", "--no-ff", "-qm", "merge side", "side")
+    fs.writeFileSync(path.join(r, "main.txt"), "m\n")
+    git(r, "add", "-A")
+    git(r, "commit", "-qm", "main")
+    await assert.rejects(syncWorktree(worktree, "merges"), /merge commits/)
+  })
+
+  test("sync identifies the baseline by position, not by a message a worker can reuse", async () => {
+    const r = repo()
+    fs.writeFileSync(path.join(r, "notes.txt"), "carried\n")
+    const { worktree } = await createWorktree(r, "baseline", {
+      rootDir: path.join(tmpDir(), "wt"),
+      includeUncommitted: true,
+      link: [],
+    })
+    assert.ok(worktree.baseline)
+    const subject = git(worktree.root, "log", "-1", "--format=%s", worktree.baseline!)
+    fs.writeFileSync(path.join(worktree.root, "work.txt"), "w\n")
+    git(worktree.root, "add", "-A")
+    git(worktree.root, "commit", "-qm", "the work")
+    git(worktree.root, "commit", "--allow-empty", "-qm", subject)
+    fs.writeFileSync(path.join(r, "main.txt"), "m\n")
+    git(r, "add", "main.txt")
+    git(r, "commit", "-qm", "main")
+    const synced = (await syncWorktree(worktree, "baseline")).worktree!
+    const start = workStart(synced)
+    assert.equal(git(synced.root, "rev-list", "--count", `${start}..HEAD`), "2")
+    assert.match(git(synced.root, "show", "--name-only", "--format=", start), /notes\.txt/)
   })
 
   test("commits need both user.name and user.email, else the fallback identity is used", async () => {

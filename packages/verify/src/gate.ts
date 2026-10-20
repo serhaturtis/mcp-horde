@@ -83,7 +83,9 @@ export async function gate(directory: string, opts: GateOptions = {}): Promise<V
   const dir = path.resolve(directory)
   // The diff starts where HEAD meets base; the rules are base's, so the work cannot rewrite them.
   const base = opts.base ? await diffBase(await git(dir, "rev-parse", "--show-toplevel"), opts.base) : undefined
-  const settings = base ? await loadSettingsAt(dir, base) : loadSettings(dir)
+  // Without an audit (a shared directory) the human's working horde.json is the config; with
+  // one, only base's rules count, so the work cannot loosen them.
+  const settings = base ? await loadSettingsAt(dir, base, opts.audit === false ? "working" : "default") : loadSettings(dir)
   const all = await detectChecks(dir, settings)
   const selected = opts.checks?.length ? pick(all, opts.checks) : all
   const doAudit = opts.audit !== false && !!base

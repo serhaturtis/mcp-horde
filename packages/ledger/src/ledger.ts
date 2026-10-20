@@ -225,6 +225,8 @@ function similarity(o: Outcome, d: { kind: Kind; areas: string[]; repo?: string 
  * for its recorded tier when its model is no longer listed or was not recorded.
  */
 export function suggest(draft: Draft, outcomes: Outcome[], tiers: Tier[], repo?: string): Suggestion | undefined {
+  // No model list means there is no tier to suggest (and no tier 1 to fall back to).
+  if (!tiers.length) return undefined
   const d = { kind: kindOf(draft.title, draft.goal), areas: areasOf(draft.scope ?? []), repo }
   const tierOf = (o: Outcome) => {
     const listed = o.model ? tiers.findIndex((t) => t.model === o.model && (t.variant ?? undefined) === (o.variant ?? undefined)) : -1

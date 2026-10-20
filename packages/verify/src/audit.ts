@@ -254,6 +254,76 @@ async function changes(root: string, base: string): Promise<Change[]> {
   return [...byPath.values()]
 }
 
+interface HistoricalSecret {
+  commit: string
+  file: string
+  line: number
+  what: string
+}
+
+/** Secret-looking lines added in any commit since base, even when a later commit removed them. */
+async function secretHistory(root: string, base: string): Promise<HistoricalSecret[]> {
+  const raw = await gitRaw(root, [
+    ...Q,
+    "-c",
+    "color.ui=never",
+    "log",
+    "--format=%x1e%H%x1f%h",
+    "-p",
+    "-U0",
+    "-m",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
+    `${base}..HEAD`,
+  ])
+  const out: HistoricalSecret[] = []
+  const seen = new Set<string>()
+  let sha = ""
+  let short = ""
+  let file: string | undefined
+  let lineNo = 0
+  let inHunk = false
+  for (const line of raw.split("\n")) {
+    if (line.startsWith("\x1e")) {
+      const [nextSha, nextShort] = line.slice(1).split("\x1f")
+      sha = nextSha ?? ""
+      short = nextShort ?? ""
+      file = undefined
+      inHunk = false
+      continue
+    }
+    if (line.startsWith("diff --git ")) {
+      file = undefined
+      inHunk = false
+      continue
+    }
+    if (!inHunk && line.startsWith("+++ ")) {
+      const path = unquoteC(line.slice(4).replace(/\t$/, ""))
+      file = line.slice(4) === "/dev/null" || path === "/dev/null" ? undefined : path.replace(/^b\//, "")
+      continue
+    }
+    const h = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line)
+    if (h) {
+      lineNo = Number(h[1])
+      inHunk = true
+      continue
+    }
+    if (!inHunk || !file) continue
+    if (line.startsWith("+")) {
+      const what = secretIn(line.slice(1))
+      const key = `${sha}\0${file}\0${what}`
+      if (what && !seen.has(key)) {
+        seen.add(key)
+        out.push({ commit: short, file, line: lineNo, what })
+      }
+      lineNo++
+    } else if (line.startsWith(" ")) lineNo++
+  }
+  return out
+}
+
 /** Size of a file at a commit (0 when it did not exist there). */
 async function sizeAt(root: string, rev: string, file: string): Promise<number> {
   return Number(await git(root, "cat-file", "-s", `${rev}:${file}`).catch(() => "0")) || 0
@@ -420,6 +490,15 @@ export async function audit(directory: string, opts: AuditOptions): Promise<Audi
 
   for (const f of await ruleChanges(root, base, all, opts.ruleScripts ?? []))
     add("tests", { file: f.file, text: `changes the rules the gate checks with: ${f.what}` })
+
+  // A secret committed and then deleted still leaked: scan the commits, not only the net diff.
+  if (severityOf("secrets")) {
+    const current = findings.filter((f) => f.category === "secrets")
+    for (const h of await secretHistory(root, base)) {
+      if (current.some((f) => f.file === h.file && f.text.includes(h.what))) continue
+      add("secrets", { file: h.file, line: h.line, text: `adds what looks like ${h.what} in commit ${h.commit}` })
+    }
+  }
 
   const commits = Number(await git(root, "rev-list", "--count", `${base}..HEAD`).catch(() => "0"))
   const merges = (await git(root, "rev-list", "--merges", `${base}..HEAD`).catch(() => "")).split("\n").filter(Boolean)

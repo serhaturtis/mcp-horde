@@ -156,7 +156,12 @@ export class Store {
       const server = /^https?:\/\/(127\.|localhost)/.test(r.server) ? "local" : r.server
       writeAtomic(file, JSON.stringify({ ...rest, server }, null, 2))
     }
-    fs.renameSync(legacy, `${legacy}.migrated`)
+    try {
+      fs.renameSync(legacy, `${legacy}.migrated`)
+    } catch (err) {
+      // Another process may have migrated it between the read and the rename.
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err
+    }
   }
 
   private agentFile(id: string) {
@@ -184,13 +189,24 @@ export class Store {
     writeAtomic(this.agentFile(record.id), JSON.stringify(record, null, 2))
   }
 
-  /** Merge a patch into the stored record (only its owner writes it, so there is no race). */
+  /**
+   * Merge a patch into the stored record. Under the claim lock, so a claim cannot land between
+   * our read and write; a record another process owns is left alone. Takes the lock for at most
+   * 200 ms: persistence is best effort and a heartbeat retries later.
+   */
   update(id: string, patch: Partial<AgentRecord>) {
-    const current = this.get(id)
-    if (!current) return
-    const next = { ...current, ...patch }
-    for (const [k, v] of Object.entries(patch)) if (v === undefined) delete (next as Record<string, unknown>)[k]
-    this.put(next)
+    this.lockSync(
+      "claim",
+      () => {
+        const current = this.get(id)
+        if (!current) return
+        if (current.owner && current.owner.token !== SELF.token) return
+        const next = { ...current, ...patch }
+        for (const [k, v] of Object.entries(patch)) if (v === undefined) delete (next as Record<string, unknown>)[k]
+        this.put(next)
+      },
+      200,
+    )
   }
 
   remove(id: string) {

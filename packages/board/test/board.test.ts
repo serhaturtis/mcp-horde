@@ -123,6 +123,16 @@ describe("board", () => {
     assert.notEqual((await projectOf(repo())).key, a.key)
   })
 
+  test("concurrent opens agree on the migrated board directory", async () => {
+    const root = repo()
+    const state = tmp()
+    const p = await projectOf(root)
+    assert.ok(p.legacyKey)
+    fs.mkdirSync(path.join(state, p.legacyKey), { recursive: true })
+    const boards = await Promise.all(Array.from({ length: 10 }, () => Board.open(root, state)))
+    assert.deepEqual(new Set(boards.map((b) => b.dir)), new Set([path.join(state, p.key)]))
+  })
+
   test("plan: dependencies by title, cycles refused, parallel scope overlaps flagged (also against existing tasks)", async () => {
     const board = new Board(tmp())
     const r = await board.plan([
@@ -270,6 +280,9 @@ describe("board", () => {
     const first = await board.assign(t.id)
     await board.recordActivity(t.id, first.attempt.n, { cost: 0.5, state: "running" })
     assert.equal(board.task(t.id).attempts[0]!.activity?.state, "running")
+    assert.equal(board.task(t.id).cost, 0.5)
+    // A late snapshot with an older cost must not lower the attempt's spend.
+    await board.recordActivity(t.id, first.attempt.n, { cost: 0.2 })
     assert.equal(board.task(t.id).cost, 0.5)
     await board.fail(t.id, { reason: "nope" })
     const second = await board.assign(t.id)
@@ -437,7 +450,7 @@ describe("board rules found in review", () => {
     const board = await Board.open(root, tmp())
     const t = (await board.plan([{ title: "x", goal: "y" }])).tasks[0]!
     const { attempt } = await board.assign(t.id)
-    for (const bad of ["**", "/etc/passwd", "../other", "*"]) await assert.rejects(board.lock(t.id, attempt.token, [bad]), /cannot lock/, bad)
+    for (const bad of ["**", "/etc/passwd", "../other", "*", "."]) await assert.rejects(board.lock(t.id, attempt.token, [bad]), /cannot lock/, bad)
     const long = "q".repeat(5000)
     await board.report(t.id, attempt.token, { summary: "s", questions: Array.from({ length: 40 }, (_, i) => `${i}${long}`) })
     const r = board.task(t.id).reports[0]!

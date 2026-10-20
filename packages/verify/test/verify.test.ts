@@ -16,6 +16,7 @@ import {
   globMatcher,
   isTestPath,
   loadSettings,
+  loadSettingsAt,
   logFileFor,
   narrowCommand,
   planRelated,
@@ -388,6 +389,17 @@ describe("fixes", () => {
     assert.ok(!v.blockers.some((b) => /pyproject.*\[project\]/.test(b)), "other pyproject sections are not rules")
   })
 
+  test("a horde.json added after base cannot choose the gate's rules", async () => {
+    const { root, base } = repo({ "README.md": "# x\n" })
+    write(root, {
+      "horde.json": JSON.stringify({ verify: { checks: { fake: 'node -e "process.exit(0)"' }, audit: { off: ["secrets"] } } }),
+    })
+    const s = await loadSettingsAt(root, base)
+    assert.equal(s.configFile, undefined)
+    assert.equal(s.checks, undefined)
+    assert.deepEqual(s.audit.block, ["scope", "tests", "secrets", "binaries"])
+  })
+
   test("no checks is not a pass", async () => {
     const { root } = repo({ "README.md": "# x\n" })
     const v = await gate(root, { stateDir: tmp() })
@@ -501,6 +513,21 @@ describe("fixes", () => {
     const hit = new Set((await audit(root, { base, block: ["secrets"], warn: [] })).findings.map((f) => f.line))
     for (const [i, b] of bad.entries()) assert.ok(hit.has(i + 1), b)
     for (const [i, f] of fine.entries()) assert.ok(!hit.has(bad.length + i + 1), f)
+  })
+
+  test("a secret committed and then removed is still reported", async () => {
+    const { root, base } = repo({ "a.txt": "x\n" })
+    write(root, { "a.txt": 'x\nkey = "sk-AbCdEfGhIjKlMnOpQrStUv12"\n' })
+    git(root, "add", "-A")
+    git(root, "commit", "-qm", "add a key")
+    write(root, { "a.txt": "x\n" })
+    git(root, "add", "-A")
+    git(root, "commit", "-qm", "oops, remove it")
+    const l = await lines(root, base)
+    assert.ok(
+      l.some((x) => /^block secrets a\.txt:2 adds what looks like .+ in commit [0-9a-f]+$/.test(x)),
+      l.join("\n"),
+    )
   })
 
   test("size: new or newly big files only, never lockfiles", async () => {

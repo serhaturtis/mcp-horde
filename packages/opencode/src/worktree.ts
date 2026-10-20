@@ -247,6 +247,20 @@ function pipePatch(repo: string, root: string): Promise<boolean> {
   })
 }
 
+/** Untracked files that usually hold credentials; copying them into a baseline commit leaks them. */
+function secretLooking(rel: string): boolean {
+  const name = path.posix.basename(rel.toLowerCase())
+  if (name === ".env" || (name.startsWith(".env.") && !/\.(example|sample|template|dist)$/.test(name))) return true
+  return (
+    /\.(pem|key|p12|pfx|jks|keystore)$/.test(name) ||
+    /^id_(rsa|dsa|ecdsa|ed25519)$/.test(name) ||
+    name === ".npmrc" ||
+    name === ".pypirc" ||
+    /^credentials(\..+)?$/.test(name) ||
+    /^secrets?\.(json|ya?ml|toml)$/.test(name)
+  )
+}
+
 async function carryUncommitted(repo: string, root: string, notes: string[], links: string[] = []): Promise<string | undefined> {
   const parts: string[] = []
   // git apply ignores gitlink (submodule pointer) changes; say so instead of dropping them silently.
@@ -259,6 +273,7 @@ async function carryUncommitted(repo: string, root: string, notes: string[], lin
   let files = 0
   let bytes = 0
   let skippedRepos = 0
+  let skippedSecrets = 0
   let capped = false
   // Linked paths are symlinked afterwards and never committed: do not copy them into the baseline.
   const linked = (rel: string) => links.some((l) => rel === l || rel === `${l}/` || rel.startsWith(`${l}/`))
@@ -267,6 +282,11 @@ async function carryUncommitted(repo: string, root: string, notes: string[], lin
     // A nested repository shows up as "dir/": copying it would embed its .git.
     if (rel.endsWith("/")) {
       skippedRepos++
+      continue
+    }
+    // Never put a credential file in the baseline commit; `link` is the explicit way to provide it.
+    if (secretLooking(rel)) {
+      skippedSecrets++
       continue
     }
     const src = path.join(repo, rel)
@@ -285,6 +305,7 @@ async function carryUncommitted(repo: string, root: string, notes: string[], lin
   }
   if (files) parts.push(`${files} untracked file(s)`)
   if (skippedRepos) notes.push(`skipped ${skippedRepos} untracked nested git repositor${skippedRepos === 1 ? "y" : "ies"}`)
+  if (skippedSecrets) notes.push(`skipped ${skippedSecrets} secret-looking untracked file(s); link them explicitly if the agent needs them`)
   if (capped)
     notes.push(`stopped carrying untracked files at ${CARRY_MAX_FILES} files / ${CARRY_MAX_BYTES >> 20} MB; add large directories to .gitignore or link them`)
   return parts.length ? `carried over ${parts.join(" and ")} from the main checkout` : undefined
@@ -507,9 +528,16 @@ export async function syncWorktree(wt: Worktree, name: string): Promise<{ text: 
     () => false,
   )
   if (ahead) return { text: [...notes, `${wt.branch} already contains ${target} (${tip.slice(0, 10)}); nothing to sync`].join("\n") }
+  // A rebase replays only ordinary commits: merge-only changes would disappear. Refuse, as mergeWorktree does.
+  const merges = (await git(wt.root, "rev-list", "--merges", `${wt.base}..HEAD`)).split("\n").filter(Boolean)
+  if (merges.length)
+    throw new Error(
+      `${wt.branch} contains merge commits (${merges.slice(0, 3).join(", ")}${merges.length > 3 ? ", …" : ""}), which a rebase would replay without their merge-only changes. Merge it by hand instead, e.g. git merge ${target}.`,
+    )
+  const baselineCount = wt.baseline ? Number(await git(wt.root, "rev-list", "--count", `${wt.baseline}..HEAD`)) : 0
   const identity = (await hasIdentity(wt.root)) ? [] : IDENTITY
   try {
-    await git(wt.root, ...NO_SIGN, ...identity, "-c", "core.editor=true", "rebase", "--onto", tip, wt.base, wt.branch)
+    await git(wt.root, ...NO_SIGN, ...identity, "-c", "core.editor=true", "rebase", "--empty=keep", "--onto", tip, wt.base, wt.branch)
   } catch (err) {
     const conflicts = await git(wt.root, "diff", "--name-only", "--diff-filter=U").catch(() => "")
     await git(wt.root, "rebase", "--abort").catch(() => undefined)
@@ -518,9 +546,10 @@ export async function syncWorktree(wt: Worktree, name: string): Promise<{ text: 
       `syncing ${wt.branch} onto ${target} failed and was aborted; the worktree is unchanged.\n${detail}\nTell the agent what changed in ${target} (or merge by hand).`,
     )
   }
-  // The baseline commit was replayed with a new id (or dropped, if those changes are in the target now).
-  const replayed = (await git(wt.root, "log", "--format=%H%x00%s", `${tip}..HEAD`)).split("\n").filter(Boolean)
-  const baseline = wt.baseline ? replayed.map((l) => l.split("\0")).find(([, subject]) => subject === BASELINE_MESSAGE)?.[0] : undefined
+  // The baseline commit is the oldest replayed commit, and there is one more than before the
+  // rebase. Identify it by position, not by subject: a worker can create a commit with any message.
+  const replayed = (await git(wt.root, "log", "--format=%H", `${tip}..HEAD`)).split("\n").filter(Boolean)
+  const baseline = wt.baseline && replayed.length > baselineCount ? replayed.at(-1) : undefined
   const own = replayed.length - (baseline ? 1 : 0)
   notes.push(
     `rebased ${own} commit(s) of ${wt.branch} onto ${target} (${tip.slice(0, 10)})${wt.baseline && !baseline ? "; the carried-over changes are in it now" : ""}`,

@@ -32,6 +32,16 @@ describe("fleet fixes: ownership and helpers", () => {
     assert.equal(ownerAlive(SELF, 0), true, "we are alive whatever the record says")
   })
 
+  test("update does not overwrite a record another process has claimed", () => {
+    const store = new Store(fs.mkdtempSync(path.join(os.tmpdir(), "horde-update-")))
+    store.put(record("ses_mine", SELF))
+    store.update("ses_mine", { name: "mine" })
+    assert.equal(store.get("ses_mine")?.name, "mine")
+    store.put({ ...store.get("ses_mine")!, owner: { ...SELF, token: "someone-else" } })
+    store.update("ses_mine", { name: "stale" })
+    assert.equal(store.get("ses_mine")?.name, "mine")
+  })
+
   test("a claim re-reads the record under the lock: only one process gets an orphan", () => {
     const store = new Store(fs.mkdtempSync(path.join(os.tmpdir(), "horde-claim-")))
     const dead = { pid: 999_999_999, host: SELF.host, token: "dead" }
@@ -96,6 +106,16 @@ describe("fleet fixes: gates, tasks and worktrees (real opencode, mock LLM)", { 
       /big\.txt is a 300 KB text file[\s\S]*limited to 256 KB/,
     )
     assert.doesNotMatch(await h.call("opencode_status"), /big \(ses_/)
+  })
+
+  test("an attachment over the total limit is refused before it is read", async () => {
+    fs.writeFileSync(path.join(repo, "big.bin"), Buffer.alloc(20 * 1024 * 1024 + 1))
+    await assert.rejects(
+      h.call("opencode_spawn", { prompt: "read it", name: "bigbin", files: ["big.bin"] }),
+      /big\.bin is 20\.0 MB; attachments are limited to 20 MB/,
+    )
+    assert.doesNotMatch(await h.call("opencode_status"), /bigbin \(ses_/)
+    fs.rmSync(path.join(repo, "big.bin"))
   })
 
   test("a gate failure waits for a running slot instead of exceeding the limit", async () => {
