@@ -8,5 +8,6 @@
   },
   "repository": "https://github.com/serhaturtis/mcp-horde",
   "keywords": ["opencode", "agents", "orchestration", "deepseek", "verification"],
-  "license": "MIT"
+  "license": "MIT",
+  "hooks": "./hooks/hooks.json"
 }
