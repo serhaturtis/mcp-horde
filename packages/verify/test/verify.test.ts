@@ -229,7 +229,8 @@ describe("gate", () => {
     assert.equal(bad.cached, false)
     assert.match(bad.text, /^FAIL · 1 check failed/)
     assert.match(bad.text, /✗ test · 1 failed, 0 passed/)
-    assert.match(bad.text, /✗ test: adds — test\/math\.test\.mjs:3\n\s+Expected values to be strictly equal:/)
+    // Node 24 prints the spec reporter by default; older versions print TAP when piped.
+    assert.match(bad.text, /✗ test: adds — test\/math\.test\.mjs:3\n\s+(?:AssertionError \[ERR_ASSERTION\]: )?Expected values to be strictly equal:/)
     assert.match(bad.text, /✓ typecheck · ok/)
     assert.match(bad.text, /audit: 1 file changed, 0 commits since/)
     assert.deepEqual(bad.blockers, ["test: 1 failed, 0 passed"])
@@ -649,7 +650,8 @@ describe("MCP server", () => {
       assert.match(logsFirst.text, /no log for "test"/)
       const verdict = await call("verify_gate", { base })
       assert.match(verdict.text, /^FAIL · 1 check failed/)
-      assert.match((await call("verify_logs", { check: "test", max_chars: 4000 })).text, /not ok 1 - adds/)
+      // TAP on Node 20/22, spec on Node 24.
+      assert.match((await call("verify_logs", { check: "test", max_chars: 4000 })).text, /(?:not ok 1 - adds|✖ adds)/)
       assert.match((await call("verify_audit", { base })).text, /0 files changed, 0 commits since \w+; no findings\./)
     } finally {
       await client.close()
