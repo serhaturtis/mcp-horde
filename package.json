@@ -10,7 +10,7 @@
   "scripts": {
     "build": "npm run build -w @mcp-horde/core && npm run build -w @mcp-horde/context && npm run build -w @mcp-horde/verify && npm run build -w @mcp-horde/board && npm run build -w @mcp-horde/ledger && npm run build -w @mcp-horde/review && npm run build -w @mcp-horde/opencode",
     "typecheck": "npm run typecheck --workspaces --if-present",
-    "test": "npm run test --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present && node --test plugins/horde/hooks/*.test.mjs",
     "lint": "biome check .",
     "format": "biome check --write .",
     "bundle": "node scripts/bundle-plugin.mjs"
