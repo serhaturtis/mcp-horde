@@ -295,7 +295,7 @@ export function registerTools(server: McpServer, ctx: Context) {
     {
       provider: z.string().optional().describe("Only this provider id (e.g. deepseek, openrouter)."),
       query: z.string().optional().describe("Case-insensitive substring filter on the model id or name."),
-      include_unsupported: z.boolean().optional().describe("Also list models the v2 agent runner cannot use."),
+      include_unsupported: z.boolean().optional().describe("Also list models OpenCode 2 cannot run."),
       directory: z.string().optional().describe("Project directory whose opencode config applies."),
     },
     async (a, fleet) => {

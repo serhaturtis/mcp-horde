@@ -149,10 +149,10 @@ ${output}`)
     }
   })
 
-  // Canary: workers reach the board through bash because v2 runners do not offer MCP tools
-  // (OpenCode 1.19). When this starts failing (the dev-tag CI job runs it first), v2 has
-  // gained MCP tools and the horde can mount its servers for workers instead.
-  test("canary: an injected MCP server connects, but v2 runners do not offer its tools yet", async () => {
+  // Canary: workers reach the board through bash because OpenCode 2 sessions do not offer MCP tools
+  // to the model. When this starts failing, OpenCode has gained MCP tools for sessions and the
+  // horde can mount its servers for workers instead.
+  test("canary: an injected MCP server connects, but OpenCode does not offer its tools yet", async () => {
     const { tmp, repo } = makeRepo(mock.url)
     const port = await freePort()
     const fixture = path.join(import.meta.dirname, "fixtures", "probe-mcp.mjs")
@@ -183,7 +183,7 @@ ${output}`)
         return text?.type === "text" ? text.text : undefined
       }, 60_000)
       assert.match(tools, /\bshell\b/, "built-in tools are offered")
-      assert.doesNotMatch(tools, /horde_echo/, "MCP tools reached the v2 runner: switch workers from the CLI to MCP mounts (docs/DESIGN.md §4.2e)")
+      assert.doesNotMatch(tools, /horde_echo/, "MCP tools reached the session: switch workers from the CLI to MCP mounts (docs/DESIGN.md §4.2e)")
     } finally {
       await stopTree(proc)
     }

@@ -45,7 +45,7 @@ async function pickFreeModel(): Promise<string> {
   const listed = await h.call("opencode_models", { provider: "opencode", include_unsupported: true })
   console.log(`OpenCode's catalog:\n${listed}`)
   const candidates = [...listed.matchAll(/^(opencode\/\S+) — .* · free · (?!.*UNSUPPORTED)/gm)].map((m) => m[1]!)
-  assert.ok(candidates.length, "no free OpenCode model the v2 runner can use")
+  assert.ok(candidates.length, "no free OpenCode model the horde can use")
   for (const [i, m] of candidates.entries()) {
     const name = `ping-${i}`
     try {

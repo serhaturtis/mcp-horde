@@ -426,7 +426,7 @@ export function defined<T extends object>(o: T): Partial<T> {
   return Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined)) as Partial<T>
 }
 
-/** Orchestrates OpenCode sessions ("agents") through the OpenCode v2 API. */
+/** Orchestrates OpenCode sessions ("agents") through the OpenCode 2 API. */
 export class Fleet {
   private readonly live = new Map<string, Live>()
   private readonly childToRoot = new Map<string, string>()
