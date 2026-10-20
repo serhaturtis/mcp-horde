@@ -1574,6 +1574,9 @@ export class Fleet {
       const v = await runGate(live.session?.location.directory ?? live.record.directory, {
         base: wt ? workStart(wt) : cfg.base,
         audit: cfg.audit,
+        // Only an unaudited shared gate may use the human's working config; an audited one
+        // must judge by the rules that were in force at base.
+        settingsFrom: !wt && !cfg.audit ? "working" : "base",
         checks: cfg.checks,
         allowed: cfg.allowed,
         related: cfg.related !== false,
@@ -1687,7 +1690,17 @@ export class Fleet {
       .catch(() => undefined)
       .then(async () => {
         const board = await Board.open(live.record.worktree?.repo ?? live.record.directory).catch(() => undefined)
-        await board?.recordActivity(task.id, task.attempt, { cost: s.cost || undefined, state: s.state, gate, model, variant }).catch(() => undefined)
+        if (!board) return false
+        try {
+          await board.recordActivity(task.id, task.attempt, { cost: s.cost || undefined, state: s.state, gate, model, variant })
+          return true
+        } catch {
+          return false
+        }
+      })
+      .then((ok) => {
+        // Forget a failed snapshot so the next refresh retries it instead of short-circuiting.
+        if (!ok && live.activity?.key === key) live.activity = undefined
       })
     live.activity = { key, write }
     return write
@@ -2524,15 +2537,29 @@ async function prepareFiles(paths: string[], directory: string): Promise<Prepare
   for (const f of paths) {
     const abs = path.resolve(directory, f)
     const rel = path.relative(directory, abs) || abs
-    const st = await fs.stat(abs).catch(() => undefined)
-    if (!st?.isFile()) throw new Error(`attachment not found: ${abs}`)
-    if (st.size > MAX_ATTACHMENT_BYTES)
-      throw new Error(`attachment ${rel} is ${(st.size / (1024 * 1024)).toFixed(1)} MB; attachments are limited to ${MAX_ATTACHMENT_BYTES / (1024 * 1024)} MB`)
-    const buf = await fs.readFile(abs)
-    if (buf.length > MAX_ATTACHMENT_BYTES)
-      throw new Error(
-        `attachment ${rel} is ${(buf.length / (1024 * 1024)).toFixed(1)} MB; attachments are limited to ${MAX_ATTACHMENT_BYTES / (1024 * 1024)} MB`,
-      )
+    const fh = await fs.open(abs, "r").catch(() => undefined)
+    if (!fh) throw new Error(`attachment not found: ${abs}`)
+    let buf: Buffer
+    try {
+      const st = await fh.stat()
+      if (!st.isFile()) throw new Error(`attachment not found: ${abs}`)
+      if (st.size > MAX_ATTACHMENT_BYTES)
+        throw new Error(
+          `attachment ${rel} is ${(st.size / (1024 * 1024)).toFixed(1)} MB; attachments are limited to ${MAX_ATTACHMENT_BYTES / (1024 * 1024)} MB`,
+        )
+      // Read at most the size checked above: a file growing concurrently must not allocate past the limit.
+      buf = Buffer.alloc(st.size)
+      let read = 0
+      while (read < buf.length) {
+        const { bytesRead } = await fh.read(buf, read, buf.length - read, read)
+        if (!bytesRead) break
+        read += bytesRead
+      }
+      if ((await fh.stat()).size !== st.size) throw new Error(`attachment ${rel} changed while it was being read; try again`)
+      buf = buf.subarray(0, read)
+    } finally {
+      await fh.close()
+    }
     const isText = !buf.subarray(0, 8192).includes(0)
     if (isText && buf.length > INLINE_LIMIT)
       throw new Error(

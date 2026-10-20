@@ -369,6 +369,27 @@ describe("worktree fixes", () => {
     assert.match(git(synced.root, "show", "--name-only", "--format=", start), /notes\.txt/)
   })
 
+  test("sync keeps the baseline when the target already has the agent's patch", async () => {
+    const r = repo()
+    fs.writeFileSync(path.join(r, "notes.txt"), "carried\n")
+    const { worktree } = await createWorktree(r, "replayed", {
+      rootDir: path.join(tmpDir(), "wt"),
+      includeUncommitted: true,
+      link: [],
+    })
+    assert.ok(worktree.baseline)
+    fs.writeFileSync(path.join(worktree.root, "work.txt"), "w\n")
+    git(worktree.root, "add", "-A")
+    git(worktree.root, "commit", "-qm", "the work")
+    fs.writeFileSync(path.join(r, "work.txt"), "w\n")
+    git(r, "add", "work.txt")
+    git(r, "commit", "-qm", "the same work")
+    const synced = (await syncWorktree(worktree, "replayed")).worktree!
+    const start = workStart(synced)
+    assert.match(git(synced.root, "show", "--name-only", "--format=", start), /notes\.txt/)
+    assert.equal(git(synced.root, "diff", "--name-only", start, "HEAD"), "")
+  })
+
   test("commits need both user.name and user.email, else the fallback identity is used", async () => {
     const r = repo()
     git(r, "config", "user.email", "only@mail")

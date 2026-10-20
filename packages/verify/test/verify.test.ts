@@ -400,6 +400,14 @@ describe("fixes", () => {
     assert.deepEqual(s.audit.block, ["scope", "tests", "secrets", "binaries"])
   })
 
+  test("a shared gate can use the working config when the caller says so", async () => {
+    const { root, base } = repo({ "README.md": "# x\n" })
+    write(root, { "horde.json": JSON.stringify({ verify: { checks: { ok: 'node -e "process.exit(0)"' } } }) })
+    const v = await gate(root, { base, audit: false, settingsFrom: "working", stateDir: tmp() })
+    assert.equal(v.pass, true)
+    assert.equal(v.checks[0]?.name, "ok")
+  })
+
   test("no checks is not a pass", async () => {
     const { root } = repo({ "README.md": "# x\n" })
     const v = await gate(root, { stateDir: tmp() })

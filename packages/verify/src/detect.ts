@@ -56,10 +56,9 @@ export function loadSettings(directory: string): VerifySettings {
  * gate applies (drop a check, unblock a category) by editing horde.json. The same files
  * loadHordeFile would find are looked up in the base commit; when none existed there, the
  * defaults apply: a working-tree horde.json is the work's own change (the audit flags it),
- * not a rule the gate may run. A shared-directory gate that does not audit passes
- * `fallback = "working"`: there the human's untracked horde.json is the configuration.
+ * not a rule the gate may run.
  */
-export async function loadSettingsAt(directory: string, base: string, fallback: "default" | "working" = "default"): Promise<VerifySettings> {
+export async function loadSettingsAt(directory: string, base: string): Promise<VerifySettings> {
   const top = await git(directory, "rev-parse", "--show-toplevel").catch(() => undefined)
   if (!top) return loadSettings(directory)
   const realTop = realpath(top)
@@ -80,7 +79,6 @@ export async function loadSettingsAt(directory: string, base: string, fallback: 
     }
     if (!rel) break
   }
-  if (fallback === "working") return loadSettings(directory)
   return parseSettings({ root: path.resolve(directory), data: {} })
 }
 

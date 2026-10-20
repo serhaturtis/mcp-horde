@@ -37,7 +37,7 @@ npm run lint         # Biome
 npm test
 ```
 
-Requirements: Node.js 20 or newer. After changing a server, `npm run bundle` regenerates the plugin's bundles (CI checks they match the sources).
+Requirements: Node.js 20 or newer, and Git 2.34 or newer (worktree sync replays every commit). After changing a server, `npm run bundle` regenerates the plugin's bundles (CI checks they match the sources).
 
 ## License
 

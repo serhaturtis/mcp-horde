@@ -254,6 +254,12 @@ function secretLooking(rel: string): boolean {
   return (
     /\.(pem|key|p12|pfx|jks|keystore)$/.test(name) ||
     /^id_(rsa|dsa|ecdsa|ed25519)$/.test(name) ||
+    name === ".envrc" ||
+    name === ".git-credentials" ||
+    name === ".netrc" ||
+    name === ".htpasswd" ||
+    name === ".pgpass" ||
+    name === ".my.cnf" ||
     name === ".npmrc" ||
     name === ".pypirc" ||
     /^credentials(\..+)?$/.test(name) ||
@@ -534,10 +540,12 @@ export async function syncWorktree(wt: Worktree, name: string): Promise<{ text: 
     throw new Error(
       `${wt.branch} contains merge commits (${merges.slice(0, 3).join(", ")}${merges.length > 3 ? ", …" : ""}), which a rebase would replay without their merge-only changes. Merge it by hand instead, e.g. git merge ${target}.`,
     )
-  const baselineCount = wt.baseline ? Number(await git(wt.root, "rev-list", "--count", `${wt.baseline}..HEAD`)) : 0
   const identity = (await hasIdentity(wt.root)) ? [] : IDENTITY
   try {
-    await git(wt.root, ...NO_SIGN, ...identity, "-c", "core.editor=true", "rebase", "--empty=keep", "--onto", tip, wt.base, wt.branch)
+    // Reapply commits even when the target already has the same patch, and keep the ones that
+    // become empty. Every original commit then has a replay, so the baseline is the first one;
+    // no commit message or count can be spoofed.
+    await git(wt.root, ...NO_SIGN, ...identity, "-c", "core.editor=true", "rebase", "--empty=keep", "--reapply-cherry-picks", "--onto", tip, wt.base, wt.branch)
   } catch (err) {
     const conflicts = await git(wt.root, "diff", "--name-only", "--diff-filter=U").catch(() => "")
     await git(wt.root, "rebase", "--abort").catch(() => undefined)
@@ -546,10 +554,9 @@ export async function syncWorktree(wt: Worktree, name: string): Promise<{ text: 
       `syncing ${wt.branch} onto ${target} failed and was aborted; the worktree is unchanged.\n${detail}\nTell the agent what changed in ${target} (or merge by hand).`,
     )
   }
-  // The baseline commit is the oldest replayed commit, and there is one more than before the
-  // rebase. Identify it by position, not by subject: a worker can create a commit with any message.
-  const replayed = (await git(wt.root, "log", "--format=%H", `${tip}..HEAD`)).split("\n").filter(Boolean)
-  const baseline = wt.baseline && replayed.length > baselineCount ? replayed.at(-1) : undefined
+  // Every commit was replayed in order, so the first one is the baseline.
+  const replayed = (await git(wt.root, "rev-list", "--reverse", `${tip}..HEAD`)).split("\n").filter(Boolean)
+  const baseline = wt.baseline ? replayed[0] : undefined
   const own = replayed.length - (baseline ? 1 : 0)
   notes.push(
     `rebased ${own} commit(s) of ${wt.branch} onto ${target} (${tip.slice(0, 10)})${wt.baseline && !baseline ? "; the carried-over changes are in it now" : ""}`,

@@ -72,7 +72,7 @@ Anything else gets a generic excerpt around the first error, or the end of the o
 
 ## Where checks come from
 
-From `horde.json` at the repository root when it defines them (with `base`, horde.json as it was at base: the work under judgement cannot change its own rules; if it did not exist there, an audited gate uses the defaults and flags an added horde.json; a shared-directory gate without an audit uses the working config); otherwise detected from the nearest project root (walking up from the directory to the repository root):
+From `horde.json` at the repository root when it defines them (with `base`, horde.json as it was at base: the work under judgement cannot change its own rules; if it did not exist there, an audited gate uses the defaults and flags an added horde.json; a shared-directory gate uses the working config); otherwise detected from the nearest project root (walking up from the directory to the repository root):
 
 | Found | Checks |
 | --- | --- |

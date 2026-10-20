@@ -166,18 +166,14 @@ export class Board {
     const { key, legacyKey } = await projectOf(directory)
     const dir = path.join(stateRoot, key)
     const old = legacyKey && path.join(stateRoot, legacyKey)
-    if (old && old !== dir) {
-      // Another process may be migrating the same legacy board. Retry only while the old
-      // directory is still there and the new one is not; whichever exists when we stop wins.
-      for (let i = 0; i < 3 && !fs.existsSync(dir) && fs.existsSync(old); i++) {
-        try {
-          fs.renameSync(old, dir)
-        } catch {
-          // lost the race (or could not move it): re-check instead of assuming we won
-        }
-      }
+    if (old && old !== dir && fs.existsSync(old) && !fs.existsSync(dir)) {
+      fs.mkdirSync(stateRoot, { recursive: true, mode: 0o700 })
+      // One process migrates; the others wait, then use the directory that is there.
+      await withLock(stateRoot, "board-migrate", async () => {
+        if (fs.existsSync(old) && !fs.existsSync(dir)) fs.renameSync(old, dir)
+      })
     }
-    return new Board(old && !fs.existsSync(dir) && fs.existsSync(old) ? old : dir)
+    return new Board(fs.existsSync(dir) || !old || !fs.existsSync(old) ? dir : old)
   }
 
   private mutate<T>(fn: () => T): Promise<T> {

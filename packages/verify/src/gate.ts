@@ -19,6 +19,12 @@ export interface GateOptions {
   allowed?: string[]
   /** Skip the audit (e.g. outside a worktree, where the human's own edits would be audited too). */
   audit?: boolean
+  /**
+   * Where the gate's settings come from when `base` is set. `"base"` (the default) freezes the
+   * rules at the start of the work; `"working"` is for a shared directory, whose horde.json the
+   * human owns and may not have committed yet.
+   */
+  settingsFrom?: "base" | "working"
   /** Character budget for the rendered verdict. */
   budgetChars?: number
   signal?: AbortSignal
@@ -83,9 +89,9 @@ export async function gate(directory: string, opts: GateOptions = {}): Promise<V
   const dir = path.resolve(directory)
   // The diff starts where HEAD meets base; the rules are base's, so the work cannot rewrite them.
   const base = opts.base ? await diffBase(await git(dir, "rev-parse", "--show-toplevel"), opts.base) : undefined
-  // Without an audit (a shared directory) the human's working horde.json is the config; with
-  // one, only base's rules count, so the work cannot loosen them.
-  const settings = base ? await loadSettingsAt(dir, base, opts.audit === false ? "working" : "default") : loadSettings(dir)
+  // In a worktree the rules are base's, so the work cannot rewrite them. In a shared directory
+  // the human's working horde.json is the configuration; the caller must say so explicitly.
+  const settings = base && opts.settingsFrom !== "working" ? await loadSettingsAt(dir, base) : loadSettings(dir)
   const all = await detectChecks(dir, settings)
   const selected = opts.checks?.length ? pick(all, opts.checks) : all
   const doAudit = opts.audit !== false && !!base
