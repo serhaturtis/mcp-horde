@@ -102,6 +102,10 @@ export async function connect(env: Record<string, string>, opts: { elicitation?:
       channel.push(n.params)
     },
   )
+  // A worker's shell inherits the server's credentials; a test only gets them from its own env.
+  const inherited = { ...(process.env as Record<string, string>) }
+  delete inherited.OPENCODE_SERVER_PASSWORD
+  delete inherited.OPENCODE_SERVER_USERNAME
   await client.connect(
     new StdioClientTransport({
       command: process.execPath,
@@ -112,7 +116,7 @@ export async function connect(env: Record<string, string>, opts: { elicitation?:
           ? [path.join(pkg, "dist/index.js")]
           : ["--conditions=source", "--import", "tsx", path.join(pkg, "src/index.ts")],
       cwd: pkg,
-      env: { ...(process.env as Record<string, string>), HORDE_OPENCODE_BIN: opencodeBin, ...env },
+      env: { ...inherited, HORDE_OPENCODE_BIN: opencodeBin, ...env },
       stderr: "inherit",
     }),
   )
