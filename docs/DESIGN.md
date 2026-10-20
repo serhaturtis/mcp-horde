@@ -26,6 +26,7 @@ The arrangement breaks in three places, and every server exists to fix one of th
 6. **No daemons, no network.** State is files with atomic writes and cross-process locks (the scheme `opencode` already uses). Every server is a stdio MCP. This keeps Windows, macOS and Linux identical and makes attach-mode and multi-session setups work without a broker.
 7. **Harness-agnostic, OpenCode-specific, OpenCode 2 only.** Tools work from any MCP client. Worker integration assumes OpenCode (its config, its agents, its permission system). All server calls go through OpenCode 2's API (`/api/*`, `@opencode/client`) (§3.1).
 8. **Reuse the agent runtime for model access.** One-shot model calls go through OpenCode too (its providers, auth and catalog), so there is exactly one place where models are configured.
+9. **Delegating is a tool call, not a procedure.** Starting work, collecting it and landing it take one call each (§4.9). Everything an agent would otherwise have to know (worktrees, dependencies, scopes, gates, review, cleanup) is a default it can override, and every answer names the calls that make sense next. An agent that has never seen the horde succeeds from the tool descriptions alone; the other tools are for finer control, not for the common case.
 
 ## 3. The system
 
@@ -262,6 +263,43 @@ A library plus a small server with no store of its own, so it is always consiste
 ### 4.8 `@mcp-horde/review` (built after M5)
 
 The gate proves the code builds and its tests pass; it cannot tell whether the change does what the task asked, so the orchestrator still read reports and diffs. `review_task { id, models? }` (in `opencode`, which owns the models; the logic is the `review` library) gives each acceptance criterion to a cheap model with the attempt's worktree diff (new-file line numbers, touched definitions, a budget that lists what it leaves out) and asks for met / not met / unclear with cited lines, as checked JSON through `opencode_ask`. Every citation is then checked against the lines the diff shows: a "met" without a real line becomes "unclear", invented citations are dropped and counted, a skipped criterion is "unclear". The default reviewer is the cheapest tier model other than the worker's; several models cross-check and list disagreements. The first reviewer's outcome is kept on the attempt and shown by `board_task`.
+
+### 4.9 The simple path: `horde_do`, `horde_wait`, `horde_tell`, `horde_land`, `horde_drop` (M6)
+
+**The vision.** Delegating coding work should feel like calling a subagent: one call to start it, one to collect it, one to take it. An agent that has never seen the horde must succeed from the tool descriptions alone, with no skill, README or inspection, and must never be left with a broken branch or a dead end. The full flow (§6) took nine calls across four servers per task, plus knowledge the agent could only get by reading the code: link the dependencies into the worktree, re-pass the scope, pick a reviewer, verify by hand what the reviewer could not see. All of that becomes a default.
+
+**Five verbs** in the `opencode` server (it owns the fleet, and already uses the board, verify and review libraries). A task id (`t-…`) is also the worker's name.
+
+| Call | Does |
+| --- | --- |
+| `horde_do { goal, done?, scope?, title?, model?, variant?, directory?, wait? }` | Plans one board task and starts a worker on it with the defaults below. Returns the id at once (`wait: true` blocks until the outcome, like a subagent). |
+| `horde_wait { ids?, timeout_seconds? }` | Returns every outcome that is ready, each once; if none is, blocks until the first. |
+| `horde_tell { id, message?, approve?, model?, scope? }` | Answers what the worker waits on (a question: `message`; a permission: `approve`, and a `message` alone refuses it with that instruction), or asks for changes (a new round of work and checks). While it works, the message steers it. `model` switches it first (escalation without losing its context); `scope` replaces the task's scope (its session rules, the audit and the board together), so an edit refused outside the scope is one call, not a new task. Approving never widens the scope. |
+| `horde_land { id }` | Takes a READY task's work atomically (below), marks the task done, removes the worktree and branch. After a failed landing and a fix, it is called again. |
+| `horde_drop { id, reason? }` | Stops the worker, fails the attempt on the board (the ledger learns from it), removes the worktree and branch; the answer names the last commit. |
+
+**Outcomes.** Each is a compact block that ends with the calls that make sense next, so the agent never has to look up what to do:
+
+- **READY**: the checks' verdict, the review in words ("3 of 4 criteria met, 1 unclear"), whether the report matches the diff, the files changed with line counts, the worker's one-line summary, each undecided criterion with a ready-made `horde_tell` to have it proven (so the agent is not pulled back into the diff), cost, time, model → `horde_land` · `horde_tell` · `horde_drop`.
+- **NEEDS YOU**: the question with its options, or the command or edit it asks permission for → `horde_tell`.
+- **FAILED**: why (the checks' verdict after the last round, an error, a limit), the edits it was refused outside its scope, the files it changed with a short excerpt, the worker's last words, the `git diff` command for the whole change, and the next tier's model when there is one → `horde_tell` (a hint, or `model` to escalate) · `horde_drop`.
+- **WORKING** (a wait that timed out): elapsed time, cost and the current activity per worker.
+
+**Defaults the agent no longer chooses.**
+1. Always a worktree, on branch `horde/<id>`.
+2. Dependencies: `horde.json` `"workers": { "link": [...], "setup": "…" }` when present; otherwise every untracked dependency directory git ignores in the checkout (`node_modules` anywhere, `.venv`, `venv`) is linked.
+3. The task's scope confines edits (session rules, outside denied) as well as the audit, for every task-bound spawn.
+4. The model is the task's tier from `horde.json`, else OpenCode's default model; the answer says which.
+5. The gate is the project's checks, the audit and the **review**: once the checks pass, a reviewer model (the next tier's, else the default) judges each criterion with cited lines, and it sees the checks' verdict, so "tests pass" can be met by citing a passed check. A criterion it finds not met goes back to the worker like a failing check while rounds remain (2 by default); criteria it cannot decide become "check yourself" lines.
+6. Questions from the worker come to the caller (they are about intent); permission requests follow the configured policy.
+
+**Landing never breaks your branch.** `horde_land` replays the worker's commits onto your current branch's tip *inside its worktree* (`worktree sync`), runs the project's full checks there, and only if they pass, and your branch has not moved meanwhile, replays the same commits onto your branch. The tree that was tested is the tree you get, so there is no second check run. A conflict or a failing check leaves your branch untouched; the worker is now on top of your branch and can fix it after a `horde_tell`. Uncommitted changes in your checkout stay where they are; a conflict with them is refused before anything changes. Because commits are replayed, the worker's branch is deleted only after `git cherry` shows every one of its commits on your branch.
+
+**What stays.** The 47 other tools remain for what the simple path does not cover: multi-task plans with dependencies (`board_*`), best-of-N, steering in the middle of a step, transcripts, saved permissions, one-shot asks, code search and checks for the agent's own work (`context_*`, `verify_*`). Their descriptions say when to prefer `horde_do`. The server instructions lead with the five verbs, and the skill shrinks to the judgement calls (how to write a goal, when to split work, when to escalate).
+
+**Measured, not assumed.** The design was checked on paper before any code: two fresh agents, given only the tool list, these descriptions and sample outputs, planned two tasks, a question, a permission request, a failure and a broken landing. The first scored it 7/10 against a plain subagent call and found that landing could leave the branch broken and that failures sent it outside the five tools; both were fixed (atomic landing, FAILED outcomes with the change and the refused edits, `model` on `horde_tell`). The second scored the revision 8/10 ("each output told me the next call") and found one dead end left, a scope that cannot change once the task runs, now `scope` on `horde_tell`. Both found the other tools noise; they stay visible because they are real capabilities (a plain `opencode_spawn` has no task, worktree or gate), and hiding them is the next step if the live test shows an agent reaching for them. It is done when a fresh agent with only the plugin installed delegates a real task in this repository in three calls (`horde_do`, `horde_wait`, `horde_land`) without reading anything else.
+
+**Not in the simple path yet:** dependencies between tasks (land one, then `horde_do` the next), per-task budgets (`opencode_spawn` `limits`), several workers on one task.
 
 ## 5. Configuration: one `horde.json`
 
