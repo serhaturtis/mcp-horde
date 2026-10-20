@@ -1,0 +1,17 @@
+schema_version: "1.1"
+name: two-file-fix
+description: Borderline. A well-described fix, but small (one function and its test). Should be done directly.
+tags: [direct, borderline]
+context:
+  scaffold_script: scaffold.sh
+execution:
+  max_turns: 10
+  allowed_tools: [Read, Glob, Grep, Skill]
+  prompt: |
+    formatDuration in packages/core/src/text.ts rounds badly near minute boundaries: 59.6 seconds prints as "60s" and 119.6 seconds as "1m60s". Make those print "1m00s" and "2m00s", and add both cases to its test in packages/core/test/core.test.ts.
+graders:
+  - name: not-delegated
+    type: tool_used
+    tool: mcp__plugin_horde_opencode__horde_do
+    min: 0
+    max: 0

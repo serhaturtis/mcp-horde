@@ -1,0 +1,17 @@
+schema_version: "1.1"
+name: vague-speedup
+description: Borderline. Sounds like work, but the change cannot be described before investigating. Should not be delegated yet.
+tags: [direct, borderline]
+context:
+  scaffold_script: scaffold.sh
+execution:
+  max_turns: 10
+  allowed_tools: [Read, Glob, Grep, Skill]
+  prompt: |
+    The board CLI's watch view gets sluggish once the board has a few hundred tasks. Can you make it faster?
+graders:
+  - name: not-delegated
+    type: tool_used
+    tool: mcp__plugin_horde_opencode__horde_do
+    min: 0
+    max: 0

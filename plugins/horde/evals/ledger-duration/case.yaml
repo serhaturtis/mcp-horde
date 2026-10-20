@@ -1,0 +1,15 @@
+schema_version: "1.1"
+name: ledger-duration
+description: Borderline. A sizeable change across the ledger's code, README and tests, asked for casually and needing some reading first. Should go to a worker.
+tags: [delegate, borderline]
+context:
+  scaffold_script: scaffold.sh
+execution:
+  max_turns: 10
+  allowed_tools: [Read, Glob, Grep, Skill]
+  prompt: |
+    ledger_stats reports pass rate, gate rounds and cost per accepted task for each model, tier or area. I'd also like to see how long accepted attempts take: add the median time from start to end, per group, to its output and to the ledger README, with tests.
+graders:
+  - name: delegated
+    type: tool_used
+    tool: mcp__plugin_horde_opencode__horde_do
