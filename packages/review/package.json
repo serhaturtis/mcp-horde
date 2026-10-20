@@ -33,7 +33,7 @@
   "scripts": {
     "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.test.json",
-    "test": "node --conditions=source --import tsx --test --test-concurrency=1 test/review.test.ts"
+    "test": "node --conditions=source --import tsx --import ../../scripts/test-env.mjs --test --test-concurrency=1 test/review.test.ts"
   },
   "dependencies": {
     "@mcp-horde/board": "^0.1.0",
