@@ -10,6 +10,9 @@ Does an agent hand work to the horde when that is the better path, and keep it w
 | `servers-log` | Keep the test servers' log lines out of the real state directory (mostly investigation, a small fix) | do directly |
 | `one-line` | Change `watch`'s default interval from one second to two | do directly |
 | `question` | How the verify server finds the tests that cover a change | do directly |
+| `ledger-duration` | Median attempt duration in `ledger_stats`, its README and tests, asked casually (borderline) | delegate |
+| `two-file-fix` | A rounding bug in `formatDuration`, described precisely, plus its test (borderline: well described but small) | do directly |
+| `vague-speedup` | "The watch view is sluggish, make it faster" (borderline: sounds like work, but cannot be described yet) | do directly |
 
 The reasons for these choices are in [docs/research/horde-implications.md](../../../docs/research/horde-implications.md#the-target-restated).
 
@@ -23,14 +26,14 @@ claude plugin eval plugins/horde --runs 1 --ablation none --model claude-opus-5-
 ```
 
 - **`--runs 1 --ablation none`.** One run per case, and no run without the plugin. Without the plugin `horde_do` does not exist, so that arm would measure nothing. One run is noisy: use `--runs 3` before trusting a small difference.
-- **`--max-cost-usd 2.4`.** The runner checks the ceiling before it starts each run, so the run in flight can pass it by about $0.45. A whole pass cost $1.84 on 2026-10-21 (about $0.20–0.45 per case), and 2.4 keeps a pass under $3.
+- **`--max-cost-usd 2.4`.** The runner checks the ceiling before it starts each run, so the run in flight can pass it by about $0.50. Cases cost $0.19–0.51 each. Six cases came to $1.84, and the nine of the suite now come to about $3, so a pass held under $3 may stop before the last case. The summary then says "partial".
 - **`--scaffold`.** It runs `scaffold.sh` (each case links to it), which clones this repository into the run's empty workspace and checks out the pinned commit.
 - **`--allow-tools Bash Edit Write`.** These let the agent do the work itself, so not delegating is a real option. Bash runs in Claude Code's sandbox (bubblewrap and socat on Linux).
 - **The 10-turn cap.** Each case stops at 10 turns. The decision comes well before that, and most runs end with "Reached maximum number of turns", which is expected and does not affect the score.
 
 ## The mocks
 
-`mocks/opencode/` answers the five horde tools with fixed text in the shape of the real answers: a task starts, comes back READY and lands. No worker runs. `_tools.json` carries the real tool definitions, because the descriptions are part of what is being measured.
+`mocks/opencode/` answers the five horde tools with fixed text in the shape of the real answers. No worker runs. A task starts, and `horde_wait` says it is still working, as a real wait does when it times out. The first version returned READY and then "landed". Agents went looking for work that never appeared, which cost turns and told nothing. `_tools.json` carries the real tool definitions, because the descriptions are part of what is being measured.
 
 `node scripts/eval-tools.mjs` regenerates it from the bundled server; run it after changing a description. `ci.sh` fails while it is out of date.
 
@@ -48,3 +51,4 @@ claude plugin eval plugins/horde --runs 1 --ablation none --model claude-opus-5-
 | Date | Texts | Runs | Score | Cost |
 | --- | --- | --- | --- | --- |
 | 2026-10-21 | As of ead8811 (hook, skill and descriptions of that commit) | 1 per case | 6/6: all three delegate cases called `horde_do` (three-pieces three times, in parallel), none of the direct cases did | $1.84 |
+| 2026-10-21 | As of 8fa4876 (factual hook text, edit-count note, calmer descriptions with "more than a few edits") | 1 per case, 8 of 9 cases (the ceiling stopped `vague-speedup`) | 5/8. All direct cases stayed direct, and three-pieces delegated three times. status-json, core-text-tests and ledger-duration were done by hand, with "Small enough to do directly" and "The change is small, so I'm making it directly" | $2.73 |

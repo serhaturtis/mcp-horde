@@ -70,6 +70,30 @@ The suite in [`plugins/horde/evals`](../../plugins/horde/evals/README.md) runs s
 - Server instructions are absent, so they cannot be what made the difference.
 - Which of the hook, the skill and the descriptions carries the effect is not known. Finding out needs an arm without the hook, or with other texts.
 
+## Eval rerun with best-practice wording
+
+Same suite plus three borderline cases. The texts of 8fa4876 rewrote what the agent sees, following [vendor guidance](vendor-guidance.md#prompting-for-tool-use):
+- the hook says what the horde does and suits, as facts, instead of an imperative "HORDE:" rule;
+- `horde_do` says to use it "when writing it yourself would take more than a few edits", and that "small edits … are quicker done directly", instead of "the default for any self-contained change … (not for a one-line edit…)";
+- the skill's description drops "by default";
+- a PostToolUse note fires at the fourth file edited by hand.
+
+| Case | Expected | ead8811 | 8fa4876 |
+| --- | --- | --- | --- |
+| status-json | delegate | delegated | **by hand**: "Small enough to do directly" |
+| core-text-tests | delegate | delegated | **by hand** |
+| three-pieces | delegate | delegated ×3 | delegated ×3 |
+| ledger-duration | delegate | (not run) | **by hand**: "The change is small, so I'm making it directly", then about 17 edits in five files |
+| servers-log, one-line, question | direct | direct | direct |
+| two-file-fix | direct | (not run) | direct |
+| vague-speedup | direct | (not run) | not run (cost ceiling) |
+
+$2.73 for the pass.
+
+**The edit-count note fired** in ledger-duration at the fourth file: the hook's state file records it. PostToolUse context does not appear in the eval trace. The agent was finishing the change by then, as the note allows.
+
+**What it suggests.** The calmer wording lost the delegation of single sizeable tasks, and the agents' own words point at the size threshold. "One-line edit" is a concrete line. "More than a few edits" and "small edits" let the model call a feature slice small. The hook text changed in the same run, so this run cannot attribute the drop to one text. One run per case, but three flips with stated reasons are unlikely to be noise [inference]. Wording the guidance calls best practice was worse here, which is the reason to measure.
+
 ## Earlier subagent run
 
 Before the tools were loaded upfront (779d122), a general-purpose subagent was given a plain request to write `ci.sh`. It did not delegate. In its report it cited:
