@@ -44,4 +44,4 @@ claude mcp add context  -- node "$PWD/plugins/horde/servers/context.js"
 
 Copy `skills/horde/SKILL.md` into your project's `.claude/skills/horde/` for the procedure.
 
-The bundles are generated from `packages/*` by `npm run bundle` (esbuild); CI fails when they do not match the sources. Do not edit them by hand.
+The bundles are generated from `packages/*` by `npm run bundle` (esbuild); `./ci.sh` fails when they do not match the sources. Do not edit them by hand.

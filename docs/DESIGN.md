@@ -67,7 +67,7 @@ plugins/horde: .mcp.json + the `horde` skill + every server above, bundled (no c
 
 ### 3.1 API policy: OpenCode 2
 
-The target is OpenCode 2: the `/api/*` endpoints served by `opencode serve`, typed by `@opencode/client` (the CLI is `@opencode/cli`; the old `opencode-ai` package stops at 1.19.3). The version is pinned (2.1.1) and CI also runs the suite against the latest release in a non-blocking job, so API changes show up before users hit them.
+The target is OpenCode 2: the `/api/*` endpoints served by `opencode serve`, typed by `@opencode/client` (the CLI is `@opencode/cli`; the old `opencode-ai` package stops at 1.19.3). The version is pinned (2.1.1) and `./ci.sh --latest` runs the suite against the latest release, so API changes show up before users hit them.
 
 What the horde uses: sessions (create with `location`, `title`, `model`, `agent` and the session's own `permissions` rules; get; list; active; remove; interrupt; switch model and agent; prompt with `steer`/`queue` delivery; inbox; compact; revert stage/commit), messages, permission requests (per-session list and reply, saved rules list and remove), forms (the question tool's questions), `model`, `agent`, `location`, `server.info` (health and version), `debug.location.evict` (release a directory before a worktree is deleted) and the SSE event stream.
 
@@ -247,7 +247,7 @@ Precise briefs instead of exploration. Fast models are weakest at navigating lar
 
 Distribution and procedure. A plugin directory with:
 
-- `.mcp.json` registering `opencode`, `board`, `verify`, `context` and `ledger`, each started with `node ${CLAUDE_PLUGIN_ROOT}/servers/<name>.js`: self-contained bundles generated from the packages (`npm run bundle`, checked in CI), so the plugin needs no npm. The packages are not published.
+- `.mcp.json` registering `opencode`, `board`, `verify`, `context` and `ledger`, each started with `node ${CLAUDE_PLUGIN_ROOT}/servers/<name>.js`: self-contained bundles generated from the packages (`npm run bundle`, checked by `ci.sh`), so the plugin needs no npm. The packages are not published.
 - `skills/horde/SKILL.md`: the orchestration procedure the strong model follows. Plan with `board_plan` (small tasks, each with observable acceptance and a scope), then `ledger_suggest { apply: true }` for starting tiers. For each ready task: `opencode_spawn { task }` (brief, worktree, scope and gate from the board; model from the task's tier) → `opencode_wait` (gated) → `review_task` on a pass → read the review and the report (checked against the diff), not the transcript → `opencode_worktree merge` in dependency order (the project's checks then run on the merged checkout) → `board_accept`, or `board_fail` with escalation. Escalation: two failed gates raise the tier; the top tier is "do it yourself". Best-of-N for hard, well-specified tasks: spawn N on cheap tiers, gate filters, `opencode_ask` judges the survivors' diffs. Steer with `opencode_message` when a worker drifts; never let a worker run more than `limits` allow. What not to do: reading transcripts before a gate has failed twice, re-briefing from memory instead of `board_brief`, merging without a gate.
 The skill also explains the tier table users edit (`horde.json` `tiers`, §5).
 
@@ -406,7 +406,7 @@ Rules that keep this true: every tool takes a `budget` argument with a sane defa
 14. **Configuration sprawl.** One `horde.json`; env vars only for machine-level settings.
 15. **Many servers in the client.** Claude Code defers tool loading, so eight servers' worth of descriptions do not sit in context; descriptions stay terse; the plugin registers everything in one step.
 16. **The shared server is also the human's.** Injected config may add MCP mounts but must never change agents, permissions or models. A horde server mounted into the human's own TUI sessions is harmless: without a task token its worker tools only read.
-17. **Staying on v2 as it moves.** Legacy calls are confined to one adapter with a test guarding the boundary; CI also runs against OpenCode's `dev` tag (non-blocking) so v2 changes are seen early; `session.wait` and project copies are watched as replacements for polling and for the horde's own worktrees.
+17. **Staying on v2 as it moves.** Legacy calls are confined to one adapter with a test guarding the boundary; `./ci.sh --latest` runs against OpenCode's latest release so v2 changes are seen early; `session.wait` and project copies are watched as replacements for polling and for the horde's own worktrees.
 
 ### Review pass (October 2026)
 
@@ -438,7 +438,7 @@ Each goes into a `probe/` script in the relevant package, like the probes used w
 | **M5** ✓ tree-sitter `context`, `horde watch` (plugin packaging done early: bundled servers, no npm) | depth and visibility | after the shape is proven |
 | **M6** ✓ the simple path (§4.9): `horde_do`, `horde_wait`, `horde_tell`, `horde_land`, `horde_drop`; review inside the gate, seeing the checks; task scopes confine edits; dependencies linked into worktrees; atomic landing | delegating is a tool call: three calls per task, no procedure to learn | two fresh agents found the nine-call flow usable only with the skill and inside knowledge |
 
-Each milestone ships with the same bar as `opencode`: unit tests, integration tests against a real `opencode serve` with the mock LLM, CI on Linux, macOS and Windows on Node 20 and 22, READMEs updated.
+Each milestone ships with the same bar as `opencode`: unit tests, integration tests against a real `opencode serve` with the mock LLM, `./ci.sh` passing, READMEs updated.
 
 ## 13. Non-goals
 

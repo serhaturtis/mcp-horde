@@ -45,9 +45,11 @@ npm run build        # builds every package
 npm run typecheck
 npm run lint         # Biome
 npm test
+./ci.sh              # all of the above plus the bundle check (--install: from a clean install first)
+                     # (--live: real-model e2e run, --latest: against OpenCode's latest release)
 ```
 
-Requirements: Node.js 20 or newer, and Git 2.34 or newer (worktree sync replays every commit). After changing a server, `npm run bundle` regenerates the plugin's bundles (CI checks they match the sources).
+Requirements: Node.js 20 or newer, and Git 2.34 or newer (worktree sync replays every commit). After changing a server, `npm run bundle` regenerates the plugin's bundles (`./ci.sh` checks they match the sources).
 
 ## License
 
