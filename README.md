@@ -37,6 +37,8 @@ The plugin carries its servers as self-contained bundles (`plugins/horde/servers
 
 [`docs/DESIGN.md`](docs/DESIGN.md) describes the whole horde: how the servers fit around `opencode`, what was verified against OpenCode 2.1, what is still planned, and the build order.
 
+[`docs/research/`](docs/research/README.md) is the reference for further MCP work: how Claude Code and other hosts put tools, server instructions, skills and hooks in front of a model, what the MCP specification says as of 2026-07-28, what vendors and papers have measured about tool selection and delegation, and what that means for the horde. Every claim carries its source.
+
 ## Development
 
 ```sh
