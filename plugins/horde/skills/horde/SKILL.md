@@ -5,7 +5,7 @@ description: Delegate coding work to cheap, fast OpenCode workers (DeepSeek, Kim
 
 # Running the horde
 
-You plan and judge; workers do the typing. Your context is the scarce resource: read outcomes, not transcripts or whole diffs.
+You plan and judge; workers do the typing. Your context is the scarce resource: read outcomes, not transcripts or whole diffs. This holds when you are a subagent too: a worker is a cheaper model running one piece of your assignment, not another Claude agent; hand it the pieces, keep the judgement.
 
 ## The loop
 
