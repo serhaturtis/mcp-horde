@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import path from "node:path"
 import { loadSyntax } from "@mcp-horde/context"
-import { loadTiers, packageVersion, tierLabel } from "@mcp-horde/core"
+import { loadTiers, packageVersion, recordLifecycle, tierLabel } from "@mcp-horde/core"
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js"
@@ -10,6 +10,7 @@ import { Board, defaultStateRoot } from "./board.js"
 import { renderBrief, renderNotes, renderSummary, renderTask } from "./render.js"
 
 const VERSION = packageVersion(import.meta.url)
+recordLifecycle("board", VERSION)
 
 process.on("unhandledRejection", (err) => {
   process.stderr.write(`[mcp-horde/board] unhandled rejection: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`)

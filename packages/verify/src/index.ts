@@ -2,7 +2,7 @@
 import fs from "node:fs"
 import path from "node:path"
 import { loadSyntax } from "@mcp-horde/context"
-import { git, packageVersion, truncateHead } from "@mcp-horde/core"
+import { git, packageVersion, recordLifecycle, truncateHead } from "@mcp-horde/core"
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js"
@@ -13,6 +13,7 @@ import { defaultStateDir, gate } from "./gate.js"
 import { logDirFor, logFileFor } from "./run.js"
 
 const VERSION = packageVersion(import.meta.url)
+recordLifecycle("verify", VERSION)
 
 process.on("unhandledRejection", (err) => {
   process.stderr.write(`[mcp-horde/verify] unhandled rejection: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`)

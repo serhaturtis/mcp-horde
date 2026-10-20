@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { loadSyntax } from "@mcp-horde/context"
-import { packageVersion } from "@mcp-horde/core"
+import { packageVersion, recordLifecycle } from "@mcp-horde/core"
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { Backend, sharedServerAlive, stopServer } from "./backend.js"
@@ -12,6 +12,7 @@ import { INSTRUCTIONS, registerTools } from "./tools.js"
 import { repoRoot } from "./worktree.js"
 
 const VERSION = packageVersion(import.meta.url)
+recordLifecycle("opencode", VERSION)
 
 // A bug in a background task must not take the whole MCP server down.
 process.on("unhandledRejection", (err) => {

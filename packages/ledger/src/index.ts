@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import path from "node:path"
 import { Board, defaultStateRoot } from "@mcp-horde/board"
-import { loadTiers, packageVersion } from "@mcp-horde/core"
+import { loadTiers, packageVersion, recordLifecycle } from "@mcp-horde/core"
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js"
@@ -9,6 +9,7 @@ import { z } from "zod"
 import { allBoards, type Outcome, outcomesOf, renderStats, stats, suggest, suggestTiers } from "./ledger.js"
 
 const VERSION = packageVersion(import.meta.url)
+recordLifecycle("ledger", VERSION)
 
 process.on("unhandledRejection", (err) => {
   process.stderr.write(`[mcp-horde/ledger] unhandled rejection: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`)

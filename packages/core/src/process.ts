@@ -1,6 +1,47 @@
 import { spawn, spawnSync } from "node:child_process"
+import fs from "node:fs"
+import os from "node:os"
+import path from "node:path"
 
 const isWindows = process.platform === "win32"
+
+/**
+ * Note a server's start, and how it ends, in one log the horde's servers share
+ * ($XDG_STATE_HOME/mcp-horde/servers.log): the signal it got, its stdin closing, an uncaught
+ * exception with its stack, the exit code. A server that vanished from its client says why;
+ * nothing at all after "started" means it was killed outright (SIGKILL).
+ * ponytail: the log only grows (a few lines per server start); rotate it if that ever matters.
+ */
+export function recordLifecycle(name: string, version: string): void {
+  const file = path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state"), "mcp-horde", "servers.log")
+  const note = (what: string) => {
+    try {
+      fs.mkdirSync(path.dirname(file), { recursive: true })
+      fs.appendFileSync(file, `${new Date().toISOString()} ${name} pid ${process.pid}: ${what}\n`)
+    } catch {
+      // Logging must never be what breaks a server.
+    }
+  }
+  note(`started (version ${version}, parent ${process.ppid})`)
+  process.on("uncaughtException", (err) => {
+    note(`uncaught exception: ${err.stack ?? err.message}`)
+    process.stderr.write(`[mcp-horde/${name}] ${err.stack ?? err.message}\n`)
+    process.exit(1)
+  })
+  for (const [signal, code] of [
+    ["SIGTERM", 143],
+    ["SIGINT", 130],
+    ["SIGHUP", 129],
+  ] as const) {
+    process.on(signal, () => {
+      note(`got ${signal}`)
+      // The only listener: keep the default of exiting. A server with its own handler stops itself.
+      if (process.listenerCount(signal) === 1) process.exit(code)
+    })
+  }
+  process.stdin.once("close", () => note("stdin closed by the client"))
+  process.once("exit", (code) => note(`exited with code ${code} after ${Math.round(process.uptime())}s`))
+}
 
 /** Stop a process and everything it started (`group`: it leads its own process group). */
 export function killTree(pid: number, group: boolean, signal: NodeJS.Signals = "SIGTERM") {

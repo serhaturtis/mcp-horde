@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import { execFileSync } from "node:child_process"
+import { execFileSync, spawn } from "node:child_process"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
@@ -70,6 +70,40 @@ describe("files and locks", () => {
       /timed out/,
     )
     assert.ok(fs.existsSync(path.join(dir, "x.lock")), "someone else's lock is left alone")
+  })
+})
+
+describe("lifecycle log", () => {
+  // A child that records its lifecycle, then exits, throws, or waits to be signalled.
+  const child = (state: string, how: "exit" | "throw" | "wait") => {
+    const lib = JSON.stringify(path.resolve(import.meta.dirname, "../src/index.ts"))
+    const body = `const { recordLifecycle } = await import(${lib}); recordLifecycle("probe", "1.2.3"); ${
+      how === "exit"
+        ? "process.exit(3)"
+        : how === "throw"
+          ? "setTimeout(() => { throw new Error('boom') })"
+          : "process.stdout.write('ready'); setInterval(() => {}, 1000)"
+    }`
+    return spawn(process.execPath, ["--import", "tsx", "--input-type=module", "-e", body], {
+      env: { ...process.env, XDG_STATE_HOME: state },
+      stdio: ["pipe", "pipe", "pipe"],
+    })
+  }
+  const done = (p: ReturnType<typeof spawn>) => new Promise<void>((r) => p.once("exit", () => r()))
+  const log = (state: string) => fs.readFileSync(path.join(state, "mcp-horde", "servers.log"), "utf8")
+
+  test("a server's start and how it ended: exit code, uncaught exception, signal", { skip: process.platform === "win32" }, async () => {
+    const state = tmp()
+    await done(child(state, "exit"))
+    assert.match(log(state), /probe pid \d+: started \(version 1\.2\.3, parent \d+\)\n.*probe pid \d+: exited with code 3 after \d+s/)
+    await done(child(state, "throw"))
+    assert.match(log(state), /probe pid \d+: uncaught exception: Error: boom/)
+    const waiting = child(state, "wait")
+    await new Promise<void>((r) => waiting.stdout!.once("data", () => r()))
+    waiting.kill("SIGHUP")
+    await done(waiting)
+    assert.match(log(state), /probe pid \d+: got SIGHUP\n.*probe pid \d+: exited with code 129/)
+    assert.equal(waiting.exitCode, 129, "the default of exiting on a signal is kept")
   })
 })
 

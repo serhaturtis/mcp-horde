@@ -20,7 +20,8 @@ export interface HordeOptions {
   progress: (extra: unknown) => ((snaps: Snapshot[], elapsedMs: number) => void) | undefined
 }
 
-export const HORDE_INSTRUCTIONS = `horde: delegate coding work to cheap, fast worker models and get it back checked.
+export const HORDE_INSTRUCTIONS = `horde: cheap, fast worker models that do coding work for you and hand it back checked.
+Reach for it first whenever you are about to write a self-contained change yourself (a fix, a feature slice, tests, a refactor, docs): a worker costs a fraction of your tokens, keeps your context for the user, works while you do something else, and its work comes back tested and reviewed and lands without breaking the branch. It takes minutes, so start it and keep going. Do the work yourself only for a one-line edit, for something you need the result of to keep reasoning right now, or for a change you cannot describe in a paragraph.
 - horde_do {goal, done, scope} starts a worker in its own git worktree; when it finishes, the project's checks run and a reviewer judges your done-criteria against the diff. Workers do not see your conversation.
 - horde_wait returns outcomes: READY → horde_land, NEEDS YOU → horde_tell, FAILED → horde_tell or horde_drop.
 Start several for independent work. The opencode_* and board_* tools give finer control (steering mid-step, multi-task plans with dependencies, agents without a worktree or checks); you rarely need them.`
@@ -35,7 +36,7 @@ const timeout = z
 export function registerHorde(tool: Tool, opts: HordeOptions) {
   tool(
     "horde_do",
-    "Delegate a piece of coding work to a cheap, fast worker model and get it back checked. Describe it the way you would to a new colleague: goal (what and why), done (how you will know it is finished), scope (the files it may change). The worker gets its own git worktree with the project's dependencies, and code context from the repository; when it finishes, the project's tests, typecheck and lint run, a reviewer model checks each done-criterion against the diff, and failures go back to the worker to fix (2 rounds). Returns at once with the task id, so several can run in parallel; call horde_wait for the outcome, or pass wait: true to block until it is done (like a subagent).",
+    "Delegate a piece of coding work to a cheap, fast worker model and get it back checked: the default for any self-contained change you would otherwise write yourself (not for a one-line edit, or something you need the result of right now). Describe it the way you would to a new colleague: goal (what and why), done (how you will know it is finished), scope (the files it may change). The worker gets its own git worktree with the project's dependencies, and code context from the repository; when it finishes, the project's tests, typecheck and lint run, a reviewer model checks each done-criterion against the diff, and failures go back to the worker to fix (2 rounds). Returns at once with the task id, so several can run in parallel; call horde_wait for the outcome, or pass wait: true to block until it is done (like a subagent).",
     {
       goal: z
         .string()
