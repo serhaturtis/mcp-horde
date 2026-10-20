@@ -3,6 +3,7 @@ export {
   checkVerdicts,
   collectReview,
   disagreements,
+  type GateCheck,
   REVIEW_SCHEMA,
   type ReviewInput,
   renderDiff,

@@ -28,12 +28,17 @@ export interface ReviewInput {
 
 export type Status = "met" | "not_met" | "unclear"
 
+/** A check the gate ran (tests, typecheck, lint), which a review may cite instead of a diff line. */
+export type GateCheck = { name: string; pass: boolean; summary?: string }
+
 export interface Verdict {
   /** 1-based criterion number. */
   criterion: number
   text: string
   status: Status
   evidence: { file: string; line: number }[]
+  /** Names of the gate checks cited as evidence, kept only when they passed. */
+  checks: string[]
   note: string
 }
 
@@ -49,7 +54,12 @@ export const REVIEW_SCHEMA = {
           status: { enum: ["met", "not_met", "unclear"] },
           evidence: {
             type: "array",
-            items: { type: "object", properties: { file: { type: "string" }, line: { type: "integer", minimum: 1 } }, required: ["file", "line"] },
+            items: {
+              anyOf: [
+                { type: "object", properties: { file: { type: "string" }, line: { type: "integer", minimum: 1 } }, required: ["file", "line"] },
+                { type: "object", properties: { check: { type: "string" } }, required: ["check"] },
+              ],
+            },
           },
           note: { type: "string" },
         },
@@ -189,7 +199,8 @@ export function renderDiff(raw: string, maxChars: number) {
   return { diff: kept.join("\n\n"), shown, omitted, changed }
 }
 
-export function reviewPrompt(r: ReviewInput): string {
+export function reviewPrompt(r: ReviewInput, checks?: GateCheck[]): string {
+  const gate = checks?.length ? checks : undefined
   return [
     `You review a change made for a task. Judge each acceptance criterion separately, only from the change below.`,
     "",
@@ -199,12 +210,15 @@ export function reviewPrompt(r: ReviewInput): string {
     "# Acceptance criteria",
     ...r.criteria.map((c, i) => `${i + 1}. ${c}`),
     "",
+    ...(gate ? ["# Checks the gate ran", ...gate.map((c) => `${c.pass ? "✓" : "✗"} ${c.name}${c.summary ? `: ${c.summary}` : ""}`), ""] : []),
     "# How to answer",
     '- For every criterion give status "met", "not_met" or "unclear", evidence and a one-sentence note (under 200 characters).',
     '- "met" needs evidence: the lines of the change that do it, as {file, line} using the L<number> shown before each line. Cite the lines that matter most (at most 5).',
     '- "not_met" when the change does not do it or does it wrongly; say what is missing in the note and cite the closest lines if any.',
     '- "unclear" when the change alone cannot tell (it depends on code not shown, or a test that was not run).',
-    "- Do not assume work that is not in the change. Tests passing is checked elsewhere; judge behaviour.",
+    gate
+      ? '- Do not assume work that is not in the change. A criterion about checks passing (tests, typecheck, lint) may cite a passed check as evidence: {"check": "<name>"}.'
+      : "- Do not assume work that is not in the change. Tests passing is checked elsewhere; judge behaviour.",
     "",
     r.touched.length ? `# Definitions the change touches\n${r.touched.join("\n")}\n` : "",
     `# The change (L<n> is the line number in the new file; + added, - removed)`,
@@ -215,27 +229,36 @@ export function reviewPrompt(r: ReviewInput): string {
     .join("\n")
 }
 
-/** The model's answer, with every citation checked against the diff and a verdict for every criterion. */
-export function checkVerdicts(r: ReviewInput, json: unknown): Verdict[] {
+/** The model's answer, with every citation checked against the diff and the gate's passed checks, and a verdict for every criterion. */
+export function checkVerdicts(r: ReviewInput, json: unknown, checks: GateCheck[] = []): Verdict[] {
+  const passed = new Set(checks.filter((c) => c.pass).map((c) => c.name))
   const given = ((json as { verdicts?: unknown[] })?.verdicts ?? []) as {
     criterion: number
     status: Status
-    evidence?: { file: string; line: number }[]
+    evidence?: ({ file: string; line: number } | { check: string })[]
     note?: string
   }[]
   return r.criteria.map((text, i) => {
     const v = given.find((g) => g.criterion === i + 1)
-    if (!v) return { criterion: i + 1, text, status: "unclear" as const, evidence: [], note: "the reviewer gave no verdict for this criterion" }
+    if (!v) return { criterion: i + 1, text, status: "unclear" as const, evidence: [], checks: [], note: "the reviewer gave no verdict for this criterion" }
     const norm = (f: string) => f.replace(/\\/g, "/").replace(/^(\.\/|b\/)/, "")
-    const real = (v.evidence ?? []).map((e) => ({ file: norm(e.file), line: e.line })).filter((e) => r.shown.get(e.file)?.has(e.line))
-    const dropped = (v.evidence ?? []).length - real.length
+    const isCheck = (e: { file: string; line: number } | { check: string }): e is { check: string } => "check" in e
+    const real = (v.evidence ?? [])
+      .filter((e): e is { file: string; line: number } => !isCheck(e))
+      .map((e) => ({ file: norm(e.file), line: e.line }))
+      .filter((e) => r.shown.get(e.file)?.has(e.line))
+    const kept = (v.evidence ?? [])
+      .filter(isCheck)
+      .map((e) => e.check)
+      .filter((name) => passed.has(name))
+    const dropped = (v.evidence ?? []).length - real.length - kept.length
     let status = v.status
     let note = truncate(v.note ?? "", 300)
-    if (status === "met" && !real.length) {
+    if (status === "met" && !real.length && !kept.length) {
       status = "unclear"
       note = `${note} (said met, but cited no line of the change)`.trim()
     } else if (dropped) note = `${note} (${dropped} citation(s) not in the change were dropped)`.trim()
-    return { criterion: i + 1, text, status, evidence: real.slice(0, 5), note }
+    return { criterion: i + 1, text, status, evidence: real.slice(0, 5), checks: [...new Set(kept)], note }
   })
 }
 
@@ -265,7 +288,8 @@ export function renderVerdicts(r: ReviewInput, verdicts: Verdict[], model: strin
   const not = verdicts.filter((v) => v.status === "not_met").length
   const head = `review ${r.task.id} "${r.task.title}" by ${model}: ${met}/${verdicts.length} met${not ? `, ${not} not met` : ""}`
   const lines = verdicts.map((v) => {
-    const where = v.evidence.length ? ` — ${cite(v.evidence)}` : ""
+    const cited = [v.evidence.length ? cite(v.evidence) : "", v.checks.length ? `checks: ${v.checks.join(", ")}` : ""].filter(Boolean).join(", ")
+    const where = cited ? ` — ${cited}` : ""
     return `${MARK[v.status]} ${v.criterion}. ${truncate(v.text, 120)}${where}${v.note ? `\n    ${v.note}` : ""}`
   })
   const tail = r.omitted.length ? `\n(not reviewed: ${r.omitted.join(", ")})` : ""

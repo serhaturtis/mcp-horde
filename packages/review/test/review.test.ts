@@ -6,7 +6,7 @@ import path from "node:path"
 import { before, describe, test } from "node:test"
 import { Board } from "@mcp-horde/board"
 import { loadSyntax } from "@mcp-horde/context"
-import { checkVerdicts, collectReview, disagreements, renderDiff, renderVerdicts, reviewPrompt } from "../src/lib.js"
+import { checkVerdicts, collectReview, disagreements, type GateCheck, REVIEW_SCHEMA, renderDiff, renderVerdicts, reviewPrompt } from "../src/lib.js"
 
 const tmp = () => fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "horde-review-")))
 const git = (cwd: string, ...args: string[]) =>
@@ -94,6 +94,69 @@ describe("review", () => {
     assert.match(text, /\? 2\. the limit is configurable\n {4}configurable \(said met/)
     const other = checkVerdicts(r, { verdicts: [{ criterion: 1, status: "not_met", evidence: [], note: "no" }] })
     assert.deepEqual(disagreements({ model: "a", verdicts: v }, { model: "b", verdicts: other }), ["criterion 1: a says met, b says not_met"])
+  })
+
+  test("the gate's checks are listed and may be cited as evidence; without them the prompt is unchanged", async () => {
+    const { board, id } = await fixture()
+    const r = await collectReview(board, id)
+    const checks: GateCheck[] = [
+      { name: "test", pass: true, summary: "12 passing" },
+      { name: "lint", pass: false },
+    ]
+    const prompt = reviewPrompt(r, checks)
+    assert.match(prompt, /# Checks the gate ran\n✓ test: 12 passing\n✗ lint\n# How to answer/)
+    assert.match(prompt, /\{"check": "<name>"\}/)
+    assert.doesNotMatch(prompt, /Tests passing is checked elsewhere/)
+    const plain = reviewPrompt(r)
+    assert.equal(plain, reviewPrompt(r, undefined))
+    assert.equal(plain, reviewPrompt(r, []))
+    assert.doesNotMatch(plain, /# Checks the gate ran|"check"/)
+    assert.match(plain, /Tests passing is checked elsewhere; judge behaviour\./)
+  })
+
+  test("the review schema accepts a line or a check as evidence", () => {
+    const items = REVIEW_SCHEMA.properties.verdicts.items.properties.evidence.items as unknown as { anyOf: { required: string[] }[] }
+    assert.deepEqual(
+      items.anyOf.map((x) => x.required),
+      [["file", "line"], ["check"]],
+    )
+  })
+
+  test("a passed check is evidence; a failed one and an invalid line are dropped together", async () => {
+    const { board, id } = await fixture()
+    const r = await collectReview(board, id)
+    const v = checkVerdicts(
+      r,
+      {
+        verdicts: [
+          { criterion: 1, status: "met", evidence: [{ check: "test" }], note: "tests pass" },
+          { criterion: 2, status: "met", evidence: [{ check: "lint" }], note: "lint passes" },
+          { criterion: 3, status: "not_met", evidence: [{ file: "src/login.ts", line: 99 }, { check: "nope" }], note: "not logged" },
+        ],
+      },
+      [
+        { name: "test", pass: true },
+        { name: "lint", pass: false },
+      ],
+    )
+    assert.deepEqual(
+      v.map((x) => [x.status, x.evidence.length, x.checks]),
+      [
+        ["met", 0, ["test"]],
+        ["unclear", 0, []],
+        ["not_met", 0, []],
+      ],
+    )
+    assert.match(v[1]!.note, /said met, but cited no line of the change/)
+    assert.match(v[2]!.note, /2 citation\(s\) not in the change were dropped/)
+    const text = renderVerdicts(r, v, "mid/kimi")
+    assert.match(text, /✓ 1\. 429 after 5 failures per minute — checks: test/)
+    const combo = renderVerdicts(
+      r,
+      [{ criterion: 1, text: "429", status: "met", evidence: [{ file: "src/login.ts", line: 3 }], checks: ["test"], note: "" }],
+      "mid/kimi",
+    )
+    assert.match(combo, /— src\/login\.ts:3, checks: test/)
   })
 
   test("the diff budget keeps whole small files and lists the rest; hunk lines starting with dashes are not headers", () => {
