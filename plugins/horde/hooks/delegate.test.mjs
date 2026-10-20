@@ -6,7 +6,13 @@ import path from "node:path"
 import { describe, test } from "node:test"
 
 const hookPath = path.resolve(import.meta.dirname, "delegate.mjs")
-const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), "horde-hook-"))
+
+/** A fresh scratchpad for one test, removed when it ends. */
+function scratch(t) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "horde-hook-"))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  return dir
+}
 
 /** Run the hook the way Claude Code does: the event in argv, its input as JSON on stdin. */
 function run(event, input = {}) {
@@ -45,8 +51,8 @@ describe("SubagentStart", () => {
 })
 
 describe("PostToolUse", () => {
-  test("the fourth distinct file edited under one prompt gets a note naming the four files", () => {
-    const hook = session(tmp())
+  test("the fourth distinct file edited under one prompt gets a note naming the four files", (t) => {
+    const hook = session(scratch(t))
     const files = ["/repo/src/a.ts", "/repo/src/b.ts", "/repo/src/c.ts", "/repo/src/d.ts"]
     for (const file of files.slice(0, 3)) assert.equal(hook(...edit(file)), undefined, file)
     const note = hook(...edit(files[3]))
@@ -55,8 +61,8 @@ describe("PostToolUse", () => {
     assert.equal(hook(...edit("/repo/src/e.ts")), undefined, "the note is printed once per prompt")
   })
 
-  test("editing the same file twice counts once", () => {
-    const hook = session(tmp())
+  test("editing the same file twice counts once", (t) => {
+    const hook = session(scratch(t))
     assert.equal(hook(...edit("/repo/src/a.ts")), undefined)
     assert.equal(hook(...edit("/repo/src/a.ts")), undefined)
     assert.equal(hook(...edit("/repo/src/b.ts")), undefined)
@@ -64,8 +70,8 @@ describe("PostToolUse", () => {
     assert.match(hook(...edit("/repo/src/d.ts")), /edited 4 files by hand/)
   })
 
-  test("a new prompt_id starts the count again", () => {
-    const scratchpad_dir = tmp()
+  test("a new prompt_id starts the count again", (t) => {
+    const scratchpad_dir = scratch(t)
     const hook = session(scratchpad_dir)
     for (const file of ["a.ts", "b.ts", "c.ts"]) hook(...edit(`/repo/${file}`))
     assert.match(hook(...edit("/repo/d.ts")), /edited 4 files by hand/)
@@ -73,8 +79,8 @@ describe("PostToolUse", () => {
     assert.match(hook(...edit("/repo/z.ts"), "prompt-2"), /edited 4 files by hand/)
   })
 
-  test("a horde_do call earlier in the prompt stops the note", () => {
-    const hook = session(tmp())
+  test("a horde_do call earlier in the prompt stops the note", (t) => {
+    const hook = session(scratch(t))
     assert.equal(hook("mcp__plugin_horde_opencode__horde_do", { goal: "delegate it" }), undefined)
     for (const file of ["a.ts", "b.ts", "c.ts", "d.ts", "e.ts"]) assert.equal(hook(...edit(`/repo/${file}`)), undefined, file)
   })
