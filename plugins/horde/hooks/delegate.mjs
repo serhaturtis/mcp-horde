@@ -41,7 +41,10 @@ function subagentStart(input) {
 /** Counts the files edited since the prompt began; a horde_do call means the agent is delegating already. */
 function postToolUse(input) {
   if (!input.session_id) return undefined
-  const key = [input.session_id, input.agent_id].filter(Boolean).join("-").replace(/[^\w-]/g, "_")
+  const key = [input.session_id, input.agent_id]
+    .filter(Boolean)
+    .join("-")
+    .replace(/[^\w-]/g, "_")
   const file = path.join(input.scratchpad_dir ?? os.tmpdir(), `horde-edits-${key}.json`)
   let state = { prompt: input.prompt_id, files: [], done: false }
   try {
