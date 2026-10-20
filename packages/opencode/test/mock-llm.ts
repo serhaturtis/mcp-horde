@@ -8,7 +8,7 @@ import type { AddressInfo } from "node:net"
  *   a board brief    → runs its "First:" command, its RUN: lines, shares its FINDING:, reports, then answers
  *   "STEPS: <n>"    → calls shell `echo step` n times in a row, then answers "DONE"
  *   "ASK: <q>"      → calls the question tool (options Red/Blue), then answers "DONE: <tool output>"
- *   "SLOW"          → streams "Working...." for ~15s
+ *   "SLOW"          → streams "Working...." for ~15s; "SLOW <n>s" → for ~n seconds
  *   "FAIL400"       → HTTP 400; "FREETIER" → HTTP 403 FreeTierError when no tools are offered
  *   "TOOLS?"        → answers with the tool names it was offered
  *   "JSON: <json>"  → answers with that text; "JSON-RETRY" answers prose until told it was not valid; "JSON-NEVER" always prose
@@ -171,9 +171,11 @@ export async function startMockLlm(): Promise<{ url: string; close: () => void; 
     if (userText.includes("JSON-RETRY")) return say("I think b is better.")
     const json = /^JSON: (.+)$/m.exec(userText)
     if (json) return say(json[1]!)
-    if (userText.includes("SLOW")) {
+    const slow = /SLOW(?:\s+(\d+(?:\.\d+)?)s)?/.exec(userText)
+    if (slow) {
+      const ticks = slow[1] ? Math.round(Number(slow[1]) * 2) : 30
       chunk({ role: "assistant", content: "Working" })
-      for (let i = 0; i < 30 && !res.destroyed; i++) {
+      for (let i = 0; i < ticks && !res.destroyed; i++) {
         await sleep(500)
         chunk({ content: "." })
       }

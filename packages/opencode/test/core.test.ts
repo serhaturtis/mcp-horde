@@ -118,12 +118,12 @@ describe("opencode MCP server: core behaviour (real opencode, mock LLM)", { time
   })
 
   test("queued messages run after the current turn", async () => {
-    await h.call("opencode_spawn", { prompt: "SLOW first", name: "queuer" })
+    await h.call("opencode_spawn", { prompt: "SLOW 2s first", name: "queuer" })
     await h.call("opencode_message", { id: "queuer", message: "queued second", delivery: "queue" })
     const out = await h.call("opencode_wait", { ids: ["queuer"], timeout_seconds: 60 })
     assert.match(out, /IDLE/)
     const all = await h.call("opencode_output", { id: "queuer", scope: "all" })
-    assert.match(all, /SLOW first[\s\S]*Working[\s\S]*queued second[\s\S]*Echo\[none\]: queued second/)
+    assert.match(all, /SLOW 2s first[\s\S]*Working[\s\S]*queued second[\s\S]*Echo\[none\]: queued second/)
   })
 
   test("parallel agents: wait any reports each one once, then the next", async () => {
