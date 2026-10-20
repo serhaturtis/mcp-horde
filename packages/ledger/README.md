@@ -1,6 +1,6 @@
 # @mcp-horde/ledger
 
-Learns which worker model to start a task on, from what the board already records about every attempt: the task's kind of work and scope, the model that worked it, its gate rounds, its cost, and whether it was accepted or failed. Read-only over the boards, except when you ask it to apply its tier suggestions.
+Learns which worker model to start a task on, from what the board already records about every attempt: the task's kind of work and scope, the model that worked it, its gate rounds, its cost, and whether it was accepted or failed. Read-only over the boards, with one exception: `ledger_suggest { apply: true }` raises the tier of untried tasks, through the board's own edit (locked and logged like any `board_edit`). It never lowers a tier and touches nothing else.
 
 | Tool | What it does |
 | --- | --- |

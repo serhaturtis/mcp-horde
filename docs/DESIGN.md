@@ -31,15 +31,16 @@ The arrangement breaks in three places, and every server exists to fix one of th
 
 ```
                  Claude Code / any MCP harness (orchestrator model)
-   ┌────────────┬─────────────┬──────────────┬──────────────┐
-   │ opencode   │ verify      │ board        │ context      │   stdio MCP servers
-   │ spawn/wait │ gate/audit  │ plan/brief/  │ map/symbol/  │   (orchestrator mode)
-   │ steer/stop │ run/detect  │ accept/recall│ tests/pack   │
-   └─────┬──────┴──────┬──────┴──────┬───────┴──────┬───────┘
-         │ v2 API      │ lib         │ files        │ lib
-         ▼             ▼             ▼              ▼
+   ┌────────────┬─────────────┬──────────────┬──────────────┬──────────────┐
+   │ opencode   │ verify      │ board        │ context      │ ledger       │   stdio MCP servers
+   │ spawn/wait │ gate/audit  │ plan/brief/  │ map/symbol/  │ stats/       │   (the `horde` plugin)
+   │ steer/ask/ │ run/detect  │ accept/recall│ tests/pack   │ suggest tier │
+   │ review     │             │              │              │              │
+   └─────┬──────┴──────┬──────┴──────┬───────┴──────┬───────┴──────┬───────┘
+         │ v2 API      │ lib         │ files        │ lib          │ reads the boards
+         ▼             ▼             ▼              ▼              ▼
    opencode serve  ◄── gate runs in the agent's directory when it settles
-     │  (shared, one per machine; config injected via OPENCODE_CONFIG_CONTENT)
+     │  (shared, one per machine, or private per MCP process)
      │  sessions = agents, each in its own git worktree on branch horde/<name>
      ▼
    worker model (DeepSeek …) with tools: bash, edit, read …
@@ -47,18 +48,21 @@ The arrangement breaks in three places, and every server exists to fix one of th
          the fleet auto-approves exactly those commands (v2 runners offer no MCP tools yet)
                                               │
                                               ▼
-                      ~/.local/state/mcp-horde/<project>/   (board state: tasks, findings, memory, locks, events)
+                      ~/.local/state/mcp-horde/board/<repo>-<hash>/   (board state: tasks, findings, memory, locks, events)
 ```
 
 Package dependency graph (npm workspaces, all TypeScript, Node 20+):
 
 ```
-core ─┬─ verify ─── opencode      (opencode imports verify's library for gates)
-      ├─ context ── board         (board imports context's library for briefs)
-      └─ playbook (Claude Code plugin: .mcp.json + skill; no code)
+core ── context ─┬─ verify ──────────┐        (verify narrows tests with context's import graph)
+                 ├─ board ─┬─ ledger │        (board puts context packs in briefs; ledger reads boards)
+                 │         └─ review ┤        (review reads a task and its attempt's diff)
+                 └───────────────────┴─ opencode   (gates, task-bound spawns, review_task)
+
+plugins/horde: .mcp.json + the `horde` skill + every server above, bundled (no code of its own)
 ```
 
-`opencode` and `board` stay decoupled in v1; the orchestrator composes them. A later optimization lets `opencode_spawn` take a task id directly (see §10).
+`opencode` depends on `board` since M4 (`opencode_spawn { task }` assigns the attempt, briefs the worker and records its workspace, model, cost and state on the board). The orchestrator still composes everything else.
 
 ### 3.1 API policy: the v2 series
 
@@ -134,19 +138,19 @@ Requires `isolation: "worktree"` (the only place a per-agent profile can be inst
 ```
 opencode_ask { prompt, model?, variant?, files?, schema?: JSONSchema } → text | JSON
 ```
-Runs as a v2 session in a horde-owned directory (`<data dir>/ask/`) that carries one agent profile, `horde-ask`: every tool disabled, a fixed system prompt ("answer directly; no tools are available"). The directory never changes, so OpenCode loads the profile once. The call creates a session there with `agent: "horde-ask"` and the requested model, sends one prompt, waits for the single step through history, returns the text with its cost, and deletes the session (adapter). With `schema`, the prompt asks for JSON matching the schema, the reply is parsed and validated client-side, and one retry with the validation error is attempted before giving up. No agent loop, no worktree. Uses: classification, summarizing a long log or diff for the orchestrator, judging between candidates, drafting a brief. Best-of-N is `opencode_spawn` ×N + `verify` + `opencode_ask` as judge; the playbook describes it rather than a dedicated tool.
+Runs as a v2 session in a horde-owned directory (`<project>/.opencode/horde-ask-3/`, excluded from git; versioned so a server that cached an older profile never reuses it) that carries one agent profile, `horde-ask`: every tool disabled, a fixed system prompt ("answer directly; no tools are available"). The directory never changes, so OpenCode loads the profile once. The call creates a session there with `agent: "horde-ask"` and the requested model, sends one prompt, waits for the single step through history, returns the text with its cost, and deletes the session (adapter). With `schema`, the prompt asks for JSON matching the schema, the reply is parsed and validated client-side, and one retry with the validation error is attempted before giving up. No agent loop, no worktree. Uses: classification, summarizing a long log or diff for the orchestrator, judging between candidates, drafting a brief. Best-of-N is `opencode_spawn` ×N + `verify` + `opencode_ask` as judge; the skill describes it rather than a dedicated tool.
 
 To verify before building: whether `tools: {"*": false}` is honoured in a profile (otherwise the profile enumerates every tool id from `/api/agent`'s build agent).
 
-**f. Context management (`opencode_compact`, context in status).** Long tasks on small-context models hit the window. `session.context` gives the usage; the snapshot shows it (`ctx 71%`) so the orchestrator can see a worker about to lose its thread; `opencode_compact` calls `session.compact` on an idle agent before messaging it again. The playbook's rule: compact instead of re-spawning when the task is mid-way and the worktree holds good work.
+**f. Context management (`opencode_compact`, context in status).** Long tasks on small-context models hit the window. `session.context` gives the usage; the snapshot shows it (`ctx 71%`) so the orchestrator can see a worker about to lose its thread; `opencode_compact` calls `session.compact` on an idle agent before messaging it again. The skill's rule: compact instead of re-spawning when the task is mid-way and the worktree holds good work.
 
 **g. Undo a turn (`opencode_revert`).** `session.revert.stage` to a message id rolls the worker's files back to that point and marks the later messages reverted; `revert.commit` makes it permanent, `revert.clear` abandons it. `opencode_revert { id, to?: messageID }` defaults to the start of the last turn. Cheaper than discarding a worktree when one bad turn ruined a good run, and it keeps the worker's context consistent with its files, which a manual `git checkout` would not.
 
 **h. Saved permission rules (`opencode_permissions`).** An "always" reply saves a rule in OpenCode. `opencode_permissions { action: "list" | "remove", id? }` shows and removes those rules so the orchestrator can see what has been permanently allowed for a project and undo it.
 
-**d. `opencode_worktree action: "sync"`.** Merges the base branch into the agent's branch inside the agent's worktree, so conflicts with other merged work land where a cheap model (with a gate) can resolve them, instead of at the orchestrator's merge. Refused while the agent is running; after a sync the playbook says to message the agent "resolve the conflicts and run the gate".
+**d. `opencode_worktree action: "sync"`.** Merges the base branch into the agent's branch inside the agent's worktree, so conflicts with other merged work land where a cheap model (with a gate) can resolve them, instead of at the orchestrator's merge. Refused while the agent is running; after a sync the skill says to message the agent "resolve the conflicts and run the gate".
 
-**e. Worker access to the horde (revised in M2).** v2 runners offer no MCP tools (§3.1), so workers reach the board, verify and context through a `horde` CLI they run with `bash`; the brief contains the exact command. The fleet auto-approves a `bash` permission request only when the command is exactly that CLI with plain arguments (a shell-word check rejects `;`, `&&`, `||`, pipes, redirects, `$`, backticks and newlines anywhere outside single quotes), whatever the agent's policy, so board plumbing never prompts the human and a hijacked worker cannot chain anything onto a trusted command. The rest of this item describes the MCP route, kept for when v2 runners load MCP tools:
+**e. Worker access to the horde (revised in M2).** v2 runners offer no MCP tools (§3.1), so workers reach the board, verify and context through a `horde` CLI they run with `bash`; the brief contains the exact command. The fleet auto-approves a `bash` permission request only when the command is exactly that CLI with plain arguments (a shell-word check rejects `;`, `&&`, `||`, pipes, redirects, `$`, backticks and newlines anywhere outside single quotes), whatever the agent's policy, so board plumbing never prompts the human and a hijacked worker cannot chain anything onto a trusted command. Since the review pass the command must also name the board of the agent's own repository (so a worker cannot create board files elsewhere or read another repository's notes), quoted text may hold no control characters, and agents adopted from a human's TUI get no auto-approval at all. The rest of this item describes the MCP route, not built, kept for when v2 runners load MCP tools:
 
 When `opencode` starts the shared or private server it sets `OPENCODE_CONFIG_CONTENT` with `mcp` entries for the worker-side horde servers that are installed and enabled (`HORDE_WORKER_TOOLS=board,context,verify`, default: whichever are resolvable next to this package). Each is `type: "local"` with `command: [process.execPath, <bin>, "--worker"]` and `environment` carrying the state dir. In attach mode the server is the user's; the README gives the `opencode.json` snippet. The injected config never changes agents or permissions (the shared server is also the human's TUI server).
 
@@ -171,7 +175,7 @@ Mechanical judgement with a compact verdict. Library + MCP server; both orchestr
 - `verify_gate { directory, base, checks?, related?, allowed?, budget_chars? (default 1500) }` (`related` derives the changed files from `base`) → `PASS` or `FAIL` with `blockers` (failing checks, blocking audit findings) and `warnings`, rendered within the budget. This is what `opencode` calls.
 - `verify_logs { directory, check }` → the last run's full output for one check, head-truncated to a requested size. Available, never automatic.
 
-**Output extraction without a model.** Per-runner extractors run on captured stdout+stderr: TAP (`not ok` blocks with their YAML), jest/vitest (`●`/`FAIL` blocks, `AssertionError`, `expected`/`received` lines), pytest (`FAILED path::test - message` and the `E ` lines), cargo (`---- name stdout ----` to `failures:`), go (`--- FAIL` to the next `===`), tsc (`path(line,col): error TSxxxx`), eslint/ruff/biome (path:line rule lines), generic (`Error:`/`Traceback`/`panicked at` with 6 lines of context). Each failure keeps: the test or file name, the assertion text (up to 300 chars), and the first stack frame inside the project (not `node_modules`, not `node:internal`). Fallback when nothing matches: the last 40 lines. Counts are always exact (`14 failed, 212 passed`) even when details are truncated. For logs that still exceed the budget, the playbook's option is `opencode_ask` with a cheap model summarizing them: cheap compresses for expensive.
+**Output extraction without a model.** Per-runner extractors run on captured stdout+stderr: TAP (`not ok` blocks with their YAML), jest/vitest (`●`/`FAIL` blocks, `AssertionError`, `expected`/`received` lines), pytest (`FAILED path::test - message` and the `E ` lines), cargo (`---- name stdout ----` to `failures:`), go (`--- FAIL` to the next `===`), tsc (`path(line,col): error TSxxxx`), eslint/ruff/biome (path:line rule lines), generic (`Error:`/`Traceback`/`panicked at` with 6 lines of context). Each failure keeps: the test or file name, the assertion text (up to 300 chars), and the first stack frame inside the project (not `node_modules`, not `node:internal`). Fallback when nothing matches: the last 40 lines. Counts are always exact (`14 failed, 212 passed`) even when details are truncated. For logs that still exceed the budget, the skill's option is `opencode_ask` with a cheap model summarizing them: cheap compresses for expensive.
 
 **Execution.** Each check runs through the shell in the directory with a timeout (default 600 s, from config), in its own process group, killed as a tree on timeout or abort; `OPENCODE_SERVER_*` and `HORDE_*` are stripped from the environment; `CI=1` is set; output is capped at 8 MB per check with the head and tail kept. Checks run sequentially by default (shared `node_modules`, ports); `parallel: true` in config opts in.
 
@@ -226,7 +230,7 @@ Worker questions go through OpenCode's own question tool (they already surface a
 
 **Memory.** Entries `{ id, text, tags, confidence, source: {task, attempt}, createdAt, verifiedAt? }`. `board_recall` ranks by tag and path overlap, then recency; stale entries (older than 90 days, never re-verified) are marked `(stale)` in output. The brief includes memory under a "Project notes" heading with the caveat that notes may be outdated.
 
-**Events.** Every mutation appends to `events.jsonl`. `board_summary` prints the summary; a terminal view is a later addition (§11).
+**Events.** Every mutation appends to `events.jsonl`. `board_summary` prints the summary for the orchestrator; `horde status` and `horde watch` (live) show the board to people (§10.13).
 
 ### 4.5 `@mcp-horde/context`
 
@@ -245,15 +249,13 @@ Precise briefs instead of exploration. Fast models are weakest at navigating lar
 
 **Conventions file.** `horde.json` `context.ignore` extends `.gitignore`; `context.entrypoints` names files always worth listing.
 
-### 4.6 `playbook` (Claude Code plugin, no code)
+### 4.6 The `horde` plugin and its skill (no code of its own)
 
 Distribution and procedure. A plugin directory with:
 
-- `.mcp.json` registering `opencode`, `board`, `verify` and `context`, each started with `node ${CLAUDE_PLUGIN_ROOT}/servers/<name>.js`: self-contained bundles generated from the packages (`npm run bundle`, checked in CI), so the plugin needs no npm. The packages are not published.
-- `skills/horde/SKILL.md`: the orchestration procedure the strong model follows. Plan with `board_plan` (small tasks, each with observable acceptance and a scope). For each ready task: `board_brief` → `opencode_spawn` with `gate`, `scope`, `isolation: "worktree"`, model from the task's tier → `opencode_wait` (gated) → read the verdict and the report, not the transcript → `board_accept` or `board_fail` → `opencode_worktree merge` in dependency order, `verify_gate` on the integrated result. Escalation: two failed gates raise the tier; the top tier is "do it yourself". Best-of-N for hard, well-specified tasks: spawn N on cheap tiers, gate filters, `opencode_ask` judges the survivors' diffs. Steer with `opencode_message` when a worker drifts; never let a worker run more than `limits` allow. What not to do: reading transcripts before a gate has failed twice, re-briefing from memory instead of `board_brief`, merging without a gate.
-- A worker brief template (the fixed part `board_brief` emits), kept here so humans can read and tune it.
-
-The playbook also explains the tier table users edit (`horde.json` `tiers`, §5).
+- `.mcp.json` registering `opencode`, `board`, `verify`, `context` and `ledger`, each started with `node ${CLAUDE_PLUGIN_ROOT}/servers/<name>.js`: self-contained bundles generated from the packages (`npm run bundle`, checked in CI), so the plugin needs no npm. The packages are not published.
+- `skills/horde/SKILL.md`: the orchestration procedure the strong model follows. Plan with `board_plan` (small tasks, each with observable acceptance and a scope), then `ledger_suggest { apply: true }` for starting tiers. For each ready task: `opencode_spawn { task }` (brief, worktree, scope and gate from the board; model from the task's tier) → `opencode_wait` (gated) → `review_task` on a pass → read the review and the report (checked against the diff), not the transcript → `opencode_worktree merge` in dependency order (the project's checks then run on the merged checkout) → `board_accept`, or `board_fail` with escalation. Escalation: two failed gates raise the tier; the top tier is "do it yourself". Best-of-N for hard, well-specified tasks: spawn N on cheap tiers, gate filters, `opencode_ask` judges the survivors' diffs. Steer with `opencode_message` when a worker drifts; never let a worker run more than `limits` allow. What not to do: reading transcripts before a gate has failed twice, re-briefing from memory instead of `board_brief`, merging without a gate.
+The skill also explains the tier table users edit (`horde.json` `tiers`, §5).
 
 ### 4.7 `@mcp-horde/ledger` (built after M5)
 
@@ -262,7 +264,7 @@ The board already records every attempt's task (kind of work, scope), tier, mode
 - `ledger_suggest { ids? | draft?, apply? }`: the cheapest tier that similar work has not shown to fail. Similar work: the same area of the same repository (scope directories, two levels), then the same kind (test, fix, refactor, docs, build, feature, from the title/goal); other repositories count by kind at half weight. A tier is skipped only when similar work passed on it under 40% of the time with at least two weighted attempts; otherwise tier 0 stands. `apply` raises untried tasks' tiers, never lowers them. History is matched to today's tiers by model.
 - `ledger_stats { by: model | tier | kind | area | repo, all_repos?, since_days? }`: accepted/attempts, mean gate rounds, cost per accepted task (failed attempts' spend counts against the accepted ones), and a drift warning when a model's last 10 attempts pass clearly less often than its history.
 
-Read-only over the boards (a library plus a small server; no store of its own), so it is always consistent with them. The playbook calls `ledger_suggest { apply: true }` right after `board_plan`.
+A library plus a small server with no store of its own, so it is always consistent with the boards. It reads them directly (`ledger → board`), with one write path: `ledger_suggest { apply: true }` raises the tier of open, untried tasks through the board's own `edit` (under the board's lock, recorded in `events.jsonl` like any edit), and never lowers a tier. Keeping that write in the ledger saves the orchestrator one `board_edit` per task; the cost is that the board's tiers can change from a second server, so anything reasoning about who mutates a board should count `ledger` alongside `board`, `opencode` (assignments, workspaces, activity, reviews) and the worker CLI. The skill calls `ledger_suggest { apply: true }` right after `board_plan`.
 
 ### 4.8 `@mcp-horde/review` (built after M5)
 
@@ -311,7 +313,7 @@ Orchestrator-visible tool output: roughly 1k tokens plus the brief it generated.
 Three cheap workers on the same brief in three worktrees. `opencode_wait mode: all`. Gates filter; `opencode_ask` with a judge prompt over the survivors' `opencode_worktree diff` outputs (the diffs capped) picks one; the others are disposed with `discard`.
 
 ### Escalation
-`board_fail { id, escalate: true }` raises the tier; the next spawn uses the next model. When the tier is `"orchestrator"`, the playbook says the strong model does the task itself, with the worker's report and the failed verdict as its starting point, which is usually most of the diagnosis already done.
+`board_fail { id, escalate: true }` raises the tier; the next spawn uses the next model. When the tier is `"orchestrator"`, the skill says the strong model does the task itself, with the worker's report and the failed verdict as its starting point, which is usually most of the diagnosis already done.
 
 ## 7. Token economy
 
@@ -340,7 +342,7 @@ Rules that keep this true: every tool takes a `budget` argument with a sane defa
 | Failure | Handling |
 | --- | --- |
 | Gate hangs (test suite stuck) | per-check timeout, process-tree kill, `FAIL (timeout)` verdict with the tail of the output |
-| Worker loops on a failing gate | `max_rounds`, then `IDLE ✗ gate`; the playbook escalates |
+| Worker loops on a failing gate | `max_rounds`, then `IDLE ✗ gate`; the skill escalates |
 | Worker claims success without running anything | the gate runs regardless; the audit compares `testsAdded` in the report with the diff and flags mismatches as `warn: report claims tests not in diff` |
 | Two workers need the same file | scope overlap warning at plan time; advisory locks at run time; the audit flags out-of-scope edits; `worktree sync` lets the later worker resolve conflicts |
 | Orchestrator process dies mid-feature | board state is on disk; agents keep running on the shared server; `opencode` reclaims ownership on restart; `board_summary` restores the picture |
@@ -361,7 +363,7 @@ Rules that keep this true: every tool takes a `budget` argument with a sane defa
 8. **One-shot calls without leaving v2.** Agents cannot be injected via config content (verified) and v2 prompts carry no per-call tool or format options, so `opencode_ask` uses a tool-less agent profile in a horde-owned directory and validates JSON client-side. Verified in M4: `tools: { "*": false }` disables every tool.
 9. **No daemon.** Everything is files plus locks; stdio only. Cost: no push from board to workers; workers read findings when they start and when the orchestrator steers them to.
 10. **Verifying worker claims.** Reports have `unverifiedClaims`; the audit cross-checks claimed tests against the diff; the gate is the only path to done.
-11. **Escalation.** Built: tiers in `horde.json`; a task-bound spawn picks the tier's model; `board_fail { escalate }` moves to the next tier and says which model that is; the playbook escalates after two failed gates; past the last tier is the orchestrator.
+11. **Escalation.** Built: tiers in `horde.json`; a task-bound spawn picks the tier's model; `board_fail { escalate }` moves to the next tier and says which model that is; the skill escalates after two failed gates; past the last tier is the orchestrator.
 12. **Cost.** Tracking, not budgets. `opencode` estimates from the catalog; a task-bound agent's spend is written to its attempt whenever it settles (and when it is disposed), so `board_task`/`board_summary` show it without the orchestrator passing anything; `board_accept`/`board_fail` may still override it. There is no spending limit unless the caller sets `limits.max_cost_usd` on a spawn (per turn); the default is none.
 13. **Observability.** Built: `events.jsonl`, and `horde status [task id]` on the command line (the board summary, or one task in full with its report checked against the diff; read-only, and not a worker command, so the fleet never approves it). Built in M5: `horde watch`, the board live in a terminal (tasks, tiers, costs, each attempt's agent state and gate as `opencode` records them on the board, locks, recent events; a task's full view on enter). It only reads files, like everything else: no daemon.
 14. **Configuration sprawl.** One `horde.json`; env vars only for machine-level settings.

@@ -138,4 +138,4 @@ Merged findings from a full audit (one manual pass plus three independent review
 - [x] P5. Tests depend on each other's order, and the graceful-pause test is timing-sensitive.
 - [x] P6. Tests are missing for all of the fixes above.
 - [x] P7. The config `bool` parser is case-sensitive, and a missing `HORDE_OPENCODE_DIRECTORY` gives a misleading error.
-- [ ] P8. No license (left to the owner).
+- [x] P8. No license (left to the owner). Resolved: MIT, in the root `LICENSE` and every package's `package.json`.

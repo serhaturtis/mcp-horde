@@ -6,7 +6,8 @@ import { formatUsd, type Tier } from "@mcp-horde/core"
 /**
  * What the boards already know about how attempts went, turned into decisions: which model
  * passes which kind of work, at what cost, and which tier a new task should start on.
- * Read-only over the boards; nothing here changes a task except `applySuggestions`.
+ * Read-only over the boards, with one write path: `suggestTiers` with `apply` raises the
+ * tier of untried tasks, through the board's own `edit` (under its lock, logged as an event).
  */
 
 export type Kind = "test" | "fix" | "refactor" | "docs" | "build" | "feature"
