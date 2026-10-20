@@ -4,6 +4,33 @@ An MCP server that gives any harness (Claude Code, Codex, Cursor, OpenCode itsel
 
 It is built on the server API of **OpenCode 2** (`/api/*`, through `@opencode/client`).
 
+## The simple path
+
+Five tools cover delegating coding work, and their answers always name the next call, so an agent needs nothing else:
+
+| Tool | Does |
+| --- | --- |
+| `horde_do { goal, done?, scope?, model?, wait? }` | Plans a board task and starts a worker on it in its own worktree, with the project's dependencies linked (or `horde.json` `"workers": { "link", "setup" }`) and edits confined to `scope`. When the worker finishes, the project's checks run, then a reviewer model judges each `done` criterion against the diff (it may cite a passed check); failures go back to the worker, 2 rounds. Returns the task id; `wait: true` blocks like a subagent. The model is the task's `horde.json` tier, else OpenCode's default. |
+| `horde_wait { ids? }` | Every outcome that is ready, each once. **READY** (checks, review in words, the report checked against the diff, files changed, the worker's summary, unproven criteria with a ready-made `horde_tell`, cost), **NEEDS YOU** (a question or a permission request), **FAILED** (why, edits refused outside the scope, what changed with an excerpt, the `git diff` command, the next tier's model), or what each worker is doing on a timeout. |
+| `horde_tell { id, message?, approve?, model?, scope? }` | Answers a question, allows or refuses a request (a message alone refuses it), asks for changes (a new round of work and checks), steers a running worker, switches its model, or replaces its scope. |
+| `horde_land { id }` | Replays the worker's commits onto your branch's tip inside its worktree, runs the project's checks there, and only if they pass, and your branch has not moved, puts the same commits on your branch. Then the task is done and its worktree and branch are removed. A conflict or a failing check leaves your branch untouched. |
+| `horde_drop { id, reason? }` | Stops the worker, records the attempt as failed, removes its worktree and branch (naming the last commit). |
+
+```text
+horde_do   { goal: "POST /login answers 429 after 5 failed attempts per IP in a minute …", done: […], scope: ["src/auth/**", "test/auth/**"] }
+horde_wait { ids: ["t-4f1a"] }
+  t-4f1a READY · "Rate-limit failed logins"
+    checks ✓ typecheck, lint, test (212 passed) · review: 3 of 3 criteria met · report matches the diff
+    changed 3 file(s) (+86 −2): src/auth/limit.ts (new), src/auth/login.ts, test/auth/limit.test.ts
+    worker: Added a sliding-window limiter keyed by IP and used it in POST /login.
+    $0.03 · 4m · deepseek/deepseek-flash (tier 0; tier 1 is deepseek/deepseek-v4-pro)
+  → horde_land {id: "t-4f1a"} · horde_tell {id: "t-4f1a", message} for changes · horde_drop {id: "t-4f1a"}
+horde_land { id: "t-4f1a" }
+  landed t-4f1a on main: 2 commit(s) · checks ✓ typecheck, lint, test (215 passed) on main's tip before updating it · task done, worktree and branch removed
+```
+
+Everything below is the finer control underneath: agents without a task, worktree or checks, steering mid-step, multi-task plans on the board, transcripts and the rest.
+
 ## What the calling agent can do
 
 | Capability | Tool |

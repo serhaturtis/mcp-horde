@@ -3,7 +3,8 @@
 Bundles the horde for Claude Code:
 
 - **MCP servers:** `opencode` (workers), `board` (tasks, briefs, reports), `verify` (checks and audits), `context` (code search and the code context in briefs) and `ledger` (which model to start each task on, learned from past attempts). They ship in `servers/` as self-contained bundles and start with `node`: no npm install, no build step.
-- **Skill `/horde:horde`:** the procedure Claude follows: plan small tasks with observable acceptance criteria and scopes, spawn a worker per task (briefed from the board, in a worktree, behind a gate), read the gate verdict and the worker's report (checked against its diff) instead of its transcript, then merge and accept, or fail and escalate to a stronger tier.
+- **Delegating is three calls:** `horde_do { goal, done, scope }` starts a worker in its own worktree; `horde_wait` returns its outcome once the project's checks and a review of each `done` criterion are through (READY, NEEDS YOU or FAILED, each naming the next call); `horde_land` puts the work on your branch after checking it on top of that branch. `horde_tell` and `horde_drop` handle the rest.
+- **Skill `/horde:horde`:** the judgement calls around those tools: how to write a goal and done-criteria a cheap model can meet, when to split work, when to escalate to a stronger tier or do it yourself.
 
 ```text
 /plugin marketplace add serhaturtis/mcp-horde

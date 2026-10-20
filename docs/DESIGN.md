@@ -328,6 +328,12 @@ At the repository root (optional; everything auto-detects without it):
 ## 6. Flows
 
 ### A single task
+1. `horde_do { goal, done, scope }` → `t-1 working · deepseek/deepseek-flash (tier 0 of 2) · worktree horde/t-1`.
+2. The worker works; the checks fail on round 1 (a type error) and the verdict goes back to it; round 2 passes; the reviewer finds every criterion met.
+3. `horde_wait` → `t-1 READY · checks ✓ · review: 3 of 3 criteria met · report matches the diff · changed 3 files (+86 −2) · $0.04` (~300 tokens).
+4. `horde_land { id: "t-1" }` → the checks pass on top of the orchestrator's branch, the commits land, the task is done.
+
+Orchestrator-visible tool output: well under 1k tokens, and the goal it wrote. The same task by hand, as the flow ran before §4.9:
 1. `board_plan` (one task) → `t-1`.
 2. `board_brief t-1` → ~4k tokens of brief, which the orchestrator forwards without reading closely.
 3. `opencode_spawn { prompt: brief, model: tier 0, isolation: "worktree", scope, gate: {max_rounds: 2}, limits }`.
@@ -430,6 +436,7 @@ Each goes into a `probe/` script in the relevant package, like the probes used w
 | **M4** ✓ `opencode_ask`, `scope`, `worktree sync`, `opencode_compact`, `opencode_revert`, `opencode_permissions`, `opencode_spawn { task }` (+ report-vs-diff checks, context use in status, prices in the catalog) | one-shot calls and judging; scope enforcement; conflict handling; context and undo for long tasks; fewer calls | refinements once the loop works end to end |
 | **Integration** ✓ tiers from `horde.json`, automatic attempt costs, checks after merges, `opencode.maxRunning`, `horde status` | the loop without hand-carried models, costs or limits | gaps found by running the whole flow |
 | **M5** ✓ tree-sitter `context`, `horde watch` (plugin packaging done early: bundled servers, no npm) | depth and visibility | after the shape is proven |
+| **M6** ✓ the simple path (§4.9): `horde_do`, `horde_wait`, `horde_tell`, `horde_land`, `horde_drop`; review inside the gate, seeing the checks; task scopes confine edits; dependencies linked into worktrees; atomic landing | delegating is a tool call: three calls per task, no procedure to learn | two fresh agents found the nine-call flow usable only with the skill and inside knowledge |
 
 Each milestone ships with the same bar as `opencode`: unit tests, integration tests against a real `opencode serve` with the mock LLM, CI on Linux, macOS and Windows on Node 20 and 22, READMEs updated.
 

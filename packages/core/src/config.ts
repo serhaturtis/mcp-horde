@@ -93,6 +93,26 @@ export function loadTiers(directory: string): Tier[] {
   })
 }
 
+/** How workers' worktrees are prepared, from horde.json "workers"; unset fields keep their defaults. */
+export interface Workers {
+  /** Paths to link from the checkout (default: the dependency directories git ignores). */
+  link?: string[]
+  /** A command run in a new worktree before the worker starts, e.g. "npm run build". */
+  setup?: string
+}
+
+export function loadWorkers(directory: string): Workers {
+  const { file, data } = loadHordeFile(directory)
+  const raw = data.workers
+  if (raw === undefined) return {}
+  const where = `${file}: "workers"`
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error(`${where} must be an object { "link"?: [...], "setup"?: "…" }`)
+  const { link, setup } = raw as Workers
+  if (link !== undefined && (!Array.isArray(link) || link.some((l) => typeof l !== "string"))) throw new Error(`${where}.link must be an array of paths`)
+  if (setup !== undefined && typeof setup !== "string") throw new Error(`${where}.setup must be a command string`)
+  return { ...(link ? { link } : {}), ...(setup ? { setup } : {}) }
+}
+
 /** "tier 1 (deepseek/deepseek-chat high)", or just "tier 1" without a model for it. */
 export function tierLabel(tier: number, tiers: Tier[]): string {
   const t = tiers[tier]

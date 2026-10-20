@@ -7,6 +7,7 @@ import type { Backend } from "./backend.js"
 import { POLICIES } from "./config.js"
 import type { Fleet, GateView, Snapshot } from "./fleet.js"
 import { defined, formatModel, SETTLED, unsupportedReason } from "./fleet.js"
+import { HORDE_INSTRUCTIONS, registerHorde } from "./horde.js"
 import type { Turn } from "./tracker.js"
 
 type Extra = {
@@ -285,6 +286,9 @@ export function registerTools(server: McpServer, ctx: Context) {
     return parts.join("\n\n")
   }
 
+  // The simple path comes first: most agents need nothing else.
+  registerHorde(tool, { waitSeconds: () => defaultWait(ctx), progress: (extra) => progress(extra as Extra) })
+
   tool(
     "opencode_models",
     "List models OpenCode agents can run (any provider: DeepSeek, Kimi, GLM, Qwen, GPT, Claude, local …) with context size, price (USD per million input/output tokens, or free) and effort variants. Use the ids with opencode_spawn model/variant.",
@@ -335,7 +339,7 @@ export function registerTools(server: McpServer, ctx: Context) {
 
   tool(
     "opencode_spawn",
-    "Spawn an OpenCode agent on a task with any model and effort level. Returns immediately (it runs in the background) unless wait is set. Spawn several for parallel work, then opencode_wait. The agent does not see your conversation: make the prompt self-contained (put shared context in instructions).",
+    "Spawn an OpenCode agent on a task with any model and effort level (for coding work that should come back checked and land on your branch, horde_do is simpler). Returns immediately (it runs in the background) unless wait is set. Spawn several for parallel work, then opencode_wait. The agent does not see your conversation: make the prompt self-contained (put shared context in instructions).",
     {
       prompt: z.string().optional().describe("The task. With task: extra instructions added to the board's brief."),
       task: z
@@ -564,7 +568,7 @@ export function registerTools(server: McpServer, ctx: Context) {
 
   tool(
     "opencode_ask",
-    "A one-shot answer from any model, without an agent loop: no tools, no worktree, nothing left behind. For classifying, summarizing a long log or diff, judging between candidates, drafting a brief. With schema the answer is JSON that conforms to it (checked, with one retry). Attach files to give it material.",
+    "A one-shot answer from any model, without an agent loop: no tools, no worktree, nothing left behind (not for coding work: use horde_do). For classifying, summarizing a long log or diff, judging between candidates, drafting a brief. With schema the answer is JSON that conforms to it (checked, with one retry). Attach files to give it material.",
     {
       prompt: z.string().min(1),
       model: z.string().optional().describe('"provider/model" from opencode_models (a cheap one is usually right).'),
@@ -607,7 +611,7 @@ export function registerTools(server: McpServer, ctx: Context) {
 
   tool(
     "review_task",
-    'Check a board task\'s latest attempt against its acceptance criteria: a model reads the attempt\'s worktree diff and answers each criterion met / not met / unclear, citing the lines that show it; every citation is checked against the diff, so a "met" without real evidence becomes "unclear". The gate proves the code builds and its tests pass; this asks whether it does what the task asked. Default reviewer: the cheapest tier model other than the worker\'s. Two models cross-check each other and list where they disagree. The outcome is kept on the attempt (board_task shows it).',
+    'Check a board task\'s latest attempt against its acceptance criteria (horde_do reviews its tasks by itself; use this to review again, or with other models): a model reads the attempt\'s worktree diff and answers each criterion met / not met / unclear, citing the lines that show it; every citation is checked against the diff, so a "met" without real evidence becomes "unclear". The gate proves the code builds and its tests pass; this asks whether it does what the task asked. Default reviewer: the cheapest tier model other than the worker\'s. Two models cross-check each other and list where they disagree. The outcome is kept on the attempt (board_task shows it).',
     {
       id: z.string().describe("Board task id, e.g. t-3fa2 (its latest attempt's worktree is reviewed)."),
       directory: z.string().optional().describe("Repository of the board (default: the server's directory)."),
@@ -770,8 +774,9 @@ export function registerTools(server: McpServer, ctx: Context) {
   )
 }
 
-export const INSTRUCTIONS = `opencode: delegate coding work to OpenCode agents running any model (DeepSeek, Kimi, GLM, Qwen, GPT, Claude, local, …), in parallel, like your own subagents.
+export const INSTRUCTIONS = `${HORDE_INSTRUCTIONS}
 
+Finer control, with opencode_* (OpenCode agents on any model, with or without a worktree or checks):
 1. Pick a model per task: opencode_models (provider/model + effort variants). opencode_agents lists profiles.
 2. opencode_spawn with a self-contained prompt (shared context in instructions). It runs in the background. Use isolation "worktree" when several agents edit one repo.
 3. opencode_wait returns the next agent with news (final answer, failure or a request for you). Call it again for the next one.

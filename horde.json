@@ -1,0 +1,4 @@
+{
+  "tiers": ["deepseek/deepseek-flash", "deepseek/deepseek-v4-pro"],
+  "workers": { "setup": "npm run build" }
+}

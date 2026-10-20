@@ -4,9 +4,19 @@ import fs from "node:fs/promises"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
 import { Board, current, isTrustedCommand, renderBrief } from "@mcp-horde/board"
-import { formatUsd, git, loadTiers, oneLine, tierLabel, tierModel } from "@mcp-horde/core"
-import { checkVerdicts, collectReview, disagreements, REVIEW_SCHEMA, renderVerdicts, reviewPrompt, type Verdict } from "@mcp-horde/review"
-import { gate as runGate, defaultStateDir as verifyStateDir } from "@mcp-horde/verify"
+import { formatUsd, git, loadTiers, loadWorkers, oneLine, tierLabel, tierModel } from "@mcp-horde/core"
+import {
+  checkVerdicts,
+  collectReview,
+  disagreements,
+  type GateCheck,
+  REVIEW_SCHEMA,
+  type ReviewInput,
+  renderVerdicts,
+  reviewPrompt,
+  type Verdict,
+} from "@mcp-horde/review"
+import { type CheckResult, gate as runGate, defaultStateDir as verifyStateDir } from "@mcp-horde/verify"
 import type {
   AgentInfo,
   FormInfo,
@@ -22,7 +32,7 @@ import { ASK_GUARDED_PROFILE, ASK_PREAMBLE, ASK_PROFILE, extractJson, type JsonS
 import type { Backend } from "./backend.js"
 import { type Config, inProject, type PermissionPolicy } from "./config.js"
 import { type Detail, inputSummary, renderTranscript } from "./render.js"
-import { type AgentRecord, type GateConfig, type Limits, ownerAlive, SELF, type Store } from "./state.js"
+import { type AgentRecord, type GateConfig, type Limits, ownerAlive, type ReviewSummary, SELF, type Store } from "./state.js"
 import { buildTrack, type CostEstimator, costSince, currentTurn, emptyTrack, latestTool, stablePrefix, type Track, type Turn, turnsSince } from "./tracker.js"
 import { commitAll, createWorktree, mergeWorktree, removeWorktree, syncWorktree, type Worktree, workStart, worktreeDiff } from "./worktree.js"
 
@@ -178,7 +188,7 @@ export interface SpawnInput {
 }
 
 /** How a caller asks for a gate: true for the defaults, or settings. */
-export type GateInput = boolean | { checks?: string[]; audit?: boolean; allowed?: string[]; maxRounds?: number; related?: boolean }
+export type GateInput = boolean | { checks?: string[]; audit?: boolean; allowed?: string[]; maxRounds?: number; related?: boolean; review?: boolean }
 
 export interface Hooks {
   /** True when the client can show form dialogs to the human. */
@@ -341,16 +351,33 @@ export async function gateConfig(input: GateInput | undefined, directory: string
     maxRounds: o.maxRounds ?? current?.maxRounds ?? 2,
     related: o.related ?? current?.related ?? true,
     base,
+    review: o.review ?? current?.review,
   }) as GateConfig
 }
 
 /** What the agent is told when its gate fails. The verdict comes last, verbatim. */
 export function gateFeedback(round: number, maxRounds: number, verdict: string): string {
   return [
-    `The checks for this task failed (gate round ${round} of ${maxRounds}). Fix the problems below, then stop.`,
+    `This task is not done yet (gate round ${round} of ${maxRounds}). Fix the problems below, then stop.`,
     "Do not skip, delete or weaken tests, do not silence errors or type checks, and stay within the files the task is about.",
     "",
     verdict,
+  ].join("\n")
+}
+
+/** A check's result in a few words, e.g. "219 passed" or "1 failed of 212". */
+export function checkSummary(c: Pick<CheckResult, "pass" | "extracted" | "stopped">): string {
+  const n = c.extracted.counts
+  if (c.stopped) return c.stopped === "timeout" ? "timed out" : "cancelled"
+  if (c.pass) return n?.passed !== undefined ? `${n.passed} passed` : "ok"
+  return n ? `${n.failed} failed${n.passed !== undefined ? ` of ${n.failed + n.passed}` : ""}` : "failed"
+}
+
+/** What the agent is told when the review finds criteria not met (the gate's lead line comes first). */
+export function reviewFeedback(r: ReviewSummary): string {
+  return [
+    "The checks pass, but a reviewer comparing your change with the task's acceptance criteria found these not met:",
+    ...r.notMet.map((c) => `- ${c.n}. ${c.text}${c.note ? ` (${c.note})` : ""}`),
   ].join("\n")
 }
 
@@ -676,6 +703,27 @@ export class Fleet {
     timeoutMs?: number
     signal?: AbortSignal
   }): Promise<string> {
+    const { r, results, worker } = await this.reviewAttempt(input)
+    const first = results[0]!
+    const parts = results.map((x) => renderVerdicts(r, x.verdicts, x.model))
+    const disputes = results.slice(1).flatMap((x) => disagreements(first, x))
+    const cost = results.reduce((n, x) => n + x.cost, 0)
+    const same = worker && results.some((x) => x.model === worker) ? `\n(reviewed by the model that did the work: a different one catches more)` : ""
+    return `${parts.join("\n\n")}${results.length > 1 ? `\n\n${disputes.length ? `Reviewers disagree on:\n${disputes.join("\n")}` : "Reviewers agree on every criterion."}` : ""}\n(${formatUsd(cost)})${same}`
+  }
+
+  /** The verdicts of each reviewer model; the first is kept on the attempt. `checks` that passed may be cited. */
+  private async reviewAttempt(input: {
+    id: string
+    directory?: string
+    models?: string[]
+    path?: string
+    base?: string
+    maxDiffChars?: number
+    timeoutMs?: number
+    signal?: AbortSignal
+    checks?: GateCheck[]
+  }): Promise<{ r: ReviewInput; results: { model: string; verdicts: Verdict[]; cost: number }[]; worker?: string }> {
     const repo = this.resolveDir(input.directory)
     const board = await Board.open(repo)
     const attempt = current(board.task(input.id))
@@ -686,7 +734,7 @@ export class Fleet {
     const results: { model: string; verdicts: Verdict[]; cost: number }[] = []
     for (const model of models) {
       const answer = await this.ask({
-        prompt: reviewPrompt(r),
+        prompt: reviewPrompt(r, input.checks),
         model,
         schema: REVIEW_SCHEMA as unknown as JsonSchema,
         directory: repo,
@@ -695,7 +743,7 @@ export class Fleet {
       })
       results.push({
         model: answer.model ? `${answer.model.providerID}/${answer.model.id}` : "default model",
-        verdicts: checkVerdicts(r, answer.json),
+        verdicts: checkVerdicts(r, answer.json, input.checks),
         cost: answer.cost,
       })
     }
@@ -708,11 +756,26 @@ export class Fleet {
         total: first.verdicts.length,
         at: Date.now(),
       })
-    const parts = results.map((x) => renderVerdicts(r, x.verdicts, x.model))
-    const disputes = results.slice(1).flatMap((x) => disagreements(first, x))
-    const cost = results.reduce((n, x) => n + x.cost, 0)
-    const same = worker && results.some((x) => x.model === worker) ? `\n(reviewed by the model that did the work: a different one catches more)` : ""
-    return `${parts.join("\n\n")}${results.length > 1 ? `\n\n${disputes.length ? `Reviewers disagree on:\n${disputes.join("\n")}` : "Reviewers agree on every criterion."}` : ""}\n(${formatUsd(cost)})${same}`
+    return { r, results, worker }
+  }
+
+  /** The gate's review: the change judged against the task's criteria, seeing the checks that just passed. Never throws. */
+  private async reviewForGate(live: Live, taskId: string, checks: GateCheck[], signal: AbortSignal): Promise<ReviewSummary> {
+    try {
+      const { results } = await this.reviewAttempt({ id: taskId, directory: live.record.worktree?.repo ?? live.record.directory, checks, signal })
+      const first = results[0]!
+      const pick = (status: Verdict["status"]) => first.verdicts.filter((v) => v.status === status).map((v) => ({ n: v.criterion, text: v.text, note: v.note }))
+      return {
+        model: first.model,
+        cost: results.reduce((n, x) => n + x.cost, 0),
+        total: first.verdicts.length,
+        met: first.verdicts.filter((v) => v.status === "met").length,
+        notMet: pick("not_met"),
+        unclear: pick("unclear"),
+      }
+    } catch (err) {
+      return { model: "", cost: 0, total: 0, met: 0, notMet: [], unclear: [], error: (err as Error).message }
+    }
   }
 
   /**
@@ -826,6 +889,8 @@ export class Fleet {
       variant: input.model ? input.variant : (input.variant ?? tier?.variant),
       isolation: input.isolation ?? "worktree",
       gate: input.gate ?? (current.scope.length ? { allowed: current.scope } : true),
+      // The task's scope confines edits too, not only the audit.
+      scope: input.scope ?? (current.scope.length ? { paths: current.scope } : undefined),
     }
     // Everything that can be checked is checked before the board records an attempt.
     const checked = await this.checkSpawn(effective)
@@ -913,11 +978,13 @@ export class Fleet {
     let prompted = false
     try {
       if (input.isolation === "worktree") {
+        // horde.json "workers" says how to prepare a worktree; without it, ignored dependency directories are linked.
+        const workers = loadWorkers(directory)
         const made = await createWorktree(directory, name, {
           rootDir: this.config.worktreeDir,
           includeUncommitted: input.worktree?.includeUncommitted ?? true,
-          link: input.worktree?.link ?? [],
-          setup: input.worktree?.setup,
+          link: input.worktree?.link ?? workers.link,
+          setup: input.worktree?.setup ?? workers.setup,
           submodules: input.worktree?.submodules,
           signal: input.signal,
           onProgress: input.onProgress,
@@ -1270,16 +1337,7 @@ export class Fleet {
         if (out.worktree) this.updateRecord(live.record.id, { worktree: out.worktree, gateState: this.supersededGate(live) })
         return out
       })
-      if (synced.worktree) {
-        const task = live.record.task
-        if (task) {
-          const board = await Board.open(wt.repo).catch(() => undefined)
-          const t = board?.task(task.id)
-          const a = t?.attempts.find((x) => x.n === task.attempt)
-          if (board && a?.workspace && !a.endedAt)
-            await board.bindWorkspace(task.id, a.token, { ...a.workspace, base: workStart(synced.worktree) }).catch(() => undefined)
-        }
-      }
+      if (synced.worktree) await this.rebindTaskBase(live, synced.worktree)
       const next = live.record.gate ? " The gate does not re-run by itself; it judges the turn that message starts." : ""
       return `${synced.text}${synced.worktree ? `\nMessage the agent to re-run its checks on the updated code.${next}` : ""}`
     }
@@ -1295,6 +1353,135 @@ export class Fleet {
     } catch (err) {
       return `${result.text}\nthe checks after the merge could not run: ${(err as Error).message}`
     }
+  }
+
+  /** After a sync, the task's attempt starts where the worktree's own work now starts (for reviews and report checks). */
+  private async rebindTaskBase(live: Live, wt: Worktree) {
+    const task = live.record.task
+    if (!task) return
+    const board = await Board.open(wt.repo).catch(() => undefined)
+    const a = board?.task(task.id).attempts.find((x) => x.n === task.attempt)
+    if (board && a?.workspace && !a.endedAt) await board.bindWorkspace(task.id, a.token, { ...a.workspace, base: workStart(wt) }).catch(() => undefined)
+  }
+
+  /**
+   * Land a task-bound agent's work without ever breaking your branch: its commits are replayed onto
+   * your branch's tip inside its worktree, the project's checks run there, and only if they pass, and
+   * your branch has not moved meanwhile, are the same commits replayed onto your branch. Then the
+   * task is accepted and the worktree and branch are removed. Anything that fails leaves your branch
+   * as it was; the agent is then on top of your branch and can be told to fix it.
+   */
+  async land(ref: string, signal?: AbortSignal): Promise<LandResult> {
+    const live = await this.get(ref)
+    const id = live.record.id
+    const name = live.record.name ?? id
+    const task = live.record.task
+    if (!task || !live.record.worktree) throw new Error(`${name} is not a task in a worktree (horde_do starts one); merge it with opencode_worktree`)
+    await this.refresh(live)
+    if (this.working(live))
+      throw new Error(`${name} is still ${live.state === "needs_input" ? "waiting for an answer" : "working"}; horde_wait for its outcome first`)
+    if (!this.readyToLand(live)) {
+      const g = this.gateView(live)
+      throw new Error(
+        `${name} is not ready to land: ${g ? `its checks ${g.state === "fail" ? "failed" : "have not passed yet"}` : `it is ${live.state}`}. horde_tell it to finish, or horde_drop it.`,
+      )
+    }
+    return this.withoutGate(live, async () => {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        let wt = live.record.worktree!
+        const target = await git(wt.repo, "symbolic-ref", "-q", "--short", "HEAD").catch(() => "")
+        if (!target) throw new Error(`your checkout ${wt.repo} is on a detached HEAD; switch to a branch first`)
+        const tip = await git(wt.repo, "rev-parse", "HEAD")
+        // 1. Onto your branch's tip, inside the worktree. A conflict leaves both as they were.
+        try {
+          const synced = await syncWorktree(wt, name)
+          if (synced.worktree) {
+            wt = synced.worktree
+            // The verdict stands for landing again; a new turn is gated as usual.
+            const gs = live.record.gateState ?? { round: 0 }
+            this.updateRecord(id, { worktree: wt, gateState: { ...gs, superseded: currentTurn(live.track)?.startSeq } })
+            await this.rebindTaskBase(live, wt)
+          }
+        } catch (err) {
+          return {
+            landed: false,
+            target,
+            why: "conflict",
+            text: (err as Error).message
+              .split("\n")
+              .filter((l) => !/^Tell the agent/.test(l))
+              .join("\n"),
+          }
+        }
+        // 2. The project's checks on exactly the tree your branch would get.
+        const v = await runGate(wt.root, { audit: false, related: false, signal, stateDir: verifyStateDir() })
+        if (!v.pass)
+          return { landed: false, target, why: "checks", text: v.text, checks: v.checks.map((c) => ({ name: c.name, pass: c.pass, summary: checkSummary(c) })) }
+        // 3. Your branch must still be where the checks saw it; otherwise go round again.
+        if ((await git(wt.repo, "rev-parse", "HEAD")) !== tip) continue
+        const start = workStart(wt)
+        const commits = (await git(wt.repo, "rev-list", "--count", `${start}..${wt.branch}`).catch(() => "0")).trim()
+        try {
+          await mergeWorktree(wt, name, "merge")
+        } catch (err) {
+          // Only your uncommitted changes can collide here: the commits apply cleanly onto the tip.
+          return { landed: false, target, why: "uncommitted", text: (err as Error).message }
+        }
+        const board = await Board.open(wt.repo)
+        await board.accept(task.id, { note: `landed on ${target}` }).catch(() => undefined)
+        // Commits are replayed, so the branch goes only once every one of them is on your branch.
+        const unmerged = (await git(wt.repo, "cherry", target, wt.branch, start).catch(() => "+")).split("\n").filter((l) => l.startsWith("+"))
+        await this.dispose(id, { worktree: "remove" })
+        if (!unmerged.length) await git(wt.repo, "branch", "-D", wt.branch).catch(() => undefined)
+        return {
+          landed: true,
+          target,
+          commits: Number(commits) || 0,
+          checks: v.checks.map((c) => ({ name: c.name, pass: c.pass, summary: checkSummary(c) })),
+          branchKept: unmerged.length ? wt.branch : undefined,
+        }
+      }
+      throw new Error(`your branch kept moving while ${name} was being landed; call horde_land again`)
+    })
+  }
+
+  /** The agent finished and its gate passed (also when a landing synced it since). */
+  private readyToLand(live: Live): boolean {
+    if (this.gateView(live)?.state === "pass") return true
+    const gs = live.record.gateState
+    const turn = currentTurn(live.track)
+    return !!(gs?.verdict?.pass && gs.verdict.final && turn && gs.superseded === turn.startSeq && gs.verdict.turn === turn.startSeq)
+  }
+
+  /** Replace an agent's scope: its session's edit rules, the gate's audit and its board task. Approving a request never does this. */
+  async setScope(ref: string, paths: string[]): Promise<void> {
+    if (!paths.length) throw new Error("scope needs at least one path or glob")
+    const live = await this.get(ref)
+    const id = live.record.id
+    const scope: Scope = { paths, outside: live.record.scope?.outside ?? "deny" }
+    const session = await this.session(id)
+    const kept = (session.permissions ?? []).filter((r) => r.action !== "edit")
+    await req("updating the agent's rules", this.api.session.update({ sessionID: id, permissions: [...kept, ...profileRules(withScope({}, scope))] }))
+    this.updateRecord(id, { scope, ...(live.record.gate ? { gate: { ...live.record.gate, allowed: scopeGlobs(paths) } } : {}) })
+    const task = live.record.task
+    if (task) await (await Board.open(live.record.worktree?.repo ?? live.record.directory)).edit(task.id, { scope: paths })
+  }
+
+  /** What an outcome reports beyond the snapshot: the record (worktree, task, gate verdict) and edits refused outside the scope. */
+  async inspect(ref: string): Promise<{ snapshot: Snapshot; record: AgentRecord; refused: string[] }> {
+    const live = await this.get(ref)
+    const snapshot = await this.snapshot(live.record.id)
+    const refused = new Set<string>()
+    for (const m of live.track.messages) {
+      if (m.type !== "assistant") continue
+      for (const c of m.content) {
+        if (c.type !== "tool" || c.state.status !== "error" || !/permission denied/i.test(c.state.error.message)) continue
+        const input = c.state.input as { path?: unknown; filePath?: unknown; command?: unknown }
+        const what = [input.path, input.filePath, input.command].find((x): x is string => typeof x === "string")
+        refused.add(`${c.name}${what ? ` ${what}` : ""}`)
+      }
+    }
+    return { snapshot, record: live.record, refused: [...refused] }
   }
 
   /**
@@ -1565,6 +1752,8 @@ export class Fleet {
     const wt = live.record.worktree
     let pass = false
     let text: string
+    let checks: { name: string; pass: boolean; summary: string }[] | undefined
+    let review: ReviewSummary | undefined
     try {
       const v = await runGate(live.session?.location.directory ?? live.record.directory, {
         base: wt ? workStart(wt) : cfg.base,
@@ -1580,14 +1769,25 @@ export class Fleet {
       })
       pass = v.pass
       text = v.text
+      checks = v.checks.map((c) => ({ name: c.name, pass: c.pass, summary: checkSummary(c) }))
     } catch (err) {
       text = `the gate could not run: ${(err as Error).message}`
+    }
+    // The checks pass: does the change do what the task asked? A criterion found not met goes back
+    // to the agent like a failing check while rounds remain; on the last round it is reported.
+    const task = live.record.task
+    if (pass && cfg.review && task && !abort.signal.aborted) {
+      review = await this.reviewForGate(live, task.id, checks ?? [], abort.signal)
+      if (review.notMet.length && round < cfg.maxRounds) {
+        pass = false
+        text = reviewFeedback(review)
+      }
     }
     // A new instruction (or dispose, or shutdown) superseded this run: its verdict is about an old task.
     if (this.closed || abort.signal.aborted || this.live.get(id) !== live) return
     if (live.sent || live.sending || live.track.lastPromptedSeq > turn || currentTurn(live.track)?.startSeq !== turn) return
     const final = pass || round >= cfg.maxRounds || text.startsWith("the gate could not run")
-    this.updateRecord(id, { gateState: { round, verdict: { turn, pass, final, text, at: Date.now() } } })
+    this.updateRecord(id, { gateState: { round, verdict: { turn, pass, final, text, at: Date.now(), checks, review } } })
     if (!final) {
       // The fix round wakes the agent: it waits for a running slot like any other wake-up.
       live.fix = { turn, round, text }
@@ -2494,6 +2694,10 @@ export class Fleet {
     return [...this.live.keys()]
   }
 }
+
+export type LandResult =
+  | { landed: true; target: string; commits: number; checks: GateCheck[]; branchKept?: string }
+  | { landed: false; target: string; why: "conflict" | "checks" | "uncommitted"; text: string; checks?: GateCheck[] }
 
 interface Prepared {
   files: { uri: string; name: string }[]

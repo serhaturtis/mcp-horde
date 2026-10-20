@@ -10,6 +10,7 @@ import {
   globMatcher,
   loadHordeFile,
   loadTiers,
+  loadWorkers,
   readJson,
   runCommand,
   splitZ,
@@ -246,6 +247,18 @@ describe("horde.json", () => {
     assert.throws(() => tierModel(2, tiers, "t-1"), /t-1 is at tier 2, past the last of the 2 tier\(s\) in horde\.json: the last tier is you/)
     fs.writeFileSync(path.join(repo, "horde.json"), JSON.stringify({ tiers: [{ model: "no-provider" }] }))
     assert.throws(() => loadTiers(repo), /"tiers"\[0\] needs "model": "provider\/model"/)
+  })
+
+  test("worker setup: link and setup, validated; absent means the defaults", () => {
+    const repo = tmp()
+    fs.mkdirSync(path.join(repo, ".git"))
+    assert.deepEqual(loadWorkers(repo), {})
+    fs.writeFileSync(path.join(repo, "horde.json"), JSON.stringify({ workers: { link: ["node_modules"], setup: "npm run build" } }))
+    assert.deepEqual(loadWorkers(repo), { link: ["node_modules"], setup: "npm run build" })
+    fs.writeFileSync(path.join(repo, "horde.json"), JSON.stringify({ workers: { link: "node_modules" } }))
+    assert.throws(() => loadWorkers(repo), /"workers"\.link must be an array of paths/)
+    fs.writeFileSync(path.join(repo, "horde.json"), JSON.stringify({ workers: { setup: ["npm ci"] } }))
+    assert.throws(() => loadWorkers(repo), /"workers"\.setup must be a command string/)
   })
 })
 

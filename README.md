@@ -12,9 +12,19 @@ A collection of [MCP](https://modelcontextprotocol.io) servers for agentic codin
 | [`@mcp-horde/review`](packages/review) | Checks a worker's change against its task's acceptance criteria: a model answers each criterion with cited diff lines, and every citation is verified, so an unfounded "met" cannot pass. Run by `opencode`'s `review_task`. |
 | [`@mcp-horde/core`](packages/core) | Internal building blocks shared by the servers: atomic state files, cross-process locks, process-tree control, git helpers, `horde.json` loading, and compact rendering. |
 
+## Delegating in three calls
+
+```text
+horde_do   { goal, done, scope }  → t-4f1a working · deepseek/deepseek-flash · worktree horde/t-4f1a
+horde_wait { ids: ["t-4f1a"] }    → t-4f1a READY · checks ✓ · review: 3 of 3 criteria met · changed 3 files (+86 −2) · $0.03
+horde_land { id: "t-4f1a" }       → landed t-4f1a on main: 2 commits · checks ✓ on main's tip before updating it
+```
+
+A worker model gets its own worktree, the project's dependencies and code context; when it finishes, the project's checks run and a reviewer judges each `done` criterion against the diff, and failures go back to the worker. Landing re-runs the checks on top of your branch first, so it never breaks it. `horde_tell` answers a worker's question or permission request, asks for changes, switches its model or widens its scope; `horde_drop` gives up on a task. Every answer names the calls that make sense next. See [`packages/opencode`](packages/opencode#the-simple-path) and the design in [`docs/DESIGN.md`](docs/DESIGN.md) §4.9.
+
 ## Claude Code plugin
 
-[`plugins/horde`](plugins/horde) bundles the servers with the orchestration skill (`/horde:horde`), the procedure Claude follows to plan, brief, gate, review and merge workers' tasks:
+[`plugins/horde`](plugins/horde) bundles the servers with the orchestration skill (`/horde:horde`), the judgement calls for delegating well (writing goals, splitting work, escalating):
 
 ```text
 /plugin marketplace add serhaturtis/mcp-horde

@@ -37,6 +37,20 @@ export interface GateConfig {
   related?: boolean
   /** Audit base outside a worktree: HEAD when the agent was spawned. */
   base?: string
+  /** Once the checks pass, review the change against the task's acceptance criteria (task-bound agents). */
+  review?: boolean
+}
+
+/** A gate's review of a task's change: per criterion, what the reviewer decided. */
+export interface ReviewSummary {
+  model: string
+  cost: number
+  total: number
+  met: number
+  notMet: { n: number; text: string; note: string }[]
+  unclear: { n: number; text: string; note: string }[]
+  /** Why there is no review (it could not run); the checks' verdict stands. */
+  error?: string
 }
 
 export interface GateState {
@@ -55,6 +69,9 @@ export interface GateState {
     final: boolean
     text: string
     at: number
+    /** The checks that ran, one line each, for compact outcomes. */
+    checks?: { name: string; pass: boolean; summary: string }[]
+    review?: ReviewSummary
   }
 }
 

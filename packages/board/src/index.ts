@@ -25,6 +25,7 @@ const fail = (err: unknown): CallToolResult => ({
 })
 
 export const INSTRUCTIONS = `board: the shared task graph for you (the orchestrator) and your workers.
+To delegate a piece of work, horde_do (in the opencode server) is all you need: it plans the task here, briefs and starts a worker, checks and reviews its work, and lands it. The tools below are for plans of several tasks with dependencies, and for reading the board.
 1. board_plan small tasks, each with a goal, observable acceptance criteria, a scope (paths) and dependencies.
 2. For each task from board_next: board_brief starts an attempt and returns the worker prompt (with its reporting commands); pass it unchanged as the prompt of opencode_spawn (with gate and isolation "worktree").
 3. Workers file a structured report; the task moves to review. Read the report (board_task), not the transcript, then board_accept or board_fail (retry, optionally escalate to the next tier).
