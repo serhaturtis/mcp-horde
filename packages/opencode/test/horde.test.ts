@@ -81,8 +81,12 @@ describe("the simple path: horde_do, horde_wait, horde_land (real opencode, mock
     const ready = await settle(id)
     assert.match(ready, new RegExp(`^${id} READY · "Write the greeting file"`), ready)
     // The mock's canned report names files it never touched: the outcome says so.
-    assert.match(ready, /checks ✓ test · review: 1 of 2 criteria met, 1 unproven · ⚠ the report claims a\.ts, b\.ts, a\.test\.ts, not in the diff/)
+    assert.match(
+      ready,
+      /checks ✓ test · review: 1 of 2 criteria met, 1 unproven · ⚠ the worker's report names a\.ts, b\.ts, a\.test\.ts, which its diff does not touch/,
+    )
     assert.match(ready, /changed 1 file\(s\) \(\+1 −0\): hello\.txt/)
+    assert.match(ready, /branch horde\/t-\w+ · diff: git -C \S+ diff [0-9a-f]{10}/)
     // A criterion the review could not prove comes with the call that gets it proven.
     assert.match(ready, /unproven: "nothing else changes" → horde_tell \{id: "t-\w+", message: "Show that this holds/)
     assert.match(ready, /\$\d.* · mock\/mock \(tier 0; tier 1 is mock\/pricey\)/)
@@ -114,7 +118,7 @@ describe("the simple path: horde_do, horde_wait, horde_land (real opencode, mock
     assert.match(failed, new RegExp(`^${id} FAILED · "Write the stubborn file" \\(checks failed after 2 round\\(s\\)\\)`), failed)
     assert.match(failed, /stubborn\.txt must say ok/)
     assert.match(failed, /changed 1 file\(s\) \(\+1 −0\): stubborn\.txt\n {4}stubborn\.txt\n {4}\+nope/)
-    assert.match(failed, /full diff: git -C \S+ diff [0-9a-f]{10}/)
+    assert.match(failed, /branch horde\/t-\w+ · diff: git -C \S+ diff [0-9a-f]{10}/)
     assert.match(failed, /tier 1 is mock\/pricey/)
     assert.match(
       failed,

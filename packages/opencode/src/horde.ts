@@ -262,12 +262,13 @@ export async function outcome(fleet: Fleet, ref: string): Promise<string> {
       review ? reviewLine(review) : "",
       report
         ? report.claimedNotChanged.length
-          ? `⚠ the report claims ${report.claimedNotChanged.join(", ")}, not in the diff`
+          ? `⚠ the worker's report names ${report.claimedNotChanged.join(", ")}, which its diff does not touch`
           : "report matches the diff"
         : "",
     ].filter(Boolean)
     const lines = [say("READY"), `  ${head.join(" · ")}`]
     if (changes) lines.push(`  ${changes.line}`)
+    if (changes && wt) lines.push(`  branch ${wt.branch} · diff: git -C ${wt.root} diff ${workStart(wt).slice(0, 10)}`)
     if (workerSaid) lines.push(`  worker: ${truncate(workerSaid, 240)}`)
     for (const c of review?.notMet ?? []) lines.push(`  not met: "${truncate(c.text, 160)}"${c.note ? ` (${truncate(c.note, 160)})` : ""}`)
     for (const c of review?.unclear ?? [])
@@ -294,7 +295,7 @@ export async function outcome(fleet: Fleet, ref: string): Promise<string> {
   if (changes) {
     lines.push(`  ${changes.line}`)
     if (changes.excerpt) lines.push(indent(changes.excerpt, "    "))
-    lines.push(`  full diff: git -C ${wt!.root} diff ${workStart(wt!).slice(0, 10)}`)
+    lines.push(`  branch ${wt!.branch} · diff: git -C ${wt!.root} diff ${workStart(wt!).slice(0, 10)}`)
   }
   if (workerSaid) lines.push(`  worker: ${truncate(workerSaid, 240)}`)
   lines.push(`  ${footer}`)

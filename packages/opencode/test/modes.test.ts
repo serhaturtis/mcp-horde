@@ -149,7 +149,7 @@ ${output}`)
     }
   })
 
-  // Canary: workers reach the board through bash because OpenCode 2 sessions do not offer MCP tools
+  // Canary: workers reach the board through their shell tool because OpenCode 2 sessions do not offer MCP tools
   // to the model. When this starts failing, OpenCode has gained MCP tools for sessions and the
   // horde can mount its servers for workers instead.
   test("canary: an injected MCP server connects, but OpenCode does not offer its tools yet", async () => {
