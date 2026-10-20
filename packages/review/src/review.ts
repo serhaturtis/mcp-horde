@@ -19,6 +19,8 @@ export interface ReviewInput {
   diff: string
   /** Lines of the new files the diff shows (added or context), by file: what may be cited. */
   shown: Map<string, Set<number>>
+  /** Lines the change adds, by file, for every file including ones the budget omitted. */
+  changed: Map<string, Set<number>>
   /** Files the review could not show (too large, binary, or over the budget). */
   omitted: string[]
   /** Definitions the change touches, one line each ("src/a.ts: function foo (12-40)"). */
@@ -39,6 +41,8 @@ export interface Verdict {
   evidence: { file: string; line: number }[]
   /** Names of the gate checks cited as evidence, kept only when they passed. */
   checks: string[]
+  /** Files ("src/a.ts") or lines ("src/a.ts:141") the change leaves untouched, kept only when it does. */
+  untouched: string[]
   note: string
 }
 
@@ -58,6 +62,7 @@ export const REVIEW_SCHEMA = {
               anyOf: [
                 { type: "object", properties: { file: { type: "string" }, line: { type: "integer", minimum: 1 } }, required: ["file", "line"] },
                 { type: "object", properties: { check: { type: "string" } }, required: ["check"] },
+                { type: "object", properties: { untouched: { type: "string" } }, required: ["untouched"] },
               ],
             },
           },
@@ -118,7 +123,7 @@ export async function collectReview(
       if ([...lines].some((l) => l >= d.line && l <= d.end)) touched.push(`${file}: ${d.kind} ${d.name} (${d.line}-${d.end})`)
   }
   const criteria = task.acceptance.length ? task.acceptance : [`The goal is met: ${truncate(task.goal, 400)}`]
-  return { task, criteria, diff, shown, omitted: [...new Set([...omitted, ...skipped])], touched: touched.slice(0, 60), workspace }
+  return { task, criteria, diff, shown, changed, omitted: [...new Set([...omitted, ...skipped])], touched: touched.slice(0, 60), workspace }
 }
 
 /** The diff with new-file line numbers, within a budget; which lines it shows, and which it changes. */
@@ -214,6 +219,7 @@ export function reviewPrompt(r: ReviewInput, checks?: GateCheck[]): string {
     "# How to answer",
     '- For every criterion give status "met", "not_met" or "unclear", evidence and a one-sentence note (under 200 characters).',
     '- "met" needs evidence: the lines of the change that do it, as {file, line} using the L<number> shown before each line. Cite the lines that matter most (at most 5).',
+    '- A criterion saying something must not change may cite {"untouched": "<path>"} or {"untouched": "<path>:<line>"} instead.',
     '- "not_met" when the change does not do it or does it wrongly; say what is missing in the note and cite the closest lines if any.',
     '- "unclear" when the change alone cannot tell (it depends on code not shown, or a test that was not run).',
     gate
@@ -232,33 +238,55 @@ export function reviewPrompt(r: ReviewInput, checks?: GateCheck[]): string {
 /** The model's answer, with every citation checked against the diff and the gate's passed checks, and a verdict for every criterion. */
 export function checkVerdicts(r: ReviewInput, json: unknown, checks: GateCheck[] = []): Verdict[] {
   const passed = new Set(checks.filter((c) => c.pass).map((c) => c.name))
+  type Evidence = { file: string; line: number } | { check: string } | { untouched: string }
   const given = ((json as { verdicts?: unknown[] })?.verdicts ?? []) as {
     criterion: number
     status: Status
-    evidence?: ({ file: string; line: number } | { check: string })[]
+    evidence?: Evidence[]
     note?: string
   }[]
   return r.criteria.map((text, i) => {
     const v = given.find((g) => g.criterion === i + 1)
-    if (!v) return { criterion: i + 1, text, status: "unclear" as const, evidence: [], checks: [], note: "the reviewer gave no verdict for this criterion" }
+    if (!v)
+      return {
+        criterion: i + 1,
+        text,
+        status: "unclear" as const,
+        evidence: [],
+        checks: [],
+        untouched: [],
+        note: "the reviewer gave no verdict for this criterion",
+      }
     const norm = (f: string) => f.replace(/\\/g, "/").replace(/^(\.\/|b\/)/, "")
-    const isCheck = (e: { file: string; line: number } | { check: string }): e is { check: string } => "check" in e
+    const isCheck = (e: Evidence): e is { check: string } => "check" in e
+    const isUntouched = (e: Evidence): e is { untouched: string } => "untouched" in e
     const real = (v.evidence ?? [])
-      .filter((e): e is { file: string; line: number } => !isCheck(e))
+      .filter((e): e is { file: string; line: number } => !isCheck(e) && !isUntouched(e))
       .map((e) => ({ file: norm(e.file), line: e.line }))
       .filter((e) => r.shown.get(e.file)?.has(e.line))
     const kept = (v.evidence ?? [])
       .filter(isCheck)
       .map((e) => e.check)
       .filter((name) => passed.has(name))
-    const dropped = (v.evidence ?? []).length - real.length - kept.length
+    const untouched = (v.evidence ?? [])
+      .filter(isUntouched)
+      .map((e) => {
+        const m = /^(.*):(\d+)$/.exec(e.untouched)
+        return { file: norm(m ? m[1]! : e.untouched), line: m ? Number(m[2]) : undefined }
+      })
+      .filter((u) =>
+        u.line === undefined ? !r.changed.has(u.file) && !r.shown.has(u.file) && !r.omitted.includes(u.file) : !r.changed.get(u.file)?.has(u.line),
+      )
+      .map((u) => (u.line === undefined ? u.file : `${u.file}:${u.line}`))
+    const dropped = (v.evidence ?? []).length - real.length - kept.length - untouched.length
     let status = v.status
     let note = truncate(v.note ?? "", 300)
-    if (status === "met" && !real.length && !kept.length) {
+    if (status === "met" && !real.length && !kept.length && !untouched.length) {
       status = "unclear"
       note = `${note} (said met, but cited no line of the change)`.trim()
-    } else if (dropped) note = `${note} (${dropped} citation(s) not in the change were dropped)`.trim()
-    return { criterion: i + 1, text, status, evidence: real.slice(0, 5), checks: [...new Set(kept)], note }
+    }
+    if (dropped) note = `${note} (${dropped} citation(s) not in the change were dropped)`.trim()
+    return { criterion: i + 1, text, status, evidence: real.slice(0, 5), checks: [...new Set(kept)], untouched: [...new Set(untouched)].slice(0, 5), note }
   })
 }
 
@@ -288,7 +316,13 @@ export function renderVerdicts(r: ReviewInput, verdicts: Verdict[], model: strin
   const not = verdicts.filter((v) => v.status === "not_met").length
   const head = `review ${r.task.id} "${r.task.title}" by ${model}: ${met}/${verdicts.length} met${not ? `, ${not} not met` : ""}`
   const lines = verdicts.map((v) => {
-    const cited = [v.evidence.length ? cite(v.evidence) : "", v.checks.length ? `checks: ${v.checks.join(", ")}` : ""].filter(Boolean).join(", ")
+    const cited = [
+      v.evidence.length ? cite(v.evidence) : "",
+      v.checks.length ? `checks: ${v.checks.join(", ")}` : "",
+      v.untouched.length ? `untouched: ${v.untouched.join(", ")}` : "",
+    ]
+      .filter(Boolean)
+      .join(", ")
     const where = cited ? ` — ${cited}` : ""
     return `${MARK[v.status]} ${v.criterion}. ${truncate(v.text, 120)}${where}${v.note ? `\n    ${v.note}` : ""}`
   })

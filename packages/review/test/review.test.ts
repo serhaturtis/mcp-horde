@@ -54,6 +54,7 @@ describe("review", () => {
     assert.match(r.diff, /=== src\/login\.ts[\s\S]*L1 \+const LIMIT = 5[\s\S]*L3 \+ {2}if \(failures\(user\) > LIMIT\) return 429/)
     assert.match(r.diff, /=== src\/login\.test\.ts\n@@\nL1 \+test\('429'/, "untracked files are part of the change")
     assert.ok(r.shown.get("src/login.ts")?.has(4), "context lines may be cited too")
+    assert.deepEqual([...r.changed.get("src/login.ts")!], [1, 3], "the lines the change adds, for untouched checks")
     assert.deepEqual([...r.touched].sort(), ["src/login.ts: function login (2-5)", "src/login.ts: variable LIMIT (1-1)"])
     const prompt = reviewPrompt(r)
     assert.match(prompt, /# Acceptance criteria\n1\. 429 after 5 failures per minute\n2\. the limit is configurable\n3\. failures are logged/)
@@ -114,11 +115,11 @@ describe("review", () => {
     assert.match(plain, /Tests passing is checked elsewhere; judge behaviour\./)
   })
 
-  test("the review schema accepts a line or a check as evidence", () => {
+  test("the review schema accepts a line, a check or an untouched path as evidence", () => {
     const items = REVIEW_SCHEMA.properties.verdicts.items.properties.evidence.items as unknown as { anyOf: { required: string[] }[] }
     assert.deepEqual(
       items.anyOf.map((x) => x.required),
-      [["file", "line"], ["check"]],
+      [["file", "line"], ["check"], ["untouched"]],
     )
   })
 
@@ -153,10 +154,58 @@ describe("review", () => {
     assert.match(text, /✓ 1\. 429 after 5 failures per minute — checks: test/)
     const combo = renderVerdicts(
       r,
-      [{ criterion: 1, text: "429", status: "met", evidence: [{ file: "src/login.ts", line: 3 }], checks: ["test"], note: "" }],
+      [{ criterion: 1, text: "429", status: "met", evidence: [{ file: "src/login.ts", line: 3 }], checks: ["test"], untouched: [], note: "" }],
       "mid/kimi",
     )
     assert.match(combo, /— src\/login\.ts:3, checks: test/)
+  })
+
+  test("an untouched citation is kept only for a file or line the change does not touch", async () => {
+    const { board, id } = await fixture()
+    const r = await collectReview(board, id)
+    assert.match(reviewPrompt(r), /\{"untouched": "<path>"\} or \{"untouched": "<path>:<line>"\}/)
+    const v = checkVerdicts(r, {
+      verdicts: [
+        { criterion: 1, status: "met", evidence: [{ untouched: "src/other.ts" }], note: "other file unchanged" },
+        { criterion: 2, status: "met", evidence: [{ untouched: "src/login.ts" }], note: "login unchanged" },
+        {
+          criterion: 3,
+          status: "met",
+          evidence: [{ untouched: "./src/login.ts:2" }, { untouched: "src/login.ts:3" }],
+          note: "line 2 unchanged",
+        },
+      ],
+    })
+    assert.deepEqual(
+      v.map((x) => [x.status, x.untouched]),
+      [
+        ["met", ["src/other.ts"]],
+        ["unclear", []],
+        ["met", ["src/login.ts:2"]],
+      ],
+    )
+    assert.match(v[1]!.note, /said met, but cited no line of the change/)
+    assert.match(v[1]!.note, /1 citation\(s\) not in the change were dropped/)
+    assert.match(v[2]!.note, /1 citation\(s\) not in the change were dropped/)
+    const text = renderVerdicts(r, v, "mid/kimi")
+    assert.match(text, /✓ 1\. 429 after 5 failures per minute — untouched: src\/other\.ts/)
+    assert.match(text, /✓ 3\. failures are logged — untouched: src\/login\.ts:2/)
+  })
+
+  test("a file the diff budget left out is never counted as untouched", async () => {
+    const { board, id } = await fixture()
+    const r = await collectReview(board, id, { maxDiffChars: 1 })
+    assert.ok(r.omitted.includes("src/login.ts") && r.omitted.includes("src/login.test.ts"))
+    const [file] = checkVerdicts(r, {
+      verdicts: [{ criterion: 1, status: "met", evidence: [{ untouched: "src/login.ts" }, { untouched: "src/login.test.ts" }], note: "not changed" }],
+    })
+    assert.equal(file!.status, "unclear")
+    assert.deepEqual(file!.untouched, [])
+    const [line] = checkVerdicts(r, {
+      verdicts: [{ criterion: 1, status: "met", evidence: [{ untouched: "src/login.test.ts:2" }], note: "line not changed" }],
+    })
+    assert.equal(line!.status, "met")
+    assert.deepEqual(line!.untouched, ["src/login.test.ts:2"])
   })
 
   test("the diff budget keeps whole small files and lists the rest; hunk lines starting with dashes are not headers", () => {
