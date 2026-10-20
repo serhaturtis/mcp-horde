@@ -3,12 +3,18 @@
     "SessionStart": [
       {
         "matcher": "startup|resume|clear|compact",
-        "hooks": [{ "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/delegate.js\" SessionStart", "timeout": 5 }]
+        "hooks": [{ "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/delegate.mjs\" SessionStart", "timeout": 5 }]
       }
     ],
     "SubagentStart": [
       {
-        "hooks": [{ "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/delegate.js\" SubagentStart", "timeout": 5 }]
+        "hooks": [{ "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/delegate.mjs\" SubagentStart", "timeout": 5 }]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit|mcp__plugin_horde_opencode__horde_do",
+        "hooks": [{ "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/delegate.mjs\" PostToolUse", "timeout": 5 }]
       }
     ]
   }
