@@ -26,7 +26,10 @@ describe("opencode MCP server: core behaviour (real opencode, mock LLM)", { time
   })
 
   test("catalog: tools, models with variants, agents, unsupported models hidden", async () => {
-    const tools = (await h.client.listTools()).tools.map((t) => t.name)
+    const listed = (await h.client.listTools()).tools
+    // The simple path loads upfront in Claude Code; the finer control stays behind tool search.
+    for (const t of listed) assert.equal(t._meta?.["anthropic/alwaysLoad"], t.name.startsWith("horde_") ? true : undefined, t.name)
+    const tools = listed.map((t) => t.name)
     for (const t of [
       "opencode_spawn",
       "opencode_wait",

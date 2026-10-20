@@ -253,8 +253,11 @@ export function registerTools(server: McpServer, ctx: Context) {
     shape: S,
     run: (args: z.infer<z.ZodObject<S>>, fleet: Fleet, extra: Extra) => Promise<string>,
     annotations: { readOnlyHint?: boolean; destructiveHint?: boolean; idempotentHint?: boolean } = {},
+    opts: { alwaysLoad?: boolean } = {},
   ) => {
-    server.registerTool(name, { description, inputSchema: shape, annotations: { openWorldHint: false, ...annotations } }, (async (
+    // Claude Code defers MCP tools behind a search; the few an agent should see at once load upfront.
+    const _meta = opts.alwaysLoad ? { "anthropic/alwaysLoad": true } : undefined
+    server.registerTool(name, { description, inputSchema: shape, annotations: { openWorldHint: false, ...annotations }, _meta }, (async (
       args: z.infer<z.ZodObject<S>>,
       extra: Extra,
     ) => {
@@ -287,7 +290,10 @@ export function registerTools(server: McpServer, ctx: Context) {
   }
 
   // The simple path comes first: most agents need nothing else.
-  registerHorde(tool, { waitSeconds: () => defaultWait(ctx), progress: (extra) => progress(extra as Extra) })
+  registerHorde((name, description, shape, run) => tool(name, description, shape, run, {}, { alwaysLoad: true }), {
+    waitSeconds: () => defaultWait(ctx),
+    progress: (extra) => progress(extra as Extra),
+  })
 
   tool(
     "opencode_models",
