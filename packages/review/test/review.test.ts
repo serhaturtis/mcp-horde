@@ -22,6 +22,7 @@ async function fixture() {
   git(repo, "init", "-q")
   fs.mkdirSync(path.join(repo, "src"))
   fs.writeFileSync(path.join(repo, "src", "login.ts"), "export function login(user: string) {\n  return check(user)\n}\n")
+  fs.writeFileSync(path.join(repo, "src", "config.ts"), `${Array.from({ length: 12 }, (_, i) => `export const v${i + 1} = ${i + 1}`).join("\n")}\n`)
   git(repo, "add", "-A")
   git(repo, "commit", "-qm", "init")
   const base = git(repo, "rev-parse", "HEAD")
@@ -55,6 +56,8 @@ describe("review", () => {
     assert.match(r.diff, /=== src\/login\.test\.ts\n@@\nL1 \+test\('429'/, "untracked files are part of the change")
     assert.ok(r.shown.get("src/login.ts")?.has(4), "context lines may be cited too")
     assert.deepEqual([...r.changed.get("src/login.ts")!], [1, 3], "the lines the change adds, for untouched checks")
+    assert.ok(r.diffFiles.has("src/login.ts") && r.diffFiles.has("src/login.test.ts"))
+    assert.deepEqual(r.hunks.get("src/login.ts"), [[1, 5]], "the hunk covers its context lines too")
     assert.deepEqual([...r.touched].sort(), ["src/login.ts: function login (2-5)", "src/login.ts: variable LIMIT (1-1)"])
     const prompt = reviewPrompt(r)
     assert.match(prompt, /# Acceptance criteria\n1\. 429 after 5 failures per minute\n2\. the limit is configurable\n3\. failures are logged/)
@@ -171,8 +174,8 @@ describe("review", () => {
         {
           criterion: 3,
           status: "met",
-          evidence: [{ untouched: "./src/login.ts:2" }, { untouched: "src/login.ts:3" }],
-          note: "line 2 unchanged",
+          evidence: [{ untouched: "./src/login.ts:2" }, { untouched: "src/login.test.ts:2" }],
+          note: "test line unchanged",
         },
       ],
     })
@@ -181,7 +184,7 @@ describe("review", () => {
       [
         ["met", ["src/other.ts"]],
         ["unclear", []],
-        ["met", ["src/login.ts:2"]],
+        ["met", ["src/login.test.ts:2"]],
       ],
     )
     assert.match(v[1]!.note, /said met, but cited no line of the change/)
@@ -189,13 +192,14 @@ describe("review", () => {
     assert.match(v[2]!.note, /1 citation\(s\) not in the change were dropped/)
     const text = renderVerdicts(r, v, "mid/kimi")
     assert.match(text, /✓ 1\. 429 after 5 failures per minute — untouched: src\/other\.ts/)
-    assert.match(text, /✓ 3\. failures are logged — untouched: src\/login\.ts:2/)
+    assert.match(text, /✓ 3\. failures are logged — untouched: src\/login\.test\.ts:2/)
   })
 
   test("a file the diff budget left out is never counted as untouched", async () => {
     const { board, id } = await fixture()
     const r = await collectReview(board, id, { maxDiffChars: 1 })
     assert.ok(r.omitted.includes("src/login.ts") && r.omitted.includes("src/login.test.ts"))
+    assert.ok(r.diffFiles.has("src/login.ts") && r.hunks.has("src/login.ts"), "files and hunks survive the budget")
     const [file] = checkVerdicts(r, {
       verdicts: [{ criterion: 1, status: "met", evidence: [{ untouched: "src/login.ts" }, { untouched: "src/login.test.ts" }], note: "not changed" }],
     })
@@ -238,6 +242,43 @@ describe("review", () => {
     const r = await collectReview(board, id)
     assert.match(r.diff, /=== src\/login\.ts \(deleted\)/)
     assert.equal(r.shown.get("src/login.ts"), undefined)
+    assert.ok(r.diffFiles.has("src/login.ts") && r.deleted.has("src/login.ts"))
+    const [file] = checkVerdicts(r, {
+      verdicts: [{ criterion: 1, status: "met", evidence: [{ untouched: "src/login.ts" }], note: "unchanged" }],
+    })
+    assert.equal(file!.status, "unclear")
+    assert.deepEqual(file!.untouched, [])
+    const [line] = checkVerdicts(r, {
+      verdicts: [{ criterion: 1, status: "met", evidence: [{ untouched: "src/login.ts:1" }], note: "unchanged" }],
+    })
+    assert.equal(line!.status, "unclear")
+    assert.deepEqual(line!.untouched, [])
+  })
+
+  test("a deletion-only change makes its hunk lines touched, while a line outside stays untouched", async () => {
+    const { repo, board, id } = await fixture()
+    const config = path.join(repo, "src", "config.ts")
+    const lines = fs.readFileSync(config, "utf8").trimEnd().split("\n")
+    fs.writeFileSync(config, `${lines.filter((_, i) => i !== 5).join("\n")}\n`)
+    const r = await collectReview(board, id)
+    assert.equal(r.changed.get("src/config.ts"), undefined, "nothing was added")
+    assert.ok(r.diffFiles.has("src/config.ts"))
+    assert.deepEqual(r.hunks.get("src/config.ts"), [[3, 8]])
+    const v = checkVerdicts(r, {
+      verdicts: [
+        { criterion: 1, status: "met", evidence: [{ untouched: "src/config.ts:5" }], note: "inside the hunk" },
+        { criterion: 2, status: "met", evidence: [{ untouched: "src/config.ts:10" }], note: "far outside" },
+        { criterion: 3, status: "not_met", evidence: [], note: "not relevant" },
+      ],
+    })
+    assert.deepEqual(
+      v.map((x) => [x.status, x.untouched]),
+      [
+        ["unclear", []],
+        ["met", ["src/config.ts:10"]],
+        ["not_met", []],
+      ],
+    )
   })
 
   test("an untracked file too large to show is listed as not shown", async () => {

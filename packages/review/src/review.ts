@@ -21,6 +21,12 @@ export interface ReviewInput {
   shown: Map<string, Set<number>>
   /** Lines the change adds, by file, for every file including ones the budget omitted. */
   changed: Map<string, Set<number>>
+  /** Every file the diff mentions, including deleted files and files the budget omitted. */
+  diffFiles: Set<string>
+  /** New-file line ranges of each file's hunks, context lines included. */
+  hunks: Map<string, [number, number][]>
+  /** Files the diff deletes. */
+  deleted: Set<string>
   /** Files the review could not show (too large, binary, or over the budget). */
   omitted: string[]
   /** Definitions the change touches, one line each ("src/a.ts: function foo (12-40)"). */
@@ -113,7 +119,7 @@ export async function collectReview(
     const lines = text.replace(/\n$/, "").split("\n")
     extra += `diff --git a/${f} b/${f}\nnew file\n--- /dev/null\n+++ b/${f}\n@@ -0,0 +1,${lines.length} @@\n${lines.map((l) => `+${l}`).join("\n")}\n`
   }
-  const { diff, shown, omitted, changed } = renderDiff(raw + extra, opts.maxDiffChars ?? 60_000)
+  const { diff, shown, omitted, changed, diffFiles, hunks, deleted } = renderDiff(raw + extra, opts.maxDiffChars ?? 60_000)
   const touched: string[] = []
   for (const [file, lines] of changed) {
     const lang = langOf(file)
@@ -123,13 +129,28 @@ export async function collectReview(
       if ([...lines].some((l) => l >= d.line && l <= d.end)) touched.push(`${file}: ${d.kind} ${d.name} (${d.line}-${d.end})`)
   }
   const criteria = task.acceptance.length ? task.acceptance : [`The goal is met: ${truncate(task.goal, 400)}`]
-  return { task, criteria, diff, shown, changed, omitted: [...new Set([...omitted, ...skipped])], touched: touched.slice(0, 60), workspace }
+  return {
+    task,
+    criteria,
+    diff,
+    shown,
+    changed,
+    diffFiles,
+    hunks,
+    deleted,
+    omitted: [...new Set([...omitted, ...skipped])],
+    touched: touched.slice(0, 60),
+    workspace,
+  }
 }
 
-/** The diff with new-file line numbers, within a budget; which lines it shows, and which it changes. */
+/** The diff with new-file line numbers, within a budget; which lines it shows, which it changes, and which files and hunks it touches. */
 export function renderDiff(raw: string, maxChars: number) {
   const shown = new Map<string, Set<number>>()
   const changed = new Map<string, Set<number>>()
+  const diffFiles = new Set<string>()
+  const hunks = new Map<string, [number, number][]>()
+  const deleted = new Set<string>()
   const files: { file: string; text: string }[] = []
   let file: string | undefined
   let oldFile: string | undefined
@@ -137,7 +158,7 @@ export function renderDiff(raw: string, maxChars: number) {
   let newLine = 0
   let inHunk = false
   const flush = () => {
-    if (file) files.push({ file, text: out.join("\n") })
+    if (file && out.length) files.push({ file, text: out.join("\n") })
     out = []
   }
   for (const line of raw.split("\n")) {
@@ -146,6 +167,12 @@ export function renderDiff(raw: string, maxChars: number) {
       file = undefined
       oldFile = undefined
       inHunk = false
+      // The header names every file, even binary or deleted ones that have no +++ line.
+      const m = /^diff --git a\/(.*) b\/(.*)$/.exec(line)
+      if (m) {
+        file = m[2]!
+        diffFiles.add(file)
+      }
       continue
     }
     // Headers only before a file's first hunk: a removed "-- x" line is not a header.
@@ -153,10 +180,17 @@ export function renderDiff(raw: string, maxChars: number) {
       if (line === "+++ /dev/null") {
         // A deleted file has no new side to cite; show it by name instead of dropping it.
         file = oldFile
-        if (file) out.push(`=== ${file} (deleted)`)
+        if (file) {
+          deleted.add(file)
+          diffFiles.add(file)
+          out.push(`=== ${file} (deleted)`)
+        }
       } else {
         file = line.slice(4).replace(/^b\//, "")
-        if (file) out.push(`=== ${file}`)
+        if (file) {
+          diffFiles.add(file)
+          out.push(`=== ${file}`)
+        }
       }
       continue
     }
@@ -164,11 +198,18 @@ export function renderDiff(raw: string, maxChars: number) {
       if (line !== "--- /dev/null") oldFile = line.slice(4).replace(/^a\//, "")
       continue
     }
-    const h = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@(.*)$/.exec(line)
+    const h = /^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$/.exec(line)
     if (h) {
       inHunk = true
-      newLine = Number(h[1])
-      out.push(`@@${h[2] ?? ""}`)
+      newLine = Number(h[2])
+      const count = h[3] === undefined ? 1 : Number(h[3])
+      if (file) {
+        const range: [number, number] = [newLine, newLine + count - 1]
+        const list = hunks.get(file)
+        if (list) list.push(range)
+        else hunks.set(file, [range])
+      }
+      out.push(`@@${h[4] ?? ""}`)
       continue
     }
     if (!inHunk) continue
@@ -201,7 +242,7 @@ export function renderDiff(raw: string, maxChars: number) {
     kept.push(f.text)
     used += f.text.length
   }
-  return { diff: kept.join("\n\n"), shown, omitted, changed }
+  return { diff: kept.join("\n\n"), shown, omitted, changed, diffFiles, hunks, deleted }
 }
 
 export function reviewPrompt(r: ReviewInput, checks?: GateCheck[]): string {
@@ -275,7 +316,9 @@ export function checkVerdicts(r: ReviewInput, json: unknown, checks: GateCheck[]
         return { file: norm(m ? m[1]! : e.untouched), line: m ? Number(m[2]) : undefined }
       })
       .filter((u) =>
-        u.line === undefined ? !r.changed.has(u.file) && !r.shown.has(u.file) && !r.omitted.includes(u.file) : !r.changed.get(u.file)?.has(u.line),
+        u.line === undefined
+          ? !r.diffFiles.has(u.file)
+          : !r.deleted.has(u.file) && !r.hunks.get(u.file)?.some(([start, end]) => u.line! >= start && u.line! <= end),
       )
       .map((u) => (u.line === undefined ? u.file : `${u.file}:${u.line}`))
     const dropped = (v.evidence ?? []).length - real.length - kept.length - untouched.length
