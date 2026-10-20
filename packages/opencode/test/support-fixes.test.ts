@@ -14,7 +14,7 @@ import { profileRules, type Snapshot } from "../src/fleet.js"
 import { makeHooks, permissionMessage } from "../src/hooks.js"
 import { Store } from "../src/state.js"
 import { attachCommand, renderSnapshot } from "../src/tools.js"
-import { anchoredPattern, commitAll, createWorktree, excludeFromGit, removeWorktree, syncWorktree, workStart } from "../src/worktree.js"
+import { anchoredPattern, commitAll, createWorktree, dependencyLinks, excludeFromGit, removeWorktree, syncWorktree, workStart } from "../src/worktree.js"
 import { connect, git, pkg } from "./harness.js"
 
 const tmps: string[] = []
@@ -344,5 +344,41 @@ describe("worktree fixes", () => {
     fs.writeFileSync(path.join(worktree.root, "f.txt"), "x")
     assert.match((await commitAll(worktree, "work")) ?? "", /committed/)
     assert.equal(execFileSync("git", ["log", "-1", "--format=%an"], { cwd: worktree.root }).toString().trim(), "mcp-horde")
+  })
+
+  test("dependencyLinks finds ignored dependency directories at any depth and nothing else", async () => {
+    const r = repo()
+    fs.writeFileSync(path.join(r, ".gitignore"), "node_modules/\n.venv/\nvenv/\ndist/\n")
+    for (const dir of ["node_modules", "packages/a/node_modules", ".venv", "dist"]) {
+      fs.mkdirSync(path.join(r, dir), { recursive: true })
+      fs.writeFileSync(path.join(r, dir, "keep.txt"), "x")
+    }
+    fs.mkdirSync(path.join(r, "tracked", "node_modules"), { recursive: true })
+    fs.writeFileSync(path.join(r, "tracked", "node_modules", "keep.txt"), "x")
+    git(r, "add", ".gitignore")
+    git(r, "add", "-f", "tracked/node_modules/keep.txt")
+    git(r, "commit", "-qm", "ignore deps")
+    assert.deepEqual(await dependencyLinks(r), [".venv", "node_modules", "packages/a/node_modules"])
+  })
+
+  test("createWorktree links dependency directories by default and only those given explicitly", async () => {
+    const r = repo()
+    fs.writeFileSync(path.join(r, ".gitignore"), "node_modules/\n.venv/\n")
+    git(r, "add", ".gitignore")
+    git(r, "commit", "-qm", "ignore deps")
+    fs.mkdirSync(path.join(r, "node_modules", "pkg"), { recursive: true })
+    fs.writeFileSync(path.join(r, "node_modules", "pkg", "index.js"), "module.exports = 1\n")
+    fs.mkdirSync(path.join(r, ".venv"), { recursive: true })
+    fs.writeFileSync(path.join(r, ".venv", "pyvenv.cfg"), "x\n")
+    const rootDir = path.join(tmpDir(), "wt")
+    const { worktree } = await createWorktree(r, "deps", { rootDir, includeUncommitted: false })
+    for (const rel of ["node_modules", ".venv"]) {
+      const dst = path.join(worktree.root, rel)
+      assert.ok(fs.lstatSync(dst).isSymbolicLink(), `${rel} is a symlink into the main checkout`)
+      assert.equal(fs.realpathSync(dst), fs.realpathSync(path.join(r, rel)))
+    }
+    const bare = await createWorktree(r, "no-deps", { rootDir, includeUncommitted: false, link: [] })
+    assert.equal(fs.existsSync(path.join(bare.worktree.root, "node_modules")), false)
+    assert.equal(fs.existsSync(path.join(bare.worktree.root, ".venv")), false)
   })
 })

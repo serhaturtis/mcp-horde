@@ -3,7 +3,7 @@ import { createHash } from "node:crypto"
 import { existsSync } from "node:fs"
 import fs from "node:fs/promises"
 import path from "node:path"
-import { GIT_ENV, git, gitRaw, runCommand } from "@mcp-horde/core"
+import { GIT_ENV, git, gitRaw, runCommand, splitZ } from "@mcp-horde/core"
 
 const isWindows = process.platform === "win32"
 
@@ -43,8 +43,8 @@ export interface WorktreeOptions {
   rootDir: string
   /** Carry over uncommitted (staged, unstaged and untracked) changes from the main checkout. */
   includeUncommitted: boolean
-  /** Paths (relative to the repo root) to symlink from the main checkout, e.g. node_modules. */
-  link: string[]
+  /** Paths (relative to the repo root) to symlink from the main checkout; default: dependencyLinks(repo). */
+  link?: string[]
   /** Shell command run in the new worktree before the agent starts, e.g. "npm ci". */
   setup?: string
   /** Initialize submodules in the new worktree (default: when the repo has any). */
@@ -88,13 +88,21 @@ export async function validateLink(repo: string, rel: string): Promise<string> {
   return norm
 }
 
+/** Dependency directories ignored by git in this checkout, so a worktree can link them. */
+export async function dependencyLinks(repo: string): Promise<string[]> {
+  const out = await gitRaw(repo, ["ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"])
+  return splitZ(out)
+    .map((p) => p.replace(/\/+$/, ""))
+    .filter((p) => ["node_modules", ".venv", "venv"].includes(path.posix.basename(p)))
+}
+
 /**
  * Create an isolated worktree on a new branch `horde/<name>`. Worktrees live
  * outside the repository (under rootDir) so they never appear in it.
  */
 export async function createWorktree(directory: string, name: string, opts: WorktreeOptions): Promise<{ worktree: Worktree; notes: string[] }> {
   const repo = await repoRoot(directory)
-  const links = await Promise.all(opts.link.map((l) => validateLink(repo, l)))
+  const links = await Promise.all((opts.link ?? (await dependencyLinks(repo))).map((l) => validateLink(repo, l)))
   const notes: string[] = []
   const slug = branchSlug(name)
   const repoKey = `${branchSlug(path.basename(repo))}-${createHash("sha1").update(repo).digest("hex").slice(0, 8)}`
