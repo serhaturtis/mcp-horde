@@ -5,184 +5,174 @@ import os from "node:os"
 import path from "node:path"
 import { describe, test } from "node:test"
 import { formatTokens, formatUsd, truncate, truncateHead } from "@mcp-horde/core"
-import type { QuestionV2Request } from "@opencode-ai/sdk/v2"
+import type { FormInfo, SessionInboxInfo, SessionMessageInfo } from "@opencode/client"
 import { extractJson, validate } from "../src/ask.js"
 import { isLoopback, shimTarget } from "../src/backend.js"
 import { loadConfig } from "../src/config.js"
-import { defaultQuestionPolicy, defined, formatModel, parseModel } from "../src/fleet.js"
+import { defaultQuestionPolicy, defined, dismissAnswer, formAnswer, formatModel, parseModel } from "../src/fleet.js"
 import { questionAnswers, questionSchema } from "../src/hooks.js"
 import { Store } from "../src/state.js"
 import { price } from "../src/tools.js"
-import { apply, costSince, currentTurn, type DurableEvent, emptyTrack, isInterruptMessage, latestTool, turnsSince } from "../src/tracker.js"
+import { buildTrack, costSince, currentTurn, latestTool, stablePrefix, turnsSince } from "../src/tracker.js"
 import { branchSlug, validateLink } from "../src/worktree.js"
 // Fixes from the support-module audit (hooks, tracker, worktree, backend, supervisor, ask, config).
 import "./support-fixes.test.js"
 
-let seq = 0
-const ev = (type: string, data: Record<string, unknown> = {}): DurableEvent => ({
-  type: `session.next.${type}`,
-  durable: { seq: ++seq },
-  data: { timestamp: 1000 + seq, sessionID: "ses_x", ...data },
+let clock = 1000
+type Msg = SessionMessageInfo
+const user = (id: string, text: string): Msg => ({ id, type: "user", text, time: { created: ++clock } })
+const idle = (id: string, outcome: "succeeded" | "failed" | "interrupted", error?: { type: string; message: string; status?: number }): Msg => ({
+  id,
+  type: "idle",
+  outcome,
+  ...(error ? { error } : {}),
+  time: { created: ++clock },
 })
+const step = (
+  id: string,
+  o: {
+    text?: string
+    finish?: "stop" | "tool-calls"
+    cost?: number
+    tokens?: { input: number; output: number; reasoning?: number; cache?: { read: number; write: number } }
+    tools?: { id: string; name: string; status: "running" | "completed" }[]
+    open?: boolean
+    model?: string
+  } = {},
+): Msg => {
+  const created = ++clock
+  return {
+    id,
+    type: "assistant",
+    agent: "build",
+    model: { id: o.model ?? "m", providerID: "p" },
+    content: [
+      ...(o.text ? [{ type: "text" as const, text: o.text }] : []),
+      ...(o.tools ?? []).map((t) => ({
+        type: "tool" as const,
+        id: t.id,
+        name: t.name,
+        time: { created },
+        state:
+          t.status === "running"
+            ? { status: "running" as const, input: { command: "ls" }, metadata: {} }
+            : { status: "completed" as const, input: {}, content: [{ type: "text" as const, text: "ok" }] as [{ type: "text"; text: string }] },
+      })),
+    ],
+    finish: o.open ? undefined : (o.finish ?? "stop"),
+    cost: o.cost ?? 0,
+    tokens: { reasoning: 0, cache: { read: 0, write: 0 }, ...(o.tokens ?? { input: 0, output: 0 }) },
+    time: { created, ...(o.open ? {} : { completed: created }) },
+  } as Msg
+}
 
 describe("tracker", () => {
-  test("a simple turn: prompt, text, end", () => {
-    const t = emptyTrack()
-    apply(t, ev("prompt.admitted", { messageID: "m1", prompt: { text: "hi" } }))
-    assert.equal(t.admitted.size, 1)
-    apply(t, ev("prompted", { messageID: "m1", prompt: { text: "hi" } }))
-    assert.equal(t.admitted.size, 0)
-    assert.equal(t.inLoop, true)
-    apply(t, ev("step.started", { model: { id: "m", providerID: "p" }, agent: "build" }))
-    apply(t, ev("text.ended", { assistantMessageID: "a1", text: "hello" }))
-    apply(t, ev("step.ended", { finish: "stop", cost: 0.5, tokens: { input: 10, output: 5, reasoning: 1, cache: { read: 2, write: 3 } } }))
+  test("a simple turn: prompt, answer, idle marker", () => {
+    const t = buildTrack([
+      user("m1", "hi"),
+      step("a1", { text: "hello", cost: 0.5, tokens: { input: 10, output: 5, reasoning: 1, cache: { read: 2, write: 3 } } }),
+      idle("i1", "succeeded"),
+    ])
     assert.equal(t.inLoop, false)
     const turn = currentTurn(t)!
+    assert.equal(turn.prompt, "hi")
     assert.equal(turn.finalText, "hello")
     assert.equal(turn.steps, 1)
+    assert.ok(turn.endedAt)
+    assert.deepEqual(turn.messageIDs, ["m1", "a1"])
     assert.equal(t.cost, 0.5)
     assert.deepEqual(t.tokens, { input: 10, output: 5, reasoning: 1, cacheRead: 2, cacheWrite: 3 })
     assert.equal(t.model?.providerID, "p")
     assert.equal(t.agent, "build")
+    assert.ok(t.ids.has("i1"))
   })
 
-  test("tool-calls keep the loop going; the last message's text is the answer", () => {
-    const t = emptyTrack()
-    apply(t, ev("prompted", { messageID: "m1", prompt: { text: "do it" } }))
-    apply(t, ev("step.started"))
-    apply(t, ev("text.ended", { assistantMessageID: "a1", text: "let me check" }))
-    apply(t, ev("tool.called", { callID: "c1", tool: "bash", input: { command: "ls" } }))
-    assert.equal(t.openTools.get("c1")?.tool, "bash")
-    apply(t, ev("tool.success", { callID: "c1" }))
-    assert.equal(t.openTools.size, 0)
-    apply(t, ev("step.ended", { finish: "tool-calls" }))
-    assert.equal(t.inLoop, true)
-    apply(t, ev("step.started"))
-    apply(t, ev("text.ended", { assistantMessageID: "a2", text: "done" }))
-    apply(t, ev("step.ended", { finish: "stop" }))
+  test("tool steps keep the turn open until the idle marker; the last text is the answer", () => {
+    const msgs = [
+      user("m1", "do it"),
+      step("a1", { text: "let me check", finish: "tool-calls", tools: [{ id: "c1", name: "shell", status: "completed" }] }),
+      step("a2", { text: "done" }),
+    ]
+    const running = buildTrack(msgs)
+    assert.equal(running.inLoop, true, "no idle marker yet")
+    assert.equal(currentTurn(running)!.endedAt, undefined)
+    const t = buildTrack([...msgs, idle("i1", "succeeded")])
     assert.equal(currentTurn(t)!.finalText, "done")
     assert.equal(currentTurn(t)!.steps, 2)
   })
 
-  test("a steer joins the running turn; a later prompt starts a new one", () => {
-    const t = emptyTrack()
-    apply(t, ev("prompted", { messageID: "m1", prompt: { text: "first" } }))
-    apply(t, ev("step.started"))
-    apply(t, ev("prompted", { messageID: "m2", prompt: { text: "also this" } }))
+  test("a prompt during a run joins it; one after the idle marker starts a new turn", () => {
+    const t = buildTrack([user("m1", "first"), step("a1"), user("m2", "also this"), step("a2"), idle("i1", "succeeded")])
     assert.equal(t.turns.length, 1)
-    assert.match(currentTurn(t)!.prompt, /\[steer\] also this/)
-    apply(t, ev("step.ended", { finish: "stop" }))
+    assert.equal(currentTurn(t)!.prompt, "first\n[steer] also this")
     const before = t.seq
-    apply(t, ev("prompted", { messageID: "m3", prompt: { text: "second" } }))
-    assert.equal(t.turns.length, 2)
-    assert.equal(turnsSince(t, before).length, 1)
+    const next = buildTrack([...t.messages, user("m3", "second")])
+    assert.equal(next.turns.length, 2)
+    assert.deepEqual(
+      turnsSince(next, before).map((x) => x.prompt),
+      ["second"],
+    )
   })
 
-  test("failures and interrupts", () => {
-    const t = emptyTrack()
-    apply(t, ev("prompted", { messageID: "m1", prompt: { text: "x" } }))
-    apply(t, ev("step.started"))
-    apply(t, ev("step.failed", { error: { type: "unknown", message: "Provider request failed with HTTP 400" } }))
-    assert.equal(t.inLoop, false)
-    assert.equal(currentTurn(t)!.failure, "Provider request failed with HTTP 400")
-    assert.equal(currentTurn(t)!.interrupted, false)
-
-    apply(t, ev("prompted", { messageID: "m2", prompt: { text: "y" } }))
-    apply(t, ev("step.started"))
-    apply(t, ev("tool.called", { callID: "c1", tool: "question", input: {} }))
-    apply(t, ev("tool.failed", { callID: "c1", error: { type: "unknown", message: "Tool execution interrupted" } }))
-    assert.equal(currentTurn(t)!.interrupted, true)
+  test("failures carry the provider's status; interrupts are marked", () => {
+    const failed = buildTrack([user("m1", "x"), step("a1"), idle("i1", "failed", { type: "provider.invalid-request", message: "bad request", status: 400 })])
+    assert.equal(currentTurn(failed)!.failure, "bad request (HTTP 400)")
+    assert.equal(currentTurn(failed)!.interrupted, undefined)
+    const stopped = buildTrack([user("m1", "x"), step("a1", { open: false }), idle("i1", "interrupted")])
+    assert.equal(currentTurn(stopped)!.interrupted, true)
+    assert.equal(currentTurn(stopped)!.failure, "interrupted")
   })
 
-  test("only OpenCode's own interrupt messages count as interrupts", () => {
-    assert.ok(isInterruptMessage("Tool execution interrupted"))
-    assert.ok(isInterruptMessage("Provider turn interrupted"))
-    assert.ok(!isInterruptMessage("The operation was aborted"))
-    assert.ok(!isInterruptMessage("curl: (56) Recv failure: interrupted system call"))
-
-    // An ordinary tool error does not end the turn.
-    const t = emptyTrack()
-    apply(t, ev("prompted", { messageID: "m1", prompt: { text: "x" } }))
-    apply(t, ev("step.started"))
-    apply(t, ev("tool.called", { callID: "c1", tool: "bash", input: {} }))
-    apply(t, ev("tool.failed", { callID: "c1", error: { message: "The operation was aborted" } }))
-    assert.equal(t.inLoop, true)
-    assert.equal(currentTurn(t)!.interrupted, undefined)
-  })
-
-  test("an interrupted tool closes the turn; the next prompt starts a new one", () => {
-    const t = emptyTrack()
-    apply(t, ev("prompted", { messageID: "m1", prompt: { text: "ask me" } }))
-    apply(t, ev("step.started"))
-    apply(t, ev("tool.called", { callID: "c1", tool: "question", input: {} }))
-    apply(t, ev("tool.failed", { callID: "c1", error: { message: "Tool execution interrupted" } }))
-    assert.equal(t.inLoop, false)
-    assert.equal(t.stepOpen, false)
-    assert.ok(currentTurn(t)!.endedAt)
-    apply(t, ev("prompted", { messageID: "m2", prompt: { text: "go on" } }))
-    assert.equal(t.turns.length, 2)
-    assert.equal(currentTurn(t)!.prompt, "go on")
-  })
-
-  test("parallel tool calls are tracked separately", () => {
-    const t = emptyTrack()
-    apply(t, ev("prompted", { messageID: "m1", prompt: { text: "x" } }))
-    apply(t, ev("step.started"))
-    apply(t, ev("tool.called", { callID: "a", tool: "read", input: {} }))
-    apply(t, ev("tool.called", { callID: "b", tool: "grep", input: {} }))
+  test("the open step's running tools are tracked separately", () => {
+    const t = buildTrack([
+      user("m1", "x"),
+      step("a1", {
+        open: true,
+        tools: [
+          { id: "a", name: "read", status: "running" },
+          { id: "b", name: "grep", status: "running" },
+          { id: "c", name: "glob", status: "completed" },
+        ],
+      }),
+    ])
+    assert.equal(t.stepOpen, true)
+    assert.deepEqual([...t.openTools.keys()], ["a", "b"])
     assert.equal(latestTool(t)?.tool, "grep")
-    apply(t, ev("tool.success", { callID: "b" }))
-    assert.equal(latestTool(t)?.tool, "read")
-    apply(t, ev("tool.success", { callID: "a" }))
-    assert.equal(latestTool(t), undefined)
+    assert.equal(buildTrack([...t.messages.slice(0, 1), step("a1")]).openTools.size, 0, "a completed step has none")
   })
 
-  test("queued prompts keep their admission time and seq", () => {
-    const t = emptyTrack()
-    apply(t, ev("prompt.admitted", { messageID: "m1", prompt: { text: "queued" } }))
-    const admittedSeq = t.seq
-    const admittedAt = 1000 + admittedSeq
-    apply(t, ev("prompted", { messageID: "m1", prompt: { text: "queued" } }))
-    assert.equal(currentTurn(t)!.admittedSeq, admittedSeq)
-    assert.equal(currentTurn(t)!.admittedAt, admittedAt)
-    assert.equal(t.lastPromptedSeq, t.seq)
+  test("prompts waiting in the inbox are admitted, not started", () => {
+    const inbox = [{ id: "q1", sessionID: "s", type: "user", time: { created: 5000 }, payload: { text: "later" }, delivery: "queue" }] as SessionInboxInfo[]
+    const t = buildTrack([user("m1", "x"), step("a1", { open: true })], inbox)
+    assert.deepEqual([...t.admitted.keys()], ["q1"])
+    assert.equal(t.admitted.get("q1")?.delivery, "queue")
+    assert.equal(t.seq, 5000)
   })
 
-  test("a failed step only marks an open turn; step costs are kept for limits", () => {
-    const t = emptyTrack()
-    apply(t, ev("prompted", { messageID: "m1", prompt: { text: "x" } }))
-    apply(t, ev("step.started"))
-    apply(t, ev("step.ended", { finish: "stop", cost: 1 }))
-    apply(t, ev("step.failed", { error: { message: "late failure" } }))
-    assert.equal(currentTurn(t)!.failure, undefined)
-    const at = 1000 + t.seq
-    apply(t, ev("prompted", { messageID: "m2", prompt: { text: "y" } }))
-    apply(t, ev("step.started"))
-    apply(t, ev("step.ended", { finish: "stop", cost: 2 }))
-    assert.equal(costSince(t, at), 2)
-    assert.equal(t.cost, 3)
-  })
-
-  test("steps OpenCode reports as free are priced by the estimator", () => {
-    const t = emptyTrack()
+  test("free steps are priced by the estimator; a reported cost wins; limits see cost by time", () => {
     const estimate = (m: { id: string }, tok: { input: number; output: number }) => (m.id === "paid" ? (tok.input + tok.output) / 100 : undefined)
-    apply(t, ev("prompted", { messageID: "m1", prompt: { text: "x" } }), estimate)
-    apply(t, ev("step.started", { model: { id: "paid", providerID: "p" } }), estimate)
-    apply(t, ev("step.ended", { finish: "stop", cost: 0, tokens: { input: 10, output: 5 } }), estimate)
-    assert.equal(t.cost, 0.15)
-    // A cost OpenCode does report wins.
-    apply(t, ev("prompted", { messageID: "m2", prompt: { text: "y" } }), estimate)
-    apply(t, ev("step.started", { model: { id: "paid", providerID: "p" } }), estimate)
-    apply(t, ev("step.ended", { finish: "stop", cost: 2, tokens: { input: 10, output: 5 } }), estimate)
+    const first = [user("m1", "x"), step("a1", { model: "paid", tokens: { input: 10, output: 5 } }), idle("i1", "succeeded")]
+    const since = clock + 1
+    const t = buildTrack(
+      [...first, user("m2", "y"), step("a2", { model: "paid", cost: 2, tokens: { input: 10, output: 5 } }), idle("i2", "succeeded")],
+      [],
+      estimate,
+    )
     assert.equal(t.cost, 2.15)
+    assert.equal(costSince(t, since), 2)
   })
 
-  test("replayed or out-of-order events are ignored", () => {
-    const t = emptyTrack()
-    const e = ev("prompted", { messageID: "m1", prompt: { text: "x" } })
-    apply(t, e)
-    apply(t, e)
-    assert.equal(t.turns.length, 1)
+  test("compactions reset the context; only what follows the last idle marker is re-read", () => {
+    const msgs = [user("m1", "a"), step("a1", { tokens: { input: 100, output: 10, reasoning: 1000, cache: { read: 5, write: 0 } } }), idle("i1", "succeeded")]
+    assert.equal(buildTrack(msgs).context, 115, "reasoning is not resent")
+    const compacted = buildTrack([
+      ...msgs,
+      { id: "c1", type: "compaction", status: "completed", reason: "manual", summary: "s", time: { created: ++clock } } as Msg,
+    ])
+    assert.equal(compacted.compactions, 1)
+    assert.equal(compacted.context, undefined)
+    assert.equal(stablePrefix(compacted.messages), 3)
+    assert.equal(stablePrefix([user("m1", "a")]), 0)
   })
 })
 
@@ -290,30 +280,32 @@ describe("helpers", () => {
 
   test("question dialogs: single, multi-select and custom answers", () => {
     const req = {
-      id: "q",
+      id: "frm_q",
       sessionID: "s",
-      questions: [
+      title: "Questions",
+      fields: [
         {
-          question: "Pick one",
-          header: "",
+          key: "q0",
+          type: "string",
+          description: "Pick one",
           options: [
-            { label: "A", description: "first" },
-            { label: "B", description: "" },
+            { value: "A", label: "A", description: "first" },
+            { value: "B", label: "B" },
           ],
           custom: false,
         },
         {
-          question: "Pick many",
-          header: "",
+          key: "q1",
+          type: "multiselect",
+          description: "Pick many",
           options: [
-            { label: "x, y", description: "" },
-            { label: "z", description: "" },
+            { value: "x, y", label: "x, y" },
+            { value: "z", label: "z" },
           ],
-          multiple: true,
         },
-        { question: "Free text", header: "", options: [] },
+        { key: "q2", type: "string", description: "Free text" },
       ],
-    } as unknown as QuestionV2Request
+    } as unknown as FormInfo
     const { properties, required } = questionSchema(req)
     assert.deepEqual(required, ["q0", "q2_text"])
     assert.deepEqual((properties.q0 as { oneOf: unknown[] }).oneOf, [
@@ -323,9 +315,14 @@ describe("helpers", () => {
     assert.equal(properties.q0_text, undefined, "no free text when custom answers are off")
     assert.equal((properties.q1 as { type: string }).type, "array")
     assert.ok(properties.q1_text)
-    // Labels with commas survive multi-select; free text wins over a choice.
-    assert.deepEqual(questionAnswers(req, { q0: "B", q1: ["x, y", "z"], q1_text: "", q2_text: " mine " }), [["B"], ["x, y", "z"], ["mine"]])
-    assert.deepEqual(questionAnswers(req, undefined), [[], [], []])
+    // Values with commas survive multi-select; free text wins over a choice.
+    assert.deepEqual(questionAnswers(req, { q0: "B", q1: ["x, y", "z"], q1_text: "", q2_text: " mine " }), { q0: "B", q1: ["x, y", "z"], q2: "mine" })
+    assert.deepEqual(questionAnswers(req, undefined), {})
+    // The caller answers by label, per field; "dismiss" leaves the choice to the agent where it can.
+    assert.deepEqual(formAnswer(req, [["B"], ["z"], ["free"]]), { q0: "B", q1: ["z"], q2: "free" })
+    const dismissed = dismissAnswer(req)
+    assert.equal(dismissed.q0, "A", "no custom answers: the first option")
+    assert.match(String(dismissed.q2), /No preference/)
   })
 
   test("formatting", () => {
@@ -365,20 +362,6 @@ describe("helpers", () => {
     assert.throws(() => at(), /"opencode\.maxRunning" must be a non-negative integer/)
     fs.writeFileSync(path.join(dir, "horde.json"), JSON.stringify({ opencode: 4 }))
     assert.throws(() => at(), /"opencode" must be an object/)
-  })
-})
-
-describe("API policy", () => {
-  test("only compat.ts uses OpenCode's legacy API; everything else is v2", () => {
-    const src = path.resolve(import.meta.dirname, "../src")
-    const legacy = /\bclient\.(session|instance|global|config|project|app|file|find|tool|agent|provider|mcp|event|lsp|command|tui|path|auth|pty)\./
-    for (const f of fs.readdirSync(src)) {
-      if (!f.endsWith(".ts") || f === "compat.ts") continue
-      const lines = fs.readFileSync(path.join(src, f), "utf8").split("\n")
-      lines.forEach((line, i) => {
-        assert.doesNotMatch(line, legacy, `${f}:${i + 1} uses the legacy API; add it to compat.ts with the v2 gap it covers`)
-      })
-    }
   })
 })
 

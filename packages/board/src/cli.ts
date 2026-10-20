@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * The worker side of the board, run with an agent's bash tool:
+ * The worker side of the board, run with an agent's shell tool:
  *   horde --state <board dir> <command> …
  * Only worker commands exist here; planning, accepting and failing tasks are
  * the orchestrator's (MCP tools). Output is short, for a model to read.

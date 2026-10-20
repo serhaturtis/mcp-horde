@@ -51,7 +51,7 @@ export function renderBrief(board: Board, t: Task, a: Attempt, budgetTokens = 60
     {
       text: [
         "## Reporting (required)",
-        "Run these with your bash tool, exactly as written (only replace the quoted text). Do not add $, backticks, backslashes, ;, &, | or redirects: those commands are refused.",
+        "Run these with your shell tool, exactly as written (only replace the quoted text). Do not add $, backticks, backslashes, ;, &, | or redirects: those commands are refused.",
         `- First:   ${cmd} task ${id} ${a.token}`,
         `- Progress (optional, renews your locks): ${cmd} progress ${id} ${a.token} "what you are doing"`,
         `- A fact other workers need: ${cmd} finding "the fact" --paths "src/x.ts" --task ${id} --token ${a.token}`,

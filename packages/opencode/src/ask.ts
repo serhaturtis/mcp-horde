@@ -1,50 +1,27 @@
 /**
- * One-shot answers for `opencode_ask`: a tool-less agent profile, and JSON replies checked
+ * One-shot answers for `opencode_ask`: sessions that may use no tools, and JSON replies checked
  * against a JSON Schema (the common subset: type, properties, required, items, enum, const,
  * anyOf/oneOf/allOf, additionalProperties, minItems/maxItems, minimum/maximum,
  * exclusiveMinimum/exclusiveMaximum, minLength/maxLength, pattern, min/maxProperties).
  * Schemas using anything else are rejected up front (`unsupportedSchema`), never half-checked.
  */
 
+import type { Profile } from "./fleet.js"
+
 /**
- * The agent profile ask sessions run with: no tools. It has no prompt of its own, so
- * OpenCode's system prompt stays (OpenCode's free tier refuses sessions without it); the
- * instruction to answer directly travels with the user's prompt instead.
+ * The permissions ask sessions run with: every tool denied. OpenCode's system prompt stays
+ * (its free tier refuses sessions without it); the instruction to answer directly travels
+ * with the user's prompt instead.
  */
-export const ASK_AGENT = "horde-ask"
-export const ASK_PROFILE = `---
-description: mcp-horde one-shot answers (no tools)
-mode: primary
-tools:
-  "*": false
----
-`
+export const ASK_PROFILE: Profile = { permission: { "*": "deny" } }
+
 /**
- * OpenCode's free tier refuses sessions whose agent has no tools at all ("can only be used
- * from within OpenCode"). This profile keeps the read-only tools (read, grep, glob, list) and
- * denies every other permission: no edits, shell, subagents, web fetches or searches (rules
- * are matched last-first, so the catch-all comes first). Ask sessions also run with the
- * "deny" policy, so nothing that asks for permission is ever allowed.
+ * OpenCode's free tier refuses sessions that offer no tools at all ("can only be used from
+ * within OpenCode"). This keeps the read-only tools (read, grep, glob) and denies everything
+ * else (the last matching rule wins, so the catch-all comes first). Ask sessions also run with
+ * the "deny" policy, so nothing that asks for permission is ever allowed.
  */
-export const ASK_GUARDED_AGENT = "horde-ask-guarded"
-export const ASK_GUARDED_PROFILE = `---
-description: mcp-horde one-shot answers (read-only tools)
-mode: primary
-permission:
-  "*": deny
-  read: allow
-  grep: allow
-  glob: allow
-  list: allow
-  edit: deny
-  bash: deny
-  task: deny
-  webfetch: deny
-  websearch: deny
-  codesearch: deny
-  external_directory: deny
----
-`
+export const ASK_GUARDED_PROFILE: Profile = { permission: { "*": "deny", read: "allow", grep: "allow", glob: "allow" } }
 export const ASK_PREAMBLE =
   "Answer the request below directly from what it contains. Do not use tools in this session: do not try to edit files, run commands or search the web. If something you need is missing, say exactly what.\n\n"
 

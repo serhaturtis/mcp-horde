@@ -44,7 +44,7 @@ function repo() {
   return root
 }
 
-/** Run a command the way a worker's bash tool would, returning stdout or throwing with stderr. */
+/** Run a command the way a worker's shell tool would, returning stdout or throwing with stderr. */
 function sh(command: string, cwd: string): string {
   return execSync(command, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, NODE_TEST_CONTEXT: "" } }).trim()
 }

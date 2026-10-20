@@ -2,7 +2,7 @@
 
 An MCP server that gives any harness (Claude Code, Codex, Cursor, OpenCode itself, …) subagents powered by [OpenCode](https://opencode.ai). Each agent can run any model OpenCode supports: DeepSeek, Kimi, GLM, Qwen, GPT, Claude, local models. The calling model picks the model and effort level per agent at runtime. Agents run in parallel, report back when they finish, and can be steered, paused, resumed and stopped while they work.
 
-It is built on OpenCode's **v2 server API** (`/api/*`, through `@opencode-ai/sdk/v2`). The legacy API is used only for what v2 lacks (session titles and deletion, releasing a directory, the server version), from one adapter module (`src/compat.ts`); each use is best effort and goes away when v2 covers it.
+It is built on the server API of **OpenCode 2** (`/api/*`, through `@opencode/client`).
 
 ## What the calling agent can do
 
@@ -12,9 +12,9 @@ It is built on OpenCode's **v2 server API** (`/api/*`, through `@opencode-ai/sdk
 | Spawn an agent with its own model, effort (`variant`), profile, instructions, directory, limits and permission policy | `opencode_spawn` |
 | Get a one-shot answer from any model, with no tools and nothing left behind (classify, summarize a log or diff, judge candidates); with a JSON Schema, a checked JSON answer (the common subset: `type`, `properties`, `required`, `items`, `enum`, `const`, `anyOf`/`oneOf`/`allOf`, `additionalProperties`, `pattern`, length/size/range bounds; schemas using anything else, such as `$ref`, are refused). Waits 300 s in Claude Code, 50 s elsewhere, unless `timeout_seconds` says otherwise | `opencode_ask` |
 | Check a board task's attempt against its acceptance criteria: a model answers each criterion met / not met / unclear, citing lines of the attempt's diff, and every citation is checked (an unfounded "met" becomes "unclear"); two models cross-check and list disagreements; the outcome is kept on the attempt ([`@mcp-horde/review`](../review)) | `review_task` |
-| Give an agent a custom profile (tool allow/deny list, step cap) | `opencode_spawn` `profile` |
+| Give an agent extra permission rules on top of its profile (tool allow/deny list, step cap) | `opencode_spawn` `profile` |
 | Run agents in parallel without collisions, each in its own git worktree and branch | `opencode_spawn` `isolation: "worktree"` |
-| Confine an agent's file edits to some paths: OpenCode refuses the rest (`outside: "deny"`) or asks you (`"ask"`, whatever the permission policy) | `opencode_spawn` `scope` (worktree only; `bash` writes are caught by the gate's audit instead) |
+| Confine an agent's file edits to some paths: OpenCode refuses the rest (`outside: "deny"`) or asks you (`"ask"`, whatever the permission policy) | `opencode_spawn` `scope` (shell commands can still write files; the gate's audit catches that) |
 | Check an agent's work mechanically when it finishes, and send failures back to it to fix | `opencode_spawn` / `opencode_message` `gate` |
 | Work a task from [`@mcp-horde/board`](../board): the board's brief as the prompt, a worktree and a gate on the task's scope, the model of the task's tier (`horde.json` `tiers`) unless you pass one, the attempt, its worktree and its cost recorded on the board | `opencode_spawn` `task` |
 | Get notified when agents finish | `opencode_wait` (returns each result once), or channel push (below) |
@@ -26,7 +26,7 @@ It is built on OpenCode's **v2 server API** (`/api/*`, through `@opencode-ai/sdk
 | Review and merge an isolated agent's work | `opencode_worktree` (`diff`, `commit`, `merge`) |
 | Bring an agent's branch up to date with work merged since it started (its commits are replayed onto your branch's tip; aborted cleanly on conflicts) | `opencode_worktree` `sync` |
 | Undo a bad turn: OpenCode restores the files it changed and drops it from the conversation | `opencode_revert` (`turns`, or `to: <message id>`) |
-| See how full an agent's context window is (`ctx 71k/128k (55%)` in every status) and compact it | `opencode_status`, `opencode_compact` (needs an OpenCode with v2 compaction; 1.19 answers "not available yet") |
+| See how full an agent's context window is (`ctx 71k/128k (55%)` in every status) and compact it | `opencode_status`, `opencode_compact` |
 | See and remove the rules OpenCode saved from "always" answers | `opencode_permissions` |
 | Read transcripts (also as MCP resources: `opencode://agents/{id}/transcript`) | `opencode_output` |
 | Clean up | `opencode_dispose` |
@@ -40,14 +40,14 @@ Agents are OpenCode sessions. You can address them by `name` or by `ses_…` id.
 | State | Meaning |
 | --- | --- |
 | `running` | Working. This includes waiting for the human to answer a dialog. |
-| `needs_input` | Blocked on a permission request (`per_…`) or a question (`que_…`) that is for the calling model. Answer it with `opencode_respond`. |
+| `needs_input` | Blocked on a permission request (`per_…`) or a question (`frm_…`) that is for the calling model. Answer it with `opencode_respond`. |
 | `idle` | The turn finished. Its result comes back once through `opencode_wait`. |
 | `interrupted` | Stopped by `opencode_interrupt` or by a limit; the reason is shown. Unread messages are delivered when it resumes. |
 | `error` | The turn failed: a provider error, or a turn OpenCode accepted but never ran (detected after 30 s, or 60 s for an agent's first turn). |
 
 ### Permissions and questions
 
-When OpenCode needs approval (shell commands, edits outside the project, …), the agent's policy decides what happens:
+When OpenCode asks for approval, the agent's policy decides what happens. OpenCode 2 asks only where its permission rules say `ask` (its default allows everything), so give it rules in `opencode.json` for the policy to have something to decide, e.g. `"permissions": [{ "action": "shell", "resource": "*", "effect": "ask" }]`.
 
 - `user` (default): the **human** is asked in an MCP elicitation dialog, the way Claude Code asks about its own subagents. The dialog (and the `needs_input` line) shows the patterns an "always" answer would save. Only an explicit "Allow once" or "Always" approves. If the client can't show form dialogs, the dialog is dismissed, fails, comes back without a decision, or goes unanswered for `HORDE_OPENCODE_DIALOG_TIMEOUT` seconds, the request goes to the calling model as `needs_input` (and `opencode_respond` can still answer while a dialog is open).
 - `ask`: the calling model answers with `opencode_respond` (`once`, `always`, `reject`).
@@ -73,11 +73,11 @@ opencode_wait  → auth IDLE · gate: ✓ PASS (round 2/2) · 4.2s
 
 ### Board commands
 
-Workers briefed by [`@mcp-horde/board`](../board) report through a CLI they run with `bash`. Those exact commands are approved automatically, whatever the agent's permission policy, so reporting never waits on a human. Only a command that is this installation's board CLI with plain arguments qualifies: anything chained onto it (`;`, `&&`, pipes, redirects, `$(…)`, backticks) goes through the normal policy.
+Workers briefed by [`@mcp-horde/board`](../board) report through a CLI they run with the shell tool. Those exact commands are approved automatically, whatever the agent's permission policy, so reporting never waits on a human. Only a command that is this installation's board CLI with plain arguments qualifies: anything chained onto it (`;`, `&&`, pipes, redirects, `$(…)`, backticks) goes through the normal policy.
 
 ### Limits
 
-Each agent can have per-turn safety limits: `max_steps`, `max_cost_usd`, `timeout_minutes`. When one is reached, the agent is interrupted and the reason is reported. Costs include the agent's subagents. OpenCode 1.19's v2 runner reports every step as free, so costs are computed from the model's pricing in the catalog (a model without pricing costs $0 and `max_cost_usd` cannot trip). Setting limits with `opencode_message` changes only the limits you pass.
+Each agent can have per-turn safety limits: `max_steps`, `max_cost_usd`, `timeout_minutes`. When one is reached, the agent is interrupted and the reason is reported. Costs include the agent's subagents. A step OpenCode reports as free is priced from the model's catalog pricing; a model without pricing costs $0, and `max_cost_usd` cannot trip. Setting limits with `opencode_message` changes only the limits you pass.
 
 Limits are enforced by an MCP server process. With a shared server, an agent keeps working after every MCP process exits, and its limits are only checked again when one takes it over (an MCP process starting in the agent's project reconnects at startup and catches up; others when a call touches the server).
 
@@ -111,7 +111,7 @@ Without channels, `opencode_wait` is the way to get notified. Claude Code moves 
 
 ## Setup
 
-1. Install OpenCode (`npm i -g opencode-ai@1.19.3`) and configure providers (`opencode auth login`, or a `provider` block in `opencode.json`).
+1. Install OpenCode 2 (`npm i -g @opencode/cli@2.1.1`, or `curl -fsSL https://opencode.ai/v2/install | bash`) and configure providers (`opencode auth login`, or `providers` in `opencode.json`).
 2. Build: `npm install && npm run build` at the repository root.
 3. Register it with your harness, for example Claude Code:
 
@@ -139,7 +139,7 @@ The model, effort, profile, directory, policies and limits are chosen by the cal
 | --- | --- | --- |
 | `HORDE_OPENCODE_SERVER` | `shared` | `shared`: one detached `opencode serve` that outlives MCP restarts, so running agents survive them. `private`: one server per MCP process, stopped with it (even on SIGKILL). |
 | `HORDE_OPENCODE_URL` | none | Attach to a server you run yourself (e.g. one whose TUI you watch). |
-| `OPENCODE_SERVER_PASSWORD` / `OPENCODE_SERVER_USERNAME` | random / `opencode` | Basic auth. A password is required for non-loopback URLs unless `HORDE_OPENCODE_ALLOW_INSECURE=1`. |
+| `OPENCODE_SERVER_PASSWORD` / `OPENCODE_SERVER_USERNAME` | random / `opencode` | Basic auth. OpenCode 2 serves its API only with a password: to attach, use the one your server was started with. Required for non-loopback URLs unless `HORDE_OPENCODE_ALLOW_INSECURE=1`. |
 | `HORDE_OPENCODE_BIN` | `opencode` | Binary used to start `opencode serve`. |
 | `HORDE_OPENCODE_DIRECTORY` | current directory | Default working directory for agents; relative `directory` arguments resolve against it. |
 | `HORDE_OPENCODE_PERMISSIONS` | `user` | Default permission policy. |
@@ -153,22 +153,22 @@ An invalid variable or `horde.json` does not keep the server from starting: ever
 
 ### Security
 
-- **Workers can see the server password.** `opencode serve` takes its password only from the `OPENCODE_SERVER_PASSWORD` environment variable (OpenCode 1.19 has no flag or file for it), and OpenCode passes its environment on to the tools it runs. A worker's `bash` commands can therefore read the password and call the server's API, for example to answer its own permission requests. Treat permission policies as guard rails against mistakes, not as a boundary against a hostile model; run untrusted work in a container or VM. (Worktree `setup` commands do get the variable stripped.)
+- **Workers can see the server password.** `opencode serve` takes its password only from the `OPENCODE_SERVER_PASSWORD` environment variable (it has no flag or file for it), and OpenCode passes its environment on to the tools it runs. A worker's shell commands can therefore read the password and call the server's API, for example to answer its own permission requests. Treat permission policies as guard rails against mistakes, not as a boundary against a hostile model; run untrusted work in a container or VM. (Worktree `setup` commands do get the variable stripped.)
 - **Plain http.** Basic auth over `http://` to a non-loopback `HORDE_OPENCODE_URL` sends the password in clear text; the server warns about it (in `opencode_status` and `opencode_server info`) unless `HORDE_OPENCODE_ALLOW_INSECURE=1`. Use https or a tunnel.
 - **Stopping the shared server** only kills the recorded pid when the server answers with its recorded password, or when it does not answer at all while that pid is alive (a hung server); anything else just clears the record.
 
 ## Example (Claude Code orchestrating DeepSeek and Kimi)
 
 ```text
-opencode_models query:"deepseek"                → deepseek/deepseek-chat … effort variants: high, max
-opencode_spawn  name:"api-tests" model:"deepseek/deepseek-chat" variant:"high" isolation:"worktree"
+opencode_models query:"deepseek"                → deepseek/deepseek-flash … effort variants: low, medium, high
+opencode_spawn  name:"api-tests" model:"deepseek/deepseek-flash" variant:"high" isolation:"worktree"
                 worktree:{link:["node_modules"]} limits:{max_cost_usd:1}
                 prompt:"Add integration tests for src/api/users.ts covering …"
 opencode_spawn  name:"docs" model:"moonshot/kimi-k3" agent:"build" prompt:"Update docs/api.md …"
 opencode_wait                                     → docs IDLE, result: "Updated docs/api.md …"
-opencode_status ids:["api-tests"]                 → RUNNING, doing: bash: npm test · $0.21
+opencode_status ids:["api-tests"]                 → RUNNING, doing: shell: npm test · $0.21
 opencode_message id:"api-tests" message:"Use the fixtures in test/fixtures."   (steer)
-   … a dialog asks you: "api-tests" wants permission: bash npm install supertest → Allow once
+   … a dialog asks you: "api-tests" wants permission: shell npm install supertest → Allow once
 opencode_wait                                     → api-tests IDLE, result: "Added 12 tests …"
 opencode_worktree id:"api-tests" action:"merge"   → merged 3 commit(s) from horde/api-tests into main
 opencode_dispose id:"api-tests" worktree:"remove"
@@ -176,23 +176,20 @@ opencode_dispose id:"api-tests" worktree:"remove"
 
 ## Known limits
 
-These are set by OpenCode 1.19's v2 API or by MCP:
+These are set by OpenCode or by MCP:
 
-- **No native gateway models:** the v2 session runner can't run OpenCode's own gateway models (`api.type: native`, e.g. `opencode/big-pickle`). They are hidden from `opencode_models` and rejected at spawn.
 - **No in-place pause:** OpenCode can't freeze a turn mid-flight. A pause ends the turn (`after_step` waits for the running tool), and resume starts a new turn with "continue".
-- **Custom profiles need a fresh directory:** OpenCode loads agent files when it first opens a directory, so custom `profile`s need `isolation: "worktree"` (or a directory the server hasn't opened yet). `instructions` work everywhere.
-- **Variants come from config:** effort variants exist only where the model or provider config defines them.
-- **Agents can't spawn subagents yet:** the v2 runner has no subagent tool. Child sessions created other ways are handled.
+- **Variants come from OpenCode:** it gives most models default effort variants; a model whose config sets `variants: {}` has none.
+- **Deprecated models are refused:** a model its provider retired is listed as unsupported and rejected at spawn.
 - **The dashboard is the TUI:** there is no Claude-Code-style agent panel. Use `opencode_server info`, then `opencode attach`.
-- **Version pinned:** tested with opencode 1.19.x; other versions trigger a warning in `opencode_status`. A shared server started by a different `opencode` binary is reused with a warning; `opencode_server stop` replaces it.
-- **No step costs from OpenCode:** the v2 runner reports $0 per step, so costs are estimated from catalog pricing (see Limits).
+- **Version pinned:** tested with opencode 2.1.x; other versions trigger a warning in `opencode_status`. A shared server started by a different `opencode` binary is reused with a warning; `opencode_server stop` replaces it.
 
 ## Development
 
 ```sh
 npm run build
 npm test            # unit tests, integration tests with a real `opencode serve` and a mock LLM, and a smoke test of dist/
-npm run test:e2e    # against real models: HORDE_E2E_MODEL=free (OpenCode's free models, no account) or provider/model
+npm run test:e2e    # against a real model: HORDE_E2E_MODEL=provider/model with the provider's key in its variable (e.g. DEEPSEEK_API_KEY), or free
 npm run lint        # at the repo root (Biome)
 ```
 
@@ -200,7 +197,7 @@ The integration tests drive the server over stdio the way a harness does. They c
 
 - parallel agents, steering, interrupts, graceful pause, resume
 - permissions and questions under every policy, including elicitation
-- limits, provider errors, silent failures, attachments, child sessions
+- limits, provider errors, providers that cannot start, attachments, child sessions
 - worktrees (carry-over, link, setup, profile, diff, merge, conflicts)
 - gates: pass on the first try, a failure fixed by the agent from the verdict, giving up after `max_rounds`, round reset on a new message
 - the running cap (including concurrent spawns), dialog timeouts, server stop and restart, channel pushes, resources

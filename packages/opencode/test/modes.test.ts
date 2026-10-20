@@ -1,9 +1,10 @@
 import assert from "node:assert/strict"
 import { spawn } from "node:child_process"
 import fs from "node:fs"
+import net from "node:net"
 import path from "node:path"
 import { after, before, describe, test } from "node:test"
-import { createOpencodeClient } from "@opencode-ai/sdk/v2"
+import { OpenCode } from "@opencode/client"
 import { connect, freePort, idOf, isolatedEnv, type Mock, makeRepo, opencodeBin, stopTree, until } from "./harness.js"
 import { startMockLlm } from "./mock-llm.js"
 
@@ -73,14 +74,15 @@ describe("server modes and durability", { timeout: 600_000 }, () => {
       const url = info.match(/attach (\S+)/)![1]!
       const mcpPid = (h.client.transport as unknown as { pid: number }).pid
       process.kill(mcpPid, "SIGKILL")
-      await until(
-        async () => {
-          const res = await fetch(`${url}/global/health`).catch(() => undefined)
-          return res === undefined
-        },
-        15_000,
-        300,
-      )
+      // A plain TCP connect: fetch can throw outside its promise on a dying socket (Node 24 on macOS).
+      const port = Number(new URL(url).port)
+      const listening = () =>
+        new Promise<boolean>((resolve) => {
+          const sock = net.connect(port, "127.0.0.1")
+          sock.once("connect", () => resolve(!!sock.destroy()))
+          sock.once("error", () => resolve(false))
+        })
+      await until(async () => !(await listening()), 15_000, 300)
     } finally {
       await h.close().catch(() => undefined)
     }
@@ -102,14 +104,12 @@ describe("server modes and durability", { timeout: 600_000 }, () => {
     proc.stderr?.on("data", (c: Buffer) => (output += c.toString()))
     const url = `http://127.0.0.1:${port}`
     try {
-      await until(
-        async () => (await fetch(`${url}/global/health`, { signal: AbortSignal.timeout(2000) }).catch(() => undefined)) !== undefined,
-        90_000,
-        300,
-      ).catch((err: Error) => {
-        throw new Error(`${err.message}; opencode serve output:
+      await until(async () => (await fetch(`${url}/api/info`, { signal: AbortSignal.timeout(2000) }).catch(() => undefined)) !== undefined, 90_000, 300).catch(
+        (err: Error) => {
+          throw new Error(`${err.message}; opencode serve output:
 ${output}`)
-      })
+        },
+      )
       const base = isolatedEnv(tmp, repo)
 
       const wrong = await connect({ ...base, HORDE_OPENCODE_URL: url, OPENCODE_SERVER_PASSWORD: "nope" })
@@ -132,8 +132,8 @@ ${output}`)
         assert.match(await h.call("opencode_spawn", { prompt: "attached hi", wait: true, timeout_seconds: 60 }), /Echo\[none\]: attached hi/)
 
         // A session created by someone else (e.g. the OpenCode TUI) can be adopted and driven.
-        const oc = createOpencodeClient({ baseUrl: url, headers: { Authorization: `Basic ${Buffer.from(`opencode:${password}`).toString("base64")}` } })
-        const outside = (await oc.v2.session.create({ location: { directory: repo } })).data!.data.id
+        const oc = OpenCode.make({ baseUrl: url, headers: { Authorization: `Basic ${Buffer.from(`opencode:${password}`).toString("base64")}` } })
+        const outside = (await oc.session.create({ location: { directory: repo } })).id
         const listed = await h.call("opencode_status", { include_untracked: true })
         assert.match(listed, new RegExp(outside))
         assert.match(await h.call("opencode_message", { id: outside, message: "adopted", wait: true, timeout_seconds: 60 }), /Echo\[none\]: adopted/)
@@ -159,31 +159,30 @@ ${output}`)
     const config = { mcp: { horde: { type: "local", command: [process.execPath, fixture] } } }
     const proc = spawn(opencodeBin, ["serve", "--hostname", "127.0.0.1", "--port", String(port)], {
       cwd: repo,
-      env: { ...process.env, ...isolatedEnv(tmp, repo), OPENCODE_CONFIG_CONTENT: JSON.stringify(config) },
+      // OpenCode 2 serves its API only with a password.
+      env: { ...process.env, ...isolatedEnv(tmp, repo), OPENCODE_SERVER_PASSWORD: "canary", OPENCODE_CONFIG_CONTENT: JSON.stringify(config) },
       stdio: "ignore",
       shell: process.platform === "win32",
       detached: process.platform !== "win32",
     })
     const url = `http://127.0.0.1:${port}`
     try {
-      await until(async () => (await fetch(`${url}/api/health`, { signal: AbortSignal.timeout(2000) }).catch(() => undefined))?.ok, 90_000, 300)
+      const oc = OpenCode.make({ baseUrl: url, headers: { Authorization: `Basic ${Buffer.from("opencode:canary").toString("base64")}` } })
+      await until(async () => !!(await oc.server.info({ signal: AbortSignal.timeout(2000) }).catch(() => undefined)), 90_000, 300)
       const status = await until(async () => {
-        const s = (await fetch(`${url}/mcp?directory=${encodeURIComponent(repo)}`, { signal: AbortSignal.timeout(10_000) }).then((r) => r.json())) as Record<
-          string,
-          { status: string }
-        >
-        return s.horde?.status === "connected" ? s : undefined
+        const list = await oc.mcp.list({ location: { directory: repo } }, { signal: AbortSignal.timeout(10_000) }).catch(() => undefined)
+        const horde = list?.data.find((m) => m.name === "horde")
+        return horde?.status.status === "connected" ? horde.status.status : undefined
       }, 30_000)
-      assert.equal(status.horde!.status, "connected")
-      const oc = createOpencodeClient({ baseUrl: url })
-      const sid = (await oc.v2.session.create({ location: { directory: repo } })).data!.data.id
-      await oc.v2.session.prompt({ sessionID: sid, prompt: { text: "TOOLS?" } })
+      assert.equal(status, "connected")
+      const sid = (await oc.session.create({ location: { directory: repo } })).id
+      await oc.session.prompt({ sessionID: sid, text: "TOOLS?" })
       const tools = await until(async () => {
-        const msgs = (await oc.v2.session.messages({ sessionID: sid })).data as { data: { type: string; content?: { type: string; text?: string }[] }[] }
-        const text = msgs.data.flatMap((m) => (m.type === "assistant" ? (m.content ?? []) : [])).find((c) => c.type === "text" && c.text?.startsWith("Tools:"))
-        return text?.text
+        const msgs = await oc.message.list({ sessionID: sid })
+        const text = msgs.data.flatMap((m) => (m.type === "assistant" ? m.content : [])).find((c) => c.type === "text" && c.text.startsWith("Tools:"))
+        return text?.type === "text" ? text.text : undefined
       }, 60_000)
-      assert.match(tools, /\bbash\b/, "built-in tools are offered")
+      assert.match(tools, /\bshell\b/, "built-in tools are offered")
       assert.doesNotMatch(tools, /horde_echo/, "MCP tools reached the v2 runner: switch workers from the CLI to MCP mounts (docs/DESIGN.md §4.2e)")
     } finally {
       await stopTree(proc)

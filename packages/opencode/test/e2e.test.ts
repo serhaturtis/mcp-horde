@@ -1,14 +1,14 @@
 /**
  * End-to-end tests against a real model. Skipped unless HORDE_E2E_MODEL is set:
  *
- *   HORDE_E2E_MODEL=free npm run test:e2e                         # OpenCode's free models, no account needed
- *   HORDE_E2E_MODEL=deepseek/deepseek-chat npm run test:e2e        # your own providers
- *   HORDE_E2E_MODEL=anthropic/claude-haiku-4-5 HORDE_E2E_VARIANT=high npm run test:e2e
+ *   HORDE_E2E_MODEL=free npm run test:e2e                                          # OpenCode's free models, no account
+ *   DEEPSEEK_API_KEY=… HORDE_E2E_MODEL=deepseek/deepseek-flash npm run test:e2e
+ *   ANTHROPIC_API_KEY=… HORDE_E2E_MODEL=anthropic/claude-haiku-4-5 HORDE_E2E_VARIANT=high npm run test:e2e
  *
- * With "free", the suite lists OpenCode's free models, keeps the first one that answers
- * a ping, and runs everything on it in an isolated OpenCode home (no user config or
- * credentials). With a named model, your own OpenCode config and credentials are used
- * and it spends a few cents of tokens.
+ * Every run uses an isolated OpenCode home, so it never touches your sessions, database or
+ * config: a named model's provider key comes from the environment (the variable OpenCode reads
+ * for that provider). With "free", the suite lists OpenCode's free models, keeps the first one
+ * that answers a ping, and runs everything on it. A named model spends a few cents of tokens.
  */
 import assert from "node:assert/strict"
 import fs from "node:fs"
@@ -66,17 +66,12 @@ describe("real model end to end", { skip: !wanted && "set HORDE_E2E_MODEL=free o
   before(async () => {
     tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "horde-e2e-")))
     const home = newRepo("home")
-    // Free models need no credentials: run in an isolated OpenCode home. Named models use yours.
-    const isolated: Record<string, string> = free
-      ? {
-          XDG_DATA_HOME: path.join(tmp, "xdg-data"),
-          XDG_STATE_HOME: path.join(tmp, "xdg-state"),
-          XDG_CACHE_HOME: path.join(tmp, "xdg-cache"),
-          XDG_CONFIG_HOME: path.join(tmp, "xdg-config"),
-        }
-      : {}
+    // An isolated OpenCode home: the user's sessions and database are never touched.
     h = await connect({
-      ...isolated,
+      XDG_DATA_HOME: path.join(tmp, "xdg-data"),
+      XDG_STATE_HOME: path.join(tmp, "xdg-state"),
+      XDG_CACHE_HOME: path.join(tmp, "xdg-cache"),
+      XDG_CONFIG_HOME: path.join(tmp, "xdg-config"),
       HORDE_OPENCODE_DIRECTORY: home,
       HORDE_OPENCODE_STATE_DIR: path.join(tmp, "state"),
       HORDE_OPENCODE_WORKTREE_DIR: path.join(tmp, "worktrees"),

@@ -25,7 +25,7 @@ The plugin carries its servers as self-contained bundles (`plugins/horde/servers
 
 ## Design
 
-[`docs/DESIGN.md`](docs/DESIGN.md) describes the whole horde: how the servers fit around `opencode`, what was verified against OpenCode 1.19, what is still planned, and the build order.
+[`docs/DESIGN.md`](docs/DESIGN.md) describes the whole horde: how the servers fit around `opencode`, what was verified against OpenCode 2.1, what is still planned, and the build order.
 
 ## Development
 

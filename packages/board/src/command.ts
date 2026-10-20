@@ -3,8 +3,8 @@ import path from "node:path"
 import { fileURLToPath } from "node:url"
 
 /**
- * How workers reach the board: a CLI they run with their `bash` tool (OpenCode's
- * v2 runners offer no MCP tools yet). The brief gives the exact invocation, and
+ * How workers reach the board: a CLI they run with their shell tool (OpenCode does
+ * not offer agents injected MCP tools). The brief gives the exact invocation, and
  * `isTrustedCommand` lets the agent runtime approve precisely that and nothing
  * chained onto it.
  */

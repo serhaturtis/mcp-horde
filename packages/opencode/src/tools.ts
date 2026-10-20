@@ -174,10 +174,10 @@ export function renderSnapshot(s: Snapshot, opts: { resultChars?: number; mode?:
     )
   }
   for (const q of s.pending.questions) {
-    q.questions.forEach((item, i) => {
-      const opts = item.options.map((o) => o.label).join(" | ")
+    q.fields.forEach((f, i) => {
+      const opts = "options" in f ? (f.options ?? []).map((o) => o.label).join(" | ") : ""
       lines.push(
-        `  needs answer ${q.id}${q.questions.length > 1 ? ` #${i + 1}` : ""}: ${item.question}${opts ? ` [${opts}]` : ""}${item.multiple ? " (multi)" : ""}`,
+        `  needs answer ${q.id}${q.fields.length > 1 ? ` #${i + 1}` : ""}: ${f.description ?? f.title ?? q.title}${opts ? ` [${opts}]` : ""}${f.type === "multiselect" ? " (multi)" : ""}`,
       )
     })
   }
@@ -354,12 +354,12 @@ export function registerTools(server: McpServer, ctx: Context) {
       instructions: z.string().optional().describe("Role, constraints and context for the agent, prepended to the prompt (like a subagent system prompt)."),
       profile: z
         .object({
-          tools: z.record(z.string(), z.boolean()).optional().describe('Enable/disable tools, e.g. {"bash": false, "webfetch": false}.'),
-          steps: z.number().int().min(1).optional().describe("Max agent-loop steps per turn (enforced by OpenCode)."),
+          tools: z.record(z.string(), z.boolean()).optional().describe('Enable/disable tools, e.g. {"shell": false, "webfetch": false}.'),
+          steps: z.number().int().min(1).optional().describe("Max agent-loop steps per turn (a step limit)."),
           description: z.string().optional(),
         })
         .optional()
-        .describe('A custom agent profile created for this agent. Requires isolation "worktree" unless OpenCode has not opened the directory yet.'),
+        .describe("Extra rules for this agent's session, on top of its agent profile: switched-off tools are denied."),
       directory: z.string().optional().describe("Working directory (absolute, or relative to the server's default directory, which is used when omitted)."),
       isolation: z
         .enum(["none", "worktree"])
@@ -388,7 +388,7 @@ export function registerTools(server: McpServer, ctx: Context) {
         })
         .optional()
         .describe(
-          "Confine the agent's file edits (edit/write/patch tools) to these paths. Needs isolation \"worktree\". bash can still write files: the gate's audit catches that.",
+          "Confine the agent's file edits (edit/write/patch tools) to these paths. Shell commands can still write files: the gate's audit catches that.",
         ),
       wait: z.boolean().optional().describe("Block until it settles. Default false."),
       timeout_seconds: timeout.optional(),
@@ -674,7 +674,7 @@ export function registerTools(server: McpServer, ctx: Context) {
 
   tool(
     "opencode_respond",
-    "Answer an agent in needs_input: approve or reject a permission request (per_…), or answer or dismiss a question (que_…).",
+    "Answer an agent in needs_input: approve or reject a permission request (per_…), or answer or dismiss a question (frm_…).",
     {
       id,
       request_id: z.string(),

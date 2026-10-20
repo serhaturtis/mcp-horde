@@ -3,15 +3,16 @@ import type { AddressInfo } from "node:net"
 
 /**
  * A tiny OpenAI-compatible chat completions server scripted by the latest user prompt:
- *   "TOOL: <cmd>"   → calls bash with <cmd>, then answers "DONE: <tool output>"
+ *   "TOOL: <cmd>"   → calls shell with <cmd>, then answers "DONE: <tool output>"
  *   "CALL: <tool> {json}" → calls any offered tool with those arguments, then answers "DONE: <tool output>"
  *   a board brief    → runs its "First:" command, its RUN: lines, shares its FINDING:, reports, then answers
- *   "STEPS: <n>"    → calls bash `echo step` n times in a row, then answers "DONE"
+ *   "STEPS: <n>"    → calls shell `echo step` n times in a row, then answers "DONE"
  *   "ASK: <q>"      → calls the question tool (options Red/Blue), then answers "DONE: <tool output>"
  *   "SLOW"          → streams "Working...." for ~15s
  *   "FAIL400"       → HTTP 400; "FREETIER" → HTTP 403 FreeTierError when no tools are offered
  *   "TOOLS?"        → answers with the tool names it was offered
  *   "JSON: <json>"  → answers with that text; "JSON-RETRY" answers prose until told it was not valid; "JSON-NEVER" always prose
+ *   a compaction    → a summary in OpenCode's template
  *   anything else   → "Echo[<reasoning_effort>]: <prompt>" (+ " FILE:<name>" for attached files)
  */
 export async function startMockLlm(): Promise<{ url: string; close: () => void; requests: unknown[] }> {
@@ -81,9 +82,24 @@ export async function startMockLlm(): Promise<{ url: string; close: () => void; 
       end()
     }
 
+    // OpenCode's compaction prompt (or its retry): a summary with the template's headings.
+    if (/structured summary|required summary template/.test(userText)) {
+      const sections = [
+        "Objective",
+        "Requirements",
+        "Decisions",
+        "Work State\n### Completed",
+        "Active",
+        "Blocked",
+        "Next Move",
+        "Relevant Files",
+        "Important Context",
+      ]
+      return say(sections.map((h) => `${h.startsWith("Active") || h.startsWith("Blocked") ? "###" : "##"} ${h}\n- (none)`).join("\n\n"))
+    }
     const steps = userText.match(/STEPS:\s*(\d+)/)
     if (steps) {
-      if (toolResults < Number(steps[1])) return callTool("bash", { command: `echo step ${toolResults + 1}`, description: "step" })
+      if (toolResults < Number(steps[1])) return callTool("shell", { command: `echo step ${toolResults + 1}`, description: "step" })
       return say("DONE")
     }
     // A board brief: like a cooperative worker, read the task, run the goal's "RUN: <cmd>" lines,
@@ -107,14 +123,14 @@ export async function startMockLlm(): Promise<{ url: string; close: () => void; 
           ?.trim()
           .replace(/--summary "[^"]*"/, '--summary "mock work done"'),
       ].filter((c): c is string => !!c)
-      if (toolResults < steps.length) return callTool("bash", { command: steps[toolResults]!, description: `step ${toolResults + 1}` })
+      if (toolResults < steps.length) return callTool("shell", { command: steps[toolResults]!, description: `step ${toolResults + 1}` })
       return say(`DONE: reported. ${textOf(last).slice(0, 200)}`)
     }
     if (last?.role === "tool") return say(`DONE: ${textOf(last).slice(0, 400)}`)
     // "CALL: <tool> <json args>" calls any offered tool (e.g. one from an MCP server).
     const call = userText.match(/CALL:\s*(\S+)\s*(\{.*\})?\s*$/s)
     if (call) return callTool(call[1]!, call[2] ? JSON.parse(call[2]) : {})
-    if (userText.includes("TOOL:")) return callTool("bash", { command: userText.split("TOOL:")[1]!.trim(), description: "run" })
+    if (userText.includes("TOOL:")) return callTool("shell", { command: userText.split("TOOL:")[1]!.trim(), description: "run" })
     if (userText.includes("ASK:")) {
       return callTool("question", {
         questions: [

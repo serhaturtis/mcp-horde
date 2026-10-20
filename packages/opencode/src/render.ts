@@ -1,5 +1,5 @@
 import { indent, oneLine, truncate } from "@mcp-horde/core"
-import type { SessionMessage, SessionMessageAssistant, SessionMessageAssistantTool } from "@opencode-ai/sdk/v2"
+import type { SessionMessageAssistant, SessionMessageAssistantTool, SessionMessageInfo } from "@opencode/client"
 
 export type Detail = "final" | "summary" | "full"
 
@@ -19,13 +19,13 @@ export function inputSummary(input: unknown): string {
 
 function toolOutput(tool: SessionMessageAssistantTool): string {
   const state = tool.state
-  if (state.status === "pending") return ""
-  const text = state.content.map((c) => (c.type === "text" ? c.text : `[file ${c.name ?? c.uri}]`)).join("\n")
+  if (state.status === "streaming" || state.status === "running") return ""
+  const text = (state.content ?? []).map((c) => (c.type === "text" ? c.text : `[file ${c.name ?? c.uri}]`)).join("\n")
   if (state.status === "error") return [state.error.message, text].filter(Boolean).join("\n")
   return text
 }
 
-const STATUS_MARK: Record<string, string> = { pending: "…", running: "…", completed: "✓", error: "✗" }
+const STATUS_MARK: Record<string, string> = { streaming: "…", running: "…", completed: "✓", error: "✗" }
 
 export function renderTool(tool: SessionMessageAssistantTool, withOutput: boolean): string {
   const head = `[${tool.name} ${STATUS_MARK[tool.state.status] ?? tool.state.status}] ${inputSummary(tool.state.input)}`
@@ -45,7 +45,7 @@ export function assistantText(msg: SessionMessageAssistant): string {
 }
 
 /** Render a list of messages (chronological) at the requested level of detail. */
-export function renderTranscript(messages: SessionMessage[], detail: Detail): string {
+export function renderTranscript(messages: SessionMessageInfo[], detail: Detail): string {
   if (detail === "final") {
     const last = [...messages].reverse().find((m): m is SessionMessageAssistant => m.type === "assistant" && !!assistantText(m))
     return last ? assistantText(last) : "(no assistant text yet)"
@@ -54,17 +54,19 @@ export function renderTranscript(messages: SessionMessage[], detail: Detail): st
   for (const m of messages) {
     switch (m.type) {
       case "user":
-        out.push(`## user\n${m.text}${m.files?.length ? `\n[attached: ${m.files.map((f) => f.name ?? f.uri).join(", ")}]` : ""}`)
+        out.push(
+          `## user\n${m.text}${m.files?.length ? `\n[attached: ${m.files.map((f) => f.name ?? (f.source.type === "uri" ? f.source.uri : f.mime)).join(", ")}]` : ""}`,
+        )
         break
       case "synthetic":
       case "system":
         if (detail === "full") out.push(`## ${m.type}\n${m.text}`)
         break
       case "shell":
-        out.push(`## shell $ ${m.command}${detail === "full" ? `\n${indent(truncate(m.output, 2000))}` : ""}`)
+        out.push(`## shell $ ${m.command}${detail === "full" && m.output ? `\n${indent(truncate(m.output.output, 2000))}` : ""}`)
         break
       case "compaction":
-        out.push(`## compaction (${m.reason})${detail === "full" ? `\n${m.summary}` : ""}`)
+        out.push(`## compaction (${m.reason})${m.status === "failed" ? ` failed: ${m.error.message}` : detail === "full" ? `\n${m.summary}` : ""}`)
         break
       case "agent-switched":
         out.push(`## switched agent → ${m.agent}`)
@@ -84,6 +86,10 @@ export function renderTranscript(messages: SessionMessage[], detail: Detail): st
         out.push(lines.filter(Boolean).join("\n"))
         break
       }
+      case "idle":
+        // Only a run that did not finish cleanly is worth a line.
+        if (m.outcome !== "succeeded") out.push(`## ${m.outcome}${m.error ? `: ${m.error.message}` : ""}`)
+        break
     }
   }
   return out.join("\n\n")

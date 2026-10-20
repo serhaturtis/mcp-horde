@@ -27,7 +27,7 @@ To follow the horde from a terminal: `node <plugin dir>/servers/cli.js watch` in
 ## Requirements
 
 - Node.js 20 or newer.
-- [OpenCode](https://opencode.ai) on your `PATH` (`opencode --version`; tested with 1.19.3), with the providers you want workers to use (`opencode auth login`). Set `HORDE_OPENCODE_BIN` in the server's environment if it lives elsewhere.
+- [OpenCode](https://opencode.ai) on your `PATH` (OpenCode 2: `opencode --version`; tested with 2.1.1), with the providers you want workers to use (`opencode auth login`). Set `HORDE_OPENCODE_BIN` in the server's environment if it lives elsewhere.
 
 ## From a clone instead
 

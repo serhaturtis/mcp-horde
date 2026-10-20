@@ -8,35 +8,23 @@ import { formatUsd, git, loadTiers, oneLine, tierLabel, tierModel } from "@mcp-h
 import { checkVerdicts, collectReview, disagreements, REVIEW_SCHEMA, renderVerdicts, reviewPrompt, type Verdict } from "@mcp-horde/review"
 import { gate as runGate, defaultStateDir as verifyStateDir } from "@mcp-horde/verify"
 import type {
-  AgentV2Info,
+  AgentInfo,
+  FormInfo,
+  ModelInfo,
   ModelRef,
-  ModelV2Info,
+  OpenCodeEvent,
+  PermissionRequest,
   PermissionSavedInfo,
-  PermissionV2Request,
-  QuestionV2Request,
-  SessionMessage,
-  SessionV2Info,
-  V2Event,
-} from "@opencode-ai/sdk/v2"
-import {
-  ASK_AGENT,
-  ASK_GUARDED_AGENT,
-  ASK_GUARDED_PROFILE,
-  ASK_PREAMBLE,
-  ASK_PROFILE,
-  extractJson,
-  type JsonSchema,
-  retryPrompt,
-  schemaPrompt,
-  validate,
-} from "./ask.js"
+  SessionInfo,
+  SessionMessageInfo,
+} from "@opencode/client"
+import { ASK_GUARDED_PROFILE, ASK_PREAMBLE, ASK_PROFILE, extractJson, type JsonSchema, retryPrompt, schemaPrompt, validate } from "./ask.js"
 import type { Backend } from "./backend.js"
-import { deleteSession, releaseDirectory, renameSession } from "./compat.js"
 import { type Config, inProject, type PermissionPolicy } from "./config.js"
 import { type Detail, inputSummary, renderTranscript } from "./render.js"
 import { type AgentRecord, type GateConfig, type Limits, ownerAlive, SELF, type Store } from "./state.js"
-import { apply, type CostEstimator, costSince, currentTurn, type DurableEvent, emptyTrack, latestTool, type Track, type Turn, turnsSince } from "./tracker.js"
-import { commitAll, createWorktree, excludeFromGit, mergeWorktree, removeWorktree, syncWorktree, type Worktree, workStart, worktreeDiff } from "./worktree.js"
+import { buildTrack, type CostEstimator, costSince, currentTurn, emptyTrack, latestTool, stablePrefix, type Track, type Turn, turnsSince } from "./tracker.js"
+import { commitAll, createWorktree, mergeWorktree, removeWorktree, syncWorktree, type Worktree, workStart, worktreeDiff } from "./worktree.js"
 
 /**
  * running      – the agent loop is executing (or about to start on a fresh prompt)
@@ -69,9 +57,13 @@ const TICK_MS = 120_000
 const HEARTBEAT_MS = 30_000
 
 export interface Pending {
-  permissions: PermissionV2Request[]
-  questions: QuestionV2Request[]
+  permissions: PermissionRequest[]
+  /** OpenCode's forms: the question tool's questions, and any other input it asks for. */
+  questions: FormInfo[]
 }
+
+/** A form reply: per field key, the chosen value(s) or text. */
+export type FormAnswer = Record<string, string | string[] | number | boolean>
 
 export interface Snapshot {
   id: string
@@ -125,13 +117,33 @@ export function gateUndecided(s: Snapshot): boolean {
 }
 
 export interface Profile {
-  /** Tool switches, e.g. { bash: false, webfetch: false }. */
+  /** Tool switches, e.g. { shell: false, webfetch: false }. */
   tools?: Record<string, boolean>
-  /** Hard cap on agent-loop steps per turn, enforced by OpenCode. */
+  /** Cap on agent-loop steps per turn (a step limit). */
   steps?: number
   description?: string
-  /** OpenCode permission rules, e.g. { edit: { "src/**": "allow", "*": "deny" } }. */
+  /** OpenCode permission rules, e.g. { edit: { "*": "deny", "src/**": "allow" } }; the last match wins. */
   permission?: Record<string, string | Record<string, string>>
+}
+
+export type PermissionRule = { action: string; resource: string; effect: "allow" | "deny" | "ask" }
+
+/** OpenCode 1 action names that OpenCode 2 renamed. */
+const RENAMED_ACTIONS: Record<string, string> = { bash: "shell", write: "edit", patch: "edit", task: "subagent" }
+
+/** A profile as OpenCode 2 session permissions: tool switches first, then the rules in order (the last match wins). */
+export function profileRules(profile: Profile): PermissionRule[] {
+  const action = (a: string) => RENAMED_ACTIONS[a] ?? a
+  const effect = (v: string): PermissionRule["effect"] => {
+    if (v === "allow" || v === "deny" || v === "ask") return v
+    throw new Error(`permission effects are allow, deny or ask; got "${v}"`)
+  }
+  const rules: PermissionRule[] = Object.entries(profile.tools ?? {}).map(([t, on]) => ({ action: action(t), resource: "*", effect: on ? "allow" : "deny" }))
+  for (const [a, rule] of Object.entries(profile.permission ?? {})) {
+    if (typeof rule === "string") rules.push({ action: action(a), resource: "*", effect: effect(rule) })
+    else for (const [glob, v] of Object.entries(rule)) rules.push({ action: action(a), resource: glob, effect: effect(v) })
+  }
+  return rules
 }
 
 /** Paths an agent may edit; everything else is refused ("deny") or asked about ("ask"). */
@@ -171,8 +183,8 @@ export type GateInput = boolean | { checks?: string[]; audit?: boolean; allowed?
 export interface Hooks {
   /** True when the client can show form dialogs to the human. */
   canElicit(): boolean
-  askPermission(snap: Snapshot, req: PermissionV2Request, signal: AbortSignal): Promise<{ reply: "once" | "always" | "reject"; message?: string } | undefined>
-  askQuestion(snap: Snapshot, req: QuestionV2Request, signal: AbortSignal): Promise<string[][] | "dismiss" | undefined>
+  askPermission(snap: Snapshot, req: PermissionRequest, signal: AbortSignal): Promise<{ reply: "once" | "always" | "reject"; message?: string } | undefined>
+  askQuestion(snap: Snapshot, req: FormInfo, signal: AbortSignal): Promise<FormAnswer | "dismiss" | undefined>
   /** Called when an agent settles or newly needs input (channel push). */
   settled(snap: Snapshot): void
 }
@@ -181,7 +193,7 @@ interface Live {
   record: AgentRecord
   track: Track
   loaded: boolean
-  session?: SessionV2Info
+  session?: SessionInfo
   state?: AgentState
   error?: string
   pending: Pending
@@ -206,11 +218,10 @@ interface Live {
   /** Bumped on every prompt we send; refreshes started before it do not publish state. */
   gen: number
   /**
-   * A prompt we sent that history does not show yet. OpenCode can answer the
-   * prompt call before the admission is readable, and until then the previous
-   * (settled) turn would look current.
+   * A prompt we sent (its message id) that the conversation does not show yet. Until it
+   * does, the previous (settled) turn would look current.
    */
-  sent?: { at: number; seq: number }
+  sent?: { at: number; id: string }
   /** Start seq of the turn a limit already stopped: never stop the same turn twice. */
   limitedTurn?: number
   /** Local time a turn was first seen live, for time limits that do not depend on server clocks. */
@@ -241,27 +252,19 @@ interface Live {
   activity?: { key: string; write: Promise<void> }
 }
 
-type Res<T> = { data?: T; error?: unknown; response?: Response }
-
-/** OpenCode answered a request with success but without the body the caller needs. */
-export class EmptyResponseError extends Error {
-  override name = "EmptyResponseError"
+/** The answer of a request, or an error that names what failed. */
+async function req<T>(what: string, p: Promise<T>): Promise<T> {
+  try {
+    return await p
+  } catch (err) {
+    throw new Error(`${what} failed: ${(err as Error).message || String(err)}`, { cause: err })
+  }
 }
 
-/** Throw on an error response; for calls whose answer is not used. */
-function check(res: Res<unknown>, what: string) {
-  if (res.error === undefined && (res.response?.ok ?? true)) return
-  const e = res.error as { message?: string } | undefined
-  const detail = e?.message ?? (e ? JSON.stringify(e) : `HTTP ${res.response?.status}`)
-  throw new Error(`${what} failed: ${detail}`)
-}
-
-/** The answer of a successful request; throws on an error response and on a missing body. */
-function unwrap<T>(res: Res<T>, what: string): T {
-  check(res, what)
-  if (res.data === undefined || res.data === null)
-    throw new EmptyResponseError(`${what} failed: OpenCode answered HTTP ${res.response?.status ?? "?"} without a body`)
-  return res.data
+/** The client throws the server's tagged errors (e.g. SessionNotFoundError for a missing session). */
+function isNotFound(err: unknown): boolean {
+  const e = err as { name?: string; cause?: { status?: number } } | undefined
+  return /NotFoundError$/.test(e?.name ?? "") || e?.cause?.status === 404
 }
 
 /** Request options that give up after `ms` (the SDK passes them to fetch). */
@@ -281,7 +284,7 @@ function within<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
 export function parseModel(spec: string, variant?: string): ModelRef {
   const slash = spec.indexOf("/")
   if (slash <= 0 || slash === spec.length - 1) {
-    throw new Error(`model must look like "provider/model" (e.g. "deepseek/deepseek-chat"), got "${spec}"`)
+    throw new Error(`model must look like "provider/model" (e.g. "deepseek/deepseek-flash"), got "${spec}"`)
   }
   return { providerID: spec.slice(0, slash), id: spec.slice(slash + 1), ...(variant ? { variant } : {}) }
 }
@@ -291,12 +294,11 @@ export function formatModel(m?: ModelRef): string {
   return `${m.providerID}/${m.id}${m.variant && m.variant !== "default" ? ` [${m.variant}]` : ""}`
 }
 
-/** Why the OpenCode v2 session runner cannot use a model, if it cannot. */
-export function unsupportedReason(m: ModelV2Info): string | undefined {
-  // Observed with opencode 1.19: "Unsupported API for <model>: native". These are
-  // OpenCode-hosted models served through its own gateway protocol.
-  if (m.api.type === "native") return "served through OpenCode's native gateway API, which the v2 session runner does not support yet"
+/** Why an agent cannot run on a model, if it cannot. */
+export function unsupportedReason(m: ModelInfo): string | undefined {
   if (!m.capabilities.tools) return "does not support tool calls"
+  // The provider retired it: requests fail (HTTP 410).
+  if (m.status === "deprecated") return "deprecated by its provider"
   return undefined
 }
 
@@ -352,6 +354,46 @@ export function gateFeedback(round: number, maxRounds: number, verdict: string):
   ].join("\n")
 }
 
+/** What a form asks, in one line: its first field's question. */
+export function formText(f: FormInfo): string {
+  const field = f.fields[0]
+  return field.description ?? field.title ?? f.title
+}
+
+/**
+ * A form reply from the caller's answers (per field, the chosen option labels or free text):
+ * labels become option values, a multi-select keeps them all, other fields take the first.
+ */
+export function formAnswer(f: FormInfo, answers: string[][]): FormAnswer {
+  const out: FormAnswer = {}
+  f.fields.forEach((field, i) => {
+    const given = answers[i] ?? []
+    if (field.type === "external" || !given.length) return
+    const options = "options" in field ? (field.options ?? []) : []
+    const values = given.map((g) => options.find((o) => o.label === g || o.value === g)?.value ?? g)
+    if (field.type === "multiselect") out[field.key] = values
+    else if (field.type === "boolean") out[field.key] = /^(true|yes)$/i.test(values[0]!)
+    else if (field.type === "number" || field.type === "integer") out[field.key] = Number(values[0])
+    else out[field.key] = values[0]!
+  })
+  return out
+}
+
+/** "No preference" for every field: free text where allowed, else the first option or the default. */
+export function dismissAnswer(f: FormInfo): FormAnswer {
+  const text = "No preference: use your best judgment and continue."
+  const out: FormAnswer = {}
+  for (const field of f.fields) {
+    if (field.type === "string" || field.type === "multiselect") {
+      const first = field.options?.[0]?.value
+      const value = field.custom !== false || first === undefined ? text : first
+      out[field.key] = field.type === "multiselect" ? [value] : value
+    } else if (field.type === "boolean") out[field.key] = field.default ?? false
+    else if (field.type === "number" || field.type === "integer") out[field.key] = typeof field.default === "number" ? field.default : 0
+  }
+  return out
+}
+
 /** Drop undefined values, so a partial update never erases other fields. */
 export function defined<T extends object>(o: T): Partial<T> {
   return Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined)) as Partial<T>
@@ -363,7 +405,7 @@ export class Fleet {
   private readonly childToRoot = new Map<string, string>()
   /** Sessions disposed or found missing in this process: never re-adopt them implicitly. */
   private readonly gone = new Set<string>()
-  private readonly modelCache = new Map<string, { at: number; models: ModelV2Info[] }>()
+  private readonly modelCache = new Map<string, { at: number; models: ModelInfo[] }>()
   private readonly wakeups = new Set<() => void>()
   /** Spawns in progress, counted against the running limit. */
   private reserved = 0
@@ -381,7 +423,7 @@ export class Fleet {
     private readonly hooks: Hooks,
   ) {
     this.syncStore()
-    backend.events.on("event", (e: V2Event) => {
+    backend.events.on("event", (e: OpenCodeEvent) => {
       try {
         this.onEvent(e)
       } catch {
@@ -468,19 +510,19 @@ export class Fleet {
   }
 
   private get api() {
-    return this.backend.client.v2
+    return this.backend.client
   }
 
   // ---------------------------------------------------------------- catalog
 
-  async models(directory?: string): Promise<ModelV2Info[]> {
+  async models(directory?: string): Promise<ModelInfo[]> {
     const dir = this.resolveDir(directory)
     const cached = this.modelCache.get(dir)
     if (cached && Date.now() - cached.at < 60_000) return cached.models
-    let models: ModelV2Info[] = []
+    let models: ModelInfo[] = []
     // A directory OpenCode has not opened yet answers with an empty catalog at first.
     for (let i = 0; i < 20; i++) {
-      models = unwrap(await this.api.model.list({ location: { directory: dir } }, timed()), "listing models").data
+      models = (await req("listing models", this.api.model.list({ location: { directory: dir } }, timed()))).data
       if (models.length) break
       await sleep(250)
     }
@@ -489,8 +531,8 @@ export class Fleet {
   }
 
   /**
-   * OpenCode 1.19's v2 runner reports every step as free, so price steps from
-   * the catalog (USD per million tokens; reasoning is billed as output).
+   * Steps OpenCode reports as free are priced from the catalog (USD per million tokens;
+   * reasoning is billed as output), so a model without OpenCode's own pricing still counts.
    */
   private estimator(directory: string): CostEstimator {
     return (model, tok) => {
@@ -506,8 +548,8 @@ export class Fleet {
   /** Rules saved by "always" answers for the project containing `directory`. */
   async savedPermissions(directory?: string): Promise<{ project: string; rules: PermissionSavedInfo[] }> {
     const dir = this.resolveDir(directory)
-    const loc = unwrap(await this.api.location.get({ location: { directory: dir } }), "locating the project")
-    const rules = unwrap(await this.api.permission.saved.list({ projectID: loc.project.id }), "listing saved permissions").data
+    const loc = await req("locating the project", this.api.location.get({ location: { directory: dir } }))
+    const rules = await req("listing saved permissions", this.api.permission.saved.list({ projectID: loc.project.id }))
     return { project: loc.project.directory, rules }
   }
 
@@ -515,15 +557,15 @@ export class Fleet {
     const { rules } = await this.savedPermissions(directory)
     const rule = rules.find((r) => r.id === id)
     if (!rule) throw new Error(`no saved permission ${id} for this project${rules.length ? `; saved: ${rules.map((r) => r.id).join(", ")}` : ""}`)
-    check(await this.api.permission.saved.remove({ id }), "removing the saved permission")
+    await req("removing the saved permission", this.api.permission.saved.remove({ id }))
     return rule
   }
 
-  async agents(directory?: string): Promise<AgentV2Info[]> {
+  async agents(directory?: string): Promise<AgentInfo[]> {
     const dir = this.resolveDir(directory)
-    let agents: AgentV2Info[] = []
+    let agents: AgentInfo[] = []
     for (let i = 0; i < 20; i++) {
-      agents = unwrap(await this.api.agent.list({ location: { directory: dir } }), "listing agents").data
+      agents = (await req("listing agents", this.api.agent.list({ location: { directory: dir } }))).data
       if (agents.length) break
       await sleep(250)
     }
@@ -674,10 +716,9 @@ export class Fleet {
   }
 
   /**
-   * A one-shot answer: a session with no tools in the project's `.opencode/horde-ask/`
-   * directory (fresh, so OpenCode loads the tool-less profile, and inside the project, so
-   * its providers apply), one prompt, the answer, and the session is deleted. With a
-   * schema the reply must be JSON that conforms; one retry is given with the problems.
+   * A one-shot answer: a session in the project whose permissions deny every tool, one
+   * prompt, the answer, and the session is deleted. With a schema the reply must be JSON
+   * that conforms; one retry is given with the problems.
    */
   async ask(input: {
     prompt: string
@@ -690,29 +731,16 @@ export class Fleet {
     signal?: AbortSignal
   }): Promise<{ text: string; json?: unknown; cost: number; model?: ModelRef; retried: boolean; guarded: boolean }> {
     const project = this.resolveDir(input.directory)
-    // Versioned, so a directory OpenCode opened with older profiles is never reused.
-    const dir = path.join(project, ".opencode", "horde-ask-3")
-    for (const [agent, profile] of [
-      [ASK_AGENT, ASK_PROFILE],
-      [ASK_GUARDED_AGENT, ASK_GUARDED_PROFILE],
-    ] as const) {
-      const file = path.join(dir, ".opencode", "agent", `${agent}.md`)
-      if ((await fs.readFile(file, "utf8").catch(() => "")) !== profile) {
-        await fs.mkdir(path.dirname(file), { recursive: true })
-        await fs.writeFile(file, profile)
-      }
-    }
-    await excludeFromGit(project, ".opencode/horde-ask-3/").catch(() => undefined)
     const timeout = input.timeoutMs ?? 300_000
-    const once = async (agent: string) => {
+    const once = async (profile: Profile) => {
       const name = `ask-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`
       const { snapshot } = await this.spawn({
         prompt: ASK_PREAMBLE + (input.schema ? schemaPrompt(input.prompt, input.schema) : input.prompt),
         name,
         model: input.model,
         variant: input.variant,
-        agent,
-        directory: dir,
+        profile,
+        directory: project,
         files: input.files?.map((f) => path.resolve(project, f)),
         permissions: "deny",
         questions: "dismiss",
@@ -758,11 +786,11 @@ export class Fleet {
       }
     }
     try {
-      return { ...(await once(ASK_AGENT)), guarded: false }
+      return { ...(await once(ASK_PROFILE)), guarded: false }
     } catch (err) {
       // OpenCode's free tier refuses tool-less agents; ask again with tools present but denied.
-      if (!/FreeTierError/.test((err as Error).message)) throw err
-      return { ...(await once(ASK_GUARDED_AGENT)), guarded: true }
+      if (!/FreeTierError|free tier/i.test((err as Error).message)) throw err
+      return { ...(await once(ASK_GUARDED_PROFILE)), guarded: true }
     }
   }
 
@@ -856,15 +884,13 @@ export class Fleet {
       held = false
     }
     try {
-      if (input.profile && input.agent) throw new Error("pass either agent (an existing profile) or profile (a custom one), not both")
-      if (input.scope && input.agent) throw new Error("scope builds a custom profile; it cannot be combined with agent (use profile for tool switches)")
-      if (input.scope && input.isolation !== "worktree")
-        throw new Error('scope needs isolation "worktree" (a per-agent profile only loads in a fresh directory)')
       if (input.scope && !input.scope.paths.length) throw new Error("scope.paths needs at least one path or glob")
       const model = input.model ? parseModel(input.model, input.variant) : undefined
       if (!model && input.variant) throw new Error("variant requires model (pick one with opencode_models)")
       if (model) await this.validateModel(model, directory)
       if (input.agent) await this.validateAgent(input.agent, directory)
+      // Profile rules are checked here too, so a bad effect fails before anything is created.
+      if (input.profile) profileRules(input.profile)
       // Read attachments before anything is created, so a typo fails cleanly.
       const prepared = await prepareFiles(input.files ?? [], directory)
       return { directory, model, prepared, release }
@@ -883,7 +909,6 @@ export class Fleet {
     const notes: string[] = []
     const name = input.name ?? `agent-${Date.now().toString(36)}${randomBytes(2).toString("hex")}`
     let worktree: Worktree | undefined
-    let agentFile: string | undefined
     let sessionId: string | undefined
     let prompted = false
     try {
@@ -902,19 +927,20 @@ export class Fleet {
         directory = worktree.path
       }
       if (input.signal?.aborted) throw new Error("cancelled")
-      let agent = input.agent
+      // A profile is the session's own permission rules, added after the agent's.
       const profile = input.scope ? withScope(input.profile ?? {}, input.scope) : input.profile
-      if (profile) {
-        const made = await this.writeProfile(directory, name, profile)
-        agent = made.agent
-        agentFile = made.file
-      }
-      const session = unwrap(
-        await this.api.session.create({ location: { directory }, ...(model ? { model } : {}), ...(agent ? { agent } : {}) }),
+      const session = await req(
         "creating session",
-      ).data
+        this.api.session.create({
+          location: { directory },
+          title: `horde: ${name}`,
+          ...(model ? { model } : {}),
+          ...(input.agent ? { agent: input.agent } : {}),
+          ...(profile ? { permissions: profileRules(profile) } : {}),
+        }),
+      )
       sessionId = session.id
-      await renameSession(this.backend.client, session.id, directory, `horde: ${name}`)
+      const steps = [input.limits?.maxSteps, profile?.steps].filter((n): n is number => !!n)
       const policy = input.permissions ?? this.config.defaultPermissions
       // A gate on a scoped agent audits against the scope unless told otherwise.
       let gate = input.gate
@@ -930,8 +956,7 @@ export class Fleet {
         policy,
         questions: input.questions ?? defaultQuestionPolicy(policy),
         worktree,
-        limits: defined(input.limits ?? {}),
-        agentFile,
+        limits: defined({ ...input.limits, maxSteps: steps.length ? Math.min(...steps) : undefined }),
         scope: input.scope,
         createdAt: Date.now(),
         owner: SELF,
@@ -957,9 +982,8 @@ export class Fleet {
       if (!prompted) {
         if (sessionId) {
           this.forget(sessionId)
-          await deleteSession(this.backend.client, sessionId, directory)
+          await this.api.session.remove({ sessionID: sessionId }).catch(() => undefined)
         }
-        if (agentFile) await fs.rm(agentFile, { force: true })
         if (worktree) await removeWorktree(worktree, name, true).catch(() => undefined)
       }
       throw err
@@ -972,50 +996,6 @@ export class Fleet {
       notes.push(`(status unavailable right now: ${(err as Error).message})`)
       return { snapshot: this.build(live), notes }
     }
-  }
-
-  /**
-   * Custom profiles are OpenCode agent files. OpenCode reads them when it first
-   * opens a directory, so this works for fresh worktrees and for directories the
-   * server has not used yet.
-   */
-  private async writeProfile(directory: string, name: string, profile: Profile): Promise<{ agent: string; file: string }> {
-    const agent = `horde-${name.toLowerCase().replace(/[^a-z0-9-]+/g, "-")}-${Date.now().toString(36)}`
-    const dir = path.join(directory, ".opencode", "agent")
-    const file = path.join(dir, `${agent}.md`)
-    const front = [
-      "---",
-      `description: ${JSON.stringify(profile.description ?? `mcp-horde profile for ${name}`)}`,
-      "mode: primary",
-      ...(profile.steps ? [`steps: ${profile.steps}`] : []),
-      ...(profile.tools && Object.keys(profile.tools).length
-        ? ["tools:", ...Object.entries(profile.tools).map(([k, v]) => `  ${JSON.stringify(k)}: ${v}`)]
-        : []),
-      ...(profile.permission && Object.keys(profile.permission).length
-        ? [
-            "permission:",
-            ...Object.entries(profile.permission).flatMap(([action, rule]) =>
-              typeof rule === "string"
-                ? [`  ${JSON.stringify(action)}: ${rule}`]
-                : [`  ${JSON.stringify(action)}:`, ...Object.entries(rule).map(([glob, v]) => `    ${JSON.stringify(glob)}: ${v}`)],
-            ),
-          ]
-        : []),
-      "---",
-      "",
-    ]
-    await fs.mkdir(dir, { recursive: true })
-    await fs.writeFile(file, front.join("\n"))
-    await excludeFromGit(directory, ".opencode/agent/horde-*.md").catch(() => undefined)
-    for (let i = 0; i < 40; i++) {
-      const agents = unwrap(await this.api.agent.list({ location: { directory } }), "listing agents").data
-      if (agents.some((a) => a.id === agent)) return { agent, file }
-      await sleep(250)
-    }
-    await fs.rm(file, { force: true })
-    throw new Error(
-      `OpenCode did not pick up the custom profile because it already has ${directory} open. Use isolation "worktree" for agents with a custom profile, or pass instructions instead (prepended to the prompt).`,
-    )
   }
 
   async message(
@@ -1058,11 +1038,11 @@ export class Fleet {
             : undefined
         if (!model) throw new Error("variant requires model: the agent's model is not known yet; pass model too")
         await this.validateModel(model, directory)
-        check(await this.api.session.switchModel({ sessionID: id, model }), "switching model")
+        await req("switching model", this.api.session.switchModel({ sessionID: id, model }))
       }
       if (opts.agent) {
         await this.validateAgent(opts.agent, directory)
-        check(await this.api.session.switchAgent({ sessionID: id, agent: opts.agent }), "switching agent")
+        await req("switching agent", this.api.session.switchAgent({ sessionID: id, agent: opts.agent }))
       }
       const patch: Partial<AgentRecord> = {}
       if (opts.permissions) {
@@ -1088,17 +1068,17 @@ export class Fleet {
 
   private async sendPrompt(live: Live, text: string, prepared: Prepared, delivery?: "steer" | "queue") {
     const body = prepared.inlined.length ? `${text}\n\n${prepared.inlined.join("\n\n")}` : text
-    // History up to here predates the prompt; a refresh during the call may read further.
-    const seq = live.track.seq
+    let sent: { id: string }
     live.sending++
     try {
-      check(
-        await this.api.session.prompt({
+      sent = await req(
+        "sending prompt",
+        this.api.session.prompt({
           sessionID: live.record.id,
-          prompt: { text: body, ...(prepared.files.length ? { files: prepared.files } : {}) },
+          text: body,
+          ...(prepared.files.length ? { files: prepared.files } : {}),
           delivery: delivery ?? "steer",
         }),
-        "sending prompt",
       )
     } finally {
       live.sending--
@@ -1107,7 +1087,7 @@ export class Fleet {
     live.gen++
     live.state = "running"
     live.liveText = ""
-    live.sent = { at: Date.now(), seq }
+    live.sent = { at: Date.now(), id: sent.id }
     live.stopSent = undefined
     this.updateRecord(live.record.id, { interruptedSeq: undefined, stopReason: undefined, pauseAfterStep: undefined })
   }
@@ -1177,7 +1157,7 @@ export class Fleet {
       if (perm) await this.replyPermission(perm, reply.decision ?? "once", reply.message)
       else if (question) {
         if (reply.decision === "reject") await this.rejectQuestion(question)
-        else if (reply.answers) await this.answerQuestion(question, reply.answers)
+        else if (reply.answers) await this.answerQuestion(question, formAnswer(question, reply.answers))
         else await this.dismissQuestion(question)
       }
     } catch (err) {
@@ -1187,27 +1167,21 @@ export class Fleet {
     return this.snapshot(id)
   }
 
-  private async replyPermission(p: PermissionV2Request, reply: "once" | "always" | "reject", message?: string) {
-    check(
-      await this.api.session.permission.reply({ sessionID: p.sessionID, requestID: p.id, reply, ...(message ? { message } : {}) }),
-      "replying to permission",
-    )
+  private async replyPermission(p: PermissionRequest, decision: "once" | "always" | "reject", message?: string) {
+    await req("replying to permission", this.api.permission.reply({ sessionID: p.sessionID, requestID: p.id, decision, ...(message ? { message } : {}) }))
   }
 
-  private async answerQuestion(q: QuestionV2Request, answers: string[][]) {
-    check(await this.api.session.question.reply({ sessionID: q.sessionID, requestID: q.id, questionV2Reply: { answers } }), "answering question")
+  private async answerQuestion(q: FormInfo, answer: FormAnswer) {
+    await req("answering question", this.api.session.form.reply({ sessionID: q.sessionID, formID: q.id, answer }))
   }
 
-  /** Rejecting a question halts the agent in OpenCode, so "dismiss" answers it instead. */
-  private async dismissQuestion(q: QuestionV2Request) {
-    await this.answerQuestion(
-      q,
-      q.questions.map(() => ["No preference: use your best judgment and continue."]),
-    )
+  /** Cancelling a question halts the agent in OpenCode, so "dismiss" answers it instead. */
+  private async dismissQuestion(q: FormInfo) {
+    await this.answerQuestion(q, dismissAnswer(q))
   }
 
-  private async rejectQuestion(q: QuestionV2Request) {
-    check(await this.api.session.question.reject({ sessionID: q.sessionID, requestID: q.id }), "rejecting question")
+  private async rejectQuestion(q: FormInfo) {
+    await req("rejecting question", this.api.session.form.cancel({ sessionID: q.sessionID, formID: q.id }))
   }
 
   async dispose(ref: string, opts: { worktree?: "keep" | "remove" | "discard"; deleteSession?: boolean }): Promise<string> {
@@ -1244,8 +1218,11 @@ export class Fleet {
     if (opts.deleteSession) {
       // First, while its directory still exists: OpenCode opens the session's
       // directory to serve the request. Deleting removes the session and its children.
-      const res = await deleteSession(this.backend.client, id, live.session?.location.directory ?? live.record.directory)
-      notes.push(res.ok ? `deleted session ${id}` : `could not delete session ${id}${res.status ? ` (HTTP ${res.status})` : ""}; it stays in OpenCode history`)
+      const err = await this.api.session.remove({ sessionID: id }).then(
+        () => undefined,
+        (e: Error) => e,
+      )
+      notes.push(err ? `could not delete session ${id} (${err.message}); it stays in OpenCode history` : `deleted session ${id}`)
     }
     const wt = live.record.worktree
     if (wt) {
@@ -1258,11 +1235,10 @@ export class Fleet {
         // Stop tracking first: our own refreshes would make OpenCode reopen the directory.
         this.forget(id)
         // Let OpenCode release the directory (again before each retry) before it disappears.
-        const release = () => releaseDirectory(this.backend.client, wt.path)
+        const release = () => this.api.debug.location.evict({ location: { directory: wt.path } }).catch(() => undefined)
         notes.push(await removeWorktree(wt, name, mode === "discard", release))
       }
     }
-    if (live.record.agentFile) await fs.rm(live.record.agentFile, { force: true })
     if (!opts.deleteSession) notes.push(`the session ${id} stays in OpenCode history`)
     this.forget(id)
     notes.push(`stopped tracking ${name}`)
@@ -1346,8 +1322,8 @@ export class Fleet {
 
   // --------------------------------------------------------------- reading
 
-  async session(id: string): Promise<SessionV2Info> {
-    return unwrap(await this.api.session.get({ sessionID: id }), `loading session ${id}`).data
+  async session(id: string): Promise<SessionInfo> {
+    return req(`loading session ${id}`, this.api.session.get({ sessionID: id }))
   }
 
   /** Wait for the agent's loop to wind down. False when it is still active at the deadline. */
@@ -1363,8 +1339,7 @@ export class Fleet {
   }
 
   private async activeSet(): Promise<Set<string>> {
-    const res = unwrap(await this.api.session.active(timed()), "listing active sessions")
-    return new Set(Object.keys(res.data))
+    return new Set(Object.keys(await req("listing active sessions", this.api.session.active(timed()))))
   }
 
   /**
@@ -1398,28 +1373,29 @@ export class Fleet {
     const id = live.record.id
     const gen = live.gen
     const before = live.state
-    const sessionRes = await this.api.session.get({ sessionID: id }, timed())
-    if (sessionRes.response?.status === 404) {
+    try {
+      live.session = await this.api.session.get({ sessionID: id }, timed())
+    } catch (err) {
+      if (!isNotFound(err)) throw new Error(`loading session ${id} failed: ${(err as Error).message}`, { cause: err })
       this.forget(id)
       const wt = live.record.worktree
       throw new Error(
         `session ${id} no longer exists on the OpenCode server (deleted?); stopped tracking it${wt ? `. Its worktree is left as it was: ${wt.path} (branch ${wt.branch} in ${wt.repo}); merge or remove it with git` : ""}`,
       )
     }
-    live.session = unwrap(sessionRes, `loading session ${id}`).data
 
-    // Durable history since the last seq we applied.
+    // The conversation since its last settled turn.
     const replaying = !live.loaded
     const turnsBefore = live.track.turns.length ? currentTurn(live.track)!.startSeq : -1
     const seqBefore = live.track.seq
-    await this.readHistory(id, live.track, live.session.location.directory)
+    live.track = await this.readHistory(id, live.track, live.session.location.directory)
     // Grace windows run on local receive times, so a skewed server clock cannot shorten or stretch them.
     const seenAt = Date.now()
     if (live.track.seq !== seqBefore || replaying) live.lastNewEventAt = seenAt
     for (const mid of live.track.admitted.keys()) if (!live.admittedSeen.has(mid)) live.admittedSeen.set(mid, seenAt)
     for (const mid of live.admittedSeen.keys()) if (!live.track.admitted.has(mid)) live.admittedSeen.delete(mid)
     const sent = live.sent
-    if (sent && (live.track.lastPromptedSeq > sent.seq || [...live.track.admitted.values()].some((a) => a.seq > sent.seq))) live.sent = undefined
+    if (sent && (live.track.ids.has(sent.id) || live.track.admitted.has(sent.id))) live.sent = undefined
     const turn = currentTurn(live.track)
     if (!replaying && turn && turn.startSeq !== turnsBefore) live.turnSeen.set(turn.startSeq, Date.now())
     live.loaded = true
@@ -1434,17 +1410,13 @@ export class Fleet {
     // Child histories (for cost limits) and requests, only for children with recent activity.
     const hot = [...live.hotChildren.keys()]
     for (const c of hot) {
-      let t = live.childTracks.get(c)
-      if (!t) {
-        t = emptyTrack()
-        live.childTracks.set(c, t)
-      }
-      await this.readHistory(c, t, live.session.location.directory).catch(() => undefined)
+      const t = live.childTracks.get(c) ?? emptyTrack()
+      live.childTracks.set(c, await this.readHistory(c, t, live.session.location.directory).catch(() => t))
     }
     const tree = [id, ...hot]
     const [perms, questions] = await Promise.all([
-      Promise.all(tree.map(async (sid) => unwrap(await this.api.session.permission.list({ sessionID: sid }, timed()), "listing permissions").data)),
-      Promise.all(tree.map(async (sid) => unwrap(await this.api.session.question.list({ sessionID: sid }, timed()), "listing questions").data)),
+      Promise.all(tree.map((sid) => req("listing permissions", this.api.permission.list({ sessionID: sid }, timed())))),
+      Promise.all(tree.map((sid) => req("listing questions", this.api.session.form.list({ sessionID: sid }, timed())))),
     ])
     if (this.closed) return
     live.pending = { permissions: perms.flat(), questions: questions.flat() }
@@ -1497,15 +1469,38 @@ export class Fleet {
     this.maybePush(live)
   }
 
-  private async readHistory(sessionID: string, track: Track, directory: string) {
+  private async readHistory(sessionID: string, track: Track, directory: string): Promise<Track> {
     // Pricing comes from the catalog; load it once per directory.
     if (!this.modelCache.has(directory)) await this.models(directory).catch(() => undefined)
-    const estimate = this.estimator(directory)
+    const [messages, inbox] = await Promise.all([
+      this.conversation(sessionID, track.messages),
+      req("reading the inbox", this.api.session.inbox.list({ sessionID }, timed())),
+    ])
+    return buildTrack(messages, inbox, this.estimator(directory))
+  }
+
+  /**
+   * The conversation, oldest first. Everything through the last `idle` marker never changes,
+   * so only newer messages are read; when that marker is gone (a revert), all of it is.
+   * ponytail: an open turn is re-read whole on every refresh; read by message if long turns get slow.
+   */
+  private async conversation(sessionID: string, known: SessionMessageInfo[] = []): Promise<SessionMessageInfo[]> {
+    const keep = stablePrefix(known)
+    const anchor = known[keep - 1]
+    const fresh: SessionMessageInfo[] = []
+    let cursor: string | undefined
     for (let page = 0; page < 1000; page++) {
-      const res = unwrap(await this.api.session.history({ sessionID, after: track.seq, limit: 100 }, timed()), "reading session history")
-      for (const e of res.data as DurableEvent[]) apply(track, e, estimate)
-      if (res.data.length < 100) break
+      // The cursor already encodes the order.
+      const res = await req("reading the conversation", this.api.message.list({ sessionID, limit: 100, ...(cursor ? { cursor } : { order: "desc" }) }, timed()))
+      for (const m of res.data) {
+        if (anchor && m.id === anchor.id) return [...known.slice(0, keep), ...fresh.reverse()]
+        if (anchor && m.time.created < anchor.time.created) return this.conversation(sessionID)
+        fresh.push(m)
+      }
+      if (!res.cursor.next || res.data.length < 100) break
+      cursor = res.cursor.next
     }
+    return anchor ? this.conversation(sessionID) : fresh.reverse()
   }
 
   /** What the caller sees of the gate. Undefined when the agent has none, or none applies to its state. */
@@ -1752,7 +1747,7 @@ export class Fleet {
    */
   private async approveTrusted(live: Live) {
     if (live.record.adopted) return
-    const asks = live.pending.permissions.filter((p) => !live.handled.has(p.id) && p.action === "bash" && p.resources.length)
+    const asks = live.pending.permissions.filter((p) => !live.handled.has(p.id) && p.action === "shell" && p.resources.length)
     if (!asks.length) return
     live.boardDir ??= await Board.open(live.record.worktree?.repo ?? live.record.directory)
       .then((b) => b.dir)
@@ -1875,7 +1870,7 @@ export class Fleet {
   private async scanChildren(live: Live) {
     live.lastChildScan = Date.now()
     const directory = live.session?.location.directory ?? live.record.directory
-    const res = unwrap(await this.api.session.list({ directory, limit: 100, order: "desc" }, timed()), "listing sessions")
+    const res = await req("listing sessions", this.api.session.list({ directory, limit: 100, order: "desc" }, timed()))
     const tree = new Set([live.record.id, ...live.children])
     // Parents are listed after children in desc order; loop until no new descendants appear.
     let grew = true
@@ -1908,7 +1903,7 @@ export class Fleet {
       const tool = latestTool(track)
       if (asking.length) {
         activity = `waiting for the user to answer: ${asking
-          .map((r) => ("action" in r ? `${r.action} ${JSON.stringify(r.resources)}` : (r.questions[0]?.question ?? "a question")))
+          .map((r) => ("action" in r ? `${r.action} ${JSON.stringify(r.resources)}` : formText(r)))
           .join("; ")}`
       } else if (record.pauseAfterStep) activity = "pausing after the current step"
       else if (tool) activity = `${tool.tool}: ${inputSummary(tool.input)}${track.openTools.size > 1 ? ` (+${track.openTools.size - 1} more)` : ""}`
@@ -1974,27 +1969,17 @@ export class Fleet {
     if (live.state === "running" || live.state === "needs_input")
       throw new Error(`${live.record.name ?? live.record.id} is ${live.state}; compact it once it is idle (opencode_wait, or opencode_interrupt first)`)
     return this.withoutGate(live, async () => {
-      const before = live.track.compactions
-      const res = await this.api.session.compact({ sessionID: live.record.id })
-      if (res.error !== undefined || !res.response?.ok) {
-        const e = res.error as { message?: string } | undefined
-        const message = e?.message ?? (e ? JSON.stringify(e) : `HTTP ${res.response?.status}`)
-        // OpenCode 1.19 answers 503 "Session compact is not available yet" (the legacy summarize does not touch v2 sessions).
-        if (/not available/i.test(message))
-          throw new Error(
-            `this OpenCode server cannot compact v2 sessions yet (${message}). To continue with a fresh context, dispose the agent keeping its worktree and spawn a new one there with a summary of the task so far.`,
-          )
-        throw new Error(`compacting the session failed: ${message}`)
-      }
-      // The summary is written by the model; wait for it to land.
+      const queued = await req("compacting the session", this.api.session.compact({ sessionID: live.record.id }))
+      // The summary is written by the model; wait for it to land (its message keeps the request's id).
       const deadline = Date.now() + 120_000
       while (Date.now() < deadline) {
         await this.refresh(live)
-        if (live.track.compactions > before && !live.track.inLoop) break
+        const m = live.track.messages.find((x) => x.id === queued.id)
+        if (m?.type === "compaction" && m.status === "failed") throw new Error(`the compaction failed: ${m.error.message}`)
+        if (m?.type === "compaction" && m.status === "completed" && !live.track.inLoop) return this.build(live)
         await sleep(250)
       }
-      if (live.track.compactions <= before) throw new Error("OpenCode accepted the compaction but did not finish it within 2 minutes")
-      return this.build(live)
+      throw new Error("OpenCode accepted the compaction but did not finish it within 2 minutes")
     })
   }
 
@@ -2021,60 +2006,48 @@ export class Fleet {
     opts: { turns?: number; to?: string },
   ): Promise<{ snapshot: Snapshot; files: { path: string; status: string }[]; turns: number }> {
     const sessionID = live.record.id
-    // The conversation in order, oldest first.
-    const conversation = async () => {
-      const out: { id: string; type?: string; snapshot?: { start?: string; end?: string } }[] = []
-      let cursor: string | undefined
-      for (let page = 0; page < 50; page++) {
-        const res = unwrap(
-          await this.api.session.messages(cursor ? { sessionID, limit: 200, cursor } : { sessionID, order: "asc", limit: 200 }),
-          "reading the conversation",
-        ) as { data: typeof out; cursor?: { next?: string } }
-        out.push(...res.data)
-        cursor = res.cursor?.next
-        if (!cursor || !res.data.length) break
-      }
-      return out
-    }
+    const conversation = () => this.conversation(sessionID)
     let messages = await conversation()
     const ids = messages.map((m) => m.id)
-    let boundary = opts.to
+    // OpenCode undoes the given message and everything after it.
+    let from: string
     let undone = 0
-    if (boundary) {
-      if (!ids.includes(boundary)) throw new Error(`no message ${boundary} in ${name}'s conversation`)
-      undone = live.track.turns.filter((t) => (t.messageIDs?.[0] ? ids.indexOf(t.messageIDs[0]) > ids.indexOf(boundary!) : false)).length
+    if (opts.to) {
+      const at = ids.indexOf(opts.to)
+      if (at < 0) throw new Error(`no message ${opts.to} in ${name}'s conversation`)
+      if (at === ids.length - 1) throw new Error(`nothing comes after ${opts.to} in ${name}'s conversation; there is nothing to revert`)
+      from = ids[at + 1]!
+      undone = live.track.turns.filter((t) => (t.messageIDs[0] ? ids.indexOf(t.messageIDs[0]) > at : false)).length
     } else {
       const n = opts.turns ?? 1
       const turns = live.track.turns
       if (n < 1 || n > turns.length) throw new Error(`${name} has ${turns.length} turn(s) on record; cannot revert ${n}`)
-      const prompt = turns[turns.length - n]!.messageIDs?.[0]
-      const at = prompt ? ids.indexOf(prompt) : -1
-      if (at < 0) throw new Error("cannot find where that turn starts in the conversation (an older OpenCode history); pass to: <message id>")
-      if (at === 0) throw new Error(`that would undo ${name}'s first turn, leaving nothing; dispose the agent (and its worktree) instead`)
-      boundary = ids[at - 1]!
+      from = turns[turns.length - n]!.messageIDs[0]!
+      const at = ids.indexOf(from)
+      if (at < 0) throw new Error("cannot find where that turn starts in the conversation; pass to: <message id>")
+      if (!messages.slice(0, at).some((m) => m.type === "user"))
+        throw new Error(`that would undo ${name}'s first turn, leaving nothing; dispose the agent (and its worktree) instead`)
       undone = n
     }
     // OpenCode records a step's file snapshot shortly after the step ends (the fields can be
     // missing altogether until then); revert only once the turns being undone have theirs, or
     // it would find no changes to restore. A session that records no snapshots (outside git)
     // is not waited for.
-    const after = (ms: typeof messages) => ms.slice(ms.findIndex((m) => m.id === boundary) + 1)
-    const recording = (ms: typeof messages) => ms.some((m) => m.snapshot?.start || m.snapshot?.end)
+    const after = (ms: typeof messages) => ms.slice(ms.findIndex((m) => m.id === from))
+    const snapshot = (m: SessionMessageInfo) => (m.type === "assistant" ? m.snapshot : undefined)
+    const recording = (ms: typeof messages) => ms.some((m) => snapshot(m)?.start || snapshot(m)?.end)
     const pending = (ms: typeof messages) => recording(ms) && after(ms).some((m) => m.type === "assistant" && !m.snapshot?.end)
     for (let i = 0; i < 40 && pending(messages); i++) {
       await sleep(250)
       messages = await conversation()
     }
-    // Staging may answer without a body (204); then the restored files are not known.
-    const stageRes = await this.api.session.revert.stage({ sessionID, messageID: boundary, files: true })
-    check(stageRes, "staging the revert")
-    const staged = (stageRes.data as { data?: { files?: { path: string; status?: string }[] } } | undefined)?.data ?? {}
-    check(await this.api.session.revert.commit({ sessionID }), "committing the revert")
+    const staged = await req("staging the revert", this.api.session.revert.stage({ sessionID, messageID: from, files: true }))
+    await req("committing the revert", this.api.session.revert.commit({ sessionID }))
     await this.refresh(live)
     // The gate judged work that no longer exists, and what is left was judged before: the
     // current turn is not gated again; the agent's next turn is.
     this.updateRecord(sessionID, { gateState: this.supersededGate(live), reportedSeq: live.track.seq })
-    return { snapshot: this.build(live), files: (staged.files ?? []).map((f) => ({ path: f.path, status: f.status ?? "modified" })), turns: undone }
+    return { snapshot: this.build(live), files: (staged.files ?? []).map((f) => ({ path: f.file, status: f.status })), turns: undone }
   }
 
   async snapshot(ref: string, active?: Set<string>): Promise<Snapshot> {
@@ -2087,7 +2060,7 @@ export class Fleet {
   async list(opts: { includeUntracked?: boolean; directory?: string; limit?: number }): Promise<{
     snapshots: Snapshot[]
     errors: string[]
-    untracked: SessionV2Info[]
+    untracked: SessionInfo[]
   }> {
     this.syncStore()
     const active = await this.activeSet()
@@ -2099,15 +2072,13 @@ export class Fleet {
       if (r.status === "fulfilled") snapshots.push(r.value)
       else errors.push(`${ids[i]}: ${(r.reason as Error).message}`)
     })
-    let untracked: SessionV2Info[] = []
+    let untracked: SessionInfo[] = []
     if (opts.includeUntracked) {
       // OpenCode may record the real path (macOS /private/var, Windows long names): ask for both.
       const dir = this.resolveDir(opts.directory)
       const real = await fs.realpath(dir).catch(() => dir)
       const lists = await Promise.all(
-        [...new Set([dir, real])].map(async (directory) =>
-          unwrap(await this.api.session.list({ directory, limit: opts.limit ?? 20, order: "desc" }), "listing sessions"),
-        ),
+        [...new Set([dir, real])].map((directory) => req("listing sessions", this.api.session.list({ directory, limit: opts.limit ?? 20, order: "desc" }))),
       )
       const owned = new Set(this.store.agents(this.serverKey).map((r) => r.id))
       const seen = new Set<string>()
@@ -2130,12 +2101,12 @@ export class Fleet {
   }
 
   /** Messages in chronological order, optionally only those created at or after `since`. */
-  private async messages(id: string, since?: number): Promise<SessionMessage[]> {
-    const out: SessionMessage[] = []
+  private async messages(id: string, since?: number): Promise<SessionMessageInfo[]> {
+    const out: SessionMessageInfo[] = []
     let cursor: string | undefined
     for (let page = 0; page < 200; page++) {
-      // The cursor already encodes the order; the API rejects both together.
-      const res = unwrap(await this.api.session.messages({ sessionID: id, limit: 100, ...(cursor ? { cursor } : { order: "desc" }) }), "loading messages")
+      // The cursor already encodes the order.
+      const res = await req("loading messages", this.api.message.list({ sessionID: id, limit: 100, ...(cursor ? { cursor } : { order: "desc" }) }))
       let done = false
       for (const m of res.data) {
         if (since !== undefined && m.time.created < since) {
@@ -2277,40 +2248,42 @@ export class Fleet {
 
   // ---------------------------------------------------------------- events
 
-  private onEvent(e: V2Event) {
+  private onEvent(e: OpenCodeEvent) {
     if (this.closed) return
-    const raw = e as { type: string; data?: Record<string, unknown>; properties?: Record<string, unknown> }
-    const d = raw.data ?? raw.properties ?? {}
+    const raw = e as { type: string; data?: Record<string, unknown> }
+    const d = raw.data ?? {}
     if (raw.type === "session.created") {
-      const info = d.info as { id?: string; parentID?: string } | undefined
-      const rootId = info?.parentID ? (this.live.has(info.parentID) ? info.parentID : this.childToRoot.get(info.parentID)) : undefined
+      const parentID = typeof d.parentID === "string" ? d.parentID : undefined
+      const rootId = parentID ? (this.live.has(parentID) ? parentID : this.childToRoot.get(parentID)) : undefined
       const root = rootId ? this.live.get(rootId) : undefined
-      if (root && info?.id) this.addChild(root, info.id)
+      if (root && typeof d.sessionID === "string") this.addChild(root, d.sessionID)
       return
     }
-    const sid = typeof d.sessionID === "string" ? d.sessionID : undefined
+    // Forms carry their session inside.
+    const form = d.form as { sessionID?: unknown } | undefined
+    const sid = typeof d.sessionID === "string" ? d.sessionID : typeof form?.sessionID === "string" ? form.sessionID : undefined
     if (!sid) return
     const rootId = this.live.has(sid) ? sid : this.childToRoot.get(sid)
     const live = rootId ? this.live.get(rootId) : undefined
     if (!live) return
     if (sid !== rootId) live.hotChildren.set(sid, Date.now())
     switch (raw.type) {
-      case "session.next.text.delta":
+      case "session.text.delta":
         if (sid === rootId) live.liveText = `${live.liveText}${String(d.delta ?? "")}`.slice(-400)
         return
-      case "session.next.text.started":
-      case "session.next.step.started":
+      case "session.text.started":
+      case "session.step.started":
         if (sid === rootId) {
           live.liveText = ""
           live.retry = undefined
         }
         break
-      case "session.next.retried": {
+      case "session.retry.scheduled": {
         const err = d.error as { message?: string } | undefined
         live.retry = { attempt: Number(d.attempt) || 1, message: err?.message ?? "provider error" }
         break
       }
-      case "session.next.step.ended":
+      case "session.step.ended":
         if (sid !== rootId) break
         live.retry = undefined
         // Pause requested: stop now, between steps of the root, so no tool gets killed mid-run.
@@ -2324,7 +2297,11 @@ export class Fleet {
         }
         break
     }
-    if (/session\.next\.(prompted|step\.|tool\.(success|failed))|asked|replied|rejected|session\.idle|session\.status/.test(raw.type)) {
+    if (
+      /^session\.(inbox\.delivered|step\.(started|ended|failed)|tool\.(success|failed)|execution\.|idle$|status$|revert\.committed|compaction\.(ended|failed))|^(permission|form)\./.test(
+        raw.type,
+      )
+    ) {
       void this.refresh(live)
         .catch(() => undefined)
         .then(() => this.wake())
@@ -2397,7 +2374,7 @@ export class Fleet {
    * Track a session this server did not spawn (e.g. one started in the TUI).
    * Adopted agents get the "ask" policy: nothing is answered on a human's behalf.
    */
-  private adopt(session: SessionV2Info): Live {
+  private adopt(session: SessionInfo): Live {
     const record: AgentRecord = {
       id: session.id,
       server: this.serverKey,
@@ -2501,9 +2478,9 @@ export class Fleet {
     const root = this.childToRoot.get(ref)
     if (root && this.live.has(root)) return this.live.get(root)!
     if (this.gone.has(ref)) throw new Error(`session ${ref} was disposed or deleted; it is no longer tracked`)
-    const res = await this.api.session.get({ sessionID: ref })
-    if (res.response?.status === 404) throw new Error(`session ${ref} does not exist on this OpenCode server`)
-    const session = unwrap(res, `loading session ${ref}`).data
+    const session = await this.api.session.get({ sessionID: ref }).catch((err: unknown) => {
+      throw new Error(isNotFound(err) ? `session ${ref} does not exist on this OpenCode server` : `loading session ${ref} failed: ${(err as Error).message}`)
+    })
     // A subagent's session belongs to its root agent.
     if (session.parentID) {
       const rootLive = await this.get(session.parentID)

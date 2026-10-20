@@ -3,7 +3,7 @@ import fs from "node:fs"
 import path from "node:path"
 import { after, before, describe, test } from "node:test"
 import { Board, renderBrief, workerCommand } from "@mcp-horde/board"
-import { createOpencodeClient } from "@opencode-ai/sdk/v2"
+import { OpenCode } from "@opencode/client"
 import { connect, git, type Harness, idOf, isolatedEnv, type Mock, makeRepo, until } from "./harness.js"
 import { startMockLlm } from "./mock-llm.js"
 
@@ -159,7 +159,7 @@ describe("opencode MCP server: core behaviour (real opencode, mock LLM)", { time
   test("graceful pause lets the running tool finish", async () => {
     const marker = path.join(repo, "paused.txt")
     await h.call("opencode_spawn", { prompt: `TOOL: sleep 4 && echo done > ${marker}`, name: "pauser", permissions: "allow" })
-    await until(async () => /doing: bash/.test(await h.call("opencode_status", { ids: ["pauser"] })))
+    await until(async () => /doing: shell/.test(await h.call("opencode_status", { ids: ["pauser"] })))
     const pausing = await h.call("opencode_interrupt", { id: "pauser", when: "after_step" })
     assert.match(pausing, /RUNNING[\s\S]*pausing after the current step/)
     const out = await h.call("opencode_wait", { ids: ["pauser"], timeout_seconds: 60 })
@@ -172,7 +172,7 @@ describe("opencode MCP server: core behaviour (real opencode, mock LLM)", { time
     await h.call("opencode_spawn", { prompt: "TOOL: echo approved > approved.txt", name: "asker", permissions: "ask" })
     const blocked = await h.call("opencode_wait", { ids: ["asker"], timeout_seconds: 60 })
     assert.match(blocked, /NEEDS_INPUT/)
-    const req = blocked.match(/needs permission (per_\w+): bash/)![1]!
+    const req = blocked.match(/needs permission (per_\w+): shell/)![1]!
     await assert.rejects(h.call("opencode_respond", { id: "asker", request_id: "per_nope" }), /no pending request per_nope[\s\S]*Pending: per_/)
     await h.call("opencode_respond", { id: "asker", request_id: req, decision: "always" })
     const done = await h.call("opencode_wait", { ids: ["asker"], timeout_seconds: 60 })
@@ -180,9 +180,9 @@ describe("opencode MCP server: core behaviour (real opencode, mock LLM)", { time
     assert.equal(fs.readFileSync(path.join(repo, "approved.txt"), "utf8").trim(), "approved")
     // "always" saved a rule for the project; it can be listed and removed.
     const saved = await h.call("opencode_permissions")
-    assert.match(saved, /1 saved permission\(s\) for .*:\n(\S+) {2}bash "/, saved)
-    const rule = saved.match(/\n(\S+) {2}bash/)![1]!
-    assert.match(await h.call("opencode_permissions", { action: "remove", id: rule }), new RegExp(`Removed ${rule}: bash`))
+    assert.match(saved, /1 saved permission\(s\) for .*:\n(\S+) {2}shell "/, saved)
+    const rule = saved.match(/\n(\S+) {2}shell/)![1]!
+    assert.match(await h.call("opencode_permissions", { action: "remove", id: rule }), new RegExp(`Removed ${rule}: shell`))
     assert.match(await h.call("opencode_permissions"), /No saved permissions/)
     await assert.rejects(h.call("opencode_permissions", { action: "remove", id: "nope" }), /no saved permission nope/)
 
@@ -199,7 +199,7 @@ describe("opencode MCP server: core behaviour (real opencode, mock LLM)", { time
     h.elicit.answer = () => ({ action: "accept", content: { decision: "once" } })
     const out = await h.call("opencode_spawn", { prompt: "TOOL: echo human > human.txt", name: "human", wait: true, timeout_seconds: 60 })
     assert.match(out, /IDLE[\s\S]*DONE/)
-    assert.ok(h.elicit.seen.some((m) => m.includes('"human" wants permission: bash')))
+    assert.ok(h.elicit.seen.some((m) => m.includes('"human" wants permission: shell')))
     assert.equal(fs.readFileSync(path.join(repo, "human.txt"), "utf8").trim(), "human")
 
     h.elicit.answer = () => ({ action: "decline" })
@@ -219,8 +219,8 @@ describe("opencode MCP server: core behaviour (real opencode, mock LLM)", { time
   test("questions: ask → answer, user → elicitation, dismiss", async () => {
     await h.call("opencode_spawn", { prompt: "ASK: favourite colour?", name: "quiz", questions: "ask" })
     const blocked = await h.call("opencode_wait", { ids: ["quiz"], timeout_seconds: 60 })
-    assert.match(blocked, /needs answer (que_\w+): favourite colour\? \[Red \| Blue\]/)
-    const req = blocked.match(/needs answer (que_\w+)/)![1]!
+    assert.match(blocked, /needs answer (frm_\w+): favourite colour\? \[Red \| Blue\]/)
+    const req = blocked.match(/needs answer (frm_\w+)/)![1]!
     await h.call("opencode_respond", { id: "quiz", request_id: req, answers: [["Blue"]] })
     assert.match(await h.call("opencode_wait", { ids: ["quiz"], timeout_seconds: 60 }), /DONE: .*Blue/)
 
@@ -249,13 +249,13 @@ describe("opencode MCP server: core behaviour (real opencode, mock LLM)", { time
   test("provider errors surface as error state", async () => {
     const out = await h.call("opencode_spawn", { prompt: "FAIL400", name: "broken", wait: true, timeout_seconds: 60 })
     assert.match(out, /— ERROR/)
-    assert.match(out, /error: Provider request failed with HTTP 400/)
+    assert.match(out, /error: bad request from mock \(HTTP 400\)/)
   })
 
-  test("a turn that silently never runs is reported as an error, not idle", async () => {
+  test("a provider that cannot start is reported as an error with its cause, not idle", async () => {
     const out = await h.call("opencode_spawn", { prompt: "hello?", name: "ghost", model: "broken/model", wait: true, timeout_seconds: 120 })
     assert.match(out, /ghost .*— ERROR/)
-    assert.match(out, /error: .*(never started|stopped without finishing|failed)/)
+    assert.match(out, /error: Cannot initialize broken\/model/)
   })
 
   test("file attachments reach the model", async () => {
@@ -268,25 +268,25 @@ describe("opencode MCP server: core behaviour (real opencode, mock LLM)", { time
   test("requests from child sessions surface on the parent agent", async () => {
     const parentOut = await h.call("opencode_spawn", { prompt: "parent", name: "parent", permissions: "ask", wait: true, timeout_seconds: 60 })
     const parent = idOf(parentOut)
-    // OpenCode's v2 runner has no subagent tool yet; create the child the way the legacy task tool does.
+    // A child the way OpenCode's subagent tool makes one, but deterministic: created through the API.
     const info = await h.call("opencode_server", { action: "info" })
     const [, posixFile, winFile, url] = info.match(/(?:OPENCODE_SERVER_PASSWORD="\$\(cat '([^']+)'\)"|Get-Content -Raw '([^']+)';) opencode attach (\S+)/)!
     const file = posixFile ?? winFile
     const password = fs.readFileSync(file!, "utf8")
     assert.doesNotMatch(info, new RegExp(password), "the password itself is never printed")
-    const oc = createOpencodeClient({ baseUrl: url, headers: { Authorization: `Basic ${Buffer.from(`opencode:${password}`).toString("base64")}` } })
-    const child = (await oc.session.create({ directory: repo, parentID: parent, title: "child" })).data!.id
-    await oc.v2.session.prompt({ sessionID: child, prompt: { text: "TOOL: echo child > child.txt" } })
+    const oc = OpenCode.make({ baseUrl: url!, headers: { Authorization: `Basic ${Buffer.from(`opencode:${password}`).toString("base64")}` } })
+    const child = (await oc.session.create({ location: { directory: repo }, parentID: parent, title: "child" })).id
+    await oc.session.prompt({ sessionID: child, text: "TOOL: echo child > child.txt" })
     const blocked = await h.call("opencode_wait", { ids: ["parent"], timeout_seconds: 60 })
     assert.match(blocked, new RegExp(`subagents: ${child}`))
-    assert.match(blocked, new RegExp(`needs permission (per_\\w+) \\(subagent ${child}\\): bash`))
+    assert.match(blocked, new RegExp(`needs permission (per_\\w+) \\(subagent ${child}\\): shell`))
     const req = blocked.match(/needs permission (per_\w+)/)![1]!
     await h.call("opencode_respond", { id: "parent", request_id: req })
     await until(async () => fs.existsSync(path.join(repo, "child.txt")))
 
     // Sessions started outside this server are listed on request and adopted
     // with the cautious "ask" policy, never auto-approved by our defaults.
-    const outside = (await oc.session.create({ directory: repo, title: "outside" })).data!.id
+    const outside = (await oc.session.create({ location: { directory: repo }, title: "outside" })).id
     const listed = await h.call("opencode_status", { include_untracked: true })
     assert.match(listed, new RegExp(outside))
     assert.doesNotMatch(await h.call("opencode_status"), new RegExp(`${outside}\\) —`))
@@ -315,7 +315,7 @@ describe("opencode MCP server: core behaviour (real opencode, mock LLM)", { time
     assert.match(out, /linked node_modules/)
     assert.match(out, /setup `mkdir -p build && echo ready > build\/setup.txt` succeeded/)
     assert.match(out, /worktree, branch horde\/iso/)
-    assert.match(out, /Tools: .*bash/)
+    assert.match(out, /Tools: .*shell/)
     assert.doesNotMatch(out, /Tools: .*webfetch/)
     const dir = out.match(/dir: (\S+) \(worktree/)![1]!
     assert.ok(!dir.startsWith(repo), "worktree lives outside the repo")
@@ -452,7 +452,7 @@ describe("opencode MCP server: core behaviour (real opencode, mock LLM)", { time
       wait: true,
       timeout_seconds: 60,
     })
-    assert.match(outside, /Unable to write elsewhere\.txt/, "the agent is told the write failed")
+    assert.match(outside, /Permission denied: edit/, "the agent is told the write failed")
     assert.ok(!fs.existsSync(path.join(dir, "elsewhere.txt")), "the out-of-scope write was refused")
     await h.call("opencode_dispose", { id: "scoped", worktree: "discard" })
     // outside "ask": the out-of-scope edit comes to the caller even under the "allow" policy.
@@ -472,7 +472,17 @@ describe("opencode MCP server: core behaviour (real opencode, mock LLM)", { time
     const askDir = asking.match(/dir: (\S+) \(worktree/)![1]!
     assert.equal(fs.readFileSync(path.join(askDir, "elsewhere.txt"), "utf8"), "outside", "approved by the caller")
     await h.call("opencode_dispose", { id: "scoped-ask", worktree: "discard" })
-    await assert.rejects(h.call("opencode_spawn", { prompt: "x", scope: { paths: ["a/**"] } }), /scope needs isolation "worktree"/)
+    // Scope rules belong to the session, so they need no worktree: the shared checkout is confined too.
+    const shared = await h.call("opencode_spawn", {
+      prompt: 'CALL: write {"path": "elsewhere-shared.txt", "content": "outside"}',
+      name: "scoped-shared",
+      permissions: "allow",
+      scope: { paths: ["scoped/**"] },
+      wait: true,
+      timeout_seconds: 60,
+    })
+    assert.match(shared, /Permission denied: edit/)
+    assert.ok(!fs.existsSync(path.join(repo, "elsewhere-shared.txt")), "the out-of-scope write was refused")
   })
 
   test("gates: a failing check goes back to the agent, which fixes it; the caller only hears the outcome", async () => {
@@ -542,19 +552,17 @@ describe("opencode MCP server: core behaviour (real opencode, mock LLM)", { time
     const second = await board.assign(other.id)
     const chained = `${workerCommand(board.dir)} task ${other.id} ${second.attempt.token}; echo pwned`
     const blocked = await h.call("opencode_spawn", { prompt: `TOOL: ${chained}`, name: "chained", permissions: "ask", wait: true, timeout_seconds: 60 })
-    assert.match(blocked, /chained .*— NEEDS_INPUT[\s\S]*needs permission per_\w+: bash/)
+    assert.match(blocked, /chained .*— NEEDS_INPUT[\s\S]*needs permission per_\w+: shell/)
     const req = blocked.match(/needs permission (per_\w+)/)![1]!
     await h.call("opencode_respond", { id: "chained", request_id: req, decision: "reject" })
     assert.equal(board.task(other.id).attempts[0]!.seenAt, undefined, "the untrusted command never ran")
   })
 
-  test("context use shows in status; compaction where the server supports it", async () => {
+  test("context use shows in status; compaction summarizes and the agent carries on", async () => {
     const first = await h.call("opencode_spawn", { prompt: "remember the word kiwi", name: "long", wait: true, timeout_seconds: 60 })
     assert.match(first, /long .*— IDLE · 1 steps · .* · ctx 15\/100k \(0%\)/, first)
-    // OpenCode 1.19 cannot compact v2 sessions yet (503); when it can, the agent carries on from a summary.
-    const compacted = await h.call("opencode_compact", { id: "long" }).catch((err: Error) => err.message)
-    if (/cannot compact v2 sessions yet/.test(compacted)) assert.match(compacted, /dispose the agent keeping its worktree and spawn a new one/)
-    else assert.match(compacted, /long .*— IDLE · .* · ctx compacted/, compacted)
+    assert.match(await h.call("opencode_compact", { id: "long" }), /long .*— IDLE · .* · ctx compacted/)
+    assert.match(await h.call("opencode_message", { id: "long", message: "and now?", wait: true, timeout_seconds: 60 }), /Echo\[none\]: and now\?/)
     await h.call("opencode_spawn", { prompt: "SLOW", name: "busy-compact" })
     await assert.rejects(h.call("opencode_compact", { id: "busy-compact" }), /busy-compact is running; compact it once it is idle/)
     await h.call("opencode_interrupt", { id: "busy-compact" })

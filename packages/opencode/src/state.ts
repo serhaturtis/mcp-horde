@@ -69,8 +69,6 @@ export interface AgentRecord {
   questions: "user" | "ask" | "dismiss"
   worktree?: Worktree
   limits: Limits
-  /** Agent profile file we generated for this agent (removed on dispose). */
-  agentFile?: string
   createdAt: number
   owner?: Owner
   /** When the owner last confirmed it is alive (its heartbeat); a stale one means a dead owner. */

@@ -42,8 +42,8 @@ jobs:
       - run: npm run build
       - run: npm test
 
-  # OpenCode's v2 API is still moving: see breaking changes before users do. Never blocks.
-  test-opencode-dev:
+  # OpenCode moves fast: run against its latest release before the pin catches up. Never blocks.
+  test-opencode-latest:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     continue-on-error: true
@@ -58,13 +58,13 @@ jobs:
           git config --global user.name "CI"
           git config --global user.email "ci@example.com"
       - run: npm ci
-      - run: npm install --no-save opencode-ai@dev @opencode-ai/sdk@dev -w @mcp-horde/opencode
-      - run: npm ls opencode-ai @opencode-ai/sdk -w @mcp-horde/opencode || true
+      - run: npm install --no-save @opencode/cli@latest @opencode/client@latest -w @mcp-horde/opencode
+      - run: npm ls @opencode/cli @opencode/client -w @mcp-horde/opencode || true
       - run: npm run build
       - run: npm test
 
-  # The real thing: OpenCode's free models (no account) run the parallel-agents and horde-loop
-  # scenarios. Real models and a rate-limited free tier vary run to run, so this never blocks.
+  # The real thing: DeepSeek Flash runs the parallel-agents and horde-loop scenarios (a few cents
+  # a run, key in the DEEPSEEK_API_KEY secret). Real models vary run to run, so this never blocks.
   test-live:
     runs-on: ubuntu-latest
     timeout-minutes: 40
@@ -83,4 +83,5 @@ jobs:
       - run: npm run build
       - run: npm run test:e2e -w @mcp-horde/opencode
         env:
-          HORDE_E2E_MODEL: free
+          HORDE_E2E_MODEL: deepseek/deepseek-flash
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}

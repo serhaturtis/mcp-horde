@@ -24,7 +24,7 @@ The arrangement breaks in three places, and every server exists to fix one of th
 4. **Cheap first, escalate on evidence.** A task starts on the cheapest tier that could plausibly do it. Two failed gates escalate the tier. The last tier is the orchestrator doing it itself.
 5. **One source of truth, shared by both sides.** Orchestrator and workers see the same task graph, findings and memory, through the same server in two modes.
 6. **No daemons, no network.** State is files with atomic writes and cross-process locks (the scheme `opencode` already uses). Every server is a stdio MCP. This keeps Windows, macOS and Linux identical and makes attach-mode and multi-session setups work without a broker.
-7. **Harness-agnostic, OpenCode-specific, v2 API only.** Tools work from any MCP client. Worker integration assumes OpenCode (its config, its agent profiles, its permission system). All server calls go through OpenCode's v2 API (`/api/*`, `@opencode-ai/sdk/v2`). The legacy API is used only where v2 has no equivalent, from one adapter module, with each use marked for removal (§3.1).
+7. **Harness-agnostic, OpenCode-specific, OpenCode 2 only.** Tools work from any MCP client. Worker integration assumes OpenCode (its config, its agents, its permission system). All server calls go through OpenCode 2's API (`/api/*`, `@opencode/client`) (§3.1).
 8. **Reuse the agent runtime for model access.** One-shot model calls go through OpenCode too (its providers, auth and catalog), so there is exactly one place where models are configured.
 
 ## 3. The system
@@ -43,9 +43,9 @@ The arrangement breaks in three places, and every server exists to fix one of th
      │  (shared, one per machine, or private per MCP process)
      │  sessions = agents, each in its own git worktree on branch horde/<name>
      ▼
-   worker model (DeepSeek …) with tools: bash, edit, read …
-     └── worker-side access through bash: the `horde` CLI (board, verify, context);
-         the fleet auto-approves exactly those commands (v2 runners offer no MCP tools yet)
+   worker model (DeepSeek …) with tools: shell, edit, read …
+     └── worker-side access through the shell: the `horde` CLI (board, verify, context);
+         the fleet auto-approves exactly those commands (agents get no injected MCP tools)
                                               │
                                               ▼
                       ~/.local/state/mcp-horde/board/<repo>-<hash>/   (board state: tasks, findings, memory, locks, events)
@@ -64,42 +64,37 @@ plugins/horde: .mcp.json + the `horde` skill + every server above, bundled (no c
 
 `opencode` depends on `board` since M4 (`opencode_spawn { task }` assigns the attempt, briefs the worker and records its workspace, model, cost and state on the board). The orchestrator still composes everything else.
 
-### 3.1 API policy: the v2 series
+### 3.1 API policy: OpenCode 2
 
-The target is OpenCode's v2 API: the `/api/*` endpoints served by `opencode serve` and typed by `@opencode-ai/sdk/v2`. The v2 surface of the current release (1.19.3) and of today's `dev` build are identical, so there is no newer shape to chase yet; the policy is about staying on it as it grows.
+The target is OpenCode 2: the `/api/*` endpoints served by `opencode serve`, typed by `@opencode/client` (the CLI is `@opencode/cli`; the old `opencode-ai` package stops at 1.19.3). The version is pinned (2.1.1) and CI also runs the suite against the latest release in a non-blocking job, so API changes show up before users hit them.
 
-What v2 provides that the horde uses or will use: sessions (create with `agent`, `model`, `location`; list; get; active; interrupt; switch model; switch agent; prompt with `steer`/`queue` delivery; durable history and per-session events; messages), permissions and questions (per-session list and reply, global request lists, **saved permission rules** list and remove), `session.compact` and `session.context` (context management for long-running workers), `session.revert.stage/clear/commit` (undo a turn's file changes), `model`, `provider`, `agent`, `skill`, `command`, `fs.read/list/find`, `health`, and the SSE event stream.
+What the horde uses: sessions (create with `location`, `title`, `model`, `agent` and the session's own `permissions` rules; get; list; active; remove; interrupt; switch model and agent; prompt with `steer`/`queue` delivery; inbox; compact; revert stage/commit), messages, permission requests (per-session list and reply, saved rules list and remove), forms (the question tool's questions), `model`, `agent`, `location`, `server.info` (health and version), `debug.location.evict` (release a directory before a worktree is deleted) and the SSE event stream.
 
-What v2 does not provide, and how each case is handled:
+How each need is met:
 
-| Need | v2 status | Handling |
+| Need | OpenCode 2 | Handling |
 | --- | --- | --- |
-| health check | `GET /api/health` | use it; the current `global.health` call is replaced |
-| rename a session (`horde: <name>` titles) | missing | legacy `session.update` through the adapter; cosmetic, dropped if it ever breaks |
-| delete a session | missing | legacy `session.delete` through the adapter; without it, `opencode_dispose` leaves the session in history (acceptable degradation) |
-| release a directory before deleting a worktree | missing (`instance.dispose` is legacy) | legacy through the adapter, best effort; removal retries cover the failure case |
-| one-shot call with no tools, structured output | per-call `tools`/`format` exist only on the legacy prompt | **not used.** One-shot calls run as a v2 session with a tool-less agent profile; JSON is requested in the prompt and validated client-side (§4.2c) |
-| worktrees | `/experimental/project/{id}/copy` (experimental, not `/api`) | keep the horde's own worktrees (baseline commits, links, setup, scoped profiles); revisit when project copies reach `/api` |
-| block until a session settles | `GET /api/session/{id}/wait` exists but returns 503 in 1.19 | keep polling history plus the event stream; switch when it works |
+| health and version | `GET /api/info` | used; `/api/health` no longer exists |
+| conversation state | no replayable event log (`session.log` reports `log.synced` only); messages are the projection | the tracker rebuilds turns from messages, re-reading only what follows the last `idle` marker (§3.2); events only wake waiters and show activity |
+| per-agent rules (profiles, scopes, one-shot asks) | `permissions` on `session.create` | used; no agent files, no fresh-directory requirement |
+| one-shot call with no tools | a session whose rules deny `*` offers no tools at all | used (§4.2c) |
+| worktrees | `/api/worktree` | keep the horde's own worktrees (baseline commits, links, setup); revisit later |
+| block until a session settles | `/api/experimental/session/{id}/wait` (experimental) | keep polling plus the event stream |
 
-Every legacy call lives in `packages/opencode/src/compat.ts`, with the v2 gap it covers named in a comment. A unit test fails if any other source file touches the legacy client, so the list cannot grow silently. CI runs the suite against the pinned `opencode-ai` release and, in a non-blocking job, against the `dev` tag, so v2 changes show up before users hit them.
+### 3.2 Verified facts about OpenCode 2.1.1 this design relies on
 
-### Verified facts about OpenCode 1.19.3 this design relies on
+Checked against the pinned binary with a scripted mock model and against DeepSeek Flash during the port:
 
-Checked against the installed binary and its SDK types during this pass:
-
-- `OPENCODE_CONFIG_CONTENT` (inline JSON) **merges** with the project's `opencode.json`: the project's providers and the injected `mcp` entries are both present in the resolved config. **Agents defined in it do not register** (the agent list ignores them), while agents in the project's `opencode.json` or `.opencode/agent/*.md` do. So MCP mounts can be injected into the server we start; agent profiles cannot.
-- `mcp` config supports `type: "local"` with `command`, `cwd`, `environment` (OpenCode spawns the stdio server) and `type: "remote"` with headers.
-- Agent config supports `tools: {name: boolean}`, `maxSteps`, `prompt`, `mode`, and `permission` with **glob maps per action**: `edit: {"src/auth/**": "allow", "*": "deny"}`.
-- The v2 prompt body is `{prompt: {text, files, agents}, delivery, resume}`: no per-call tools, system prompt or output format. Those belong to agent profiles.
-- Agent `.md` files load when OpenCode first opens a directory (already relied on by `opencode` for worktree profiles).
-- **OpenCode's free models (live CI job, October 2026).** The `opencode` provider lists 42 free models; only 5 use an API the v2 runner can run (MiniMax M3/M2.5/M2.1, Qwen3.6 Plus, Muse Spark). The rest, including `deepseek-v4.1-flash-free`, `big-pickle` and `grok-code`, go through the native gateway API (§4.2 notes). A listed model can already be retired (HTTP 410 `ModelDeprecated`), so the live suite pings candidates and keeps the first that answers. Muse Spark 1.2 ran the parallel-agents scenario and the full loop (brief → worktree → gate pass on round 1 → report through the CLI) in about 30 s. Its report claimed `testsAdded: ["math.test.js"]`, a file it never touched: reports need checking against the diff (§10).
-- **OpenCode's free tier and tool-less sessions (live CI job).** The free tier answers 403 `FreeTierError` ("can only be used from within OpenCode") to a session whose agent has every tool off, and accepts the same model with tools present. `opencode_ask` therefore falls back, on that error only, to a second profile that keeps the tools but denies edit, bash and webfetch (and runs under the "deny" policy); reading files stays possible there.
-- **A tool-less profile (M4, 1.19.3).** An agent file with `tools: { "*": false }` offers the model no tools at all, so `opencode_ask` needs no tool enumeration. Its sessions run in `<project>/.opencode/horde-ask/` (excluded from git): a directory OpenCode has not opened, so the profile loads, and inside the project, so the project's providers apply.
-- **Scope through a profile (M4, 1.19.3).** An agent file's `permission: { edit: { "*": "deny", "scoped/**": "allow" } }` confines the write/edit/patch tools: inside writes succeed, outside ones fail with "Unable to write <file>" (the model sees that message). The v2 `write` tool takes `path` (repository-relative works). With `"ask"` the outside edit arrives as an `edit` permission request.
-- **Compaction and revert (probed in M4, 1.19.3).** `/api/session/{id}/compact` answers 503 "Session compact is not available yet", and the legacy `session.summarize` returns OK without touching the v2 conversation (the next request still carries every message), so there is no working compaction for v2 sessions; `opencode_compact` says so and works unchanged once the endpoint does. `session.revert.stage { messageID, files: true }` + `commit` works: it keeps everything up to and including that message, removes the rest and restores the files the removed turns changed (the staged diff lists them). Undoing a turn therefore stages at the message just before the turn's prompt. Messages list newest first by default; `cursor` cannot be combined with `order`.
-- **The v2 session runner does not offer MCP tools to agents** (1.19.3 and `dev` 0.0.0-dev-202610161232, probed in M2). An injected `mcp` local server does connect (`/mcp` reports `connected`), OpenCode starts **one process per project directory** lazily on its first request, with that directory as the working directory and the configured `environment` merged over the inherited one, and the **legacy** runner offers its tools (`horde_echo`). The v2 runner offers only built-in tools (and no `task` subagent tool either). So worker-side horde access goes through `bash` (§4.4), and a canary test watches for the day v2 gains MCP tools.
-- OpenCode's v2 runner reports every step as `cost: 0`; `opencode` prices steps from the catalog. Cost figures across the horde come from that estimate.
+- **The API needs a password.** Without `OPENCODE_SERVER_PASSWORD` only `/api/info` answers; everything else is 401. Paths outside `/api` serve the web app (HTML, 200), so a health check must use `/api/info`. `opencode serve` prints `server listening on <url>`. A missing session is a 404 `SessionNotFoundError`.
+- **A run is a prompt, steps, and an `idle` marker.** Prompts go through an inbox (`session.prompt` returns the inbox item; the user message keeps its id). A run ends with an `idle` message whose `outcome` is `succeeded`, `failed` or `interrupted`, with a structured error (message, provider status). A prompt steered or queued while a run is going is delivered inside the same run, before its `idle` marker. Assistant messages carry cost, tokens, finish and their file snapshot.
+- **Config from OpenCode 1 is translated** (`provider`, `permission`, `variants`). Models without variants get default `low`/`medium`/`high` ones unless their config sets `variants: {}`. The default permission rules allow everything; OpenCode asks only where a rule says `ask`.
+- **Agent markdown files in the OpenCode 1 format are not loaded** (`.opencode/agent/*.md` nor `.opencode/agents/*.md`). Session rules replace them: rules are matched last-first after the agent's; a session denying `*` is offered no tools; denying `*` and allowing `read` and `grep` offers exactly those; `edit` denied outside a glob makes an outside write fail with "Permission denied: edit" (with `ask`, it becomes an `edit` permission request).
+- **Tools:** `shell` (no longer `bash`), `edit`, `write` (takes `path`), `read`, `glob`, `grep`, `question`, `skill`, `subagent`, `webfetch`, `websearch`, `execute`. A shell permission request has action `shell`, the command as its resource and the proposed "always" pattern in `save`.
+- **Questions are forms** (`frm_…`): one field per question (`description` is the question, `options` have values and labels, `custom` allows free text); the reply maps field keys to values.
+- **Revert:** `revert.stage { messageID, files: true }` undoes that message and everything after it (OpenCode 1.19 kept it), and restores the files; the staged diff lists them. Undoing a turn therefore stages at the turn's own prompt.
+- **Compaction works:** it runs as an inbox item and leaves a `compaction` message, `completed` or `failed` (a summary that does not follow OpenCode's template fails).
+- **MCP:** a server injected through `OPENCODE_CONFIG_CONTENT` connects, but its tools are not offered to agents directly (a canary test watches this), so workers keep the CLI (§4.2e).
+- **Live:** DeepSeek Flash ran the parallel-agents scenario, a checked JSON answer and the full loop (brief → worktree → gate pass → report through the CLI) in about 30 s.
 
 ## 4. Package designs
 
@@ -132,15 +127,13 @@ Gates only run when the agent is idle, so they never race the agent's edits. Out
 ```
 scope: { paths: string[], outside: "deny" | "ask" (default "deny") }
 ```
-Requires `isolation: "worktree"` (the only place a per-agent profile can be installed). The generated profile gets `permission.edit` as a glob map: scope paths `allow`, `*` as `outside`. With `"ask"`, an out-of-scope edit surfaces as a permission request the orchestrator (or the human) answers; with `"deny"`, OpenCode refuses it and the model is told why. `verify_audit` independently reports out-of-scope changes in the diff, so an agent without a profile is still caught after the fact. (`edit` covers OpenCode's edit/write/patch tools; `bash` can still write files. The audit is the backstop for that; a `bash` glob map that denies `>`/`tee`/`sed -i` is not attempted because it is unenforceable in general.)
+The session gets `edit` rules: `*` as `outside`, then the scope paths `allow` (the last match wins). Works with or without a worktree. With `"ask"`, an out-of-scope edit surfaces as a permission request the orchestrator (or the human) answers; with `"deny"`, OpenCode refuses it and the model is told why. `verify_audit` independently reports out-of-scope changes in the diff, so an agent without a scope is still caught after the fact. (`edit` covers OpenCode's edit/write/patch tools; shell commands can still write files. The audit is the backstop for that; a `shell` rule set that denies `>`/`tee`/`sed -i` is not attempted because it is unenforceable in general.)
 
 **c. One-shot calls (`opencode_ask`).**
 ```
 opencode_ask { prompt, model?, variant?, files?, schema?: JSONSchema } → text | JSON
 ```
-Runs as a v2 session in a horde-owned directory (`<project>/.opencode/horde-ask-3/`, excluded from git; versioned so a server that cached an older profile never reuses it) that carries one agent profile, `horde-ask`: every tool disabled, a fixed system prompt ("answer directly; no tools are available"). The directory never changes, so OpenCode loads the profile once. The call creates a session there with `agent: "horde-ask"` and the requested model, sends one prompt, waits for the single step through history, returns the text with its cost, and deletes the session (adapter). With `schema`, the prompt asks for JSON matching the schema, the reply is parsed and validated client-side, and one retry with the validation error is attempted before giving up. No agent loop, no worktree. Uses: classification, summarizing a long log or diff for the orchestrator, judging between candidates, drafting a brief. Best-of-N is `opencode_spawn` ×N + `verify` + `opencode_ask` as judge; the skill describes it rather than a dedicated tool.
-
-To verify before building: whether `tools: {"*": false}` is honoured in a profile (otherwise the profile enumerates every tool id from `/api/agent`'s build agent).
+Runs as a session in the project whose rules deny every tool, so the model is offered none; the instruction to answer directly travels with the prompt. The call creates the session with the requested model, sends one prompt, waits for the answer, returns the text with its cost, and deletes the session. OpenCode's free tier refuses sessions without tools (403 `FreeTierError`), so on that error only a second rule set keeps `read`, `grep` and `glob` (and the "deny" policy still refuses anything that asks). With `schema`, the prompt asks for JSON matching the schema, the reply is parsed and validated client-side, and one retry with the validation error is attempted before giving up. No agent loop, no worktree. Uses: classification, summarizing a long log or diff for the orchestrator, judging between candidates, drafting a brief. Best-of-N is `opencode_spawn` ×N + `verify` + `opencode_ask` as judge; the skill describes it rather than a dedicated tool.
 
 **f. Context management (`opencode_compact`, context in status).** Long tasks on small-context models hit the window. `session.context` gives the usage; the snapshot shows it (`ctx 71%`) so the orchestrator can see a worker about to lose its thread; `opencode_compact` calls `session.compact` on an idle agent before messaging it again. The skill's rule: compact instead of re-spawning when the task is mid-way and the worktree holds good work.
 
@@ -150,11 +143,11 @@ To verify before building: whether `tools: {"*": false}` is honoured in a profil
 
 **d. `opencode_worktree action: "sync"`.** Merges the base branch into the agent's branch inside the agent's worktree, so conflicts with other merged work land where a cheap model (with a gate) can resolve them, instead of at the orchestrator's merge. Refused while the agent is running; after a sync the skill says to message the agent "resolve the conflicts and run the gate".
 
-**e. Worker access to the horde (revised in M2).** v2 runners offer no MCP tools (§3.1), so workers reach the board, verify and context through a `horde` CLI they run with `bash`; the brief contains the exact command. The fleet auto-approves a `bash` permission request only when the command is exactly that CLI with plain arguments (a shell-word check rejects `;`, `&&`, `||`, pipes, redirects, `$`, backticks and newlines anywhere outside single quotes), whatever the agent's policy, so board plumbing never prompts the human and a hijacked worker cannot chain anything onto a trusted command. Since the review pass the command must also name the board of the agent's own repository (so a worker cannot create board files elsewhere or read another repository's notes), quoted text may hold no control characters, and agents adopted from a human's TUI get no auto-approval at all. The rest of this item describes the MCP route, not built, kept for when v2 runners load MCP tools:
+**e. Worker access to the horde (revised in M2).** Agents are not offered injected MCP tools (§3.2), so workers reach the board, verify and context through a `horde` CLI they run with the shell tool; the brief contains the exact command. The fleet auto-approves a `shell` permission request only when the command is exactly that CLI with plain arguments (a shell-word check rejects `;`, `&&`, `||`, pipes, redirects, `$`, backticks and newlines anywhere outside single quotes), whatever the agent's policy, so board plumbing never prompts the human and a hijacked worker cannot chain anything onto a trusted command. Since the review pass the command must also name the board of the agent's own repository (so a worker cannot create board files elsewhere or read another repository's notes), quoted text may hold no control characters, and agents adopted from a human's TUI get no auto-approval at all. The rest of this item describes the MCP route, not built, kept for when OpenCode offers agents MCP tools:
 
 When `opencode` starts the shared or private server it sets `OPENCODE_CONFIG_CONTENT` with `mcp` entries for the worker-side horde servers that are installed and enabled (`HORDE_WORKER_TOOLS=board,context,verify`, default: whichever are resolvable next to this package). Each is `type: "local"` with `command: [process.execPath, <bin>, "--worker"]` and `environment` carrying the state dir. In attach mode the server is the user's; the README gives the `opencode.json` snippet. The injected config never changes agents or permissions (the shared server is also the human's TUI server).
 
-Also built: the snapshot shows a `task:` line when a board binding exists (§10); the running limit is `opencode.maxRunning` in `horde.json`, with `HORDE_OPENCODE_MAX_RUNNING` as override (default 8, 0 = unlimited); a task-bound spawn without `model` takes the model and variant of the task's tier; `opencode_worktree merge` runs the project's checks (no audit) in the main checkout after merging and reports the verdict (`check: false` skips it). The health check stays in `compat.ts`: v2's `/api/health` reports liveness only, not the version.
+Also built: the snapshot shows a `task:` line when a board binding exists (§10); the running limit is `opencode.maxRunning` in `horde.json`, with `HORDE_OPENCODE_MAX_RUNNING` as override (default 8, 0 = unlimited); a task-bound spawn without `model` takes the model and variant of the task's tier; `opencode_worktree merge` runs the project's checks (no audit) in the main checkout after merging and reports the verdict (`check: false` skips it).
 
 ### 4.3 `@mcp-horde/verify`
 
@@ -353,10 +346,10 @@ Rules that keep this true: every tool takes a `budget` argument with a sane defa
 
 ## 10. Gaps found in this pass, and the decisions
 
-1. **How do workers get horde tools?** Probed in M2: injected MCP servers connect, one process per project directory, but **v2 runners do not offer MCP tools** (release and `dev`). Decided: a `horde` CLI run through `bash`, auto-approved by the fleet only for exact, metacharacter-free invocations (§4.2e). Same library as the MCP servers, so moving to MCP mounts later changes the transport only. A canary test asserts the current behaviour so the `dev`-tag CI job reports when it changes.
+1. **How do workers get horde tools?** Probed in M2 and again on OpenCode 2.1.1: injected MCP servers connect, one process per project directory, but **agents are not offered their tools**. Decided: a `horde` CLI run through the shell tool, auto-approved by the fleet only for exact, metacharacter-free invocations (§4.2e). Same library as the MCP servers, so moving to MCP mounts later changes the transport only. A canary test asserts the current behaviour so the `dev`-tag CI job reports when it changes.
 2. **How does a worker identify itself?** No session identity reaches an MCP server OpenCode spawns. Decided: task id + token quoted by the worker, carried in the brief; reduced worker tool set; acceptance only on the orchestrator side.
 3. **Call overhead for the orchestrator.** Five calls per task is a lot. Decided: the gate loop lives inside `opencode` (no orchestrator involvement for retries); `board_brief` composes context and memory in one call; later, `opencode_spawn { task }` fetches the brief and records the assignment itself, cutting a task to three calls (`board_plan`, `opencode_spawn`, `opencode_wait` + `board_accept`).
-4. **Scope enforcement.** `edit` permission globs in a per-agent profile (worktrees only) plus the audit as backstop. `bash` writes cannot be fenced reliably; accepted and documented.
+4. **Scope enforcement.** `edit` rules on the agent's session plus the audit as backstop. Shell writes cannot be fenced reliably; accepted and documented.
 5. **Test time.** Related tests in the worker gate, full suite at integration, verdict cache so polling never re-runs anything.
 6. **Merge conflicts between parallel workers.** Scopes, locks, `worktree sync` so the cheap model resolves conflicts under a gate; the project's checks on the main checkout after every merge (built: `opencode_worktree merge`).
 7. **Log compaction without a model.** Per-runner extractors with exact counts and a tail fallback; `opencode_ask` with a cheap model as the optional second stage.
@@ -383,6 +376,7 @@ A full review after M5 fixed, among others: gates that could pass with nothing r
 - ~~How reliably cheap models return valid JSON when asked in the prompt~~ (answered in M4: usually on the first try with the schema in the prompt; one retry with the validation error covers the rest in the live suite).
 - ~~`session.compact` on v2 sessions; `session.revert.stage` semantics~~ (answered in M4: compaction answers 503 "not available" on 1.19.3 and the legacy summarize does not reach v2 sessions, so `opencode_compact` explains the workaround; `revert.stage { messageID, files: true }` keeps everything up to and including that message, and file snapshots land shortly after a step ends).
 - ~~`permission.edit` glob semantics~~ (answered in M4: globs are relative to the project root and the v2 `write`/`patch` tools honour the same map).
+- ~~The same questions on OpenCode 2~~ (answered in the port to 2.1.1, §3.2: compaction works; revert undoes the given message too; session rules replace agent files; MCP tools still do not reach agents).
 - ~~Whether `web-tree-sitter` WASM grammars load acceptably fast~~ (answered in M5: the runtime starts in ~30 ms and all nine grammars load in ~50 ms; a 90 KB TypeScript file parses in ~50 ms).
 
 Each goes into a `probe/` script in the relevant package, like the probes used while building `opencode`, and becomes an integration test once the behaviour is confirmed.

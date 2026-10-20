@@ -7,15 +7,14 @@ import os from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 import { killTree, pidAlive } from "@mcp-horde/core"
-import { createOpencodeClient, type OpencodeClient, type V2Event } from "@opencode-ai/sdk/v2"
-import { serverVersion } from "./compat.js"
+import { OpenCode, type OpenCodeClient } from "@opencode/client"
 import type { Config } from "./config.js"
 import type { ServerRecord, Store } from "./state.js"
 
 /** The shared-server record; `username` is absent in records written before it was stored. */
 
 /** OpenCode versions this server was tested against. Others work but get a warning. */
-export const TESTED_OPENCODE = { major: 1, minor: 19 }
+export const TESTED_OPENCODE = { major: 2, minor: 1 }
 
 export interface ServerInfo {
   url: string
@@ -42,7 +41,7 @@ export class Backend {
   private readonly abort = new AbortController()
 
   private constructor(
-    readonly client: OpencodeClient,
+    readonly client: OpenCodeClient,
     readonly info: ServerInfo,
     private readonly proc?: ChildProcess,
   ) {
@@ -79,7 +78,7 @@ export class Backend {
 
     if (config.serverMode === "shared") {
       const bin = resolveBinary(config.bin)
-      const { client, info } = await store.lock("server", async (): Promise<{ client: OpencodeClient; info: ServerInfo }> => {
+      const { client, info } = await store.lock("server", async (): Promise<{ client: OpenCodeClient; info: ServerInfo }> => {
         const known: ServerRecord | undefined = store.server // read fresh: another process may have started one
         if (known) {
           // The server checks the username it was started with, which may differ from ours.
@@ -156,12 +155,10 @@ export class Backend {
     )
   }
 
-  private static async ready(client: OpencodeClient, info: ServerInfo, config: Config, proc?: ChildProcess) {
+  private static async ready(client: OpenCodeClient, info: ServerInfo, config: Config, proc?: ChildProcess) {
     const [major, minor] = info.version.split(".").map(Number)
     if (info.version !== "unknown" && (major !== TESTED_OPENCODE.major || minor !== TESTED_OPENCODE.minor)) {
-      info.warnings.push(
-        `opencode ${info.version} is untested (tested: ${TESTED_OPENCODE.major}.${TESTED_OPENCODE.minor}.x). The v2 API is still evolving; report issues.`,
-      )
+      info.warnings.push(`opencode ${info.version} is untested (tested: ${TESTED_OPENCODE.major}.${TESTED_OPENCODE.minor}.x); report issues.`)
     }
     // A freshly started server answers with empty catalogs until it has
     // loaded the project, which would make model validation fail spuriously.
@@ -176,10 +173,8 @@ export class Backend {
     while (!this.closed) {
       let received = false
       try {
-        // The SDK swallows connection errors and just ends the stream, so
-        // success is judged by whether any event arrived.
-        const sub = await this.client.v2.event.subscribe({ signal: this.abort.signal, sseMaxRetryAttempts: 1 })
-        for await (const event of sub.stream) {
+        // A stream that ends without delivering anything counts as a failure, like a refused connection.
+        for await (const event of this.client.event.subscribe({ signal: this.abort.signal })) {
           if (this.closed) return
           if (!received) {
             received = true
@@ -188,7 +183,7 @@ export class Backend {
             failures = 0
           }
           try {
-            this.events.emit("event", event as V2Event)
+            this.events.emit("event", event)
           } catch {
             // A listener bug must not tear down the stream.
           }
@@ -270,15 +265,9 @@ function forgetShared(store: Store, known: ServerRecord) {
   fs.rmSync(passwordFilePath(store.dir, "shared", known.url), { force: true })
 }
 
-/** Whether the recorded shared server answers its (v2) health check with its password; never starts one. */
+/** Whether the recorded shared server answers with its password; never starts one. */
 export async function sharedServerAlive(config: Config, known: ServerRecord, timeoutMs = 2_000): Promise<boolean> {
-  const client = connect(known.url, known.username ?? config.username, known.password)
-  try {
-    const res = await client.v2.health.get({ signal: AbortSignal.timeout(timeoutMs) })
-    return res.data?.healthy === true
-  } catch {
-    return false
-  }
+  return (await probeHealth(connect(known.url, known.username ?? config.username, known.password), timeoutMs)).ok
 }
 
 export function isLoopback(host: string): boolean {
@@ -287,10 +276,10 @@ export function isLoopback(host: string): boolean {
   return net.isIPv4(h) && h.startsWith("127.")
 }
 
-function connect(url: string, username: string, password?: string): OpencodeClient {
+function connect(url: string, username: string, password?: string): OpenCodeClient {
   const headers: Record<string, string> = {}
   if (password) headers.Authorization = `Basic ${Buffer.from(`${username}:${password}`).toString("base64")}`
-  return createOpencodeClient({ baseUrl: url, headers })
+  return OpenCode.make({ baseUrl: url, headers })
 }
 
 interface Probe {
@@ -302,25 +291,23 @@ interface Probe {
   reason: string
 }
 
-async function probeHealth(client: OpencodeClient, timeoutMs = 5_000): Promise<Probe> {
+async function probeHealth(client: OpenCodeClient, timeoutMs = 5_000): Promise<Probe> {
   try {
-    const res = await client.v2.health.get({ signal: AbortSignal.timeout(timeoutMs) })
-    if (res.data?.healthy) {
-      // v2 health has no version; it only matters for the tested-version warning.
-      const version = (await serverVersion(client, timeoutMs)) ?? "unknown"
-      return { ok: true, version, reachable: true, timedOut: false, reason: "" }
-    }
-    const status = res.response?.status
+    const info = await client.server.info({ signal: AbortSignal.timeout(timeoutMs) })
+    if (typeof info?.version === "string") return { ok: true, version: info.version, reachable: true, timedOut: false, reason: "" }
+    return { ok: false, version: "", reachable: true, timedOut: false, reason: "not an OpenCode 2 server (no version in /api/info)" }
+  } catch (err) {
+    const e = err as { name?: string; reason?: string; cause?: unknown }
+    // The client throws a ClientError for transport failures and undeclared statuses, and the
+    // server's own tagged error (e.g. UnauthorizedError) for declared ones.
+    const transport = e.name === "ClientError" && e.reason === "Transport"
     return {
       ok: false,
       version: "",
-      reachable: status !== undefined,
-      // The SDK reports a timed-out request as an error result, not by throwing.
-      timedOut: status === undefined && isTimeout(res.error),
-      reason: status === 401 ? "unauthorized (wrong OPENCODE_SERVER_PASSWORD or USERNAME?)" : `HTTP ${status ?? "error"}: ${describe(res.error)}`,
+      reachable: !transport,
+      timedOut: transport && isTimeout(e.cause),
+      reason: e.name === "UnauthorizedError" ? "unauthorized (wrong OPENCODE_SERVER_PASSWORD or USERNAME?)" : describe(err),
     }
-  } catch (err) {
-    return { ok: false, version: "", reachable: false, timedOut: isTimeout(err), reason: describe(err) }
   }
 }
 
@@ -329,17 +316,17 @@ function isTimeout(err: unknown): boolean {
   return name === "TimeoutError" || name === "AbortError" || /timed? ?out|aborted due to timeout/i.test(describe(err))
 }
 
-async function health(client: OpencodeClient, url: string): Promise<string> {
+async function health(client: OpenCodeClient, url: string): Promise<string> {
   const probe = await probeHealth(client)
   if (!probe.ok) throw new Error(`OpenCode server at ${url} is not reachable: ${probe.reason}`)
   return probe.version
 }
 
-async function waitForCatalog(client: OpencodeClient, directory: string) {
+async function waitForCatalog(client: OpenCodeClient, directory: string) {
   const deadline = Date.now() + 20_000
   while (Date.now() < deadline) {
-    const res = await client.v2.agent.list({ location: { directory } }, { signal: AbortSignal.timeout(5_000) }).catch(() => undefined)
-    if (res?.data?.data.length) return
+    const res = await client.agent.list({ location: { directory } }, { signal: AbortSignal.timeout(5_000) }).catch(() => undefined)
+    if (res?.data.length) return
     await new Promise((r) => setTimeout(r, 300))
   }
 }
@@ -396,7 +383,7 @@ async function freePort(): Promise<number> {
   })
 }
 
-const LISTENING = /opencode server listening on\s+(https?:\/\/\S+)/
+const LISTENING = /server listening on\s+(https?:\/\/\S+)/
 const isWindows = process.platform === "win32"
 
 /**

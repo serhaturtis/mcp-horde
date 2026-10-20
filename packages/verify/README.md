@@ -120,4 +120,4 @@ claude mcp add verify -- node /path/to/mcp-horde/packages/verify/dist/index.js
 
 - **Related tests are found by naming and static imports**, not coverage data. A test that reaches the changed code only at run time (dynamic `import(variable)`, dependency injection by name, a subprocess) is not selected; that is why gates say "related tests only" and the full suite still runs after merging.
 - **The audit reads lines, not syntax.** It flags suppressions and skipped tests by pattern, so an unusual spelling can slip through or a harmless string can match. Blocking categories are chosen to be the ones where false positives are rare.
-- **`bash` can write anywhere.** Scope is checked after the fact from the diff; preventing out-of-scope edits up front is the job of the agent's permission profile.
+- **Shell commands can write anywhere.** Scope is checked after the fact from the diff; preventing out-of-scope edits up front is the job of the agent's permission rules.

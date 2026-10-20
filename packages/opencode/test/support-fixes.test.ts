@@ -6,24 +6,16 @@ import os from "node:os"
 import path from "node:path"
 import { after, describe, test } from "node:test"
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
-import type { PermissionV2Request } from "@opencode-ai/sdk/v2"
-import { ASK_GUARDED_PROFILE, unsupportedSchema, validate } from "../src/ask.js"
+import type { PermissionRequest } from "@opencode/client"
+import { ASK_GUARDED_PROFILE, ASK_PROFILE, unsupportedSchema, validate } from "../src/ask.js"
 import { passwordFilePath, stopServer } from "../src/backend.js"
 import { type Config, inProject, loadConfig } from "../src/config.js"
-import type { Snapshot } from "../src/fleet.js"
+import { profileRules, type Snapshot } from "../src/fleet.js"
 import { makeHooks, permissionMessage } from "../src/hooks.js"
 import { Store } from "../src/state.js"
 import { attachCommand, renderSnapshot } from "../src/tools.js"
-import { apply, currentTurn, type DurableEvent, emptyTrack } from "../src/tracker.js"
 import { anchoredPattern, commitAll, createWorktree, excludeFromGit, removeWorktree, syncWorktree, workStart } from "../src/worktree.js"
 import { connect, git, pkg } from "./harness.js"
-
-let seq = 0
-const ev = (type: string, data: Record<string, unknown> = {}): DurableEvent => ({
-  type: `session.next.${type}`,
-  durable: { seq: ++seq },
-  data: { timestamp: 1000 + seq, sessionID: "ses_x", ...data },
-})
 
 const tmps: string[] = []
 const tmpDir = () => {
@@ -45,7 +37,7 @@ const repo = () => {
   return dir
 }
 
-const perm: PermissionV2Request = { id: "per_1", sessionID: "ses_x", action: "bash", resources: ["npm install x"], save: ["npm install *"] }
+const perm: PermissionRequest = { id: "per_1", sessionID: "ses_x", action: "shell", resources: ["npm install x"], save: ["npm install *"] }
 
 describe("permission requests", () => {
   test("the dialog and the snapshot show what 'always' saves", () => {
@@ -64,7 +56,7 @@ describe("permission requests", () => {
       pending: { permissions: [perm], questions: [] },
       unreported: [],
     } as unknown as Snapshot
-    assert.match(renderSnapshot(snap), /needs permission per_1: bash \["npm install x"\] \(always saves \["npm install \*"\]\)/)
+    assert.match(renderSnapshot(snap), /needs permission per_1: shell \["npm install x"\] \(always saves \["npm install \*"\]\)/)
   })
 
   test("only an explicit once/always approves; anything else goes to the caller", async () => {
@@ -93,69 +85,6 @@ describe("permission requests", () => {
   })
 })
 
-describe("tracker fixes", () => {
-  test("a prompt after a turn that died before running a step starts a new turn", () => {
-    const t = emptyTrack()
-    apply(t, ev("prompted", { messageID: "msg_1", prompt: { text: "first" } }))
-    apply(t, ev("prompt.admitted", { messageID: "msg_2", prompt: { text: "second" } }))
-    apply(t, ev("prompted", { messageID: "msg_2", prompt: { text: "second" } }))
-    assert.equal(t.turns.length, 2)
-    assert.match(t.turns[0]!.failure ?? "", /stopped before running a step/)
-    assert.equal(currentTurn(t)!.prompt, "second")
-  })
-
-  test("steers between steps, and prompts picked up back to back, stay in the turn", () => {
-    const t = emptyTrack()
-    apply(t, ev("prompted", { messageID: "msg_1", prompt: { text: "a" } }))
-    apply(t, ev("prompted", { messageID: "msg_2", prompt: { text: "b" }, delivery: "steer" }))
-    apply(t, ev("step.started"))
-    apply(t, ev("step.ended", { finish: "tool-calls" }))
-    apply(t, ev("prompted", { messageID: "msg_3", prompt: { text: "c" }, delivery: "steer" }))
-    assert.equal(t.turns.length, 1)
-    assert.equal(currentTurn(t)!.prompt, "a\n[steer] b\n[steer] c")
-  })
-
-  test("a steer picked up first does not drop an earlier queued prompt", () => {
-    const t = emptyTrack()
-    apply(t, ev("prompted", { messageID: "msg_1", prompt: { text: "a" } }))
-    apply(t, ev("step.started"))
-    apply(t, ev("prompt.admitted", { messageID: "msg_q", prompt: { text: "later" }, delivery: "queue" }))
-    apply(t, ev("prompt.admitted", { messageID: "msg_s", prompt: { text: "now" }, delivery: "steer" }))
-    apply(t, ev("step.ended", { finish: "tool-calls" }))
-    apply(t, ev("prompted", { messageID: "msg_s", prompt: { text: "now" }, delivery: "steer" }))
-    assert.deepEqual([...t.admitted.keys()], ["msg_q"])
-  })
-
-  test("the context estimate leaves out reasoning", () => {
-    const t = emptyTrack()
-    apply(t, ev("prompted", { messageID: "msg_1", prompt: { text: "a" } }))
-    apply(t, ev("step.started"))
-    apply(t, ev("step.ended", { finish: "stop", tokens: { input: 100, output: 10, reasoning: 1000, cache: { read: 5, write: 0 } } }))
-    assert.equal(t.context, 115)
-  })
-
-  test("a revert to an unknown message keeps the turns, or cuts them by message order", () => {
-    const build = () => {
-      const t = emptyTrack()
-      for (const n of [1, 3, 5]) {
-        apply(t, ev("prompted", { messageID: `msg_0${n}`, prompt: { text: `t${n}` } }))
-        apply(t, ev("step.started", { assistantMessageID: `msg_0${n + 1}` }))
-        apply(t, ev("step.ended", { finish: "stop" }))
-      }
-      return t
-    }
-    const known = build()
-    apply(known, ev("revert.committed", { messageID: "msg_04" }))
-    assert.equal(known.turns.length, 2)
-    const ordered = build()
-    apply(ordered, ev("revert.committed", { messageID: "msg_03x" }))
-    assert.equal(ordered.turns.length, 2, "cut after the turns that started before the boundary")
-    const unknown = build()
-    apply(unknown, ev("revert.committed", { messageID: "weird-id" }))
-    assert.equal(unknown.turns.length, 3, "an unplaceable boundary keeps every turn")
-  })
-})
-
 describe("ask schemas", () => {
   test("unsupported keywords are rejected, common combinators work", () => {
     assert.deepEqual(unsupportedSchema({ type: "object", properties: { a: { enum: ["x"] } }, required: ["a"] }), [])
@@ -170,10 +99,26 @@ describe("ask schemas", () => {
     assert.deepEqual(validate({ a: 1 }, { allOf: [{ required: ["a"] }, { properties: { a: { type: "integer" } } }] }), [])
   })
 
-  test("the guarded profile allows read-only tools only", () => {
-    assert.match(ASK_GUARDED_PROFILE, /"\*": deny/)
-    for (const t of ["read", "grep", "glob", "list"]) assert.match(ASK_GUARDED_PROFILE, new RegExp(`\\n {2}${t}: allow`))
-    for (const t of ["bash", "edit", "task", "webfetch", "websearch", "codesearch"]) assert.match(ASK_GUARDED_PROFILE, new RegExp(`\\n {2}${t}: deny`))
+  test("ask sessions deny every tool; the guarded profile allows read-only tools after the catch-all", () => {
+    // The last matching rule wins: the catch-all first, then the exceptions.
+    assert.deepEqual(profileRules(ASK_PROFILE), [{ action: "*", resource: "*", effect: "deny" }])
+    const guarded = profileRules(ASK_GUARDED_PROFILE)
+    assert.deepEqual(guarded[0], { action: "*", resource: "*", effect: "deny" })
+    assert.deepEqual(
+      guarded.slice(1).map((r) => `${r.action}:${r.effect}`),
+      ["read:allow", "grep:allow", "glob:allow"],
+    )
+  })
+
+  test("profiles become session rules: tool switches first, OpenCode 1 action names renamed", () => {
+    assert.deepEqual(profileRules({ tools: { bash: false, webfetch: true }, permission: { edit: { "*": "deny", "src/**": "allow" }, task: "ask" } }), [
+      { action: "shell", resource: "*", effect: "deny" },
+      { action: "webfetch", resource: "*", effect: "allow" },
+      { action: "edit", resource: "*", effect: "deny" },
+      { action: "edit", resource: "src/**", effect: "allow" },
+      { action: "subagent", resource: "*", effect: "ask" },
+    ])
+    assert.throws(() => profileRules({ permission: { edit: "maybe" } }), /allow, deny or ask/)
   })
 })
 
