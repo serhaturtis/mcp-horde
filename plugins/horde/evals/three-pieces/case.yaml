@@ -1,0 +1,18 @@
+schema_version: "1.1"
+name: three-pieces
+description: Three independent pieces of work in one request. Should go to workers, ideally in parallel.
+tags: [delegate]
+context:
+  scaffold_script: scaffold.sh
+execution:
+  max_turns: 10
+  allowed_tools: [Read, Glob, Grep, Skill]
+  prompt: |
+    Three unrelated things:
+    1. packages/core has no README, unlike the other packages. Write one in the same style: what it exports and which packages use what.
+    2. `--interval` on the board CLI's `watch` command accepts any positive number, so 0.01 redraws a hundred times a second. Reject anything under 0.5 seconds with a clear error, and add a test.
+    3. packages/review/README.md is much thinner than the other package READMEs. Expand it so it explains what a review checks and how its citations of check results and untouched code work.
+graders:
+  - name: delegated
+    type: tool_used
+    tool: mcp__plugin_horde_opencode__horde_do

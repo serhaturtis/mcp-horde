@@ -42,6 +42,34 @@ claude -p "The test suites' servers write their start and exit lines into my rea
 
 **Side effect to avoid.** Run B's verification pointed `TMPDIR` inside the checkout. A test then created a `horde/failed` branch in the real repository, which was deleted afterwards. Run probe tests with temporary directories outside any git checkout.
 
+## Eval baseline
+
+The suite in [`plugins/horde/evals`](../../plugins/horde/evals/README.md) runs six requests in a clone at 7caae37, with the horde tools mocked. Three should be delegated and three done directly. On 2026-10-21 it ran with the texts of ead8811: one run per case, `claude-opus-5-5`, $1.84 for the pass, plus $0.24 for a trial of one case.
+
+| Case | Expected | `horde_do` calls | Cost |
+| --- | --- | --- | --- |
+| status-json | delegate | 1 | $0.37 |
+| core-text-tests | delegate | 1 | $0.29 |
+| three-pieces | delegate | 3 | $0.45 |
+| servers-log | direct | 0 | $0.32 |
+| one-line | direct | 0 | $0.22 |
+| question | direct | 0 | $0.20 |
+
+**What the traces show:**
+- `core-text-tests` delegated at once.
+- `status-json` read seven files (CLI, README, tests, render code), then said "I'm handing the change to a horde worker. I'll review what comes back before it lands".
+- `three-pieces` opened the horde skill, then started all three pieces in parallel.
+- Each first fetched the horde tools through tool search (the mocks do not honour `alwaysLoad`).
+- `servers-log` and `one-line` went straight to their own edits, as in the headless runs.
+
+**What it means.** Claude, given the plugin, delegates sizeable, describable work and keeps small work, which is the target in [horde-implications](horde-implications.md#the-target-restated). Earlier, only small work had been tried, and it was kept, correctly. The recognition argument in [literature](literature.md#what-the-literature-implies) (delegation has no topic to match) predicted failure on sizeable work, and this run contradicts it.
+
+**Caveats.**
+- One run per case.
+- The environment is cleaner than a real session: no other plugins such as ponytail, no user CLAUDE.md, and only the five horde tools.
+- Server instructions are absent, so they cannot be what made the difference.
+- Which of the hook, the skill and the descriptions carries the effect is not known. Finding out needs an arm without the hook, or with other texts.
+
 ## Earlier subagent run
 
 Before the tools were loaded upfront (779d122), a general-purpose subagent was given a plain request to write `ci.sh`. It did not delegate. In its report it cited:

@@ -1,0 +1,15 @@
+schema_version: "1.1"
+name: core-text-tests
+description: Tests for existing, well-understood helpers. Should go to a worker.
+tags: [delegate]
+context:
+  scaffold_script: scaffold.sh
+execution:
+  max_turns: 10
+  allowed_tools: [Read, Glob, Grep, Skill]
+  prompt: |
+    Several helpers in packages/core/src/text.ts have no tests: formatUsd, formatTokens, truncateHead, oneLine, indent and estimateTokens. Add tests for them to packages/core/test/core.test.ts, in the style of the existing ones, covering the edge cases (empty input, exact limits, rounding).
+graders:
+  - name: delegated
+    type: tool_used
+    tool: mcp__plugin_horde_opencode__horde_do

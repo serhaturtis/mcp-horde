@@ -24,6 +24,7 @@ if [[ $install || ! -d node_modules ]]; then npm ci; fi
 npm run lint
 npm run typecheck
 node scripts/bundle-plugin.mjs --check
+node scripts/eval-tools.mjs --check
 npm run build
 npm test
 

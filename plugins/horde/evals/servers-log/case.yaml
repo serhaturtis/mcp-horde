@@ -1,0 +1,17 @@
+schema_version: "1.1"
+name: servers-log
+description: A small fix whose cost is mostly investigation (the task of docs/research/experiments.md). Should be done directly.
+tags: [direct]
+context:
+  scaffold_script: scaffold.sh
+execution:
+  max_turns: 10
+  allowed_tools: [Read, Glob, Grep, Skill]
+  prompt: |
+    The test suites' servers write their start and exit lines into my real ~/.local/state/mcp-horde/servers.log. Make the tests keep those lines in a temporary directory instead.
+graders:
+  - name: not-delegated
+    type: tool_used
+    tool: mcp__plugin_horde_opencode__horde_do
+    min: 0
+    max: 0

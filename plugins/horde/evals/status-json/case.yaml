@@ -1,0 +1,15 @@
+schema_version: "1.1"
+name: status-json
+description: A feature slice across the board CLI, its README and its tests. Should go to a worker.
+tags: [delegate]
+context:
+  scaffold_script: scaffold.sh
+execution:
+  max_turns: 10
+  allowed_tools: [Read, Glob, Grep, Skill]
+  prompt: |
+    The `status` command of the board package's CLI (packages/board/src/cli.ts) prints a table for people. I want scripts to read the same information: add a `--json` flag that prints it as JSON instead, both for the whole board and for `status <task id>`. Document it in the board README and cover it with tests.
+graders:
+  - name: delegated
+    type: tool_used
+    tool: mcp__plugin_horde_opencode__horde_do

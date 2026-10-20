@@ -1,0 +1,201 @@
+{
+  "tools": [
+    {
+      "name": "horde_do",
+      "description": "Delegate a piece of coding work to a cheap, fast worker model and get it back checked: the default for any self-contained change you would otherwise write yourself (not for a one-line edit, or something you need the result of right now). Describe it the way you would to a new colleague: goal (what and why), done (how you will know it is finished), scope (the files it may change). The worker gets its own git worktree with the project's dependencies, and code context from the repository; when it finishes, the project's tests, typecheck and lint run, a reviewer model checks each done-criterion against the diff, and failures go back to the worker to fix (2 rounds). Returns at once with the task id, so several can run in parallel; call horde_wait for the outcome, or pass wait: true to block until it is done (like a subagent).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "goal": {
+            "type": "string",
+            "minLength": 1,
+            "description": "What to do and why, in a paragraph. The worker sees only this and the repository. Mention the files or functions you already know about; it gets the repository's code context itself, so there is no need to explore for it first."
+          },
+          "done": {
+            "description": "Observable criteria for \"finished\", e.g. \"POST /login answers 429 after 5 failed attempts in a minute\", \"existing tests pass\". A reviewer checks each one against the diff and the checks' results.",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "scope": {
+            "description": "Files or globs the worker may change, e.g. [\"src/auth/**\", \"test/auth/**\"]. Edits elsewhere are refused (the outcome lists any it tried). Omit when unsure.",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "title": {
+            "description": "Short name (default: the goal's first sentence).",
+            "type": "string"
+          },
+          "model": {
+            "description": "\"provider/model\" for the worker. Default: the project's cheapest tier (horde.json \"tiers\"), else OpenCode's default model.",
+            "type": "string"
+          },
+          "variant": {
+            "description": "Effort level the model offers, e.g. \"low\", \"high\", \"max\".",
+            "type": "string"
+          },
+          "directory": {
+            "description": "The repository (default: the server's directory).",
+            "type": "string"
+          },
+          "wait": {
+            "description": "Block until the outcome. Default false.",
+            "type": "boolean"
+          },
+          "timeout_seconds": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 86400,
+            "description": "How long to block (default 30 min in Claude Code, 50 s elsewhere); on a timeout the workers keep going."
+          }
+        },
+        "required": [
+          "goal"
+        ],
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "annotations": {
+        "openWorldHint": false
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      },
+      "_meta": {
+        "anthropic/alwaysLoad": true
+      }
+    },
+    {
+      "name": "horde_wait",
+      "description": "Wait for delegated tasks. Returns every outcome that is ready, each once; if none is, it blocks until the first one (up to timeout_seconds). READY: checks passed and the work was reviewed (what changed, cost) → horde_land. NEEDS YOU: the worker asks a question or for permission → horde_tell. FAILED: why, what the worker changed, and any edits refused outside its scope → horde_tell with a hint, or horde_drop. With no ids it waits for any task you started; on a timeout it says what each worker is doing (they keep working).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "ids": {
+            "description": "Task ids (t-…) from horde_do. Default: every task you started.",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "timeout_seconds": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 86400,
+            "description": "How long to block (default 30 min in Claude Code, 50 s elsewhere); on a timeout the workers keep going."
+          }
+        },
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "annotations": {
+        "openWorldHint": false
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      },
+      "_meta": {
+        "anthropic/alwaysLoad": true
+      }
+    },
+    {
+      "name": "horde_tell",
+      "description": "Reply to a worker: answer its question (message), allow or refuse what it asks permission for (approve true or false, with an optional message; a message alone refuses it and says what to do instead), or ask for changes to finished or failed work (message: it works again and is checked again, with fresh rounds). While it is working, a message steers it. model switches it to another model first, e.g. the stronger tier a FAILED outcome names. scope replaces the files it may change (approving a request never widens it). After a failed horde_land, tell it what to fix, then land again.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Task id (t-…)."
+          },
+          "message": {
+            "type": "string"
+          },
+          "approve": {
+            "type": "boolean"
+          },
+          "model": {
+            "description": "\"provider/model\" to switch the worker to first.",
+            "type": "string"
+          },
+          "scope": {
+            "description": "The files or globs it may change from now on (replaces the current scope).",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "annotations": {
+        "openWorldHint": false
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      },
+      "_meta": {
+        "anthropic/alwaysLoad": true
+      }
+    },
+    {
+      "name": "horde_land",
+      "description": "Land a READY task. Its commits are replayed onto your current branch's tip inside its worktree and the project's checks run there; only if they pass is your branch updated, with exactly those commits. Your uncommitted changes stay as they are. Then the task is marked done and its worktree and branch are removed. If the commits conflict with your branch or the checks fail, your branch is not touched: the answer shows why, and the worker, now on top of your branch, can fix it (horde_tell, then horde_land again).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Task id (t-…)."
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "annotations": {
+        "openWorldHint": false
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      },
+      "_meta": {
+        "anthropic/alwaysLoad": true
+      }
+    },
+    {
+      "name": "horde_drop",
+      "description": "Give up on a task: stop its worker, record the attempt as failed (tier suggestions learn from it), and remove its worktree and branch (the answer names the last commit, in case you want it back). To try again differently, horde_do again with a clearer goal, or horde_tell {model} for a stronger model on the same work.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Task id (t-…)."
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "annotations": {
+        "openWorldHint": false
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      },
+      "_meta": {
+        "anthropic/alwaysLoad": true
+      }
+    }
+  ]
+}

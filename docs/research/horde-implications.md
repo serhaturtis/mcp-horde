@@ -18,7 +18,7 @@ A target that holds up:
 | Several independent fixes or slices that can run in parallel | A result needed right away to keep reasoning |
 | A mechanical refactor across many files | A change that cannot be described in a paragraph yet |
 
-Success means delegating in the left column and not in the right one. Under this target, the two headless runs in [experiments](experiments.md) behaved correctly [inference].
+Success means delegating in the left column and not in the right one. Under this target, the two headless runs in [experiments](experiments.md) behaved correctly. The eval baseline backs this up: with today's texts, all three left-column cases delegated and none of the three right-column cases did, one run each ([experiments](experiments.md#eval-baseline)).
 
 ## How the current texts compare with the guidance
 
@@ -37,9 +37,11 @@ What already matches the guidance:
 
 ## Recommendations, strongest evidence first
 
+The eval baseline changes the order of these recommendations. The texts below depart from the guidance, yet they produced the target behaviour in every case measured. So recommendations 2 and 3 are now about robustness and risk, not about fixing a measured failure. Change a text only with an eval run before and after, at three runs per case for anything subtle.
+
 ### 1. Build the eval before changing more wording
 
-Two runs of one task cannot tell a better text from a worse one ([experiments](experiments.md)). `claude plugin eval` runs each case three times with and without the plugin, and supports "must not call" graders ([claude-code](claude-code.md#measuring-claude-plugin-eval)).
+Done: [`plugins/horde/evals`](../../plugins/horde/evals/README.md), with the baseline in [experiments](experiments.md#eval-baseline). The rest of this section is the design it follows. Two runs of one task cannot tell a better text from a worse one ([experiments](experiments.md)). `claude plugin eval` runs each case three times with and without the plugin, and supports "must not call" graders ([claude-code](claude-code.md#measuring-claude-plugin-eval)).
 
 - **Should-delegate cases.** A multi-file feature slice in this repository, tests for an existing module, docs for a known package, three independent small fixes in one prompt. Grade: `tool_used` on `mcp__plugin_horde_opencode__horde_do`, at least once.
 - **Should-not cases.** The servers.log fix from the experiments, a one-line change, a question about the code, a task that is mostly investigation. Grade: `horde_do` not called (`min: 0`, `max: 0`).
@@ -49,6 +51,12 @@ Two runs of one task cannot tell a better text from a worse one ([experiments](e
 - **After the first run, do one rewrite pass** driven by the false positives and false negatives. That captures most of the available gain ("A Single Rewrite Suffices", [literature](literature.md#how-much-descriptions-steer-selection)).
 
 ### 2. Rewrite the texts the way the guidance says
+
+The risks that remain:
+- The hook's imperative "HORDE:" framing could trip prompt-injection defenses. No run so far surfaced it to the user, but that has not been looked for specifically.
+- Blanket "by default" wording could over-trigger on borderline work the current cases do not cover.
+
+Add borderline cases (a two-file fix, a task that is half investigation) before rewriting. A rewrite is worth keeping only if it holds 6/6 and does better on those.
 
 - **The hook: facts about this session, no header, no imperative.** For example:
 

@@ -1,7 +1,15 @@
 {
   "$schema": "https://biomejs.dev/schemas/2.5.15/schema.json",
   "files": {
-    "includes": ["**", "!**/dist", "!**/node_modules", "!**/package-lock.json", "!plugins/horde/servers"]
+    "includes": [
+      "**",
+      "!**/dist",
+      "!**/node_modules",
+      "!**/package-lock.json",
+      "!plugins/horde/servers",
+      "!plugins/horde/evals/mocks/opencode/_tools.json",
+      "!plugins/horde/evals/results"
+    ]
   },
   "formatter": {
     "indentStyle": "space",
