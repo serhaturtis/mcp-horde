@@ -75,16 +75,19 @@ describe("files and locks", () => {
 
 describe("lifecycle log", () => {
   // A child that records its lifecycle, then exits, throws, or waits to be signalled.
-  const child = (state: string, how: "exit" | "throw" | "wait") => {
+  const child = (state: string, how: "exit" | "throw" | "wait" | "oom") => {
     const lib = JSON.stringify(path.resolve(import.meta.dirname, "../src/index.ts"))
     const body = `const { recordLifecycle } = await import(${lib}); recordLifecycle("probe", "1.2.3"); ${
       how === "exit"
         ? "process.exit(3)"
         : how === "throw"
           ? "setTimeout(() => { throw new Error('boom') })"
-          : "process.stdout.write('ready'); setInterval(() => {}, 1000)"
+          : how === "oom"
+            ? "const keep = []; for (;;) keep.push(new Array(1e5).fill({}))"
+            : "process.stdout.write('ready'); setInterval(() => {}, 1000)"
     }`
-    return spawn(process.execPath, ["--import", "tsx", "--input-type=module", "-e", body], {
+    const heap = how === "oom" ? ["--max-old-space-size=64"] : []
+    return spawn(process.execPath, [...heap, "--import", "tsx", "--input-type=module", "-e", body], {
       env: { ...process.env, XDG_STATE_HOME: state },
       stdio: ["pipe", "pipe", "pipe"],
     })
@@ -104,6 +107,18 @@ describe("lifecycle log", () => {
     await done(waiting)
     assert.match(log(state), /probe pid \d+: got SIGHUP\n.*probe pid \d+: exited with code 129/)
     assert.equal(waiting.exitCode, 129, "the default of exiting on a signal is kept")
+  })
+
+  test("a native abort leaves a report with the error next to the log", { skip: process.platform === "win32" }, async () => {
+    const state = tmp()
+    const p = child(state, "oom")
+    await done(p)
+    assert.equal(p.signalCode, "SIGABRT", "V8 aborts the process on running out of heap")
+    assert.doesNotMatch(log(state), /exited with code/, "an abort skips the exit event")
+    const reports = fs.readdirSync(path.join(state, "mcp-horde")).filter((f) => /^report\..*\.json$/.test(f))
+    assert.equal(reports.length, 1)
+    const report = JSON.parse(fs.readFileSync(path.join(state, "mcp-horde", reports[0]!), "utf8"))
+    assert.match(report.header.event, /heap/i)
   })
 })
 

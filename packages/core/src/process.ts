@@ -8,8 +8,10 @@ const isWindows = process.platform === "win32"
 /**
  * Note a server's start, and how it ends, in one log the horde's servers share
  * ($XDG_STATE_HOME/mcp-horde/servers.log): the signal it got, its stdin closing, an uncaught
- * exception with its stack, the exit code. A server that vanished from its client says why;
- * nothing at all after "started" means it was killed outright (SIGKILL).
+ * exception with its stack, the exit code. A server that vanished from its client says why.
+ * A native abort (V8 out of memory, a failed internal check) skips all of that: Node then writes a
+ * report (report.*.json, with the error, the stack and heap statistics) next to the log, and the
+ * log notes each new high of the heap. Nothing at all after "started", and no report: SIGKILL.
  * ponytail: the log only grows (a few lines per server start); rotate it if that ever matters.
  */
 export function recordLifecycle(name: string, version: string): void {
@@ -23,6 +25,19 @@ export function recordLifecycle(name: string, version: string): void {
     }
   }
   note(`started (version ${version}, parent ${process.ppid})`)
+  try {
+    process.report.directory = path.dirname(file)
+    process.report.reportOnFatalError = true
+  } catch {
+    // No report support: the log still says the rest.
+  }
+  let high = 0
+  setInterval(() => {
+    const m = process.memoryUsage()
+    if (m.heapUsed < (high + 1) * 512e6) return
+    high = Math.floor(m.heapUsed / 512e6)
+    note(`heap ${Math.round(m.heapUsed / 1e6)} MB (new high), external ${Math.round(m.external / 1e6)} MB, rss ${Math.round(m.rss / 1e6)} MB`)
+  }, 30_000).unref()
   process.on("uncaughtException", (err) => {
     note(`uncaught exception: ${err.stack ?? err.message}`)
     process.stderr.write(`[mcp-horde/${name}] ${err.stack ?? err.message}\n`)
