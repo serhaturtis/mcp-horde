@@ -668,22 +668,13 @@ const BASELINE_MESSAGE = "horde: uncommitted changes carried over from the main 
  * so the agent continues on top of everything merged since it started and its own merge
  * later applies cleanly. On a conflict the rebase is aborted and the worktree is unchanged.
  */
-export async function syncWorktree(wt: Worktree, name: string): Promise<{ text: string; worktree?: Worktree }> {
-  const notes: string[] = []
-  const committed = await commitAll(wt, `horde: work from ${name}`)
-  if (committed) notes.push(committed)
-  const target = await git(wt.repo, "symbolic-ref", "-q", "--short", "HEAD").catch(() => "")
-  if (!target) throw new Error(`your checkout ${wt.repo} is on a detached HEAD; switch to a branch first`)
-  const tip = await git(wt.repo, "rev-parse", "HEAD")
-  const busy = await operationInProgress(wt.root)
-  if (busy) throw new Error(`the worktree has ${busy} in progress; finish or abort it first`)
-  const ahead = await git(wt.root, "merge-base", "--is-ancestor", tip, "HEAD").then(
-    () => true,
-    () => false,
-  )
-  if (ahead) return { text: [...notes, `${wt.branch} already contains ${target} (${tip.slice(0, 10)}); nothing to sync`].join("\n") }
-  // A rebase replays only ordinary commits: merge-only changes would disappear. Refuse, as mergeWorktree does.
-  const merges = (await git(wt.root, "rev-list", "--merges", `${wt.base}..HEAD`)).split("\n").filter(Boolean)
+/**
+ * Rebase the commits after `start` in the worktree onto the checkout's tip (`tip`). A rebase
+ * replays only ordinary commits, so a merge commit is refused; on a conflict the rebase is
+ * aborted and the conflicting files are named. Returns the replayed commits, in order.
+ */
+async function rebaseOntoTip(wt: Worktree, target: string, tip: string, start: string): Promise<string[]> {
+  const merges = (await git(wt.root, "rev-list", "--merges", `${start}..HEAD`)).split("\n").filter(Boolean)
   if (merges.length)
     throw new Error(
       `${wt.branch} contains merge commits (${merges.slice(0, 3).join(", ")}${merges.length > 3 ? ", …" : ""}), which a rebase would replay without their merge-only changes. Merge it by hand instead, e.g. git merge ${target}.`,
@@ -693,23 +684,71 @@ export async function syncWorktree(wt: Worktree, name: string): Promise<{ text: 
     // Reapply commits even when the target already has the same patch, and keep the ones that
     // become empty. Every original commit then has a replay, so the baseline is the first one;
     // no commit message or count can be spoofed.
-    await git(wt.root, ...NO_SIGN, ...identity, "-c", "core.editor=true", "rebase", "--empty=keep", "--reapply-cherry-picks", "--onto", tip, wt.base, wt.branch)
+    await git(wt.root, ...NO_SIGN, ...identity, "-c", "core.editor=true", "rebase", "--empty=keep", "--reapply-cherry-picks", "--onto", tip, start, wt.branch)
   } catch (err) {
     const conflicts = await git(wt.root, "diff", "--name-only", "--diff-filter=U").catch(() => "")
     await git(wt.root, "rebase", "--abort").catch(() => undefined)
     const detail = conflicts ? `conflicting files:\n${conflicts}` : err instanceof Error ? err.message : String(err)
-    throw new Error(
+    const e = new Error(
       `syncing ${wt.branch} onto ${target} failed and was aborted; the worktree is unchanged.\n${detail}\nTell the agent what changed in ${target} (or merge by hand).`,
-    )
+    ) as Error & { conflicts?: boolean }
+    e.conflicts = conflicts.length > 0
+    throw e
   }
+  return (await git(wt.root, "rev-list", "--reverse", `${tip}..HEAD`)).split("\n").filter(Boolean)
+}
+
+/**
+ * Bring the agent's branch up to date with the main checkout's current branch: its commits
+ * (the carried-over baseline first) are replayed onto that branch's tip inside the worktree,
+ * so the agent continues on top of everything merged since it started and its own merge
+ * later applies cleanly. On a conflict the rebase is aborted and the worktree is unchanged.
+ */
+export async function syncWorktree(wt: Worktree, name: string): Promise<{ text: string; worktree?: Worktree }> {
+  const notes: string[] = []
+  const committed = await commitAll(wt, `horde: work from ${name}`)
+  if (committed) notes.push(committed)
+  const target = await git(wt.repo, "symbolic-ref", "-q", "--short", "HEAD").catch(() => "")
+  if (!target) throw new Error(`your checkout ${wt.repo} is on a detached HEAD; switch to a branch first`)
+  const tip = await git(wt.repo, "rev-parse", "HEAD")
+  const busy = await operationInProgress(wt.root)
+  if (busy) throw new Error(`the worktree has ${busy} in progress; finish or abort it first`)
+  // Only a branch already created from the tip needs no rebase: "the tip is an ancestor of HEAD"
+  // is also true after the user reset to an older commit or switched to an older branch, and then
+  // the work must move onto that (older) tip.
+  if (wt.base === tip) return { text: [...notes, `${wt.branch} already contains ${target} (${tip.slice(0, 10)}); nothing to sync`].join("\n") }
+  const replayed = await rebaseOntoTip(wt, target, tip, wt.base)
   // Every commit was replayed in order, so the first one is the baseline.
-  const replayed = (await git(wt.root, "rev-list", "--reverse", `${tip}..HEAD`)).split("\n").filter(Boolean)
   const baseline = wt.baseline ? replayed[0] : undefined
   const own = replayed.length - (baseline ? 1 : 0)
   notes.push(
     `rebased ${own} commit(s) of ${wt.branch} onto ${target} (${tip.slice(0, 10)})${wt.baseline && !baseline ? "; the carried-over changes are in it now" : ""}`,
   )
   return { text: notes.join("\n"), worktree: { ...wt, base: tip, baseline, merged: undefined } }
+}
+
+/**
+ * Before landing: commit leftovers, then rebase only the task's own commits (everything after
+ * workStart, leaving the carried-over baseline out) onto the checkout's current tip, so the
+ * checks judge exactly the tree that will land. The user's carried-over changes stay
+ * uncommitted in their checkout. On a conflict the worktree is unchanged.
+ */
+export async function landSync(wt: Worktree, name: string): Promise<{ text: string; worktree?: Worktree }> {
+  const notes: string[] = []
+  const committed = await commitAll(wt, `horde: work from ${name}`)
+  if (committed) notes.push(committed)
+  const target = await git(wt.repo, "symbolic-ref", "-q", "--short", "HEAD").catch(() => "")
+  if (!target) throw new Error(`your checkout ${wt.repo} is on a detached HEAD; switch to a branch first`)
+  const tip = await git(wt.repo, "rev-parse", "HEAD")
+  const busy = await operationInProgress(wt.root)
+  if (busy) throw new Error(`the worktree has ${busy} in progress; finish or abort it first`)
+  const start = workStart(wt)
+  if (start === tip) return { text: [...notes, `${wt.branch} is already on ${target} (${tip.slice(0, 10)}); nothing to rebase`].join("\n") }
+  const replayed = await rebaseOntoTip(wt, target, tip, start)
+  notes.push(
+    `rebased ${replayed.length} commit(s) of ${wt.branch} onto ${target} (${tip.slice(0, 10)})${wt.baseline ? "; the carried-over changes stay in your checkout" : ""}`,
+  )
+  return { text: notes.join("\n"), worktree: { ...wt, base: tip, baseline: undefined, merged: undefined } }
 }
 
 /** Remove the worktree. Uncommitted work is committed to the branch first unless discard is set. */

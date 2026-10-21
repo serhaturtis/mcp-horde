@@ -4,7 +4,7 @@ import fs from "node:fs/promises"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
 import { Board, current, isTrustedCommand, renderBrief } from "@mcp-horde/board"
-import { formatUsd, git, loadTiers, loadWorkers, oneLine, tierLabel, tierModel } from "@mcp-horde/core"
+import { formatUsd, git, loadTiers, loadWorkers, oneLine, tierLabel, tierModel, withLock } from "@mcp-horde/core"
 import {
   checkVerdicts,
   collectReview,
@@ -16,7 +16,7 @@ import {
   reviewPrompt,
   type Verdict,
 } from "@mcp-horde/review"
-import { type CheckResult, logDirFor, gate as runGate, defaultStateDir as verifyStateDir } from "@mcp-horde/verify"
+import { type CheckResult, lockDirFor, logDirFor, gate as runGate, defaultStateDir as verifyStateDir } from "@mcp-horde/verify"
 import type {
   AgentInfo,
   FormInfo,
@@ -39,6 +39,7 @@ import {
   commitMsgHook,
   createWorktree,
   hasUncommitted,
+  landSync,
   mergeWorktree,
   removeWorktree,
   squashWorktree,
@@ -1395,12 +1396,13 @@ export class Fleet {
   }
 
   /**
-   * Land a task-bound agent's work without ever breaking your branch: its commits are replayed onto
-   * your branch's tip inside its worktree, the project's checks run there, and only if they pass, and
-   * your branch has not moved meanwhile, are the same commits brought onto your branch. When they sit
-   * directly on your tip they are fast-forwarded, so the checked hashes are kept; otherwise they are
-   * cherry-picked. Then the task is accepted and the worktree and branch are removed. Anything that
-   * fails leaves your branch as it was; the agent is then on top of your branch and can be told to fix it.
+   * Land a task-bound agent's work without ever breaking your branch. Its own commits (everything
+   * after the carried-over baseline) are rebased onto your branch's tip inside its worktree, the
+   * project's checks run on exactly that tree, and only if they pass — and your branch has not moved
+   * meanwhile — is your branch fast-forwarded to the checked commit, keeping its hashes. The user's
+   * carried-over changes stay uncommitted in their checkout. Then the task is accepted and the
+   * worktree and branch are removed. Anything that fails leaves your branch as it was; the agent is
+   * then on top of your branch and can be told to fix it.
    *
    * With `message`, the task's own commits are squashed into one commit with it, judged first by the
    * repository's commit-msg hook. Without a message, a repository that has a hook needs its work
@@ -1432,9 +1434,10 @@ export class Fleet {
         const hook = await commitMsgHook(wt.repo)
         if (hook && !message && (await hasUncommitted(wt))) return { landed: false, target, why: "leftovers", text: hook }
         const tip = await git(wt.repo, "rev-parse", "HEAD")
-        // 1. Onto your branch's tip, inside the worktree. A conflict leaves both as they were.
+        // 1. Onto your branch's tip, inside the worktree, leaving the carried-over baseline out. A
+        // conflict leaves both as they were; anything else failing is reported by its own cause.
         try {
-          const synced = await syncWorktree(wt, name)
+          const synced = await landSync(wt, name)
           if (synced.worktree) {
             wt = synced.worktree
             // The verdict stands for landing again; a new turn is gated as usual.
@@ -1443,6 +1446,7 @@ export class Fleet {
             await this.rebindTaskBase(live, wt)
           }
         } catch (err) {
+          if (!(err as { conflicts?: boolean }).conflicts) throw err
           return {
             landed: false,
             target,
@@ -1458,7 +1462,9 @@ export class Fleet {
           const squashed = await squashWorktree(wt, message)
           if (squashed.refused !== undefined) return { landed: false, target, why: "message", text: squashed.refused, hook }
         }
-        // 2. The project's checks on exactly the tree your branch would get.
+        // 2. The exact commit the checks judge; nothing is committed in the worktree after this.
+        const judged = await git(wt.root, "rev-parse", "HEAD")
+        const commits = (await git(wt.repo, "rev-list", "--count", `${tip}..${judged}`).catch(() => "0")).trim()
         const v = await runGate(wt.root, {
           audit: false,
           related: false,
@@ -1469,21 +1475,35 @@ export class Fleet {
           stateDir: verifyStateDir(),
         })
         if (!v.pass) return { landed: false, target, why: "checks", text: v.text, checks: v.checks.map(gateCheck) }
-        // 3. Your branch must still be where the checks saw it; otherwise go round again.
-        if ((await git(wt.repo, "rev-parse", "HEAD")) !== tip) continue
-        const start = workStart(wt)
-        const commits = (await git(wt.repo, "rev-list", "--count", `${start}..${wt.branch}`).catch(() => "0")).trim()
+        // 3. Under a per-repository lock, fast-forward your branch only if it is still at the tip the
+        // checks saw; otherwise go round again (rebase onto the new tip, check again).
+        const lockDir = await lockDirFor(wt.repo, verifyStateDir())
+        await fs.mkdir(lockDir, { recursive: true }).catch(() => undefined)
+        let advanced = false
         try {
-          await mergeWorktree(wt, name, "merge")
+          advanced = await withLock(lockDir, "land", async () => {
+            if ((await git(wt.repo, "rev-parse", "HEAD")) !== tip) return false
+            await git(wt.repo, "merge", "--ff-only", judged)
+            return true
+          })
         } catch (err) {
-          // Only your uncommitted changes can collide here: the commits apply cleanly onto the tip.
-          return { landed: false, target, why: "uncommitted", text: (err as Error).message }
+          // The tip was still where the checks saw it, so only the user's uncommitted changes can
+          // refuse the fast-forward; the refusal names them.
+          const changed = await git(wt.repo, "status", "--porcelain").catch(() => "")
+          const detail = err instanceof Error ? err.message : String(err)
+          return {
+            landed: false,
+            target,
+            why: "uncommitted",
+            text: `${detail}${changed ? `\nuncommitted changes:\n${changed}` : ""}`,
+          }
         }
+        if (!advanced) continue
         const board = await Board.open(wt.repo)
         await board.accept(task.id, { note: `landed on ${target}` }).catch(() => undefined)
-        // Commits are replayed, so the branch goes only once every one of them is on your branch.
-        const unmerged = (await git(wt.repo, "cherry", target, wt.branch, start).catch(() => "+")).split("\n").filter((l) => l.startsWith("+"))
-        await this.dispose(id, { worktree: "remove" })
+        // The branch goes only once every one of its commits is on your branch (they all are, after a fast-forward).
+        const unmerged = (await git(wt.repo, "cherry", target, wt.branch, tip).catch(() => "+")).split("\n").filter((l) => l.startsWith("+"))
+        await this.dispose(id, { worktree: "discard" })
         if (!unmerged.length) await git(wt.repo, "branch", "-D", wt.branch).catch(() => undefined)
         return {
           landed: true,

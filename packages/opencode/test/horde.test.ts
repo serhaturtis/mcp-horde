@@ -288,7 +288,7 @@ describe("the simple path: horde_do, horde_wait, horde_land (real opencode, mock
     assert.match(refused, /removing a file needs a DELETE: line/, refused)
     assert.match(refused, new RegExp(`horde_land \\{id: "${id}", message:`))
     assert.equal(git(hooked, "rev-parse", "HEAD"), head, "master did not move")
-    assert.equal(git(hooked, "rev-parse", branch), workerHead, "the worker's branch is back where it was")
+    assert.equal(git(hooked, "log", "-1", "--format=%s", branch), "DELETE: drop old.txt", "the worker's branch still holds its work")
     assert.ok(!fs.existsSync(marker), "the checks did not run")
 
     // Accepted (and edited by the hook): one commit with that message, the baseline left out.
@@ -409,5 +409,177 @@ describe("the simple path: horde_do, horde_wait, horde_land (real opencode, mock
     assert.doesNotMatch(failed, /known\.txt must say ok/, failed)
     assert.equal(baselineBranches(), "")
     assert.deepEqual(baselineLeftovers(), [])
+  })
+
+  test("two READY tasks landed together never put an unchecked combination on the branch", async () => {
+    const { repo: r } = makeRepo(mock.url)
+    fs.writeFileSync(
+      path.join(r, "check.js"),
+      `const fs = require("fs")
+if (fs.existsSync("a.txt") && fs.existsSync("b.txt")) {
+  console.log("TAP version 13")
+  console.log("not ok 1 - a+b")
+  console.log("  ---")
+  console.log("  message: Error: a.txt and b.txt must not exist together")
+  console.log("  ...")
+  process.exit(1)
+}
+console.log("TAP version 13")
+console.log("1..0")
+`,
+    )
+    fs.writeFileSync(path.join(r, "horde.json"), JSON.stringify({ verify: { checks: { test: "node check.js" } }, tiers: ["mock/mock", "mock/pricey"] }))
+    git(r, "add", ".")
+    git(r, "commit", "-qm", "checks")
+    const idA = idOf(
+      await h.call("horde_do", {
+        directory: r,
+        goal: "Write a.txt.\nRUN: echo ok > a.txt && git add a.txt && git commit -qm a",
+        done: ["a.txt exists"],
+        scope: ["a.txt"],
+      }),
+    )
+    const idB = idOf(
+      await h.call("horde_do", {
+        directory: r,
+        goal: "Write b.txt.\nRUN: echo ok > b.txt && git add b.txt && git commit -qm b",
+        done: ["b.txt exists"],
+        scope: ["b.txt"],
+      }),
+    )
+    await settle(idA)
+    await settle(idB)
+    const [la, lb] = await Promise.all([h.call("horde_land", { id: idA }), h.call("horde_land", { id: idB })])
+    const both = [la, lb]
+    assert.equal(both.filter((x) => /^landed /.test(x)).length, 1, `exactly one lands:\n${both.join("\n\n")}`)
+    assert.equal(
+      both.filter((x) => /a\.txt and b\.txt must not exist together/.test(x)).length,
+      1,
+      `the other re-checks the combination:\n${both.join("\n\n")}`,
+    )
+    assert.equal(
+      [fs.existsSync(path.join(r, "a.txt")), fs.existsSync(path.join(r, "b.txt"))].filter(Boolean).length,
+      1,
+      "the unchecked combination never landed",
+    )
+    await h.call("horde_drop", { id: /^landed /.test(la) ? idB : idA })
+  })
+
+  test("a task that carried over uncommitted changes lands only its own commits, checked as landed", async () => {
+    const { repo: r } = makeRepo(mock.url)
+    fs.writeFileSync(path.join(r, "old.txt"), "stale\n")
+    fs.writeFileSync(path.join(r, "horde.json"), JSON.stringify({ verify: { checks: { test: "true" } }, tiers: ["mock/mock", "mock/pricey"] }))
+    git(r, "add", ".")
+    git(r, "commit", "-qm", "checks")
+    fs.writeFileSync(path.join(r, "carried.txt"), "carried\n")
+    const id = idOf(
+      await h.call("horde_do", {
+        directory: r,
+        goal: "Delete old.txt.\nRUN: rm old.txt && git add -A && git commit -qm drop-old",
+        done: ["old.txt is gone"],
+        scope: ["old.txt"],
+      }),
+    )
+    await settle(id)
+    const landed = await h.call("horde_land", { id })
+    assert.match(landed, new RegExp(`^landed ${id} on master: 1 commit\\(s\\)`), landed)
+    assert.ok(!fs.existsSync(path.join(r, "old.txt")), "the task's change landed")
+    assert.equal(git(r, "status", "--porcelain"), "?? carried.txt", "the user's uncommitted change stays uncommitted")
+    assert.equal(git(r, "show", "--name-only", "--format=", "HEAD"), "old.txt", "only the task's own commit landed, never the carried-over change")
+  })
+
+  test("a check that writes a file during landing never puts that file on the branch", async () => {
+    const { repo: r } = makeRepo(mock.url)
+    fs.writeFileSync(
+      path.join(r, "horde.json"),
+      JSON.stringify({
+        verify: { checks: { ok: "true", land: { command: `node -e "require('fs').writeFileSync('report.xml', 'x')"`, when: "land" } } },
+        tiers: ["mock/mock", "mock/pricey"],
+      }),
+    )
+    git(r, "add", "horde.json")
+    git(r, "commit", "-qm", "checks")
+    const id = idOf(
+      await h.call("horde_do", {
+        directory: r,
+        goal: "Write keep.txt.\nRUN: echo ok > keep.txt && git add keep.txt && git commit -qm keep",
+        done: ["keep.txt exists"],
+        scope: ["keep.txt"],
+      }),
+    )
+    await settle(id)
+    assert.match(await h.call("horde_land", { id }), new RegExp(`^landed ${id} on master: 1 commit\\(s\\)`))
+    assert.ok(fs.existsSync(path.join(r, "keep.txt")))
+    assert.ok(!fs.existsSync(path.join(r, "report.xml")), "the check's report.xml never landed")
+    assert.equal(git(r, "status", "--porcelain"), "", "and the checkout is left clean")
+  })
+
+  test("landing onto a branch that is an ancestor of the task's base rebases and checks the work there", async () => {
+    const { repo: r } = makeRepo(mock.url)
+    fs.writeFileSync(path.join(r, "horde.json"), JSON.stringify({ verify: { checks: { test: "true" } }, tiers: ["mock/mock", "mock/pricey"] }))
+    git(r, "add", "horde.json")
+    git(r, "commit", "-qm", "checks")
+    fs.writeFileSync(path.join(r, "second.txt"), "s\n")
+    git(r, "add", "second.txt")
+    git(r, "commit", "-qm", "second")
+    const id = idOf(
+      await h.call("horde_do", {
+        directory: r,
+        goal: "Write anc.txt.\nRUN: echo ok > anc.txt && git add anc.txt && git commit -qm anc",
+        done: ["anc.txt exists"],
+        scope: ["anc.txt"],
+      }),
+    )
+    await settle(id)
+    git(r, "reset", "--hard", "HEAD~1")
+    const landed = await h.call("horde_land", { id })
+    assert.match(landed, new RegExp(`^landed ${id} on master: 1 commit\\(s\\)`), landed)
+    assert.ok(fs.existsSync(path.join(r, "anc.txt")), "the work landed on the older branch")
+    assert.ok(!fs.existsSync(path.join(r, "second.txt")), "the older branch's tree is the base, not the task's original base")
+  })
+
+  test("a rebase conflict names the conflicting files, never the user's uncommitted changes", async () => {
+    const { repo: r } = makeRepo(mock.url)
+    fs.writeFileSync(path.join(r, "conflict.txt"), "base\n")
+    fs.writeFileSync(path.join(r, "horde.json"), JSON.stringify({ verify: { checks: { test: "true" } }, tiers: ["mock/mock", "mock/pricey"] }))
+    git(r, "add", ".")
+    git(r, "commit", "-qm", "checks")
+    const id = idOf(
+      await h.call("horde_do", {
+        directory: r,
+        goal: "Change conflict.txt to worker.\nRUN: echo worker > conflict.txt && git add -A && git commit -qm worker",
+        done: ["conflict.txt says worker"],
+        scope: ["conflict.txt"],
+      }),
+    )
+    await settle(id)
+    fs.writeFileSync(path.join(r, "conflict.txt"), "master\n")
+    git(r, "add", "conflict.txt")
+    git(r, "commit", "-qm", "master change")
+    const refused = await h.call("horde_land", { id })
+    assert.match(refused, /not landed: .*conflict with master in conflict\.txt/, refused)
+    assert.doesNotMatch(refused, /collides with your uncommitted changes/, refused)
+    await h.call("horde_drop", { id })
+  })
+
+  test("a fast-forward refused by the user's uncommitted changes names them", async () => {
+    const { repo: r } = makeRepo(mock.url)
+    fs.writeFileSync(path.join(r, "horde.json"), JSON.stringify({ verify: { checks: { test: "true" } }, tiers: ["mock/mock", "mock/pricey"] }))
+    git(r, "add", "horde.json")
+    git(r, "commit", "-qm", "checks")
+    const id = idOf(
+      await h.call("horde_do", {
+        directory: r,
+        goal: "Write u.txt.\nRUN: echo worker > u.txt && git add u.txt && git commit -qm u",
+        done: ["u.txt exists"],
+        scope: ["u.txt"],
+      }),
+    )
+    await settle(id)
+    fs.writeFileSync(path.join(r, "u.txt"), "mine\n")
+    const refused = await h.call("horde_land", { id })
+    assert.match(refused, /collide with your uncommitted changes/, refused)
+    assert.match(refused, /u\.txt/, refused)
+    await h.call("horde_drop", { id })
   })
 })

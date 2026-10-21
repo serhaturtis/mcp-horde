@@ -19,11 +19,13 @@ import {
   commitMsgHook,
   createWorktree,
   hasUncommitted,
+  landSync,
   mergeWorktree,
   squashWorktree,
   syncWorktree,
   validateLink,
   type Worktree,
+  workStart,
 } from "../src/worktree.js"
 // Fixes from the support-module audit (hooks, tracker, worktree, backend, supervisor, ask, config).
 import "./support-fixes.test.js"
@@ -673,5 +675,58 @@ describe("landing keeps the checked commits: fast-forward or cherry-pick", () =>
     assert.equal(await hasUncommitted(wt), true)
     fs.writeFileSync(path.join(wt.root, "a.txt"), "changed\n")
     assert.equal(await hasUncommitted(wt), true)
+  })
+})
+
+describe("landing rebases the task's own commits onto the tip, leaving the baseline out", () => {
+  const gitIn = (cwd: string, ...args: string[]) =>
+    execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", ...args], { cwd })
+      .toString()
+      .trim()
+  const makeRepo = () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "horde-land-sync-"))
+    gitIn(dir, "init", "-q")
+    fs.writeFileSync(path.join(dir, "a.txt"), "a\n")
+    gitIn(dir, "add", "-A")
+    gitIn(dir, "commit", "-qm", "base")
+    return dir
+  }
+  const makeWorktree = async (repo: string, includeUncommitted = false) => {
+    const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), "horde-land-sync-wt-"))
+    const { worktree } = await createWorktree(repo, "task", { rootDir, includeUncommitted })
+    return worktree
+  }
+
+  test("the carried-over baseline is left out even when the branch has not moved", async () => {
+    const repo = makeRepo()
+    fs.writeFileSync(path.join(repo, "carried.txt"), "carried\n")
+    const wt = await makeWorktree(repo, true)
+    assert.ok(wt.baseline, "the uncommitted change was snapshotted as the baseline")
+    fs.writeFileSync(path.join(wt.root, "b.txt"), "b\n")
+    gitIn(wt.root, "add", "-A")
+    gitIn(wt.root, "commit", "-qm", "worker one")
+    const synced = (await landSync(wt, "task")).worktree!
+    assert.equal(synced.baseline, undefined)
+    assert.equal(workStart(synced), wt.base, "the work now sits directly on the tip")
+    assert.equal(gitIn(wt.root, "show", "--name-only", "--format=", "HEAD"), "b.txt", "the baseline stayed out of the landed tree")
+  })
+
+  test("a tip that is an ancestor of the base rebases the work onto that branch", async () => {
+    const repo = makeRepo()
+    fs.writeFileSync(path.join(repo, "b.txt"), "b\n")
+    gitIn(repo, "add", "-A")
+    gitIn(repo, "commit", "-qm", "second")
+    const ancestor = gitIn(repo, "rev-parse", "HEAD~1")
+    const wt = await makeWorktree(repo)
+    fs.writeFileSync(path.join(wt.root, "c.txt"), "c\n")
+    gitIn(wt.root, "add", "-A")
+    gitIn(wt.root, "commit", "-qm", "worker one")
+    // The user switches back to an older commit: an ancestor of the task's base.
+    gitIn(repo, "reset", "--hard", ancestor)
+    const synced = (await landSync(wt, "task")).worktree!
+    assert.equal(synced.base, ancestor)
+    assert.equal(gitIn(wt.root, "log", "-1", "--format=%s"), "worker one")
+    assert.equal(gitIn(wt.root, "show", "--name-only", "--format=", "HEAD"), "c.txt")
+    assert.ok(!fs.existsSync(path.join(wt.root, "b.txt")), "the older tip's tree does not have b.txt")
   })
 })

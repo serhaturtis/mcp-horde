@@ -171,7 +171,7 @@ describe("real model end to end", { skip: !wanted && "set HORDE_E2E_MODEL=free o
     console.log(`report: ${JSON.stringify(t.reports.at(-1))}`)
     // Informational: real models do not always report what they did.
     console.log(`report vs diff: ${JSON.stringify(await board.checkReport(task.id))}`)
-    assert.match(await h.call("opencode_worktree", { id: "fixer", action: "merge" }), /merged/)
+    assert.match(await h.call("opencode_worktree", { id: "fixer", action: "merge" }), /fast-forwarded/)
     assert.match(fs.readFileSync(path.join(repo, "math.js"), "utf8"), /a \+ b/)
     await board.accept(task.id)
     await h.call("opencode_dispose", { id: "fixer", worktree: "remove" })
