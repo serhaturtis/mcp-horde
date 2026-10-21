@@ -88,7 +88,8 @@ From `horde.json` at the repository root when it defines them (with `base`, hord
     "checks": {
       "typecheck": "npm run typecheck",
       "unit": { "command": "npm test -- --run", "kind": "test" },
-      "api": { "command": "pytest -q", "cwd": "services/api" }
+      "api": { "command": "pytest -q", "cwd": "services/api", "env": { "DATABASE_URL": "" } },
+      "pg": { "command": "uv run pytest -n 8 tests/pg", "when": "land", "slots": 2, "exclusive": "dev-stack" }
     },
     "timeoutSeconds": 600,
     "audit": {
@@ -104,7 +105,9 @@ From `horde.json` at the repository root when it defines them (with `base`, hord
 
 A category in neither `block` nor `off` warns. `generated` names generated output that is committed, such as bundles. A change to it is not reported as a binary, a big file, a secret or a suppression, and it does not count as untested source; scope still applies. Like every audit rule, it is read from `horde.json` as of the work's base commit, so the work cannot declare its own files generated. Globs take `*`, `**`, `?`, `[a-z]` classes and `{a,b}` alternatives.
 
-Checks run one at a time, in their own process group (killed as a whole on timeout or cancel), with `CI=1` and colour disabled. These inherited variables are removed: `FORCE_COLOR` (some tools treat any value as "force colour on"), `NODE_TEST_CONTEXT` (a `node --test` that inherits it reports to a parent that is not listening and exits 0), `OPENCODE_SERVER_*` and `HORDE_*`.
+Per check: `env` adds variables. `"when": "land"` makes a gate skip the check during a task's rounds (`stage: "work"`, reported as skipped) and run it before landing (`stage: "land"`). `"slots": n` lets at most n runs of the check overlap, and checks naming the same `"exclusive"` resource run one at a time. Both hold across every process and worktree of the repository: lock files under the state directory, freed when their holder exits. A run waits for its turn, reporting that it waits, for at most the check timeout. Gates run for a task pass `HORDE_TASK` and `HORDE_WORKTREE` to every check.
+
+Checks run one at a time, in their own process group (killed as a whole on timeout or cancel), with `CI=1` and colour disabled. These inherited variables are removed: `FORCE_COLOR` (some tools treat any value as "force colour on"), `NODE_TEST_CONTEXT` (a `node --test` that inherits it reports to a parent that is not listening and exits 0), `OPENCODE_SERVER_*` and `HORDE_*` (variables a gate passes on purpose, like `HORDE_TASK`, are kept).
 
 ## Setup
 

@@ -40,6 +40,10 @@ export interface GateOptions {
   related?: boolean
   /** Like `related`, for these changed files (repository-relative) instead of the diff from base. */
   relatedTo?: string[]
+  /** "work": a task's rounds, which skip `when: "land"` checks; "land": the gate before landing, which runs them. */
+  stage?: "work" | "land"
+  /** Variables for every check, e.g. a task's HORDE_TASK and HORDE_WORKTREE. */
+  env?: Record<string, string>
 }
 
 export interface Verdict {
@@ -103,6 +107,8 @@ export async function gate(directory: string, opts: GateOptions = {}): Promise<V
     allowed: opts.allowed ?? [],
     settings: { ...settings, checks: undefined },
     related: relatedMode ? (opts.relatedTo ?? true) : false,
+    stage: opts.stage ?? null,
+    env: opts.env ?? null,
   })
   const hit = key && !opts.fresh ? cache.get(key) : undefined
   if (hit) return { ...hit, cached: true, text: render(hit, budget, true) }
@@ -116,12 +122,15 @@ export async function gate(directory: string, opts: GateOptions = {}): Promise<V
       : await changedFiles(dir, base!)
     ;({ plans, untested } = planRelated(root, files, selected))
   }
+  if (opts.stage === "work") for (const c of selected) if (c.when === "land") plans.set(c, { tests: [], skipped: "runs before landing (when: land)" })
   const toRun = selected.filter((c) => !plans.get(c)?.skipped).map((c) => ({ ...c, command: plans.get(c)?.command ?? c.command }))
   const ran = await runChecks(toRun, {
     timeoutMs: settings.timeoutMs,
     signal: opts.signal,
     logDir: logDirFor(path.join(opts.stateDir ?? defaultStateDir(), "logs"), dir),
     onProgress: opts.onProgress,
+    env: opts.env,
+    lockDir: toRun.some((c) => c.slots || c.exclusive) ? await lockDirFor(dir, opts.stateDir ?? defaultStateDir()) : undefined,
   })
   const checks = selected.flatMap((c): CheckResult[] => {
     const plan = plans.get(c)
@@ -172,6 +181,13 @@ export async function gate(directory: string, opts: GateOptions = {}): Promise<V
 }
 
 const NO_CHECKS = "no checks to run (configure verify.checks in horde.json)"
+
+/** Locks for checks' slots: one directory per repository (its common git dir), shared by all its worktrees. */
+async function lockDirFor(dir: string, stateDir: string): Promise<string> {
+  const common = await git(dir, "rev-parse", "--path-format=absolute", "--git-common-dir").catch(() => dir)
+  const real = await fs.realpath(common).catch(() => common)
+  return path.join(stateDir, "locks", createHash("sha256").update(real).digest("hex").slice(0, 16))
+}
 
 function pick(all: Check[], names: string[]): Check[] {
   const unknown = names.filter((n) => !all.some((c) => c.name === n))

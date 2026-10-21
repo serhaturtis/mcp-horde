@@ -91,8 +91,10 @@ export interface RunResult {
  * result says what happened. Rejects only when the shell cannot be started.
  */
 export function runCommand(command: string, opts: RunOptions): Promise<RunResult> {
-  const env: Record<string, string | undefined> = { ...process.env, ...opts.env }
+  // Prefixes strip what the command would inherit, never what the caller passes on purpose.
+  const env: Record<string, string | undefined> = { ...process.env }
   for (const prefix of opts.stripEnv ?? []) for (const k of Object.keys(env)) if (k.startsWith(prefix)) delete env[k]
+  Object.assign(env, opts.env)
   const maxChars = opts.maxChars ?? 1_000_000
   const half = Math.floor(maxChars / 2)
   const started = Date.now()

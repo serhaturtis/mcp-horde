@@ -1414,7 +1414,14 @@ export class Fleet {
           }
         }
         // 2. The project's checks on exactly the tree your branch would get.
-        const v = await runGate(wt.root, { audit: false, related: false, signal, stateDir: verifyStateDir() })
+        const v = await runGate(wt.root, {
+          audit: false,
+          related: false,
+          stage: "land",
+          env: { HORDE_TASK: task.id, HORDE_WORKTREE: wt.root },
+          signal,
+          stateDir: verifyStateDir(),
+        })
         if (!v.pass)
           return { landed: false, target, why: "checks", text: v.text, checks: v.checks.map((c) => ({ name: c.name, pass: c.pass, summary: checkSummary(c) })) }
         // 3. Your branch must still be where the checks saw it; otherwise go round again.
@@ -1764,6 +1771,8 @@ export class Fleet {
         checks: cfg.checks,
         allowed: cfg.allowed,
         related: cfg.related !== false,
+        stage: "work",
+        env: wt ? { HORDE_TASK: live.record.task?.id ?? live.record.name ?? live.record.id, HORDE_WORKTREE: wt.root } : undefined,
         signal: abort.signal,
         stateDir: verifyStateDir(),
       })

@@ -309,14 +309,14 @@ describe("opencode MCP server: core behaviour (real opencode, mock LLM)", { time
       name: "iso",
       isolation: "worktree",
       permissions: "allow",
-      worktree: { link: ["node_modules"], setup: "mkdir -p build && echo ready > build/setup.txt" },
+      worktree: { link: ["node_modules"], setup: 'mkdir -p build && echo "ready $HORDE_TASK $HORDE_WORKTREE" > build/setup.txt' },
       profile: { tools: { webfetch: false, websearch: false } },
       wait: true,
       timeout_seconds: 60,
     })
     assert.match(out, /carried over uncommitted changes and \d+ untracked file/)
     assert.match(out, /linked node_modules/)
-    assert.match(out, /setup `mkdir -p build && echo ready > build\/setup.txt` succeeded/)
+    assert.match(out, /setup `mkdir -p build && echo "ready \$HORDE_TASK \$HORDE_WORKTREE" > build\/setup.txt` succeeded/)
     assert.match(out, /worktree, branch horde\/iso/)
     assert.match(out, /Tools: .*shell/)
     assert.doesNotMatch(out, /Tools: .*webfetch/)
@@ -325,6 +325,12 @@ describe("opencode MCP server: core behaviour (real opencode, mock LLM)", { time
     assert.equal(fs.readFileSync(path.join(dir, "README.md"), "utf8"), "# test repo\nlocal edit\n")
     assert.equal(fs.readFileSync(path.join(dir, "scratch.txt"), "utf8"), "untracked\n")
     assert.ok(fs.lstatSync(path.join(dir, "node_modules")).isSymbolicLink())
+    // Setup knows which task and worktree it prepares (per-worktree databases, ports).
+    const [ready, task, root] = fs
+      .readFileSync(path.join(dir, "build", "setup.txt"), "utf8")
+      .trim()
+      .split(" ")
+    assert.deepEqual([ready, task, fs.realpathSync(root!)], ["ready", "iso", fs.realpathSync(dir)])
     assert.equal(git(repo, "status", "--porcelain", "--", ".opencode"), "", "generated profile is not visible in the main checkout")
 
     await h.call("opencode_message", {

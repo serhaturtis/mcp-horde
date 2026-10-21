@@ -65,6 +65,7 @@ describe("the simple path: horde_do, horde_wait, horde_land (real opencode, mock
     })
     assert.match(started, /^t-\w+ working: "Write the greeting file" · mock\/mock \(tier 0 of 2\) · worktree horde\/t-\w+/, started)
     assert.match(started, /scope: hello\.txt/)
+    assert.match(started, /checked by: test \(node check\.js\) · the tests related to the change after each round, every check before landing/)
     assert.match(started, /→ horde_wait \{ids: \["t-\w+"\]\}/)
     const id = idOf(started)
 
@@ -172,6 +173,21 @@ describe("the simple path: horde_do, horde_wait, horde_land (real opencode, mock
     assert.equal(branches(), "")
     assert.equal((await Board.open(repo, boardState())).task(id).status, "failed")
     await assert.rejects(h.call("horde_wait", { ids: [id] }), /unknown agent|no longer tracked|disposed/)
+  })
+
+  test("horde_do refuses up front in a repository without checks, and says how to add them", async () => {
+    const bare = path.join(tmp, "no-checks")
+    fs.mkdirSync(bare)
+    fs.writeFileSync(path.join(bare, "README.md"), "# nothing to run\n")
+    git(bare, "init", "-q")
+    git(bare, "add", ".")
+    git(bare, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init")
+    await assert.rejects(h.call("horde_do", { goal: "Change the README.", directory: bare }), (err: Error) => {
+      assert.match(err.message, /no checks found in .*no-checks, so nothing was started/)
+      assert.match(err.message, /"verify": \{"checks"/)
+      return true
+    })
+    assert.deepEqual((await Board.open(bare, boardState())).tasks(), [], "no task was planned")
   })
 
   test("horde_drop closes a task whose worker never started", async () => {

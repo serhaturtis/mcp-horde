@@ -22,6 +22,7 @@ import {
   logFileFor,
   narrowCommand,
   planRelated,
+  runChecks,
 } from "../src/lib.js"
 
 const pkg = path.resolve(import.meta.dirname, "..")
@@ -673,6 +674,81 @@ describe("fixes", () => {
     assert.equal(r.counts?.failed, 1)
     assert.notEqual(logFileFor("/l", "test:unit"), logFileFor("/l", "test_unit"))
     assert.equal(path.basename(logFileFor("/l", "test")), "test.log")
+  })
+})
+
+describe("checks that need the task, a stage or a slot", () => {
+  test("horde.json takes env, when, slots and exclusive per check, and rejects bad ones", () => {
+    const { root } = repo({ "README.md": "# x\n" })
+    const checks = {
+      unit: { command: "go test ./...", env: { AUTH_PROVIDER: "local" }, slots: 2 },
+      pg: { command: "pytest -q", when: "land", exclusive: "dev-stack" },
+      plain: "echo ok",
+    }
+    write(root, { "horde.json": JSON.stringify({ verify: { checks } }) })
+    const s = loadSettings(root)
+    assert.deepEqual(
+      s.checks!.map(({ name, env, when, slots, exclusive }) => ({ name, env, when, slots, exclusive })),
+      [
+        { name: "unit", env: { AUTH_PROVIDER: "local" }, when: undefined, slots: 2, exclusive: undefined },
+        { name: "pg", env: undefined, when: "land", slots: undefined, exclusive: "dev-stack" },
+        { name: "plain", env: undefined, when: undefined, slots: undefined, exclusive: undefined },
+      ],
+    )
+    for (const [bad, re] of [
+      [{ command: "x", env: { A: 1 } }, /env must be an object of name → string/],
+      [{ command: "x", when: "later" }, /when must be "land" or "always"/],
+      [{ command: "x", slots: 0 }, /slots must be a positive integer/],
+      [{ command: "x", exclusive: "a b" }, /exclusive must be a name/],
+    ] as const) {
+      write(root, { "horde.json": JSON.stringify({ verify: { checks: { bad } } }) })
+      assert.throws(() => loadSettings(root), re)
+    }
+  })
+
+  test("a task's rounds skip land-only checks, the landing gate runs them, and both see the task", async () => {
+    // HORDE_ variables inherited from the server are stripped from checks; the ones the gate passes are not.
+    const sees = "node -e \"process.exit(process.env.HORDE_TASK === 't-1' && process.env.HORDE_WORKTREE ? 0 : 1)\""
+    const { root } = repo({ "horde.json": JSON.stringify({ verify: { checks: { quick: sees, slow: { command: sees, when: "land" } } } }) })
+    const env = { HORDE_TASK: "t-1", HORDE_WORKTREE: root }
+    const work = await gate(root, { stage: "work", env, stateDir: tmp() })
+    assert.equal(work.pass, true, work.text)
+    assert.deepEqual(
+      work.checks.map((c) => [c.name, c.related?.skipped]),
+      [
+        ["quick", undefined],
+        ["slow", "runs before landing (when: land)"],
+      ],
+    )
+    const land = await gate(root, { stage: "land", env, stateDir: tmp(), fresh: true })
+    assert.equal(land.pass, true, land.text)
+    assert.ok(land.checks.every((c) => !c.related?.skipped))
+    const without = await gate(root, { stage: "land", stateDir: tmp(), fresh: true })
+    assert.equal(without.pass, false, "without the task's variables the check fails, so they really arrive")
+  })
+
+  test("an exclusive resource serializes runs across callers; two slots let two overlap", async () => {
+    const dir = tmp()
+    const log = path.join(dir, "log.txt")
+    // Each run logs its start and end around a 400 ms pause.
+    const step = (id: string) =>
+      `node -e "const f=require('fs');f.appendFileSync(process.argv[1],'start ${id}\\n');setTimeout(()=>f.appendFileSync(process.argv[1],'end ${id}\\n'),400)" ${JSON.stringify(log)}`
+    const run = (id: string, extra: Partial<Check>) =>
+      runChecks([{ name: "suite", command: step(id), kind: "test", cwd: dir, source: "test", ...extra }], {
+        timeoutMs: 30_000,
+        lockDir: path.join(dir, "locks"),
+      })
+    const order = () =>
+      fs
+        .readFileSync(log, "utf8")
+        .trim()
+        .split("\n")
+        .map((l) => l.split(" ")[0])
+    await Promise.all([run("a", { exclusive: "stack" }), run("b", { exclusive: "stack" })])
+    assert.deepEqual(order(), ["start", "end", "start", "end"], "one at a time")
+    fs.rmSync(log)
+    await Promise.all([run("a", { slots: 2 }), run("b", { slots: 2 })])
+    assert.deepEqual(order(), ["start", "start", "end", "end"], "both at once")
   })
 })
 

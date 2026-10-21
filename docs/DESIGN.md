@@ -314,24 +314,28 @@ At the repository root (optional; everything auto-detects without it):
     "moonshot/kimi-k3"
   ],
   "verify": {
-    "checks": { "test": "npm test", "typecheck": "npm run typecheck", "lint": "npm run lint" },
+    "checks": {
+      "test": "npm test",
+      "lint": "npm run lint",
+      "pg": { "command": "uv run pytest tests/pg", "cwd": "api", "env": { "AUTH_PROVIDER": "local" }, "when": "land", "slots": 2, "exclusive": "dev-stack" }
+    },
     "timeoutSeconds": 600,
     "audit": { "block": ["scope", "tests", "secrets", "binaries"], "warn": ["suppressions", "dependencies"] }
   },
   "context": { "ignore": ["fixtures/**"], "entrypoints": ["src/index.ts"] },
-  "workers": { "brief": ["docs/lane_brief.md"] },
+  "workers": { "setup": "uv sync --frozen", "brief": ["docs/lane_brief.md"] },
   "board": { "leaseMinutes": 30, "memoryStaleDays": 90 }
 }
 ```
 
-`tiers` lists worker models cheapest first, as `"provider/model"` or `{ model, variant }`; a task's tier indexes it, and the tier past the last entry is the orchestrator itself (a task-bound spawn there is refused with that explanation; an explicit `model` always wins). `workers.brief` lists repository-relative files (house rules) that every worker brief includes in full under `## House rules (<path>)`, right after its scope (each capped at 300 lines, with a missing file named in the brief rather than failing it). Environment variables remain for machine-level settings (state dirs, the OpenCode binary, server mode, passwords), as `opencode` does today. Project behaviour lives in `horde.json`, so it is versioned with the code and shared by every horde server and both sides.
+`tiers` lists worker models cheapest first, as `"provider/model"` or `{ model, variant }`; a task's tier indexes it, and the tier past the last entry is the orchestrator itself (a task-bound spawn there is refused with that explanation; an explicit `model` always wins). `workers.brief` lists repository-relative files (house rules) that every worker brief includes in full under `## House rules (<path>)`, right after its scope (each capped at 300 lines, with a missing file named in the brief rather than failing it). A check runs in a shell from the root or its `cwd`, with its `env`; `"when": "land"` keeps it out of a task's rounds (the related tests stand in) and in the gate before landing; `slots` and `exclusive` bound how many runs overlap across every process and worktree of the repository (lock files under verify's state directory, freed when their holder dies). Checks and `workers.setup` see `HORDE_TASK` and `HORDE_WORKTREE` when they run for a task, for per-task databases and ports. `horde_do` refuses in a repository where no checks are found, since its gate could never pass, and its first answer names the checks that will judge the work. Environment variables remain for machine-level settings (state dirs, the OpenCode binary, server mode, passwords), as `opencode` does today. Project behaviour lives in `horde.json`, so it is versioned with the code and shared by every horde server and both sides.
 
 A user-level `$XDG_CONFIG_HOME/mcp-horde/horde.json` (or `~/.config/mcp-horde/horde.json` when `XDG_CONFIG_HOME` is unset) sets `tiers` and `opencode` once for every repository; each applies only where the repository's `horde.json` does not set it, and every other key in it is ignored. For example, `{ "tiers": ["deepseek/deepseek-flash"] }` there makes `deepseek/deepseek-flash` the default worker model everywhere.
 
 ## 6. Flows
 
 ### A single task
-1. `horde_do { goal, done, scope }` → `t-1 working · deepseek/deepseek-flash (tier 0 of 2) · worktree horde/t-1`.
+1. `horde_do { goal, done, scope }` → `t-1 working · deepseek/deepseek-flash (tier 0 of 2) · worktree horde/t-1 · checked by: test (npm test), lint (npm run lint)`.
 2. The worker works; the checks fail on round 1 (a type error) and the verdict goes back to it; round 2 passes; the reviewer finds every criterion met.
 3. `horde_wait` → `t-1 READY · checks ✓ · review: 3 of 3 criteria met · report matches the diff · changed 3 files (+86 −2) · $0.04` (~300 tokens).
 4. `horde_land { id: "t-1" }` → the checks pass on top of the orchestrator's branch, the commits land, the task is done.

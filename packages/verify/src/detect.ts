@@ -16,6 +16,12 @@ export interface Check {
   env?: Record<string, string>
   /** Inherited variable prefixes removed for this check. */
   stripEnv?: string[]
+  /** "land": skipped while a task works, run before landing (a slow suite that the related tests stand in for). */
+  when?: "land"
+  /** At most this many runs of the check at once, across every horde process using the repository. */
+  slots?: number
+  /** A resource the check needs alone (a dev stack, a recording): checks naming the same one never overlap. */
+  exclusive?: string
 }
 
 export type AuditCategory = "scope" | "tests" | "suppressions" | "dependencies" | "secrets" | "binaries" | "git"
@@ -91,12 +97,30 @@ function parseSettings(horde: HordeFile): VerifySettings {
   if (v.checks !== undefined) {
     if (!v.checks || typeof v.checks !== "object" || Array.isArray(v.checks)) throw new Error(`${where}.checks must be an object of name → command`)
     checks = Object.entries(v.checks as Record<string, unknown>).map(([name, spec]) => {
-      const s = typeof spec === "string" ? { command: spec } : (spec as { command?: unknown; kind?: unknown; cwd?: unknown })
-      if (!s || typeof s.command !== "string" || !s.command.trim()) throw new Error(`${where}.checks.${name} needs a command`)
+      const s = (typeof spec === "string" ? { command: spec } : spec) as Record<string, unknown> | null
+      const at = `${where}.checks.${name}`
+      if (!s || typeof s.command !== "string" || !s.command.trim()) throw new Error(`${at} needs a command`)
       const kind = (s.kind ?? kindOf(name)) as CheckKind
-      if (!["test", "typecheck", "lint", "build", "other"].includes(kind)) throw new Error(`${where}.checks.${name}.kind is invalid`)
+      if (!["test", "typecheck", "lint", "build", "other"].includes(kind)) throw new Error(`${at}.kind is invalid`)
       const cwd = typeof s.cwd === "string" ? path.resolve(horde.root, s.cwd) : horde.root
-      return { name, command: s.command, kind, cwd, source: "horde.json" }
+      const env = s.env
+      if (env !== undefined && (!env || typeof env !== "object" || Array.isArray(env) || Object.values(env).some((v) => typeof v !== "string")))
+        throw new Error(`${at}.env must be an object of name → string`)
+      if (s.when !== undefined && s.when !== "land" && s.when !== "always") throw new Error(`${at}.when must be "land" or "always"`)
+      if (s.slots !== undefined && !(Number.isInteger(s.slots) && (s.slots as number) > 0)) throw new Error(`${at}.slots must be a positive integer`)
+      if (s.exclusive !== undefined && !(typeof s.exclusive === "string" && /^[\w.-]+$/.test(s.exclusive)))
+        throw new Error(`${at}.exclusive must be a name (letters, digits, . _ -)`)
+      return {
+        name,
+        command: s.command,
+        kind,
+        cwd,
+        source: "horde.json",
+        ...(env ? { env: env as Record<string, string> } : {}),
+        ...(s.when === "land" ? { when: "land" as const } : {}),
+        ...(s.slots ? { slots: s.slots as number } : {}),
+        ...(s.exclusive ? { exclusive: s.exclusive as string } : {}),
+      }
     })
   }
   const audit = (v.audit ?? {}) as Record<string, unknown>

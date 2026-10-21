@@ -5,6 +5,7 @@
  */
 import { Board } from "@mcp-horde/board"
 import { formatDuration, formatUsd, git, indent, loadTiers, oneLine, truncate } from "@mcp-horde/core"
+import { type Check, detectChecks } from "@mcp-horde/verify"
 import type { ServerContext } from "@modelcontextprotocol/server"
 import { z } from "zod"
 import { type Fleet, formatModel, formText, type LandResult, SETTLED, type Snapshot } from "./fleet.js"
@@ -76,6 +77,9 @@ export function registerHorde(tool: Tool, opts: HordeOptions) {
     },
     async (a, fleet, extra) => {
       const repo = fleet.resolveDir(a.directory)
+      // The checks judge the work: with none the gate can never pass, so say so before a worker spends anything.
+      const checks = await detectChecks(repo)
+      if (!checks.length) throw new Error(noChecks(repo))
       const board = await Board.open(repo)
       const { tasks, warnings } = await board.plan([{ title: a.title ?? titleOf(a.goal), goal: a.goal, acceptance: a.done ?? [], scope: a.scope ?? [] }])
       const task = tasks[0]!
@@ -103,7 +107,9 @@ export function registerHorde(tool: Tool, opts: HordeOptions) {
       const setup = notes.filter((n) => !/^working t-/.test(n)).map((n) => n.replace(/ from the main checkout$/, ""))
       return [
         `${task.id} working: "${task.title}" · ${model}${tier} · worktree ${snapshot.worktree?.branch ?? "(none)"}`,
-        ...[setup.join(" · "), task.scope.length ? `scope: ${task.scope.join(", ")}` : "", ...warnings].filter(Boolean).map((l) => `  ${l}`),
+        ...[setup.join(" · "), task.scope.length ? `scope: ${task.scope.join(", ")}` : "", plannedChecks(checks), ...warnings]
+          .filter(Boolean)
+          .map((l) => `  ${l}`),
         `→ horde_wait {ids: ["${task.id}"]} for the outcome`,
       ].join("\n")
     },
@@ -210,6 +216,20 @@ export function registerHorde(tool: Tool, opts: HordeOptions) {
       return `dropped ${task?.id ?? a.id}: the worker stopped, the attempt is recorded as failed, and its worktree and branch are removed${kept}.`
     },
   )
+}
+
+/** What will judge the work, so nobody assumes a gate that is not there. */
+function plannedChecks(checks: Check[]): string {
+  const list = checks.map((c) => `${c.name} (${truncate(c.command, 40)}${c.when === "land" ? ", before landing only" : ""})`).join(", ")
+  return `checked by: ${list} · the tests related to the change after each round, every check before landing`
+}
+
+function noChecks(repo: string): string {
+  return [
+    `no checks found in ${repo}, so nothing was started: a task's work is judged by the project's checks, and with none its gate can never pass.`,
+    'Add them to horde.json at the repository root, e.g. {"verify": {"checks": {"test": "AUTH_PROVIDER=local go test -race ./...", "web": {"command": "npm test", "cwd": "web"}}}}.',
+    "Each command runs in a shell from the repository root (or its cwd), so environment prefixes work. Then horde_do again; verify_detect shows what is found.",
+  ].join("\n")
 }
 
 /** Wait, then one outcome block per task with news, a line per task still working. */

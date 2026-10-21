@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto"
 import fs from "node:fs"
 import path from "node:path"
-import { runCommand } from "@mcp-horde/core"
+import { runCommand, withLock } from "@mcp-horde/core"
 import type { Check, CheckKind } from "./detect.js"
 import { type Extracted, extract } from "./extract.js"
 import type { Narrowing } from "./related.js"
@@ -29,6 +29,10 @@ export interface RunChecksOptions {
   onProgress?: (message: string) => void
   /** Stop after the first failing check (default: run them all, so the verdict is complete). */
   failFast?: boolean
+  /** Variables for every check, e.g. a task's HORDE_TASK and HORDE_WORKTREE. */
+  env?: Record<string, string>
+  /** Where checks with `slots` or `exclusive` take their locks: one directory per repository, shared by its worktrees. */
+  lockDir?: string
 }
 
 /** Output kept per check: plenty for any extractor, bounded for pathological logs. */
@@ -65,16 +69,18 @@ export async function runChecks(checks: Check[], opts: RunChecksOptions): Promis
   for (const check of checks) {
     if (opts.signal?.aborted) break
     opts.onProgress?.(`${check.name}: ${check.command}`)
-    const r = await runCommand(check.command, {
-      cwd: check.cwd,
-      timeoutMs: opts.timeoutMs,
-      signal: opts.signal,
-      env: { ...CI_ENV, ...check.env },
-      stripEnv: [...STRIP_ENV, ...(check.stripEnv ?? [])],
-      maxChars: MAX_LOG_CHARS,
-      onProgress: (line) => opts.onProgress?.(`${check.name}: ${line}`),
-      progressMs: 10_000,
-    }).catch((err: Error) => ({ code: null, stopped: undefined, output: `could not start: ${err.message}`, truncated: 0, durationMs: 0 }))
+    const r = await holding(check, opts, () =>
+      runCommand(check.command, {
+        cwd: check.cwd,
+        timeoutMs: opts.timeoutMs,
+        signal: opts.signal,
+        env: { ...CI_ENV, ...opts.env, ...check.env },
+        stripEnv: [...STRIP_ENV, ...(check.stripEnv ?? [])],
+        maxChars: MAX_LOG_CHARS,
+        onProgress: (line) => opts.onProgress?.(`${check.name}: ${line}`),
+        progressMs: 10_000,
+      }),
+    ).catch((err: Error) => ({ code: null, stopped: undefined, output: `could not start: ${err.message}`, truncated: 0, durationMs: 0 }))
     const pass = r.code === 0 && !r.stopped
     let logFile: string | undefined
     if (opts.logDir) {
@@ -114,4 +120,46 @@ export async function runChecks(checks: Check[], opts: RunChecksOptions): Promis
     if (!pass && opts.failFast) break
   }
   return results
+}
+
+/** Runs `fn` holding the check's slot and its exclusive resource, when it names them. */
+async function holding<T>(check: Check, opts: RunChecksOptions, fn: () => Promise<T>): Promise<T> {
+  const needs = [
+    ...(check.slots ? [{ name: `check-${check.name}`, count: check.slots }] : []),
+    ...(check.exclusive ? [{ name: `resource-${check.exclusive}`, count: 1 }] : []),
+  ]
+  const dir = opts.lockDir
+  if (!needs.length || !dir) return fn()
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+  // Slots first, then the resource: the same order everywhere, so two checks never wait on each other.
+  return needs.reduceRight<() => Promise<T>>((inner, need) => () => slot(dir, need.name, need.count, check.name, opts, inner), fn)()
+}
+
+/** One of `count` slots named `name`, held while `fn` runs (core's withLock, so a dead holder frees it). */
+async function slot<T>(dir: string, name: string, count: number, check: string, opts: RunChecksOptions, fn: () => Promise<T>): Promise<T> {
+  const deadline = Date.now() + opts.timeoutMs
+  let said = false
+  for (;;) {
+    for (let i = 0; i < count; i++) {
+      let started = false
+      try {
+        return await withLock(
+          dir,
+          `${name}.${i}`,
+          () => {
+            started = true
+            return fn()
+          },
+          0,
+        )
+      } catch (err) {
+        if (started || !/^timed out waiting for /.test((err as Error).message)) throw err
+      }
+    }
+    if (opts.signal?.aborted) throw new Error(`cancelled while waiting for ${name}`)
+    if (Date.now() > deadline) throw new Error(`waited ${Math.round(opts.timeoutMs / 1000)}s for ${name}: all ${count} of its slot(s) stayed taken`)
+    if (!said) opts.onProgress?.(`${check}: waiting for ${name} (all ${count} slot${count > 1 ? "s" : ""} taken)`)
+    said = true
+    await new Promise((r) => setTimeout(r, 1000))
+  }
 }

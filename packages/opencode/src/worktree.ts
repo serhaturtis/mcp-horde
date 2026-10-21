@@ -188,7 +188,7 @@ export async function createWorktree(directory: string, name: string, opts: Work
       await fs.mkdir(worktree.path, { recursive: true })
       notes.push(`${sub} is not in the committed tree; created it empty in the worktree`)
     }
-    if (opts.setup) notes.push(await runSetup(opts.setup, worktree.path, opts.signal, opts.onProgress))
+    if (opts.setup) notes.push(await runSetup(opts.setup, worktree.path, { HORDE_TASK: name, HORDE_WORKTREE: worktree.root }, opts.signal, opts.onProgress))
   } catch (err) {
     await git(repo, "worktree", "remove", "--force", root).catch(() => fs.rm(root, { recursive: true, force: true }))
     await git(repo, "worktree", "prune").catch(() => undefined)
@@ -326,9 +326,10 @@ async function carryUncommitted(repo: string, root: string, notes: string[], lin
 }
 
 /** Run the setup command; it is killed with all its children on timeout or abort. */
-async function runSetup(command: string, cwd: string, signal?: AbortSignal, onProgress?: (m: string) => void): Promise<string> {
+async function runSetup(command: string, cwd: string, env: Record<string, string>, signal?: AbortSignal, onProgress?: (m: string) => void): Promise<string> {
   const r = await runCommand(command, {
     cwd,
+    env,
     signal,
     timeoutMs: 15 * 60_000,
     stripEnv: ["OPENCODE_SERVER_"],
