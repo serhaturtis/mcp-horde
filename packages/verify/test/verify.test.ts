@@ -525,6 +525,66 @@ describe("related tests", () => {
     assert.match(fs.readFileSync(full.checks[0]!.logFile!, "utf8"), /ran: everything/)
     assert.doesNotMatch(full.text, /related|full suite/)
   })
+
+  test("a matching tsconfig path and Vite object alias narrow the frontend and leave other runners alone", () => {
+    const { root } = repo({
+      "pyproject.toml": "[tool.pytest.ini_options]\n",
+      "app.py": "value = 1\n",
+      "tests/test_app.py": "from app import value\n",
+      "frontend/tsconfig.json": '{ "compilerOptions": { "baseUrl": ".", "paths": { "@/*": ["./src/*"] } } }',
+      "frontend/vite.config.ts": 'import { resolve } from "node:path"\nexport default { resolve: { alias: { "@": resolve(__dirname, "src") } } }\n',
+      "frontend/src/a.ts": "export const a = 1\n",
+      "frontend/src/a.test.ts": 'import { a } from "@/a"\n',
+    })
+    const web = check("npx vitest run", path.join(root, "frontend"))
+    const py = check("pytest", root)
+    const plans = planRelated(root, ["app.py", "frontend/src/a.ts"], [web, py]).plans
+    assert.equal(plans.get(web)?.command, "npx vitest run src/a.test.ts")
+    assert.equal(plans.get(web)?.full, undefined)
+    assert.equal(plans.get(py)?.command, "pytest tests/test_app.py")
+    assert.equal(plans.get(py)?.full, undefined)
+  })
+
+  test("aliases the code map cannot resolve make only the JS check run the full suite, naming the file", () => {
+    const cases = [
+      [
+        "vite.config.ts",
+        {
+          "tsconfig.json": '{ "compilerOptions": { "paths": { "@/*": ["src/*"] } } }\n',
+          "vite.config.ts": 'export default { resolve: { alias: { "~": "/src" } } }\n',
+        },
+      ],
+      ["vite.config.ts", { "vite.config.ts": 'export default { resolve: { alias: [{ find: "@", replacement: "/src" }] } }\n' }],
+      ["tsconfig.app.json", { "tsconfig.app.json": '{ "compilerOptions": { "paths": { "@/*": ["src/*"] } } }\n' }],
+      ["package.json", { "package.json": JSON.stringify({ imports: { "#a": "./src/a.js" } }) }],
+    ] as const
+    for (const [name, files] of cases) {
+      const { root } = repo({ "src/a.js": "exports.a = 1\n", "src/a.test.js": "require('./a')\n", ...files })
+      const web = check("npx vitest run", root)
+      const plan = planRelated(root, ["src/a.js"], [web]).plans.get(web)!
+      assert.equal(plan.command, undefined, name)
+      assert.match(plan.full ?? "", new RegExp(name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), name)
+    }
+  })
+
+  test("aliases never make a Go or Python check run the full suite", () => {
+    const { root } = repo({
+      "package.json": JSON.stringify({ imports: { "#a": "./src/a.js" } }),
+      "pyproject.toml": "[tool.pytest.ini_options]\n",
+      "app.py": "value = 1\n",
+      "tests/test_app.py": "from app import value\n",
+      "go.mod": "module example.com/m\n",
+      "a.go": "package m\n",
+      "a_test.go": "package m\n",
+    })
+    const py = check("pytest", root)
+    const go = check("go test ./...", root)
+    const plans = planRelated(root, ["app.py", "a.go"], [py, go]).plans
+    assert.equal(plans.get(py)?.command, "pytest tests/test_app.py")
+    assert.equal(plans.get(py)?.full, undefined)
+    assert.equal(plans.get(go)?.command, "go test .")
+    assert.equal(plans.get(go)?.full, undefined)
+  })
 })
 
 describe("fixes", () => {
@@ -804,8 +864,8 @@ describe("fixes", () => {
     assert.match(plan(["tests/conftest.py"]).full ?? "", /without related tests \(tests\/conftest\.py\)/)
     write(root, { "svc/pyproject.toml": "[tool.pytest.ini_options]\n", "svc/tests/test_app.py": "def test_a(): pass\n" })
     assert.equal(plan(["svc/tests/test_app.py"], test("pytest", path.join(root, "svc"))).full, "its Python project is not at the repository root")
-    write(root, { "tsconfig.json": '{ "compilerOptions": { "paths": { "@/*": ["src/*"] } } }' })
-    assert.equal(plan(["src/a.js"]).full, "the project uses import aliases")
+    write(root, { "tsconfig.app.json": '{ "compilerOptions": { "paths": { "@/*": ["src/*"] } } }' })
+    assert.match(plan(["src/a.js"]).full ?? "", /import aliases in tsconfig\.app\.json/)
   })
 
   test("extract: failed suites count, Go parents are not doubled; log names do not collide", () => {

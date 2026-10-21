@@ -21,6 +21,8 @@ export interface Narrowing {
 const quote = (p: string) => (/^[\w./@-]+$/.test(p) ? p : process.platform === "win32" ? `"${p.replace(/"/g, '\\"')}"` : `'${p.replace(/'/g, "'\\''")}'`)
 
 const PYTEST = /(^|[\s/])(pytest|py\.test)(\s|$)|-m\s+pytest\b/
+const TSCONFIG = /^(tsconfig|jsconfig)([.\w-]*)\.json$/
+const BUNDLER_CONFIG = /^(vite|vitest|webpack|rollup|rspack)\.config\.[cm]?[jt]s$/
 
 /**
  * The check's command restricted to `tests` (paths relative to its directory), for runners
@@ -84,16 +86,8 @@ export function planRelated(root: string, changed: string[], checks: Check[]): {
   if (!tests.length || !changed.length) return { plans, untested: [] }
   const project = openProject(root, { fresh: true })
   // What static imports cannot see makes every narrowing unsafe: run everything.
-  const unsafe = project.capped
-    ? `the project has more files than the code map reads`
-    : usesAliases(
-          root,
-          tests.map((c) => c.cwd),
-        )
-      ? "the project uses import aliases"
-      : undefined
-  if (unsafe) {
-    for (const check of tests) plans.set(check, { tests: [], full: unsafe })
+  if (project.capped) {
+    for (const check of tests) plans.set(check, { tests: [], full: "the project has more files than the code map reads" })
     return { plans, untested: [] }
   }
   // Transitive: a test that reaches a changed file through any chain of imports runs too.
@@ -129,6 +123,11 @@ export function planRelated(root: string, changed: string[], checks: Check[]): {
     return !r.startsWith("../") && r !== ".." && !path.isAbsolute(r)
   }
   for (const check of tests) {
+    const aliases = jsRunner(check) ? aliasUnsafe(root, check) : undefined
+    if (aliases) {
+      plans.set(check, { tests: [], full: aliases })
+      continue
+    }
     const go = /^go\s+test\b/.test(check.command.trim())
     const mine = related
       .filter((t) => inside(check.cwd, t))
@@ -170,35 +169,222 @@ function nestedModule(cwd: string, file: string, manifest: string): boolean {
   return false
 }
 
+/** The runners whose module resolution follows import aliases; the others cannot be affected by them. */
+function jsRunner(check: Check): boolean {
+  const cmd = check.command.trim()
+  if (PYTEST.test(cmd)) return false
+  if (/(?:^|\s)(?:npx\s+)?(vitest|jest)(?:\s|$)/.test(cmd)) return true
+  if (!/^npm\s+(test|run\s+test)$/.test(cmd)) return false
+  return !!npmScript(check.cwd, "test")
+    ?.trim()
+    .match(/^(?:npx\s+)?(vitest(?:\s+run)?|jest)(?:\s+--?[\w-]+(?:=\S+)?)*$/)
+}
+
 /**
- * Import aliases (tsconfig/jsconfig `paths`, package.json `imports`, bundler `alias`) point at
- * files under names the code map does not resolve, so their importers would be missed.
+ * Import aliases the code map cannot follow, in the repository root or the check's own
+ * directory. `compilerOptions.paths` in tsconfig.json/jsconfig.json is resolved by the code
+ * map, and so is a bundler alias whose keys those paths cover.
  */
-function usesAliases(root: string, dirs: string[]): boolean {
-  const read = (f: string) => {
-    try {
-      return fs.readFileSync(f, "utf8")
-    } catch {
-      return ""
-    }
+function aliasUnsafe(root: string, check: Check): string | undefined {
+  for (const dir of new Set([root, check.cwd])) {
+    const problem = aliasesAt(dir)
+    if (!problem) continue
+    const file = path.relative(root, problem.file).replace(/\\/g, "/") || path.basename(problem.file)
+    return `check "${check.name}" is affected by import aliases in ${file}: ${problem.why}`
   }
-  for (const dir of new Set([root, ...dirs])) {
-    let names: string[]
-    try {
-      names = fs.readdirSync(dir)
-    } catch {
-      continue
-    }
-    for (const n of names) {
-      // tsconfig files are JSONC (comments, trailing commas, `extends`): a key match is enough.
-      if (/^(tsconfig|jsconfig)([.\w-]*)\.json$/.test(n) && /"paths"\s*:/.test(read(path.join(dir, n)))) return true
-      if (/^(vite|vitest|webpack|rollup|rspack)\.config\.[cm]?[jt]s$/.test(n) && /\balias\b/.test(read(path.join(dir, n)))) return true
-    }
-    try {
-      if ((JSON.parse(read(path.join(dir, "package.json"))) as { imports?: unknown }).imports) return true
-    } catch {
-      // No package.json, or not ours to judge.
-    }
+  return undefined
+}
+
+function aliasesAt(dir: string): { file: string; why: string } | undefined {
+  let names: string[]
+  try {
+    names = fs.readdirSync(dir)
+  } catch {
+    return undefined
   }
-  return false
+  for (const n of names) {
+    if (n === "tsconfig.json" || n === "jsconfig.json" || !TSCONFIG.test(n)) continue
+    if (/"paths"\s*:/.test(read(path.join(dir, n)))) return { file: path.join(dir, n), why: "paths in a tsconfig file the code map does not read" }
+  }
+  const pkg = path.join(dir, "package.json")
+  try {
+    if ((JSON.parse(read(pkg)) as { imports?: unknown }).imports) return { file: pkg, why: "package.json imports are not resolved by the code map" }
+  } catch {
+    // No package.json, or not ours to judge.
+  }
+  const paths = tsPaths(dir)
+  for (const n of names) {
+    if (!BUNDLER_CONFIG.test(n)) continue
+    const why = bundlerAlias(read(path.join(dir, n)), paths)
+    if (why) return { file: path.join(dir, n), why }
+  }
+  return undefined
+}
+
+/** The `paths` patterns of the nearest tsconfig.json/jsconfig.json, which the code map reads. */
+function tsPaths(dir: string): string[] {
+  for (const n of ["tsconfig.json", "jsconfig.json"]) {
+    const file = path.join(dir, n)
+    if (!fs.existsSync(file)) continue
+    const data = jsonc(read(file)) as { compilerOptions?: { paths?: unknown } } | undefined
+    const paths = data?.compilerOptions?.paths
+    // The code map reads only an object of patterns; anything else covers nothing.
+    return paths && typeof paths === "object" && !Array.isArray(paths) ? Object.keys(paths) : []
+  }
+  return []
+}
+
+/** Why a bundler config's aliases are unsafe, or undefined when it has none or all are covered. */
+function bundlerAlias(text: string, paths: string[]): string | undefined {
+  const word = /\balias\b/g
+  let i = 0
+  while (true) {
+    word.lastIndex = i
+    const hit = word.exec(text)
+    if (!hit) return undefined
+    const j = skipTrivia(text, hit.index + hit[0].length)
+    if (text[j] !== ":") return "an alias that is not a plain object literal"
+    const end = objectKeys(text, skipTrivia(text, j + 1), paths)
+    if (end === undefined) return paths.length ? "a bundler alias not covered by tsconfig.json paths" : "a bundler alias without tsconfig.json paths"
+    i = end
+  }
+}
+
+/**
+ * The end of a plain object literal starting at `start`, when every key is covered by a
+ * `paths` pattern. Undefined for anything else: arrays, variables, spreads, computed keys.
+ */
+function objectKeys(s: string, start: number, paths: string[]): number | undefined {
+  if (s[start] !== "{") return undefined
+  let i = start + 1
+  while (true) {
+    i = skipTrivia(s, i)
+    if (i >= s.length) return undefined
+    if (s[i] === "}") return i + 1
+    if (s[i] === "." || s[i] === "[") return undefined
+    let key: string
+    if (s[i] === '"' || s[i] === "'") {
+      const end = s.indexOf(s[i]!, i + 1)
+      if (end < 0) return undefined
+      key = s.slice(i + 1, end)
+      if (key.includes("\\")) return undefined
+      i = end + 1
+    } else {
+      const m = /^[A-Za-z_$][\w$-]*/.exec(s.slice(i))
+      if (!m) return undefined
+      key = m[0]
+      i += key.length
+    }
+    i = skipTrivia(s, i)
+    if (s[i] !== ":" || !paths.some((p) => covers(p, key))) return undefined
+    i++
+    // Skip the value to the next top-level comma or the object's closing brace.
+    let depth = 0
+    while (i < s.length) {
+      const c = s[i]!
+      if (c === '"' || c === "'" || c === "`") {
+        const end = skipString(s, i)
+        if (end < 0) return undefined
+        i = end
+        continue
+      }
+      if (c === "/" && s[i + 1] === "/") {
+        const end = s.indexOf("\n", i)
+        i = end < 0 ? s.length : end + 1
+        continue
+      }
+      if (c === "/" && s[i + 1] === "*") {
+        const end = s.indexOf("*/", i + 2)
+        if (end < 0) return undefined
+        i = end + 2
+        continue
+      }
+      if (c === "{" || c === "(" || c === "[") {
+        depth++
+      } else if (c === "}" || c === ")" || c === "]") {
+        if (depth === 0) {
+          if (c !== "}") return undefined
+          return i + 1
+        }
+        depth--
+      } else if (c === "," && depth === 0) {
+        i++
+        break
+      }
+      i++
+    }
+    if (i >= s.length) return undefined
+  }
+}
+
+/** Is alias key `key` covered by tsconfig `paths` pattern `pattern` (`@` by `@/*` or `@`)? */
+function covers(pattern: string, key: string): boolean {
+  if (pattern === key) return true
+  const star = pattern.indexOf("*")
+  if (star < 0) return false
+  const prefix = pattern.slice(0, star)
+  const suffix = pattern.slice(star + 1)
+  if (prefix.endsWith("/") && !suffix && key === prefix.slice(0, -1)) return true
+  return key.length >= prefix.length + suffix.length && key.startsWith(prefix) && key.endsWith(suffix)
+}
+
+function skipTrivia(s: string, i: number): number {
+  while (i < s.length) {
+    if (/\s/.test(s[i]!)) {
+      i++
+    } else if (s[i] === "/" && s[i + 1] === "/") {
+      const end = s.indexOf("\n", i)
+      i = end < 0 ? s.length : end + 1
+    } else if (s[i] === "/" && s[i + 1] === "*") {
+      const end = s.indexOf("*/", i + 2)
+      i = end < 0 ? s.length : end + 2
+    } else break
+  }
+  return i
+}
+
+/** The index after a string literal; -1 for a template with interpolation we cannot read. */
+function skipString(s: string, i: number): number {
+  const q = s[i]!
+  i++
+  while (i < s.length) {
+    if (s[i] === "\\") i += 2
+    else if (q === "`" && s[i] === "$" && s[i + 1] === "{") return -1
+    else if (s[i] === q) return i + 1
+    else i++
+  }
+  return -1
+}
+
+function read(file: string): string {
+  try {
+    return fs.readFileSync(file, "utf8")
+  } catch {
+    return ""
+  }
+}
+
+/** JSONC (comments and trailing commas), as tsconfig.json is; undefined when unreadable. */
+function jsonc(text: string): unknown {
+  let out = ""
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]!
+    if (c === '"') {
+      let j = i + 1
+      while (j < text.length && text[j] !== '"') j += text[j] === "\\" ? 2 : 1
+      out += text.slice(i, j + 1)
+      i = j
+    } else if (c === "/" && text[i + 1] === "/") {
+      while (i < text.length && text[i] !== "\n") i++
+      out += "\n"
+    } else if (c === "/" && text[i + 1] === "*") {
+      const end = text.indexOf("*/", i + 2)
+      i = end < 0 ? text.length : end + 1
+    } else out += c
+  }
+  try {
+    return JSON.parse(out.replace(/,(\s*[}\]])/g, "$1"))
+  } catch {
+    return undefined
+  }
 }
