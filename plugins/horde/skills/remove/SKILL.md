@@ -10,7 +10,7 @@ The horde keeps two kinds of things for a repository: what `/horde:setup` wrote 
 The horde CLI is `servers/cli.js` in the plugin, two directories above this skill's base directory (shown above as "Base directory for this skill"). Run it with `node` from the repository's root. (A copy of this skill outside the plugin: use `plugins/horde/servers/cli.js` in the mcp-horde clone.)
 
 1. **See what is there.** `node <plugin>/servers/cli.js remove` lists the horde's state for this repository and removes nothing. Also check for `horde.json` at the root and a line in `CLAUDE.md` that hands work to the horde.
-2. **Ask once.** Show the user the list in a few lines. Name every `horde/*` branch that has commits not on the current branch: that work never landed and is lost with the branch. If the user wants it, land it or keep the branch before going on.
+2. **Ask once.** Show the user the list in a few lines. Name every `horde/*` branch that has commits not on the current branch and every worktree holding uncommitted changes: that work never landed and is lost with them. If the user wants it, land it or keep the branch before going on. Branches the horde did not create are kept and listed as such.
 3. **Remove the state.** The same command with `--yes`.
 4. **Remove the configuration.** `git rm horde.json`, delete the delegation line from `CLAUDE.md`, and commit them together ("Remove the horde from this repository"). If the user is resetting to run `/horde:setup` again, ask whether to keep `horde.json` as its starting point.
 5. **Report** what was removed, in one short list.

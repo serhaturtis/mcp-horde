@@ -11,7 +11,7 @@
  */
 import fs from "node:fs"
 import path from "node:path"
-import { defaultWorktreeDir, git, loadTiers, repoKey } from "@mcp-horde/core"
+import { branchSlug, defaultWorktreeDir, git, gitRaw, loadTiers, splitZ } from "@mcp-horde/core"
 import { defaultStateDir, lockDirFor, logDirFor } from "@mcp-horde/verify"
 import { Board, defaultStateRoot, projectOf, type Report } from "./board.js"
 import { renderNotes, renderSummary, renderTask } from "./render.js"
@@ -88,28 +88,51 @@ async function remove(flags: Flags): Promise<string> {
   const { root, key, legacyKey } = await projectOf(dir)
   const stateRoot = defaultStateRoot()
   const verifyRoot = defaultStateDir()
-  const worktreeRoot = path.join(defaultWorktreeDir(), repoKey(root))
+  const worktreeRoot = defaultWorktreeDir()
 
   const boards = [...new Set([key, ...(legacyKey ? [legacyKey] : [])])].map((k) => path.join(stateRoot, k)).filter((p) => fs.existsSync(p))
 
-  // Worktrees git knows about under our folder, plus anything left there (the repoKey is ours alone).
-  const registered = (await git(root, "worktree", "list", "--porcelain"))
-    .split("\n")
-    .filter((l) => l.startsWith("worktree "))
-    .map((l) => l.slice("worktree ".length))
+  // git lists every linked worktree of this repository, wherever its session filed it. Only those
+  // under the horde's worktree root and on a horde branch are the horde's.
+  const registered: { path: string; branch?: string }[] = []
+  for (const line of (await git(root, "worktree", "list", "--porcelain")).split("\n")) {
+    if (line.startsWith("worktree ")) registered.push({ path: line.slice("worktree ".length) })
+    else if (line.startsWith("branch ") && registered.length) registered[registered.length - 1]!.branch = line.slice("branch ".length)
+  }
   const within = (p: string) => {
     const rel = path.relative(worktreeRoot, p)
     return rel === "" || (rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel))
   }
-  const ours = registered.filter(within)
-  const left = fs.existsSync(worktreeRoot)
-    ? fs
-        .readdirSync(worktreeRoot, { withFileTypes: true })
-        .filter((e) => e.isDirectory())
-        .map((e) => path.join(worktreeRoot, e.name))
-    : []
-  const worktrees = [...new Set([...ours, ...left])]
+  const worktrees = registered.filter((w): w is { path: string; branch: string } => !!w.branch && w.branch.startsWith("refs/heads/horde/") && within(w.path))
 
+  // Uncommitted work is unlanded too, and gone with the worktree. Linked dependency trees are not work.
+  const dependency = /(^|\/)(node_modules|\.venv|venv)(\/|$)/
+  const uncommitted = async (worktree: string) => {
+    const entries = splitZ(await gitRaw(worktree, ["status", "--porcelain", "-z", "--untracked-files=all"]).catch(() => ""))
+    const paths: string[] = []
+    for (let i = 0; i < entries.length; i++) {
+      const entry = entries[i]!
+      paths.push(entry.slice(3))
+      // A rename or copy reports its original path as the next entry.
+      if ("RC".includes(entry[0]!)) paths.push(entries[++i] ?? "")
+    }
+    return [...new Set(paths.filter((p) => p && !dependency.test(p)))]
+  }
+  const dirty = await Promise.all(worktrees.map((w) => uncommitted(w.path)))
+
+  // Branches the horde made: those of its tasks, and those checked out in its worktrees.
+  const taskBranches = new Set<string>()
+  for (const p of boards)
+    for (const t of new Board(p).tasks()) {
+      taskBranches.add(`horde/${branchSlug(t.id)}`)
+      // A task started with an explicit name lives in a worktree whose folder is that name's slug.
+      for (const a of t.attempts) {
+        if (!a.workspace?.path || !within(a.workspace.path)) continue
+        const slot = path.relative(worktreeRoot, a.workspace.path).split(path.sep)[1]
+        if (slot) taskBranches.add(`horde/${branchSlug(slot)}`)
+      }
+    }
+  const hordeBranches = new Set([...taskBranches, ...worktrees.map((w) => w.branch.slice("refs/heads/".length))])
   // Each branch's commits that never landed on the current one are work the user may still want.
   const branches = await Promise.all(
     (await git(root, "for-each-ref", "--format=%(refname:short)", "refs/heads/horde/"))
@@ -117,12 +140,15 @@ async function remove(flags: Flags): Promise<string> {
       .filter(Boolean)
       .map(async (name) => ({
         name,
+        ours: hordeBranches.has(name),
         ahead: Number(await git(root, "rev-list", "--count", `HEAD..${name}`).catch(() => "0")),
       })),
   )
+  const removedBranches = branches.filter((b) => b.ours)
+  const keptBranches = branches.filter((b) => !b.ours)
 
   const logBase = path.join(verifyRoot, "logs")
-  const logs = [...new Set([root, ...worktrees].map((d) => logDirFor(logBase, d)))].filter((p) => fs.existsSync(p))
+  const logs = [...new Set([root, ...worktrees.map((w) => w.path)].map((d) => logDirFor(logBase, d)))].filter((p) => fs.existsSync(p))
   const locks = await lockDirFor(root, verifyRoot)
   const yes = flags.yes !== undefined && flags.yes.at(-1) !== "false"
 
@@ -133,9 +159,22 @@ async function remove(flags: Flags): Promise<string> {
     "  board",
     ...(boards.length ? boards.map((p) => `    ${p}`) : ["    (none)"]),
     "  worktrees",
-    ...(worktrees.length ? worktrees.map((p) => `    ${p}`) : ["    (none)"]),
+    ...(worktrees.length
+      ? worktrees.flatMap((w, i) => [
+          `    ${w.path}`,
+          ...(dirty[i]!.length
+            ? [
+                `      unlanded work (will be lost): uncommitted changes in ${dirty[i]!.length} file${dirty[i]!.length === 1 ? "" : "s"}`,
+                ...dirty[i]!.map((p) => `        ${p}`),
+              ]
+            : []),
+        ])
+      : ["    (none)"]),
     "  branches",
-    ...(branches.length ? branches.map((b) => `    ${b.name} (${b.ahead} commit${b.ahead === 1 ? "" : "s"} not on the current branch)`) : ["    (none)"]),
+    ...(removedBranches.length
+      ? removedBranches.map((b) => `    ${b.name} (${b.ahead} commit${b.ahead === 1 ? "" : "s"} not on the current branch)`)
+      : ["    (none)"]),
+    ...(keptBranches.length ? ["  kept branches", ...keptBranches.map((b) => `    ${b.name} (kept: not a horde task or worktree)`)] : []),
     "  check logs",
     ...(logs.length ? logs.map((p) => `    ${p}`) : ["    (none)"]),
     "  locks",
@@ -145,11 +184,14 @@ async function remove(flags: Flags): Promise<string> {
   if (!yes) return [...rows, "Nothing removed. Run with --yes to remove it.", "horde.json is yours: git rm horde.json to drop the configuration."].join("\n")
 
   const failed: string[] = []
-  for (const p of ours) await git(root, "worktree", "remove", "--force", p).catch((e: Error) => failed.push(e.message.split("\n")[0]!))
-  for (const p of worktrees) fs.rmSync(p, { recursive: true, force: true })
-  fs.rmSync(worktreeRoot, { recursive: true, force: true })
+  for (const w of worktrees) await git(root, "worktree", "remove", "--force", w.path).catch((e: Error) => failed.push(e.message.split("\n")[0]!))
+  for (const w of worktrees) fs.rmSync(w.path, { recursive: true, force: true })
   await git(root, "worktree", "prune").catch((e: Error) => failed.push(e.message.split("\n")[0]!))
-  for (const b of branches) await git(root, "branch", "-D", b.name).catch((e: Error) => failed.push(e.message.split("\n")[0]!))
+  // Drop the repository's now-empty folder, never the shared root or another repository's.
+  for (const w of worktrees) {
+    for (let p = path.dirname(w.path); p !== worktreeRoot && within(p) && fs.existsSync(p) && !fs.readdirSync(p).length; p = path.dirname(p)) fs.rmdirSync(p)
+  }
+  for (const b of removedBranches) await git(root, "branch", "-D", b.name).catch((e: Error) => failed.push(e.message.split("\n")[0]!))
   for (const p of boards) fs.rmSync(p, { recursive: true, force: true })
   for (const p of logs) fs.rmSync(p, { recursive: true, force: true })
   fs.rmSync(locks, { recursive: true, force: true })

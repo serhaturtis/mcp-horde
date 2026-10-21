@@ -459,6 +459,9 @@ describe("horde remove", () => {
     fs.writeFileSync(path.join(wtA, "work.txt"), "work\n")
     git(wtA, "add", "-A")
     git(wtA, "commit", "-qm", "work")
+    fs.writeFileSync(path.join(wtA, "dirty.txt"), "uncommitted\n")
+    fs.mkdirSync(path.join(wtA, "node_modules", "dep"), { recursive: true })
+    fs.writeFileSync(path.join(wtA, "node_modules", "dep", "index.js"), "x\n")
     git(repoA, "branch", "horde/empty")
 
     // Verify logs and lock directories.
@@ -486,7 +489,10 @@ describe("horde remove", () => {
       assert.ok(preview.includes(p), `${p} is listed:\n${preview}`)
     if (a.legacyKey) assert.ok(preview.includes(path.join(state, a.legacyKey)))
     assert.match(preview, /horde\/a \(1 commit not on the current branch\)/)
-    assert.match(preview, /horde\/empty \(0 commits not on the current branch\)/)
+    assert.match(preview, /unlanded work \(will be lost\): uncommitted changes in 1 file/)
+    assert.match(preview, /dirty\.txt/)
+    assert.doesNotMatch(preview, /node_modules/)
+    assert.match(preview, /horde\/empty \(kept: not a horde task or worktree\)/)
     assert.match(preview, /Nothing removed\. Run with --yes/)
     assert.match(preview, /horde\.json is yours: git rm horde\.json to drop the configuration/)
     assert.ok(fs.existsSync(path.join(state, a.key)), "preview removes nothing")
@@ -499,7 +505,8 @@ describe("horde remove", () => {
     if (a.legacyKey) assert.ok(!fs.existsSync(path.join(state, a.legacyKey)), "the legacy board is gone")
     assert.ok(!fs.existsSync(path.join(worktrees, repoKey(a.root))), "the repository's worktree folder is gone")
     assert.ok(!fs.existsSync(logsA) && !fs.existsSync(logsWtA) && !fs.existsSync(locksA))
-    assert.equal(git(repoA, "branch", "--list", "horde/*"), "", "horde branches are gone")
+    assert.equal(git(repoA, "branch", "--list", "horde/a"), "", "the horde's branch is gone")
+    assert.match(git(repoA, "branch", "--list", "horde/empty"), /horde\/empty/, "a branch the horde did not make is kept")
     assert.ok(fs.existsSync(path.join(repoA, "horde.json")), "horde.json is the user's")
     assert.equal(fs.readFileSync(path.join(repoA, "notes.txt"), "utf8"), "uncommitted\n", "uncommitted changes stay")
 
@@ -507,6 +514,55 @@ describe("horde remove", () => {
     assert.ok(fs.existsSync(wtB), "another repository's worktree stays")
     assert.ok(fs.existsSync(logsB) && fs.existsSync(locksB), "another repository's logs and locks stay")
     assert.match(git(repoB, "branch", "--list", "horde/*"), /horde\/b/)
+  })
+
+  test("finds worktrees filed from a linked worktree, names uncommitted work, and keeps branches the horde did not make", async () => {
+    const xdgState = tmp()
+    const xdgData = tmp()
+    const state = path.join(xdgState, "mcp-horde", "board")
+    const worktrees = path.join(xdgData, "mcp-horde", "worktrees")
+    const repoA = repo()
+    const a = await projectOf(repoA)
+    const board = new Board(path.join(state, a.key))
+    const [task] = (await board.plan([{ title: "Task branch", goal: "x" }])).tasks
+    git(repoA, "branch", `horde/${task!.id}`)
+
+    // A session running in a linked worktree files its worktrees under that worktree's key.
+    const linked = path.join(tmp(), "linked")
+    git(repoA, "worktree", "add", "-q", "-b", "horde/linked", linked)
+    const linkedKey = repoKey(linked)
+    const wt = path.join(worktrees, linkedKey, "t-abc12")
+    git(linked, "worktree", "add", "-q", "-b", "horde/t-abc12", wt)
+    fs.writeFileSync(path.join(wt, "README.md"), "changed\n")
+    fs.writeFileSync(path.join(wt, "work.txt"), "work\n")
+    fs.mkdirSync(path.join(wt, "node_modules", "dep"), { recursive: true })
+    fs.writeFileSync(path.join(wt, "node_modules", "dep", "index.js"), "x\n")
+    git(repoA, "branch", "horde/mine")
+
+    const env = {
+      ...process.env,
+      XDG_STATE_HOME: xdgState,
+      XDG_DATA_HOME: xdgData,
+      HORDE_BOARD_STATE_DIR: state,
+      HORDE_VERIFY_STATE_DIR: path.join(xdgState, "mcp-horde", "verify"),
+    }
+    const run = (args: string[]) => execFileSync(cliArgv()[0]!, [...cliArgv().slice(1), "remove", ...args], { cwd: repoA, env, encoding: "utf8" })
+
+    const preview = run(["--repo", repoA])
+    assert.ok(preview.includes(wt), `the worktree filed under the linked worktree's key is listed:\n${preview}`)
+    assert.match(preview, /unlanded work \(will be lost\): uncommitted changes in 2 files/)
+    assert.match(preview, /README\.md/)
+    assert.match(preview, /work\.txt/)
+    assert.doesNotMatch(preview, /node_modules/)
+    assert.match(preview, new RegExp(`horde/${task!.id} \\(0 commits not on the current branch\\)`))
+    assert.match(preview, /horde\/mine \(kept: not a horde task or worktree\)/)
+
+    run(["--yes"])
+    assert.ok(!fs.existsSync(wt), "the worktree is removed")
+    assert.ok(!fs.existsSync(path.join(worktrees, linkedKey)), "its repository folder is gone")
+    assert.equal(git(repoA, "branch", "--list", "horde/t-abc12"), "", "its branch is deleted")
+    assert.equal(git(repoA, "branch", "--list", `horde/${task!.id}`), "", "a task's branch is deleted")
+    assert.match(git(repoA, "branch", "--list", "horde/mine"), /horde\/mine/, "a user-made branch is kept")
   })
 })
 
