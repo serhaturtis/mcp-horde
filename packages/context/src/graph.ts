@@ -19,12 +19,19 @@ const infos = new Map<string, { text: string; generation: number; info: FileInfo
 // The text cache bounds memory: what it drops, the info cache drops too.
 onTextEvicted((abs) => infos.delete(abs))
 
-/** Definitions and imports of one source file (undefined for other files). Cached by content. */
+/** Below this size parsing is cheap, so no file is worth treating as a minified bundle. */
+const MINIFIED_MIN_CHARS = 50_000
+/** Bundles pack everything onto a few very long lines; ordinary source averages far less. */
+const MINIFIED_MIN_AVG_LINE = 300
+
+/** Definitions and imports of one source file (undefined for other files and minified bundles). Cached by content. */
 export function fileInfo(project: Project, rel: string): FileInfo | undefined {
   const lang = langOf(rel)
   if (!lang) return undefined
   const text = readText(project, rel)
   if (text === undefined) return undefined
+  // Parsing a bundle is slow and its one-letter definitions are noise; skip it like a non-source file.
+  if (text.length > MINIFIED_MIN_CHARS && text.length / text.split("\n").length > MINIFIED_MIN_AVG_LINE) return undefined
   const key = path.join(project.root, rel)
   const hit = infos.get(key)
   // Computed before the grammars finished loading: compute again.

@@ -8,6 +8,7 @@ import { Client } from "@modelcontextprotocol/client"
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio"
 import {
   excerpt,
+  fileInfo,
   find,
   importGraph,
   importSpecs,
@@ -247,6 +248,16 @@ describe("imports and tests", () => {
 })
 
 describe("syntax trees: what line patterns get wrong", () => {
+  test("minified bundles get no info; long ordinary files still do", () => {
+    const minified = Array.from({ length: 2000 }, (_, i) => `function g${i}(a){return a+${i}}`).join(";")
+    assert.ok(minified.length > 60_000)
+    const ordinary = Array.from({ length: 3000 }, (_, i) => `function f${i}(a,b){return a+b+${i}}`).join("\n")
+    const p = openProject(fixture({ "bundle.min.js": minified, "long.ts": ordinary, "small.ts": "export const x = 1\n" }))
+    assert.equal(fileInfo(p, "bundle.min.js"), undefined)
+    assert.equal(fileInfo(p, "long.ts")?.defs.length, 3000)
+    assert.equal(fileInfo(p, "small.ts")?.defs.length, 1)
+  })
+
   test("a minified file's definitions keep little memory", () => {
     // 3000 functions on one 200 KB line, like a bundle: each signature once kept a copy of the line.
     const lib = JSON.stringify(path.resolve(import.meta.dirname, "../src/lib.ts"))
