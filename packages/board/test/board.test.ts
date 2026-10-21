@@ -330,6 +330,36 @@ describe("board", () => {
     assert.doesNotMatch(small, /## Code context/)
   })
 
+  test("house rules: workers.brief files ride in every brief after the scope", async () => {
+    const root = repo()
+    fs.mkdirSync(path.join(root, "docs"), { recursive: true })
+    fs.writeFileSync(path.join(root, "docs/lane_brief.md"), "# Lane rules\nUse pnpm. Always run the linter.\n")
+    fs.writeFileSync(path.join(root, "CLAUDE.md"), "# Conventions\nHouse rule from CLAUDE.\n")
+    fs.writeFileSync(path.join(root, "long.md"), `${Array.from({ length: 305 }, (_, i) => `rule ${i + 1}`).join("\n")}\n`)
+    fs.writeFileSync(path.join(root, "horde.json"), JSON.stringify({ workers: { brief: ["docs/lane_brief.md", "CLAUDE.md", "long.md", "docs/missing.md"] } }))
+    const board = new Board(tmp())
+    const t = (await board.plan([{ title: "Change a thing", goal: "Change a thing." }])).tasks[0]!
+    const { attempt } = await board.assign(t.id)
+    const brief = renderBrief(board, board.task(t.id), attempt, 6000, root)
+    assert.match(brief, /## Scope\n[\s\S]*## House rules \(docs\/lane_brief\.md\)\n# Lane rules\nUse pnpm\. Always run the linter\./)
+    const scope = brief.indexOf("## Scope")
+    const house = brief.indexOf("## House rules (docs/lane_brief.md)")
+    const reporting = brief.indexOf("## Reporting (required)")
+    assert.ok(scope < house && house < reporting, "house rules sit right after the scope")
+    assert.match(brief, /## House rules \(CLAUDE\.md\)\n# Conventions\nHouse rule from CLAUDE\./)
+    assert.match(brief, /## House rules \(long\.md, first 300 of 305 lines; read the rest before changing code\)\nrule 1\n/)
+    assert.match(brief, /\nrule 300\n/)
+    assert.doesNotMatch(brief, /rule 301/)
+    assert.match(brief, /docs\/missing\.md is listed in horde\.json workers\.brief but does not exist/)
+    // A brief file that is also an instruction file is shown once, as house rules.
+    assert.doesNotMatch(brief, /### CLAUDE\.md \(project conventions/, "not repeated in the code context")
+
+    fs.writeFileSync(path.join(root, "horde.json"), "{ not json")
+    const broken = renderBrief(board, board.task(t.id), attempt, 6000, root)
+    assert.match(broken, /## Reporting \(required\)/, "a broken horde.json still yields a brief")
+    assert.doesNotMatch(broken, /## House rules/)
+  })
+
   test("a report is checked against the attempt's diff", async () => {
     const root = repo()
     const base = git(root, "rev-parse", "HEAD")

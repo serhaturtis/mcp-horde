@@ -104,7 +104,7 @@ ${k.join(`
 `)}`:""}`}m.push({text:z,group:"files",omitted:c(R=>`(${R} more file(s) in scope not shown; ask context_file for them)`,"omitted")})}u.length>d.length&&m.push({text:`Also in scope: ${u.slice(d.length,d.length+40).join(", ")}${u.length>d.length+40?", \u2026":""}`}),m.push(...p);let y=[...o.length?ym(e,o.slice(0,200)):new Map].filter(([g,$])=>$.length&&!$.every(S=>S.test===g)).map(([g,$])=>`- ${g}: ${$.map(S=>`${S.test} (${S.why})`).join(", ")}`);y.length?m.push({text:`### Tests that cover the scope
 ${y.slice(0,30).join(`
 `)}`}):o.length&&m.push({text:`### Tests that cover the scope
-None found: add tests next to the code, following the project's conventions.`});for(let g of bm){let $=It(e,g);if(!$)continue;let S=$.replace(/\r?\n$/,"").split(/\r?\n/);m.push({text:`### ${g} (project conventions${S.length>Fb?`, first ${Fb} of ${S.length} lines; read the rest before changing code`:""})
+None found: add tests next to the code, following the project's conventions.`});for(let g of bm){if(t.exclude?.includes(g))continue;let $=It(e,g);if(!$)continue;let S=$.replace(/\r?\n$/,"").split(/\r?\n/);m.push({text:`### ${g} (project conventions${S.length>Fb?`, first ${Fb} of ${S.length} lines; read the rest before changing code`:""})
 ${S.slice(0,Fb).join(`
 `)}`,group:"conventions",omitted:c(z=>`(${z} instruction file(s) not shown: ${bm.filter(R=>e.files.includes(R)).join(", ")}; read them before changing code)`,"omitted")})}return m.length?(m.unshift({text:"## Code context",required:!0}),Vo(m,(t.budgetTokens??3e3)*4,`
 

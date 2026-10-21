@@ -13,6 +13,8 @@ export interface PackOptions {
   files?: string[]
   /** Symbols to include with their definitions. */
   symbols?: string[]
+  /** Instruction files not to show, e.g. ones already included whole as house rules. */
+  exclude?: string[]
   budgetTokens?: number
 }
 
@@ -149,6 +151,7 @@ export function pack(project: Project, opts: PackOptions): string {
     sections.push({ text: "### Tests that cover the scope\nNone found: add tests next to the code, following the project's conventions." })
 
   for (const f of INSTRUCTION_FILES) {
+    if (opts.exclude?.includes(f)) continue
     const text = readText(project, f)
     if (!text) continue
     const lines = text.replace(/\r?\n$/, "").split(/\r?\n/)

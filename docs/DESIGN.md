@@ -319,11 +319,12 @@ At the repository root (optional; everything auto-detects without it):
     "audit": { "block": ["scope", "tests", "secrets", "binaries"], "warn": ["suppressions", "dependencies"] }
   },
   "context": { "ignore": ["fixtures/**"], "entrypoints": ["src/index.ts"] },
+  "workers": { "brief": ["docs/lane_brief.md"] },
   "board": { "leaseMinutes": 30, "memoryStaleDays": 90 }
 }
 ```
 
-`tiers` lists worker models cheapest first, as `"provider/model"` or `{ model, variant }`; a task's tier indexes it, and the tier past the last entry is the orchestrator itself (a task-bound spawn there is refused with that explanation; an explicit `model` always wins). Environment variables remain for machine-level settings (state dirs, the OpenCode binary, server mode, passwords), as `opencode` does today. Project behaviour lives in `horde.json`, so it is versioned with the code and shared by every horde server and both sides.
+`tiers` lists worker models cheapest first, as `"provider/model"` or `{ model, variant }`; a task's tier indexes it, and the tier past the last entry is the orchestrator itself (a task-bound spawn there is refused with that explanation; an explicit `model` always wins). `workers.brief` lists repository-relative files (house rules) that every worker brief includes in full under `## House rules (<path>)`, right after its scope (each capped at 300 lines, with a missing file named in the brief rather than failing it). Environment variables remain for machine-level settings (state dirs, the OpenCode binary, server mode, passwords), as `opencode` does today. Project behaviour lives in `horde.json`, so it is versioned with the code and shared by every horde server and both sides.
 
 A user-level `$XDG_CONFIG_HOME/mcp-horde/horde.json` (or `~/.config/mcp-horde/horde.json` when `XDG_CONFIG_HOME` is unset) sets `tiers` and `opencode` once for every repository; each applies only where the repository's `horde.json` does not set it, and every other key in it is ignored. For example, `{ "tiers": ["deepseek/deepseek-flash"] }` there makes `deepseek/deepseek-flash` the default worker model everywhere.
 

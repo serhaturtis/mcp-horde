@@ -26,15 +26,18 @@ Hand changes that touch several files, or several independent pieces, to the hor
 
 ## Configuration
 
-Optional, in the repository's `horde.json`: the worker models per tier, cheapest first, and the running limit (default 8):
+Optional, in the repository's `horde.json`: the worker models per tier, cheapest first, the running limit (default 8), and standing house rules every worker brief includes:
 
 ```json
 {
   "tiers": [{ "model": "deepseek/deepseek-v4-flash", "variant": "high" }, "moonshot/kimi-k3"],
   "opencode": { "maxRunning": 4 },
-  "verify": { "checks": { "test": "npm test" } }
+  "verify": { "checks": { "test": "npm test" } },
+  "workers": { "brief": ["docs/lane_brief.md"] }
 }
 ```
+
+`workers.brief` lists repository-relative files (house rules) that every worker brief includes in full under `## House rules (<path>)`, right after its scope; each file is capped at 300 lines, and a listed file that does not exist is named in the brief rather than failing it.
 
 To use the same worker defaults in every repository, put `tiers` and `opencode` in `$XDG_CONFIG_HOME/mcp-horde/horde.json` (`~/.config/mcp-horde/horde.json` when `XDG_CONFIG_HOME` is unset). They apply only where the repository's `horde.json` does not set that key, and every other key is ignored. This makes `deepseek/deepseek-flash` the default worker model everywhere:
 

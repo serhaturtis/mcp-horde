@@ -122,6 +122,8 @@ export interface Workers {
   link?: string[]
   /** A command run in a new worktree before the worker starts, e.g. "npm run build". */
   setup?: string
+  /** Repository-relative files every worker brief includes in full (house rules). */
+  brief?: string[]
 }
 
 export function loadWorkers(directory: string): Workers {
@@ -129,11 +131,12 @@ export function loadWorkers(directory: string): Workers {
   const raw = data.workers
   if (raw === undefined) return {}
   const where = `${file}: "workers"`
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error(`${where} must be an object { "link"?: [...], "setup"?: "…" }`)
-  const { link, setup } = raw as Workers
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error(`${where} must be an object { "link"?: [...], "setup"?: "…", "brief"?: [...] }`)
+  const { link, setup, brief } = raw as Workers
   if (link !== undefined && (!Array.isArray(link) || link.some((l) => typeof l !== "string"))) throw new Error(`${where}.link must be an array of paths`)
   if (setup !== undefined && typeof setup !== "string") throw new Error(`${where}.setup must be a command string`)
-  return { ...(link ? { link } : {}), ...(setup ? { setup } : {}) }
+  if (brief !== undefined && (!Array.isArray(brief) || brief.some((f) => typeof f !== "string"))) throw new Error(`${where}.brief must be an array of paths`)
+  return { ...(link ? { link } : {}), ...(setup ? { setup } : {}), ...(brief ? { brief } : {}) }
 }
 
 /** "tier 1 (deepseek/deepseek-chat high)", or just "tier 1" without a model for it. */

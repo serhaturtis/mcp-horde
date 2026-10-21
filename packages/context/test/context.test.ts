@@ -369,6 +369,14 @@ describe("map and pack", () => {
     assert.doesNotMatch(cut, /rule 61/)
     assert.match(outside, /### class Order \(py\/app\/models\.py:1-7\)/)
   })
+
+  test("excluded instruction files are not shown as conventions", () => {
+    const p = project()
+    const out = pack(p, { goal: "Make `createUser` reject empty names", scope: ["src/users/**"], exclude: ["CLAUDE.md"] })
+    assert.match(out, /^## Code context\n\n### src\/users\/service\.ts/)
+    assert.doesNotMatch(out, /### CLAUDE\.md/)
+    assert.doesNotMatch(out, /project conventions/)
+  })
 })
 
 describe("paths and files", () => {

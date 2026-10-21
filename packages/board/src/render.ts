@@ -1,5 +1,7 @@
+import fs from "node:fs"
+import path from "node:path"
 import { openProject, pack } from "@mcp-horde/context"
-import { estimateTokens, fitSections, formatUsd, type Section, type Tier, tierLabel, truncate } from "@mcp-horde/core"
+import { estimateTokens, fitSections, formatUsd, loadWorkers, type Section, type Tier, tierLabel, truncate } from "@mcp-horde/core"
 import { type Attempt, type Board, current, LEASE_MS, type Note, type ReportCheck, type Task } from "./board.js"
 import { workerCommand } from "./command.js"
 
@@ -35,6 +37,29 @@ export function renderBrief(board: Board, t: Task, a: Attempt, budgetTokens = 60
       : ""
   const memory = board.memory({ paths: t.scope, query: `${t.title} ${t.goal}` })
   const findings = board.findings({ paths: t.scope }).filter((n) => n.source?.task !== id)
+  // Standing house rules are required parts; a missing file or broken horde.json is named, never fatal.
+  let briefFiles: string[] = []
+  if (repo) {
+    try {
+      briefFiles = loadWorkers(repo).brief ?? []
+    } catch {
+      // The brief must still go out when horde.json cannot be read.
+    }
+  }
+  const houseRules: Section[] = briefFiles.map((f) => {
+    let text: string
+    try {
+      const lines = fs
+        .readFileSync(path.join(repo!, f), "utf8")
+        .replace(/\r?\n$/, "")
+        .split(/\r?\n/)
+      const cut = lines.length > 300 ? `, first 300 of ${lines.length} lines; read the rest before changing code` : ""
+      text = `## House rules (${f}${cut})\n${lines.slice(0, 300).join("\n")}`
+    } catch {
+      text = `## House rules (${f})\n${f} is listed in horde.json workers.brief but does not exist`
+    }
+    return { text, required: true }
+  })
   // The goal is the only required part that can be long: cut it to what the other required
   // parts leave, so the reporting commands are never the thing that is cut.
   const fixed: Section[] = [
@@ -48,6 +73,7 @@ export function renderBrief(board: Board, t: Task, a: Attempt, budgetTokens = 60
         : "## Scope\nNo scope was set; keep your changes to what the goal needs.",
       required: true,
     },
+    ...houseRules,
     {
       text: [
         "## Reporting (required)",
@@ -85,6 +111,7 @@ export function renderBrief(board: Board, t: Task, a: Attempt, budgetTokens = 60
     context = pack(openProject(repo, { fresh: true }), {
       goal: `${t.title}\n${t.goal}\n${t.acceptance.join("\n")}`,
       scope: t.scope,
+      exclude: briefFiles,
       budgetTokens: left,
     })
   } catch {
