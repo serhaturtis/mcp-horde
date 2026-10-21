@@ -135,6 +135,22 @@ describe("the simple path: horde_do, horde_wait, horde_land (real opencode, mock
     assert.equal(board.task(id).status, "done")
   })
 
+  test("without a commit-msg hook, leftover uncommitted work is still committed during landing", async () => {
+    const id = idOf(
+      await h.call("horde_do", {
+        goal: "Write the kept file.\nRUN: echo ok > kept.txt && git add kept.txt && git commit -qm kept",
+        done: ["kept.txt says ok"],
+        scope: ["kept.txt", "loose.txt"],
+      }),
+    )
+    const ready = await settle(id)
+    assert.match(ready, new RegExp(`^${id} READY`), ready)
+    const worktree = ready.match(/diff: git -C (\S+) diff/)![1]!
+    fs.writeFileSync(path.join(worktree, "loose.txt"), "ok\n")
+    assert.match(await h.call("horde_land", { id }), /^landed t-\w+ on master: 2 commit\(s\)/)
+    assert.equal(fs.readFileSync(path.join(repo, "loose.txt"), "utf8").trim(), "ok")
+  })
+
   test("a failure says why and what changed; horde_tell gets it fixed; then it lands", async () => {
     const id = idOf(
       await h.call("horde_do", {
@@ -241,18 +257,30 @@ describe("the simple path: horde_do, horde_wait, horde_land (real opencode, mock
     })
     const id = idOf(started)
     const branch = started.match(/worktree (horde\/[\w-]+)/)![1]!
-    assert.match(await settle(id), /READY/)
+    const ready = await settle(id)
+    assert.match(ready, /READY/)
+    const worktree = ready.match(/diff: git -C (\S+) diff/)![1]!
     const head = git(hooked, "rev-parse", "HEAD")
     const workerHead = git(hooked, "rev-parse", branch)
 
-    // No message: refused before anything moves, naming the hook.
-    const need = await h.call("horde_land", { id })
-    assert.match(need, /^not landed: .*commit-msg hook checks/, need)
-    assert.ok(need.includes(path.join(hooks, "commit-msg")), need)
-    assert.match(need, new RegExp(`horde_land \\{id: "${id}", message:`))
+    // Uncommitted work in a repository with a commit-msg hook: refused before anything moves,
+    // since landing would commit it with --no-verify and bypass the hook.
+    fs.writeFileSync(path.join(worktree, "leftover.txt"), "left\n")
+    const leftovers = await h.call("horde_land", { id })
+    assert.match(leftovers, /^not landed: .*still has uncommitted changes/, leftovers)
+    assert.ok(leftovers.includes(path.join(hooks, "commit-msg")), leftovers)
+    assert.match(
+      leftovers,
+      new RegExp(
+        `horde_tell \\{id: "${id}", message: "Commit your remaining changes with git commit; this repository's commit-msg hook judges the message"\\}`,
+      ),
+      leftovers,
+    )
+    assert.match(leftovers, new RegExp(`horde_land \\{id: "${id}", message\\}`), leftovers)
     assert.equal(git(hooked, "rev-parse", "HEAD"), head, "master did not move")
     assert.equal(git(hooked, "rev-parse", branch), workerHead, "the worker's branch did not move")
     assert.ok(!fs.existsSync(marker), "no check ran")
+    fs.rmSync(path.join(worktree, "leftover.txt"))
 
     // The hook rejects the message: the branch is restored and the checks never run.
     const refused = await h.call("horde_land", { id, message: "drop the stale file" })
@@ -273,6 +301,46 @@ describe("the simple path: horde_do, horde_wait, horde_land (real opencode, mock
     assert.ok(!fs.existsSync(path.join(hooked, "old.txt")))
     assert.equal(git(hooked, "status", "--porcelain"), "?? carried.txt", "the carried-over change stays uncommitted, never landed")
     assert.equal(git(hooked, "branch", "--list", "horde/*"), "", "the merged branch is gone")
+  })
+
+  test("with a commit-msg hook: the gate sends uncommitted work back to git commit, and landing keeps the checked hashes", async () => {
+    const { tmp: at, repo: hooked } = makeRepo(mock.url)
+    fs.writeFileSync(path.join(hooked, "horde.json"), JSON.stringify({ verify: { checks: { test: "true" } }, tiers: ["mock/mock", "mock/pricey"] }))
+    git(hooked, "add", ".")
+    git(hooked, "commit", "-qm", "checks")
+    const hooks = path.join(at, "hooks")
+    fs.mkdirSync(hooks)
+    const hook = path.join(hooks, "commit-msg")
+    fs.writeFileSync(hook, "#!/bin/sh\nexit 0\n")
+    if (process.platform !== "win32") fs.chmodSync(hook, 0o755)
+    git(hooked, "config", "core.hooksPath", hooks)
+
+    const seen = mock.requests.length
+    const started = await h.call("horde_do", {
+      directory: hooked,
+      goal: 'Write the file and leave another change uncommitted.\nRUN: echo ok > file.txt && git add file.txt && git commit -qm "add file" && echo loose > loose.txt',
+      done: ["file.txt says ok"],
+      scope: ["file.txt", "loose.txt"],
+    })
+    const id = idOf(started)
+    const branch = started.match(/worktree (horde\/[\w-]+)/)![1]!
+    // The first prompt points the worker at the hook it must commit through.
+    const prompts = (mock.requests.slice(seen) as { messages?: { role: string; content: unknown }[] }[])
+      .flatMap((r) => r.messages ?? [])
+      .map((m) => (typeof m.content === "string" ? m.content : ((m.content as { text?: string }[] | undefined) ?? []).map((p) => p.text ?? "").join(" ")))
+      .join("\n")
+    assert.ok(prompts.includes(`commit-msg hook at ${hook}`), prompts)
+
+    const ready = await settle(id)
+    assert.match(ready, new RegExp(`^${id} READY`), ready)
+    // The gate sent the uncommitted change back; the worker only became ready after committing it.
+    assert.equal(git(hooked, "log", "-1", "--format=%s", branch), "test: commit the work")
+    const workerHead = git(hooked, "rev-parse", branch)
+    const landed = await h.call("horde_land", { id })
+    assert.match(landed, new RegExp(`^landed ${id} on master: 2 commit\\(s\\)`), landed)
+    assert.equal(git(hooked, "rev-parse", "HEAD"), workerHead, "fast-forward kept the checked commits' hashes")
+    assert.equal(fs.readFileSync(path.join(hooked, "file.txt"), "utf8").trim(), "ok")
+    assert.equal(fs.readFileSync(path.join(hooked, "loose.txt"), "utf8").trim(), "loose")
   })
 
   test("horde_do refuses up front in a repository without checks, and says how to add them", async () => {

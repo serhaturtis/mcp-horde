@@ -38,6 +38,7 @@ import {
   commitAll,
   commitMsgHook,
   createWorktree,
+  hasUncommitted,
   mergeWorktree,
   removeWorktree,
   squashWorktree,
@@ -1063,8 +1064,9 @@ export class Fleet {
       const preamble: string[] = []
       if (input.instructions) preamble.push(`<instructions>\n${input.instructions}\n</instructions>`)
       if (worktree) {
+        const hook = await commitMsgHook(worktree.repo)
         preamble.push(
-          `<workspace>You are working in an isolated git worktree on branch ${worktree.branch}. Commit your changes to this branch with clear messages when the task is done. Do not push, and do not switch branches.</workspace>`,
+          `<workspace>You are working in an isolated git worktree on branch ${worktree.branch}. Commit your changes to this branch with clear messages when the task is done. Do not push, and do not switch branches.${hook ? ` This repository has a commit-msg hook at ${hook}: commit your work with git commit in a message it accepts (read the hook for its rules), never with --no-verify.` : ""}</workspace>`,
         )
       }
       const text = preamble.length ? `${preamble.join("\n\n")}\n\n${input.prompt}` : input.prompt
@@ -1395,12 +1397,14 @@ export class Fleet {
   /**
    * Land a task-bound agent's work without ever breaking your branch: its commits are replayed onto
    * your branch's tip inside its worktree, the project's checks run there, and only if they pass, and
-   * your branch has not moved meanwhile, are the same commits replayed onto your branch. Then the
-   * task is accepted and the worktree and branch are removed. Anything that fails leaves your branch
-   * as it was; the agent is then on top of your branch and can be told to fix it.
+   * your branch has not moved meanwhile, are the same commits brought onto your branch. When they sit
+   * directly on your tip they are fast-forwarded, so the checked hashes are kept; otherwise they are
+   * cherry-picked. Then the task is accepted and the worktree and branch are removed. Anything that
+   * fails leaves your branch as it was; the agent is then on top of your branch and can be told to fix it.
    *
    * With `message`, the task's own commits are squashed into one commit with it, judged first by the
-   * repository's commit-msg hook; a repository that has one needs the message.
+   * repository's commit-msg hook. Without a message, a repository that has a hook needs its work
+   * committed: leftover changes are refused rather than committed with --no-verify.
    */
   async land(ref: string, signal?: AbortSignal, message?: string): Promise<LandResult> {
     const live = await this.get(ref)
@@ -1422,9 +1426,11 @@ export class Fleet {
         let wt = live.record.worktree!
         const target = await git(wt.repo, "symbolic-ref", "-q", "--short", "HEAD").catch(() => "")
         if (!target) throw new Error(`your checkout ${wt.repo} is on a detached HEAD; switch to a branch first`)
-        // Landing as one commit is judged by the hook, so it needs the message before anything moves.
+        // A repository with a commit-msg hook judges every commit: our own --no-verify commit
+        // would bypass it, so leftover work is refused until the worker commits it or a message
+        // squashes everything into one commit the hook checks.
         const hook = await commitMsgHook(wt.repo)
-        if (hook && !message) return { landed: false, target, why: "hook", text: hook }
+        if (hook && !message && (await hasUncommitted(wt))) return { landed: false, target, why: "leftovers", text: hook }
         const tip = await git(wt.repo, "rev-parse", "HEAD")
         // 1. Onto your branch's tip, inside the worktree. A conflict leaves both as they were.
         try {
@@ -1860,6 +1866,15 @@ export class Fleet {
       if (review.notMet.length && round < cfg.maxRounds) {
         pass = false
         text = reviewFeedback(review)
+      }
+    }
+    // A repository with a commit-msg hook judges every commit. Work left uncommitted would be
+    // committed during landing with --no-verify, bypassing the hook, so send it back to commit.
+    if (pass && wt && round < cfg.maxRounds && !abort.signal.aborted && (await hasUncommitted(wt))) {
+      const hook = await commitMsgHook(wt.repo)
+      if (hook) {
+        pass = false
+        text = `The work in ${wt.branch} is not committed. Commit all of it with git commit, in a message the repository's commit-msg hook at ${hook} accepts (read the hook for its rules), and never with --no-verify.`
       }
     }
     // A new instruction (or dispose, or shutdown) superseded this run: its verdict is about an old task.
@@ -2785,10 +2800,10 @@ export type LandResult =
       landed: false
       target: string
       /**
-       * message: the repository's commit-msg hook refused the message; hook: the repository has
-       * one and landing as one commit needs the message before anything moves.
+       * message: the repository's commit-msg hook refused the message; leftovers: the worktree
+       * still has uncommitted changes in a repository whose hook would judge the commit.
        */
-      why: "conflict" | "checks" | "uncommitted" | "message" | "hook"
+      why: "conflict" | "checks" | "uncommitted" | "message" | "leftovers"
       text: string
       checks?: GateCheckSummary[]
       /** why "message": the hook that refused it. */

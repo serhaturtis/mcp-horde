@@ -435,6 +435,22 @@ async function operationInProgress(cwd: string): Promise<string | undefined> {
   return undefined
 }
 
+/** Whether the worktree holds changes that commitAll would commit (ignoring links it never commits). */
+export async function hasUncommitted(wt: Worktree): Promise<boolean> {
+  if (!(await exists(wt.root))) return false
+  // HEAD compares both the index and the working tree against the last commit.
+  if (
+    await git(wt.root, "diff", "--quiet", "HEAD").then(
+      () => false,
+      () => true,
+    )
+  )
+    return true
+  const linked = (rel: string) => (wt.links ?? []).some((l) => rel === l || rel.startsWith(`${l.replace(/\/+$/, "")}/`))
+  const others = splitZ(await gitRaw(wt.root, ["ls-files", "--others", "--exclude-standard", "-z"]))
+  return others.some((rel) => !linked(rel))
+}
+
 /** Commit everything in the worktree to its branch. Returns a note, or undefined if there was nothing to commit. */
 export async function commitAll(wt: Worktree, message: string): Promise<string | undefined> {
   if (!(await exists(wt.root))) return undefined
@@ -604,6 +620,20 @@ export async function mergeWorktree(wt: Worktree, name: string, strategy: "merge
     throw new Error(
       `${wt.branch} contains merge commits (${merges.map((m) => m.slice(0, 10)).join(", ")}), which cannot be replayed safely. Merge it yourself, e.g. git merge ${wt.branch}`,
     )
+  }
+  // The agent's commits sit directly on your HEAD: keep the hashes the checks saw.
+  if (strategy === "merge" && start === (await git(wt.repo, "rev-parse", "HEAD"))) {
+    try {
+      await git(wt.repo, "merge", "--ff-only", tip)
+    } catch (err) {
+      const changed = await git(wt.repo, "status", "--porcelain").catch(() => "")
+      const detail = err instanceof Error ? err.message : String(err)
+      throw new Error(
+        `fast-forward of ${wt.branch} into ${target} failed; your checkout is unchanged.\n${detail}${changed ? `\nuncommitted changes:\n${changed}` : ""}`,
+      )
+    }
+    notes.push(`fast-forwarded ${commits.length} commit(s) from ${wt.branch} into ${target}`)
+    return { text: notes.join("\n"), merged: tip }
   }
   const identity = (await hasIdentity(wt.repo)) ? [] : IDENTITY
   const pick = async (extra: string[]) =>

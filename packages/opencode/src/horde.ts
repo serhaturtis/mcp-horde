@@ -175,14 +175,14 @@ export function registerHorde(tool: Tool, opts: HordeOptions) {
 
   tool(
     "horde_land",
-    "Land a READY task. Its commits are replayed onto your current branch's tip inside its worktree and the project's checks run there; only if they pass is your branch updated, with exactly those commits. Your uncommitted changes stay as they are. Then the task is marked done and its worktree and branch are removed. If the commits conflict with your branch or the checks fail, your branch is not touched: the answer shows why, and the worker, now on top of your branch, can fix it (horde_tell, then horde_land again). Pass message to land the task's commits as one commit with that message, judged first by the repository's commit-msg hook: a repository that has one needs it.",
+    "Land a READY task. Its commits are brought onto your current branch's tip inside its worktree and the project's checks run there; only if they pass is your branch updated, with exactly those commits (fast-forwarded, keeping their hashes, when they sit directly on your tip). Your uncommitted changes stay as they are. Then the task is marked done and its worktree and branch are removed. If the commits conflict with your branch or the checks fail, your branch is not touched: the answer shows why, and the worker, now on top of your branch, can fix it (horde_tell, then horde_land again). Pass message to land the task's commits as one commit with that message, judged first by the repository's commit-msg hook. In a repository with a commit-msg hook, work the worker left uncommitted is refused: horde_tell it to commit with git commit, or pass message.",
     {
       id: z.string().describe("Task id (t-…)."),
       message: z
         .string()
         .optional()
         .describe(
-          'The one commit\'s message, e.g. "feat(auth): add token refresh". Required when the repository has a commit-msg hook (the answer names it), which checks the message before the checks run.',
+          "Optional: land the task's commits as one commit with this message, e.g. \"feat(auth): add token refresh\". The repository's commit-msg hook, if any, judges it before the checks run. Without it the commits land as they are; in a repository with a commit-msg hook, leftover uncommitted work must be committed first.",
         ),
     },
     async (a, fleet, extra) => renderLanding(a.id, await fleet.land(a.id, extra.mcpReq.signal, a.message)),
@@ -370,10 +370,10 @@ function renderLanding(id: string, r: LandResult): string {
     for (const c of r.checks) if (c.baseline && !c.baseline.pass) lines.push(`⚠ ${c.name} fails at ${c.baseline.label} too (not caused by this work)`)
     return lines.join("\n")
   }
-  if (r.why === "hook")
+  if (r.why === "leftovers")
     return [
-      `not landed: ${id} lands as one commit whose message the repository's commit-msg hook checks (${r.text}).`,
-      `→ horde_land {id: "${id}", message: "<the commit message>"} (the task lands as one commit with it, checked by that hook) · horde_drop {id: "${id}"}`,
+      `not landed: ${id}'s worktree still has uncommitted changes, and this repository's commit-msg hook (${r.text}) judges every commit message.`,
+      `→ horde_tell {id: "${id}", message: "Commit your remaining changes with git commit; this repository's commit-msg hook judges the message"} · horde_land {id: "${id}", message} (one commit with that message) · horde_drop {id: "${id}"}`,
     ].join("\n")
   if (r.why === "message")
     return [

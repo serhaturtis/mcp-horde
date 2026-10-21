@@ -358,7 +358,7 @@ describe("opencode MCP server: core behaviour (real opencode, mock LLM)", { time
       wait: true,
       timeout_seconds: 60,
     })
-    assert.match(await h.call("opencode_worktree", { id: "iso", action: "merge" }), /merged 1 commit\(s\)/)
+    assert.match(await h.call("opencode_worktree", { id: "iso", action: "merge" }), /(?:merged|fast-forwarded) 1 commit\(s\)/)
     assert.equal(git(repo, "log", "-2", "--format=%s"), "add more\nadd feature")
     assert.match(await h.call("opencode_worktree", { id: "iso", action: "merge" }), /nothing to merge|no new commits/i)
 

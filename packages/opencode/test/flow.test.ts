@@ -117,7 +117,10 @@ describe("the horde flow: board, workers, gates (real opencode, mock LLM)", { ti
         assert.match(await boardCall("board_task", { id: task }), /review 1\/1 met by mock\/pricey/)
       }
       // The merged checkout is checked too, not just each worker's branch.
-      assert.match(await h.call("opencode_worktree", { id: name, action: "merge" }), /merged 1 commit[\s\S]*your checkout after the merge: PASS/)
+      assert.match(
+        await h.call("opencode_worktree", { id: name, action: "merge" }),
+        /(?:merged|fast-forwarded) 1 commit[\s\S]*your checkout after the merge: PASS/,
+      )
       await h.call("opencode_dispose", { id: name, worktree: "remove" })
     }
     await boardCall("board_accept", { id: a })

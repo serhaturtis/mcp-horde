@@ -14,7 +14,17 @@ import { questionAnswers, questionSchema } from "../src/hooks.js"
 import { type AgentRecord, Store } from "../src/state.js"
 import { price } from "../src/tools.js"
 import { buildTrack, costSince, currentTurn, latestTool, stablePrefix, turnsSince } from "../src/tracker.js"
-import { branchSlug, commitMsgHook, squashWorktree, validateLink, type Worktree } from "../src/worktree.js"
+import {
+  branchSlug,
+  commitMsgHook,
+  createWorktree,
+  hasUncommitted,
+  mergeWorktree,
+  squashWorktree,
+  syncWorktree,
+  validateLink,
+  type Worktree,
+} from "../src/worktree.js"
 // Fixes from the support-module audit (hooks, tracker, worktree, backend, supervisor, ask, config).
 import "./support-fixes.test.js"
 
@@ -584,5 +594,84 @@ describe("landing as one commit: squash and the repository's commit-msg hook", (
     // Without one, nothing to run.
     gitIn(wt.root, "config", "--unset", "core.hooksPath")
     assert.equal(await commitMsgHook(wt.root), undefined)
+  })
+})
+
+describe("landing keeps the checked commits: fast-forward or cherry-pick", () => {
+  const gitIn = (cwd: string, ...args: string[]) =>
+    execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", ...args], { cwd })
+      .toString()
+      .trim()
+  const makeRepo = () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "horde-land-"))
+    gitIn(dir, "init", "-q")
+    fs.writeFileSync(path.join(dir, "a.txt"), "a\n")
+    gitIn(dir, "add", "-A")
+    gitIn(dir, "commit", "-qm", "base")
+    return dir
+  }
+  const makeWorktree = async (repo: string, includeUncommitted = false) => {
+    const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), "horde-land-wt-"))
+    const { worktree } = await createWorktree(repo, "task", { rootDir, includeUncommitted })
+    return worktree
+  }
+
+  test("commits sitting directly on your HEAD are fast-forwarded, keeping their hashes", async () => {
+    const repo = makeRepo()
+    const wt = await makeWorktree(repo)
+    for (const [name, message] of [
+      ["b.txt", "worker one"],
+      ["c.txt", "worker two"],
+    ] as const) {
+      fs.writeFileSync(path.join(wt.root, name), `${name}\n`)
+      gitIn(wt.root, "add", "-A")
+      gitIn(wt.root, "commit", "-qm", message)
+    }
+    const workerHead = gitIn(wt.root, "rev-parse", "HEAD")
+    await syncWorktree(wt, "task")
+    assert.equal(gitIn(repo, "rev-parse", "HEAD"), wt.base, "nothing moved: the work starts on your HEAD")
+    await mergeWorktree(wt, "task", "merge")
+    assert.equal(gitIn(repo, "rev-parse", "HEAD"), workerHead, "the landed commit is exactly the checked one")
+    assert.equal(gitIn(repo, "log", "-2", "--format=%s"), "worker two\nworker one")
+  })
+
+  test("a carried-over baseline commit still lands by cherry-pick", async () => {
+    const repo = makeRepo()
+    fs.writeFileSync(path.join(repo, "carried.txt"), "carried\n")
+    const wt = await makeWorktree(repo, true)
+    assert.ok(wt.baseline, "the uncommitted change was snapshotted as the baseline")
+    fs.writeFileSync(path.join(wt.root, "b.txt"), "b\n")
+    gitIn(wt.root, "add", "-A")
+    gitIn(wt.root, "commit", "-qm", "worker one")
+    const workerHead = gitIn(wt.root, "rev-parse", "HEAD")
+    await mergeWorktree(wt, "task", "merge")
+    assert.notEqual(gitIn(repo, "rev-parse", "HEAD"), workerHead, "replayed, so a new hash")
+    assert.equal(gitIn(repo, "log", "-1", "--format=%s"), "worker one")
+    assert.equal(fs.readFileSync(path.join(repo, "b.txt"), "utf8"), "b\n")
+    assert.equal(gitIn(repo, "show", "--format=", "--name-only", "HEAD"), "b.txt", "the baseline stayed out")
+  })
+
+  test("uncommitted changes that collide refuse the fast-forward and leave the checkout alone", async () => {
+    const repo = makeRepo()
+    const wt = await makeWorktree(repo)
+    fs.writeFileSync(path.join(wt.root, "b.txt"), "worker\n")
+    gitIn(wt.root, "add", "-A")
+    gitIn(wt.root, "commit", "-qm", "worker one")
+    fs.writeFileSync(path.join(repo, "b.txt"), "mine\n")
+    const head = gitIn(repo, "rev-parse", "HEAD")
+    await assert.rejects(mergeWorktree(wt, "task", "merge"), /your checkout is unchanged/)
+    assert.equal(gitIn(repo, "rev-parse", "HEAD"), head)
+    assert.equal(fs.readFileSync(path.join(repo, "b.txt"), "utf8"), "mine\n")
+    assert.equal(gitIn(repo, "status", "--porcelain"), "?? b.txt")
+  })
+
+  test("hasUncommitted sees untracked and tracked work", async () => {
+    const repo = makeRepo()
+    const wt = await makeWorktree(repo)
+    assert.equal(await hasUncommitted(wt), false)
+    fs.writeFileSync(path.join(wt.root, "new.txt"), "new\n")
+    assert.equal(await hasUncommitted(wt), true)
+    fs.writeFileSync(path.join(wt.root, "a.txt"), "changed\n")
+    assert.equal(await hasUncommitted(wt), true)
   })
 })

@@ -127,6 +127,9 @@ export async function startMockLlm(): Promise<{ url: string; close: () => void; 
       return say(`DONE: reported. ${textOf(last).slice(0, 200)}`)
     }
     if (last?.role === "tool") return say(`DONE: ${textOf(last).slice(0, 400)}`)
+    // A gate sending uncommitted work back: commit it as a cooperative worker would.
+    if (userText.includes("Commit all of it with git commit"))
+      return callTool("shell", { command: "git add -A && git commit -qm 'test: commit the work'", description: "commit the work" })
     // "CALL: <tool> <json args>" calls any offered tool (e.g. one from an MCP server).
     const call = userText.match(/CALL:\s*(\S+)\s*(\{.*\})?\s*$/s)
     if (call) return callTool(call[1]!, call[2] ? JSON.parse(call[2]) : {})
