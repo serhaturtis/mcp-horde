@@ -4,7 +4,7 @@ import path from "node:path"
 import { after, before, describe, test } from "node:test"
 import { Board } from "@mcp-horde/board"
 import { logDirFor } from "@mcp-horde/verify"
-import { connect, git, type Harness, isolatedEnv, type Mock, makeRepo } from "./harness.js"
+import { connect, git, type Harness, isolatedEnv, type Mock, makeRepo, until } from "./harness.js"
 import { startMockLlm } from "./mock-llm.js"
 
 // The simple path the way an agent that has never seen the horde uses it: horde_do, horde_wait,
@@ -581,5 +581,111 @@ console.log("1..0")
     assert.match(refused, /collide with your uncommitted changes/, refused)
     assert.match(refused, /u\.txt/, refused)
     await h.call("horde_drop", { id })
+  })
+})
+
+describe("the gate review runs outside the worker limit and its failure fails the task", { timeout: 600_000 }, () => {
+  let rv: Harness
+  let rvmock: Mock
+  let rvrepo: string
+  let rvtmp: string
+
+  const rid = (text: string) => text.match(/\bt-[0-9a-f]+\b/)![0]
+  const rrepo = (check: string, tiers: string[]): string => {
+    const { repo } = makeRepo(rvmock.url, { permission: { bash: "allow" } })
+    fs.writeFileSync(path.join(repo, "horde.json"), JSON.stringify({ verify: { checks: { test: check } }, tiers }))
+    git(repo, "add", ".")
+    git(repo, "commit", "-qm", "checks")
+    return repo
+  }
+  const rsettle = async (id: string, seconds = 180): Promise<string> => {
+    for (;;) {
+      const out = await rv.call("horde_wait", { ids: [id], timeout_seconds: seconds })
+      if (/ NEEDS YOU /.test(out)) {
+        await rv.call("horde_tell", { id, approve: true })
+        continue
+      }
+      return out
+    }
+  }
+
+  before(async () => {
+    rvmock = await startMockLlm()
+    ;({ tmp: rvtmp, repo: rvrepo } = makeRepo(rvmock.url))
+    rv = await connect({ ...isolatedEnv(rvtmp, rvrepo), HORDE_OPENCODE_MAX_RUNNING: "1" })
+  })
+
+  after(async () => {
+    await rv?.call("opencode_server", { action: "stop" }).catch(() => undefined)
+    await rv?.close()
+    rvmock?.close()
+  })
+
+  test("a task's review still runs (and judges it) when the running limit is full", async () => {
+    const dir = rrepo(`node -e "setTimeout(() => process.exit(0), 5000)"`, ["mock/mock", "mock/pricey"])
+    const started = await rv.call("horde_do", {
+      directory: dir,
+      goal: "Write the greeting file.\nRUN: echo ok > hello.txt && git add hello.txt && git commit -qm hello",
+      done: ["hello.txt says ok"],
+      scope: ["hello.txt"],
+    })
+    const id = rid(started)
+    // The worker finishes and its gate starts the (slow) checks; the idle worker holds no slot.
+    await until(async () => /gate: running checks/.test(await rv.call("opencode_status", { ids: [id] })), 90_000, 100)
+    // Fill the single running slot while the checks run.
+    await rv.call("opencode_spawn", { prompt: "SLOW hog one", name: "review-hog" })
+    const ready = await rsettle(id)
+    assert.match(ready, new RegExp(`^${id} READY`), ready)
+    assert.match(ready, /review: 1 of 1 criteria met/, ready)
+    await rv.call("opencode_interrupt", { id: "review-hog" })
+  })
+
+  test("a reviewer that errors twice fails the task, saying the review could not run", async () => {
+    // The reviewer is the cheapest tier model other than the worker's; make that model broken.
+    const dir = rrepo(`node -e "process.exit(0)"`, ["mock/mock", "broken/model"])
+    const started = await rv.call("horde_do", {
+      directory: dir,
+      goal: "Write the greeting file.\nRUN: echo ok > hello.txt && git add hello.txt && git commit -qm hello",
+      done: ["hello.txt says ok"],
+      scope: ["hello.txt"],
+    })
+    const id = rid(started)
+    const failed = await rsettle(id, 300)
+    assert.match(failed, new RegExp(`^${id} FAILED`), failed)
+    assert.doesNotMatch(failed, /READY/)
+    assert.match(failed, /review could not run/, failed)
+    assert.match(failed, /Cannot initialize broken\/model/, failed)
+    assert.match(failed, /horde_tell \{id: "t-\w+", message: "Run the review again"\}/, failed)
+  })
+
+  test("a criterion judged not met on the last round fails the task, naming it", async () => {
+    const dir = rrepo(`node -e "process.exit(0)"`, ["mock/mock", "mock/pricey"])
+    const started = await rv.call("horde_do", {
+      directory: dir,
+      goal: "Write the greeting file.\nRUN: echo ok > hello.txt && git add hello.txt && git commit -qm hello",
+      done: ["hello.txt says ok", "nothing else changes", "third.txt says ok"],
+      scope: ["hello.txt"],
+    })
+    const id = rid(started)
+    const failed = await rsettle(id)
+    assert.match(failed, new RegExp(`^${id} FAILED`), failed)
+    assert.match(failed, /1 criterion not met/, failed)
+    assert.match(failed, /third\.txt says ok/, failed)
+  })
+
+  test("a fix round that errors reports the error, not the round count", async () => {
+    // The check fails with a message that makes the fix round's prompt a provider error.
+    const dir = rrepo(`node -e "console.log('Error: FAIL400'); process.exit(1)"`, ["mock/mock", "mock/pricey"])
+    const started = await rv.call("horde_do", {
+      directory: dir,
+      goal: "Write the result file.\nRUN: echo ok > result.txt && git add result.txt && git commit -qm result",
+      done: ["result.txt says ok"],
+      scope: ["result.txt"],
+    })
+    const id = rid(started)
+    const failed = await rsettle(id)
+    assert.match(failed, new RegExp(`^${id} FAILED`), failed)
+    assert.match(failed, /error: bad request from mock/, failed)
+    assert.doesNotMatch(failed, /checks failed after/, failed)
   })
 })

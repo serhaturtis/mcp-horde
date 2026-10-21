@@ -330,15 +330,21 @@ export async function outcome(fleet: Fleet, ref: string): Promise<string> {
     return lines.join("\n")
   }
 
-  // Failed: the checks after the last round, an error, an interrupt, or an unchecked finish.
-  const why =
-    s.gate?.state === "fail"
-      ? `checks failed after ${s.gate.round} round(s)`
+  // Failed: the checks after the last round, a review that could not run or found a
+  // criterion unmet, a fix round that errored or was interrupted, or an unchecked finish.
+  const reviewError = verdict?.review?.error
+  const notMet = reviewError ? 0 : (verdict?.review?.notMet?.length ?? 0)
+  const why = reviewError
+    ? `review could not run: ${truncate(oneLine(reviewError), 200)}`
+    : notMet
+      ? `${notMet} criterion${notMet === 1 ? "" : "s"} not met`
       : s.state === "error"
         ? `error: ${truncate(oneLine(s.error ?? "unknown"), 200)}`
         : s.state === "interrupted"
           ? `stopped: ${truncate(oneLine(s.error ?? "interrupted"), 200)}`
-          : "finished without a verdict"
+          : s.gate?.state === "fail"
+            ? `checks failed after ${s.gate.round} round(s)`
+            : "finished without a verdict"
   const lines = [say("FAILED", ` (${why})`)]
   if (s.gate?.state === "fail" && verdict?.text) lines.push(indent(truncate(verdict.text, 900), "  "))
   if (refused.length) lines.push(`  refused outside its scope: ${refused.slice(0, 6).join(", ")}`)
@@ -352,7 +358,9 @@ export async function outcome(fleet: Fleet, ref: string): Promise<string> {
   const stronger = nextTier(repo, task?.tier)
   lines.push(
     next(
-      `horde_tell {id: "${id}", message: "<a precise hint>"} (its checks run again)`,
+      ...(reviewError
+        ? [`horde_tell {id: "${id}", message: "Run the review again"}`]
+        : [`horde_tell {id: "${id}", message: "<a precise hint>"} (its checks run again)`]),
       ...(stronger ? [`horde_tell {id: "${id}", message, model: "${stronger}"}`] : []),
       ...(refused.length ? [`horde_tell {id: "${id}", scope: [...]} to let it edit more`] : []),
       `horde_drop {id: "${id}"}`,

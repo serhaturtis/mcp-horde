@@ -206,6 +206,8 @@ export interface SpawnInput {
   scope?: Scope
   signal?: AbortSignal
   onProgress?: (message: string) => void
+  /** False to run outside the running limit (a short one-shot ask, not a worker). */
+  reserve?: boolean
 }
 
 /** How a caller asks for a gate: true for the defaults, or settings. */
@@ -700,7 +702,7 @@ export class Fleet {
 
   async spawn(input: SpawnInput): Promise<{ snapshot: Snapshot; notes: string[] }> {
     if (this.config.maxRunning > 0) await this.refreshUnknown()
-    const release = this.reserve()
+    const release = input.reserve === false ? () => {} : this.reserve()
     try {
       if (input.task) return await this.spawnTask(input, input.task)
       const checked = await this.checkSpawn(input)
@@ -790,19 +792,30 @@ export class Fleet {
   /** The gate's review: the change judged against the task's criteria, seeing the checks that just passed. Never throws. */
   private async reviewForGate(live: Live, taskId: string, checks: GateCheck[], signal: AbortSignal): Promise<ReviewSummary> {
     try {
-      const { results } = await this.reviewAttempt({ id: taskId, directory: live.record.worktree?.repo ?? live.record.directory, checks, signal })
-      const first = results[0]!
-      const pick = (status: Verdict["status"]) => first.verdicts.filter((v) => v.status === status).map((v) => ({ n: v.criterion, text: v.text, note: v.note }))
-      return {
-        model: first.model,
-        cost: results.reduce((n, x) => n + x.cost, 0),
-        total: first.verdicts.length,
-        met: first.verdicts.filter((v) => v.status === "met").length,
-        notMet: pick("not_met"),
-        unclear: pick("unclear"),
+      return await this.reviewGate(live, taskId, checks, signal)
+    } catch {
+      // A transient provider failure (a rate limit, a timeout) is not a verdict: pause and retry once.
+      await sleep(1000)
+      if (signal.aborted) return { model: "", cost: 0, total: 0, met: 0, notMet: [], unclear: [], error: "cancelled" }
+      try {
+        return await this.reviewGate(live, taskId, checks, signal)
+      } catch (retryErr) {
+        return { model: "", cost: 0, total: 0, met: 0, notMet: [], unclear: [], error: (retryErr as Error).message }
       }
-    } catch (err) {
-      return { model: "", cost: 0, total: 0, met: 0, notMet: [], unclear: [], error: (err as Error).message }
+    }
+  }
+
+  private async reviewGate(live: Live, taskId: string, checks: GateCheck[], signal: AbortSignal): Promise<ReviewSummary> {
+    const { results } = await this.reviewAttempt({ id: taskId, directory: live.record.worktree?.repo ?? live.record.directory, checks, signal })
+    const first = results[0]!
+    const pick = (status: Verdict["status"]) => first.verdicts.filter((v) => v.status === status).map((v) => ({ n: v.criterion, text: v.text, note: v.note }))
+    return {
+      model: first.model,
+      cost: results.reduce((n, x) => n + x.cost, 0),
+      total: first.verdicts.length,
+      met: first.verdicts.filter((v) => v.status === "met").length,
+      notMet: pick("not_met"),
+      unclear: pick("unclear"),
     }
   }
 
@@ -836,6 +849,7 @@ export class Fleet {
         permissions: "deny",
         questions: "dismiss",
         limits: { maxSteps: 3 },
+        reserve: false,
         signal: input.signal,
       })
       const answer = async (): Promise<Snapshot> => {
@@ -1883,7 +1897,12 @@ export class Fleet {
     const task = live.record.task
     if (pass && cfg.review && task && !abort.signal.aborted) {
       review = await this.reviewForGate(live, task.id, checks ?? [], abort.signal)
-      if (review.notMet.length && round < cfg.maxRounds) {
+      if (review.error) {
+        // The review could not run: the checks passing is not enough to call it done.
+        pass = false
+        text = `the review could not run: ${review.error}`
+      } else if (review.notMet.length) {
+        // A criterion the reviewer judged not met is a failing check, whatever the round.
         pass = false
         text = reviewFeedback(review)
       }
@@ -1900,7 +1919,7 @@ export class Fleet {
     // A new instruction (or dispose, or shutdown) superseded this run: its verdict is about an old task.
     if (this.closed || abort.signal.aborted || this.live.get(id) !== live) return
     if (live.sent || live.sending || live.track.lastPromptedSeq > turn || currentTurn(live.track)?.startSeq !== turn) return
-    const final = pass || round >= cfg.maxRounds || text.startsWith("the gate could not run")
+    const final = pass || round >= cfg.maxRounds || text.startsWith("the gate could not run") || !!review?.error
     this.updateRecord(id, { gateState: { round, verdict: { turn, pass, final, text, at: Date.now(), checks, review } } })
     if (!final) {
       // The fix round wakes the agent: it waits for a running slot like any other wake-up.
