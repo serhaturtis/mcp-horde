@@ -795,7 +795,8 @@ export class Fleet {
       return await this.reviewGate(live, taskId, checks, signal)
     } catch {
       // A transient provider failure (a rate limit, a timeout) is not a verdict: pause and retry once.
-      await sleep(1000)
+      // Long enough for a rate limit or a refused slot to clear, short enough not to stall the gate.
+      await sleep(5000)
       if (signal.aborted) return { model: "", cost: 0, total: 0, met: 0, notMet: [], unclear: [], error: "cancelled" }
       try {
         return await this.reviewGate(live, taskId, checks, signal)

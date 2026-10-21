@@ -337,7 +337,7 @@ export async function outcome(fleet: Fleet, ref: string): Promise<string> {
   const why = reviewError
     ? `review could not run: ${truncate(oneLine(reviewError), 200)}`
     : notMet
-      ? `${notMet} criterion${notMet === 1 ? "" : "s"} not met`
+      ? `${notMet} ${notMet === 1 ? "criterion" : "criteria"} not met`
       : s.state === "error"
         ? `error: ${truncate(oneLine(s.error ?? "unknown"), 200)}`
         : s.state === "interrupted"
