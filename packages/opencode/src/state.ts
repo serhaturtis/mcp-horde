@@ -110,6 +110,8 @@ export interface AgentRecord {
   scope?: { paths: string[]; outside?: "deny" | "ask" }
   /** The board task this agent works (opencode_spawn task). */
   task?: { id: string; title: string; attempt: number }
+  /** A read-only investigation (horde_investigate): its answer becomes a REPORT, never a change to land. */
+  investigate?: boolean
 }
 
 export interface ServerRecord {

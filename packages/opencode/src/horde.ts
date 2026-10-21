@@ -3,14 +3,18 @@
  * each. Everything the full flow decided by hand is a default here, and every answer ends
  * with the calls that make sense next, so an agent needs nothing but these descriptions.
  */
+
+import fs from "node:fs"
+import path from "node:path"
 import { Board } from "@mcp-horde/board"
-import { formatDuration, formatUsd, git, indent, loadTiers, oneLine, truncate } from "@mcp-horde/core"
+import { formatDuration, formatUsd, git, indent, loadTiers, oneLine, truncate, truncateHead, writeJson } from "@mcp-horde/core"
 import { type Check, detectChecks, loadSettingsAt } from "@mcp-horde/verify"
 import type { ServerContext } from "@modelcontextprotocol/server"
 import { z } from "zod"
+import { extractJson, type JsonSchema, retryPrompt, schemaPrompt, validate } from "./ask.js"
 import { type Fleet, formatModel, formText, type LandResult, SETTLED, type Snapshot } from "./fleet.js"
 import type { AgentRecord, ReviewSummary } from "./state.js"
-import { workStart } from "./worktree.js"
+import { type Worktree, workStart } from "./worktree.js"
 
 // biome-ignore lint/suspicious/noExplicitAny: the registration helper is generic over each tool's schema
 type Tool = (name: string, description: string, shape: z.ZodRawShape, run: (args: any, fleet: Fleet, extra: ServerContext) => Promise<string>) => void
@@ -29,7 +33,8 @@ export const HORDE_INSTRUCTIONS = `horde: hands coding tasks to cheaper worker m
 It suits any change that can be stated as a goal, done-criteria and the files it may change: a fix, a feature, tests, docs, a refactor, or several independent pieces in parallel. One- or two-line edits, questions, work that is still being investigated, and results needed right away are quicker done directly.
 A task is a goal, done-criteria and the files it may change. Workers do not see the conversation, take minutes, and cost a fraction of a frontier model's tokens; subagents can use the same tools.
 - horde_do {goal, done, scope} starts a worker in its own git worktree with the project's dependencies; when it finishes, the project's checks run and a reviewer judges each done-criterion against the diff, and failures go back to the worker.
-- horde_wait returns outcomes: READY → horde_land, NEEDS YOU → horde_tell, FAILED → horde_tell or horde_drop.
+- horde_investigate {question, want, focus} starts a read-only worker in its own worktree that answers with a JSON report of findings (each citing file:line); it never changes the branch.
+- horde_wait returns outcomes: READY → horde_land, REPORT → nothing to land (an investigation), NEEDS YOU → horde_tell, FAILED → horde_tell or horde_drop.
 - horde_land applies READY work to the branch only if the checks pass on top of it.
 The opencode_* and board_* tools give finer control (steering mid-step, multi-task plans with dependencies, agents without a worktree or checks); most work needs only the horde_* tools.`
 
@@ -39,6 +44,46 @@ const timeout = z
   .min(1)
   .max(86_400)
   .describe("How long to block (default 25 min in Claude Code, 50 s elsewhere); on a timeout the workers keep going.")
+
+/** The JSON a horde_investigate worker must answer with, checked with ask.ts's validate. */
+const INVESTIGATE_SCHEMA: JsonSchema = {
+  type: "object",
+  properties: {
+    summary: { type: "string" },
+    findings: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          title: { type: "string" },
+          severity: { type: "string", enum: ["critical", "high", "medium", "low", "info"] },
+          file: { type: "string" },
+          line: { type: "integer" },
+          evidence: { type: "string" },
+          confidence: { type: "string", enum: ["high", "medium", "low"] },
+        },
+        required: ["title", "severity", "evidence", "confidence"],
+      },
+    },
+  },
+  required: ["summary", "findings"],
+}
+
+const SEVERITY = ["critical", "high", "medium", "low", "info"] as const
+
+type Finding = {
+  title: string
+  severity: (typeof SEVERITY)[number]
+  file?: string
+  line?: number
+  evidence: string
+  confidence: "high" | "medium" | "low"
+  /** The mechanical citation check, when the finding cites a file and/or line. */
+  cite?: string
+}
+
+/** How long the one retry for an invalid answer may block. */
+const INVESTIGATE_RETRY_MS = 300_000
 
 export function registerHorde(tool: Tool, opts: HordeOptions) {
   tool(
@@ -117,15 +162,75 @@ export function registerHorde(tool: Tool, opts: HordeOptions) {
   )
 
   tool(
-    "horde_wait",
-    "Wait for delegated tasks. Returns every outcome that is ready, each once; if none is, it blocks until the first one (up to timeout_seconds). READY: checks passed and the work was reviewed (what changed, cost) → horde_land. NEEDS YOU: the worker asks a question or for permission → horde_tell. FAILED: why, what the worker changed, and any edits refused outside its scope → horde_tell with a hint, or horde_drop. With no ids it waits for any task you started; on a timeout it says what each worker is doing (they keep working). In a subagent the call blocks the whole time (Claude Code moves only main-conversation calls to the background), so start the subagent's other work before waiting.",
+    "horde_investigate",
+    'Hand a read-only investigation to a cheaper worker model and get it back as a checked report. Use it for audits, code reviews, bug hunts and "how does X work" questions that produce no change: the worker reads, builds and runs code in its own git worktree (never committing), then answers with a JSON report of findings, each citing file:line and the command that produced it. The citations are checked mechanically (a file that does not exist, or a line past its end, is marked), and an answer that is not valid JSON is asked for again once before it fails. Returns at once with the task id; call horde_wait for the REPORT, or pass wait: true to block until it is done.',
     {
-      ids: z.array(z.string()).optional().describe("Task ids (t-…) from horde_do. Default: every task you started."),
+      question: z
+        .string()
+        .min(1)
+        .describe(
+          "What to find out and why, with the context you have. The worker sees only this and the repository; it does not see this conversation. It reads, builds and runs code to answer, so describe what you need to know and why it matters.",
+        ),
+      want: z.array(z.string()).optional().describe('What the answer must contain, e.g. ["which code paths call X", "whether the race is real"].'),
+      focus: z.array(z.string()).optional().describe("Paths or globs to start reading from; the worker is not limited to them."),
+      title: z.string().optional().describe("Short name (default: the question's first sentence)."),
+      model: z
+        .string()
+        .optional()
+        .describe(
+          '"provider/model" for the worker. Default: the cheapest tier of the repository\'s horde.json "tiers", else of the user-level ~/.config/mcp-horde/horde.json, else OpenCode\'s default model.',
+        ),
+      variant: z.string().optional().describe('Effort level the model offers, e.g. "low", "high", "max".'),
+      directory: z.string().optional().describe("The repository (default: the server's directory)."),
+      wait: z.boolean().optional().describe("Block until the outcome. Default false."),
+      timeout_seconds: timeout.optional(),
+    },
+    async (a, fleet, extra) => {
+      const repo = fleet.resolveDir(a.directory)
+      const board = await Board.open(repo)
+      const { tasks, warnings } = await board.plan([{ title: a.title ?? titleOf(a.question), goal: a.question, acceptance: [], scope: [] }])
+      const task = tasks[0]!
+      const { snapshot, notes } = await fleet
+        .spawn({
+          prompt: investigatePrompt(a.question, a.want ?? [], a.focus ?? []),
+          task: task.id,
+          model: a.model,
+          variant: a.variant,
+          directory: repo,
+          // Questions are about intent: they are the caller's.
+          questions: "ask",
+          gate: false,
+          investigate: true,
+          signal: extra.mcpReq.signal,
+        })
+        .catch(async (err: Error) => {
+          // Nothing started: the plan entry must not linger as an open task.
+          await board.fail(task.id, { reason: `could not start: ${err.message}`, retry: false }).catch(() => undefined)
+          throw err
+        })
+      if (a.wait) return (await collect(fleet, [snapshot.id], "all", a.timeout_seconds ?? opts.waitSeconds(), extra, opts)).text
+      const tiers = loadTiers(repo)
+      const model = snapshot.model ? formatModel(snapshot.model) : "OpenCode's default model"
+      const tier = tiers.length ? ` (tier ${task.tier} of ${tiers.length})` : ""
+      const setup = notes.filter((n) => !/^working t-/.test(n)).map((n) => n.replace(/ from the main checkout$/, ""))
+      return [
+        `${task.id} investigating: "${task.title}" · ${model}${tier} · worktree ${snapshot.worktree?.branch ?? "(none)"}`,
+        ...[setup.join(" · "), ...warnings].filter(Boolean).map((l) => `  ${l}`),
+        `→ horde_wait {ids: ["${task.id}"]} for the report`,
+      ].join("\n")
+    },
+  )
+
+  tool(
+    "horde_wait",
+    "Wait for delegated tasks. Returns every outcome that is ready, each once; if none is, it blocks until the first one (up to timeout_seconds). READY: checks passed and the work was reviewed (what changed, cost) → horde_land. REPORT: an investigation's findings, ordered by severity with each citation checked, and the path of the full report JSON → nothing to land. NEEDS YOU: the worker asks a question or for permission → horde_tell. FAILED: why, what the worker changed, and any edits refused outside its scope → horde_tell with a hint, or horde_drop. With no ids it waits for any task you started (changes and investigations); on a timeout it says what each worker is doing (they keep working). In a subagent the call blocks the whole time (Claude Code moves only main-conversation calls to the background), so start the subagent's other work before waiting.",
+    {
+      ids: z.array(z.string()).optional().describe("Task ids (t-…) from horde_do or horde_investigate. Default: every task you started."),
       timeout_seconds: timeout.optional(),
     },
     async (a, fleet, extra) => {
       const ids = a.ids?.length ? a.ids : (await fleet.list({})).snapshots.filter((s) => s.task).map((s) => s.id)
-      if (!ids.length) return "No tasks. Start one with horde_do."
+      if (!ids.length) return "No tasks. Start one with horde_do or horde_investigate."
       return (await collect(fleet, ids, "any", a.timeout_seconds ?? opts.waitSeconds(), extra, opts)).text
     },
   )
@@ -185,7 +290,15 @@ export function registerHorde(tool: Tool, opts: HordeOptions) {
           "Optional: land the task's commits as one commit with this message, e.g. \"feat(auth): add token refresh\". The repository's commit-msg hook, if any, judges it before the checks run. Without it the commits land as they are; in a repository with a commit-msg hook, leftover uncommitted work must be committed first.",
         ),
     },
-    async (a, fleet, extra) => renderLanding(a.id, await fleet.land(a.id, extra.mcpReq.signal, a.message)),
+    async (a, fleet, extra) => {
+      // A finished investigation has no agent any more (its worktree was discarded); its report file marks it.
+      const report = reportPath(fleet, a.id)
+      if (fs.existsSync(report))
+        throw new Error(
+          `${a.id} is a finished investigation (horde_investigate): it produced a report, never changes, so there is nothing to land. Its report is at ${report}.`,
+        )
+      return renderLanding(a.id, await fleet.land(a.id, extra.mcpReq.signal, a.message))
+    },
   )
 
   tool(
@@ -297,6 +410,8 @@ export async function outcome(fleet: Fleet, ref: string): Promise<string> {
           : (s.activity ?? "working")
     return `${id} working · ${footer} · ${doing}`
   }
+
+  if (record.investigate) return investigate(fleet, ref, s, record)
 
   const changes = wt ? await changeSummary(wt.root, workStart(wt)) : undefined
   const workerSaid = oneLine(task?.reports.at(-1)?.summary ?? s.lastTurn?.finalText ?? "")
@@ -478,4 +593,148 @@ async function changeSummary(root: string, start: string): Promise<{ line: strin
 function titleOf(goal: string): string {
   const first = oneLine(goal).split(/(?<=[.!?])\s/)[0] ?? goal
   return truncate(first.replace(/[.!?]$/, ""), 80)
+}
+
+// ---------------------------------------------------------------- investigation
+
+/** The worker's whole prompt: the rules it must obey, then the question and the JSON schema. */
+function investigatePrompt(question: string, want: string[], focus: string[]): string {
+  const lines = [
+    "Investigate the question below. You work in your own git worktree; you may read, build and run code, and write temporary files inside the worktree, but never commit (no git commit, push or branch changes).",
+    "Point XDG_STATE_HOME, XDG_DATA_HOME and XDG_CONFIG_HOME at a directory inside the worktree (for example $PWD/.xdg, created first) for anything that writes state, so nothing touches the machine outside it.",
+    "For every finding, cite the file:line and the command you ran to see it.",
+  ]
+  if (focus.length) lines.push(`Start from: ${focus.join(", ")} (reading is not limited to these).`)
+  lines.push("", `Question: ${question}`)
+  if (want.length) lines.push("", "The answer must cover:", ...want.map((w) => `- ${w}`))
+  return schemaPrompt(lines.join("\n"), INVESTIGATE_SCHEMA)
+}
+
+function finalTextOf(s: Snapshot): string {
+  return (s.lastTurn?.finalText ?? "").trim()
+}
+
+function judge(text: string): { errors: string[]; value?: unknown } {
+  const parsed = extractJson(text)
+  if (parsed.error) return { errors: [parsed.error] }
+  const errors = validate(parsed.value, INVESTIGATE_SCHEMA)
+  return errors.length ? { errors } : { errors, value: parsed.value }
+}
+
+function severityRank(severity: string): number {
+  return SEVERITY.indexOf(severity as (typeof SEVERITY)[number])
+}
+
+function orderBySeverity(findings: Finding[]): Finding[] {
+  return [...findings].sort((a, b) => severityRank(a.severity) - severityRank(b.severity))
+}
+
+/** The report JSON's home: the horde's state directory, so it can be read again. */
+function reportPath(fleet: Fleet, id: string): string {
+  return path.join(fleet.stateDir, "reports", `${id}.json`)
+}
+
+function resolveCitation(wt: Worktree, file: string): string | undefined {
+  for (const base of [wt.path, wt.root]) {
+    const abs = path.resolve(base, file)
+    try {
+      if (fs.statSync(abs).isFile()) return abs
+    } catch {
+      // try the next base
+    }
+  }
+  return undefined
+}
+
+function countLines(file: string): number {
+  const text = fs.readFileSync(file, "utf8").replace(/\n$/, "")
+  return text === "" ? 0 : text.split("\n").length
+}
+
+/** Check each finding's file:line against the worktree, marking citations that do not hold. */
+function checkCitations(findings: Finding[], wt: Worktree | undefined): Finding[] {
+  return findings.map((f) => {
+    if (!wt) return f
+    if (!f.file) return f.line === undefined ? f : { ...f, cite: "⚠ citation failed: no file to check the line against" }
+    const abs = resolveCitation(wt, f.file)
+    if (!abs) return { ...f, cite: `⚠ citation failed: ${f.file} not found` }
+    if (f.line === undefined) return f
+    const lines = countLines(abs)
+    if (f.line < 1 || f.line > lines) return { ...f, cite: `⚠ citation failed: line ${f.line} past end (${lines} line${lines === 1 ? "" : "s"})` }
+    return { ...f, cite: "✓ cited" }
+  })
+}
+
+/**
+ * Settle a finished investigation: validate the JSON answer (one retry), check every citation,
+ * write the report under the horde's state directory, mark the task done and discard its worktree.
+ */
+async function investigate(fleet: Fleet, ref: string, s: Snapshot, record: AgentRecord): Promise<string> {
+  const wt = record.worktree
+  const repo = wt?.repo ?? record.directory
+  const board = await Board.open(repo).catch(() => undefined)
+  const task = record.task && board ? board.task(record.task.id) : undefined
+  const id = task?.id ?? s.name ?? s.id
+  const title = task?.title ?? s.title
+  const say = (label: string, extra = "") => `${id} ${label} · "${title}"${extra}`
+
+  let snap = s
+  let text = finalTextOf(snap)
+  let result = judge(text)
+  let failedReason: string | undefined
+  if (result.errors.length) {
+    try {
+      await fleet.message(ref, retryPrompt(result.errors))
+      const r = await fleet.waitFor([ref], "all", INVESTIGATE_RETRY_MS, { markReported: false })
+      if (r.snapshots[0]) snap = r.snapshots[0]
+      if (snap.state === "idle") {
+        text = finalTextOf(snap)
+        result = judge(text)
+      } else {
+        failedReason = snap.error ?? (r.timedOut ? "no answer within the retry window" : "the worker stopped before answering")
+      }
+    } catch (err) {
+      failedReason = (err as Error).message
+    }
+  }
+
+  const footer = await footerLine(snap, record, repo, task?.tier)
+  if (result.errors.length || failedReason) {
+    const tail = text || failedReason || ""
+    return [
+      say("FAILED", " (the answer never became valid JSON)"),
+      tail ? `  answer: ${truncateHead(tail, 500)}` : "",
+      `  ${footer}`,
+      `→ horde_drop {id: "${id}"} · horde_investigate again with a clearer question`,
+    ]
+      .filter(Boolean)
+      .join("\n")
+  }
+
+  const answer = result.value as { summary: string; findings: Finding[] }
+  const findings = orderBySeverity(checkCitations(answer.findings, wt))
+  const file = reportPath(fleet, id)
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
+  writeJson(file, {
+    task: id,
+    title,
+    summary: answer.summary,
+    findings,
+    model: snap.model ? formatModel(snap.model) : "default model",
+    cost: snap.cost,
+    seconds: Math.round((Date.now() - record.createdAt) / 1000),
+    at: new Date().toISOString(),
+  })
+  if (task && board) await board.accept(task.id, { note: `investigation report: ${file}` }).catch(() => undefined)
+  await fleet.dispose(ref, { worktree: "discard" }).catch(() => undefined)
+
+  const lines = [say("REPORT"), `  ${oneLine(answer.summary)}`, `  findings (${findings.length}):`]
+  for (const f of findings) {
+    const where = f.file ? `${f.file}${f.line !== undefined ? `:${f.line}` : ""}` : "(no file)"
+    lines.push(
+      `  - [${f.severity}] ${truncate(f.title, 120)} — ${where} · ${f.confidence}${f.cite ? ` · ${f.cite}` : ""} — ${truncate(oneLine(f.evidence), 200)}`,
+    )
+  }
+  lines.push(`  ${footer}`, `  full report: ${file}`)
+  return lines.join("\n")
 }

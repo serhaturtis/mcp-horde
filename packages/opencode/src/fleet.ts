@@ -211,6 +211,8 @@ export interface SpawnInput {
   onProgress?: (message: string) => void
   /** False to run outside the running limit (a short one-shot ask, not a worker). */
   reserve?: boolean
+  /** A read-only investigation: no gate, and the prompt is the whole brief (no board reporting). */
+  investigate?: boolean
 }
 
 /** How a caller asks for a gate: true for the defaults, or settings. */
@@ -695,6 +697,11 @@ export class Fleet {
     return path.resolve(this.config.directory, dir ?? ".")
   }
 
+  /** The horde's state directory (agent records, reports). */
+  get stateDir() {
+    return this.config.stateDir
+  }
+
   /** Agents not refreshed yet (e.g. after a restart) count as working; find out first. */
   private async refreshUnknown() {
     const unknown = [...this.live.values()].filter((l) => l.state === undefined)
@@ -943,7 +950,10 @@ export class Fleet {
     try {
       const { task, attempt } = await board.assign(taskId, name)
       const extra = input.prompt.trim()
-      const prompt = `${renderBrief(board, task, attempt, 6000, directory)}${extra ? `\n\n## Additional instructions\n${extra}` : ""}`
+      // An investigation's prompt is the whole instruction (no board reporting commands).
+      const prompt = input.investigate
+        ? extra
+        : `${renderBrief(board, task, attempt, 6000, directory)}${extra ? `\n\n## Additional instructions\n${extra}` : ""}`
       let result: { snapshot: Snapshot; notes: string[] }
       try {
         result = await this.startSpawn({ ...effective, prompt }, checked)
@@ -1076,6 +1086,7 @@ export class Fleet {
         ownerSeen: Date.now(),
         reportedSeq: 0,
         gate: await gateConfig(gate, directory, !!worktree),
+        investigate: input.investigate,
       }
       this.store.put(record)
       const live = this.adoptRecord(record)
@@ -1442,6 +1453,8 @@ export class Fleet {
     const id = live.record.id
     const name = live.record.name ?? id
     const task = live.record.task
+    if (live.record.investigate)
+      throw new Error(`${name} is an investigation (horde_investigate): it produces a report, never changes, so there is nothing to land.`)
     if (!task || !live.record.worktree) throw new Error(`${name} is not a task in a worktree (horde_do starts one); merge it with opencode_worktree`)
     await this.refresh(live)
     if (this.working(live))

@@ -864,3 +864,78 @@ describe("the gate review runs outside the worker limit and its failure fails th
     assert.doesNotMatch(failed, /checks failed after/, failed)
   })
 })
+
+describe("horde_investigate: read-only workers that answer with a checked report", { timeout: 600_000 }, () => {
+  let iv: Harness
+  let ivmock: Mock
+  let ivrepo: string
+  let ivtmp: string
+  const boardState = () => path.join(ivtmp, "board-state")
+  const iid = (text: string) => text.match(/\bt-[0-9a-f]+\b/)![0]
+
+  before(async () => {
+    ivmock = await startMockLlm()
+    ;({ tmp: ivtmp, repo: ivrepo } = makeRepo(ivmock.url))
+    fs.writeFileSync(path.join(ivrepo, "horde.json"), JSON.stringify({ tiers: ["mock/mock", "mock/pricey"] }))
+    fs.writeFileSync(path.join(ivrepo, "greeting.txt"), "hello\n")
+    git(ivrepo, "add", ".")
+    git(ivrepo, "commit", "-qm", "base")
+    iv = await connect({ ...isolatedEnv(ivtmp, ivrepo), HORDE_BOARD_STATE_DIR: boardState() })
+  })
+
+  after(async () => {
+    await iv?.call("opencode_server", { action: "stop" }).catch(() => undefined)
+    await iv?.close()
+    ivmock?.close()
+  })
+
+  test("a valid JSON answer becomes a REPORT, listed by default, and its worktree is discarded", async () => {
+    const findings = [
+      { title: "greeting present", severity: "info", file: "greeting.txt", line: 1, evidence: "ran grep hello greeting.txt", confidence: "high" },
+      { title: "a critical bug", severity: "critical", file: "greeting.txt", line: 1, evidence: "ran grep hello greeting.txt", confidence: "high" },
+    ]
+    const question = `Find the greeting.\nJSON: ${JSON.stringify({ summary: "the greeting is in greeting.txt", findings })}`
+    const started = await iv.call("horde_investigate", { question, want: ["which file has the greeting"], focus: ["greeting.txt"] })
+    assert.match(started, /^t-\w+ investigating: "Find the greeting" · mock\/mock \(tier 0 of 2\) · worktree horde\/t-\w+/, started)
+    assert.doesNotMatch(started, /checked by:/, started)
+    const id = iid(started)
+
+    // horde_wait with no ids lists the investigation by default.
+    const report = await iv.call("horde_wait", { timeout_seconds: 120 })
+    assert.match(report, new RegExp(`^${id} REPORT · "Find the greeting"`), report)
+    assert.match(report, /the greeting is in greeting\.txt/, report)
+    assert.match(report, /findings \(2\):/, report)
+    assert.ok(report.indexOf("[critical]") < report.indexOf("[info]"), `severity order:\n${report}`)
+    assert.match(report, /greeting\.txt:1 · high · ✓ cited/, report)
+    const reportFile = report.match(/full report: (\S+)/)![1]!
+    assert.ok(fs.existsSync(reportFile), reportFile)
+    const saved = JSON.parse(fs.readFileSync(reportFile, "utf8"))
+    assert.equal(saved.task, id)
+    assert.equal(saved.findings[0].severity, "critical")
+    assert.equal(saved.findings[0].cite, "✓ cited")
+
+    // Done on the board, worktree and branch removed, and nothing lands.
+    assert.equal((await Board.open(ivrepo, boardState())).task(id).status, "done")
+    assert.equal(git(ivrepo, "branch", "--list", "horde/*"), "")
+    await assert.rejects(iv.call("horde_land", { id }), /finished investigation/)
+  })
+
+  test("a finding citing a missing file or a line past its end is marked", async () => {
+    const findings = [
+      { title: "ghost", severity: "medium", file: "nope.txt", line: 1, evidence: "ran ls", confidence: "low" },
+      { title: "too deep", severity: "high", file: "greeting.txt", line: 99, evidence: "ran wc -l", confidence: "medium" },
+    ]
+    const id = iid(await iv.call("horde_investigate", { question: `Check the files.\nJSON: ${JSON.stringify({ summary: "two broken citations", findings })}` }))
+    const report = await iv.call("horde_wait", { ids: [id], timeout_seconds: 120 })
+    assert.match(report, /nope\.txt not found/, report)
+    assert.match(report, /line 99 past end \(1 line\)/, report)
+  })
+
+  test("an answer that never becomes valid JSON is FAILED with its tail", async () => {
+    const id = iid(await iv.call("horde_investigate", { question: "Find the bug. JSON-NEVER" }))
+    const failed = await iv.call("horde_wait", { ids: [id], timeout_seconds: 120 })
+    assert.match(failed, new RegExp(`^${id} FAILED · "Find the bug" \\(the answer never became valid JSON\\)`), failed)
+    assert.match(failed, /still prose/, failed)
+    assert.doesNotMatch(failed, /REPORT/, failed)
+  })
+})
