@@ -730,3 +730,25 @@ describe("landing rebases the task's own commits onto the tip, leaving the basel
     assert.ok(!fs.existsSync(path.join(wt.root, "b.txt")), "the older tip's tree does not have b.txt")
   })
 })
+
+describe("createWorktree runs the setup at the worktree's repository root", () => {
+  const gitIn = (cwd: string, ...args: string[]) =>
+    execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", ...args], { cwd })
+      .toString()
+      .trim()
+
+  test("a setup from a subdirectory writes root-relative files at the root", async () => {
+    const repo = fs.mkdtempSync(path.join(os.tmpdir(), "horde-setup-"))
+    gitIn(repo, "init", "-q")
+    const sub = path.join(repo, "packages", "app")
+    fs.mkdirSync(sub, { recursive: true })
+    fs.writeFileSync(path.join(sub, "a.txt"), "a\n")
+    gitIn(repo, "add", "-A")
+    gitIn(repo, "commit", "-qm", "base")
+    const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), "horde-setup-wt-"))
+    const { worktree } = await createWorktree(sub, "setup", { rootDir, includeUncommitted: false, setup: "touch root-setup.txt" })
+    assert.equal(worktree.path, path.join(worktree.root, "packages", "app"))
+    assert.ok(fs.existsSync(path.join(worktree.root, "root-setup.txt")), "the setup ran at the worktree root")
+    assert.ok(!fs.existsSync(path.join(worktree.path, "root-setup.txt")), "not in the session's subdirectory")
+  })
+})

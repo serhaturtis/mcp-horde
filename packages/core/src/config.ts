@@ -120,7 +120,7 @@ export function loadTiers(directory: string): Tier[] {
 export interface Workers {
   /** Paths to link from the checkout (default: the dependency directories git ignores). */
   link?: string[]
-  /** A command run in a new worktree before the worker starts, e.g. "npm run build". */
+  /** A command run at the new worktree's repository root before the worker starts, e.g. "npm run build". */
   setup?: string
   /** Repository-relative files every worker brief includes in full (house rules). */
   brief?: string[]

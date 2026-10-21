@@ -47,7 +47,7 @@ export interface WorktreeOptions {
   at?: string
   /** Paths (relative to the repo root) to symlink from the main checkout; default: dependencyLinks(repo).links, or none with a setup. */
   link?: string[]
-  /** Shell command run in the new worktree before the agent starts, e.g. "npm ci". */
+  /** Shell command run at the new worktree's repository root before the agent starts, e.g. "npm ci". */
   setup?: string
   /** Initialize submodules in the new worktree (default: when the repo has any). */
   submodules?: boolean
@@ -229,7 +229,7 @@ export async function createWorktree(directory: string, name: string, opts: Work
       await fs.mkdir(worktree.path, { recursive: true })
       notes.push(`${sub} is not in the committed tree; created it empty in the worktree`)
     }
-    if (opts.setup) notes.push(await runSetup(opts.setup, worktree.path, { HORDE_TASK: name, HORDE_WORKTREE: worktree.root }, opts.signal, opts.onProgress))
+    if (opts.setup) notes.push(await runSetup(opts.setup, worktree.root, { HORDE_TASK: name, HORDE_WORKTREE: worktree.root }, opts.signal, opts.onProgress))
   } catch (err) {
     await git(repo, "worktree", "remove", "--force", root).catch(() => fs.rm(root, { recursive: true, force: true }))
     await git(repo, "worktree", "prune").catch(() => undefined)
