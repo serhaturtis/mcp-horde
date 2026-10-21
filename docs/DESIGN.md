@@ -432,6 +432,11 @@ A full review after M5 fixed, among others: gates that could pass with nothing r
 - Whether Claude Code shows a prompt that a tool call returns as `input_required` on the 2026-07-28 protocol, and how many rounds it allows. This decides whether `opencode` can keep asking the human once it serves that protocol (M7). To find out: a ten-line server whose one tool answers `input_required` with a form, tried in an interactive session.
 - Whether Claude Code delivers channel notifications on 2026-07-28. Its docs say a channel server there "can't deliver channel messages". Recheck with each Claude Code release; until it does, a server that sends them stays on the 2025 handshake.
 
+- Why the `opencode` MCP server sometimes dies in a long Claude Code session. **Seen three times on 2026-10-20/21, each while it ran a task's gate or worktree setup in this repository.** The third (pid 1272008) logged its start and nothing else in `servers.log`: no signal, no uncaught error, no exit code. So it was SIGKILLed or crashed natively, both of which bypass the handlers. Claude Code's MCP log only shows the pending `horde_wait` failing with "Connection closed".
+  - Ruled out: the OOM killer (24 GB free), this repository's tests killing their runner (the suite run through `runCommand` from a sentinel process left it alive), and that gate itself (rerun in its own process it passed in 2m40s, peaking at about 750 MB RSS).
+  - Other horde servers of the same session and of another session kept running.
+  - Next time: note the time, the other running sessions, and `dmesg`; a long session with `NODE_OPTIONS=--report-on-fatalerror` set for the plugin would catch a native crash.
+
 Each goes into a `probe/` script in the relevant package, like the probes used while building `opencode`, and becomes an integration test once the behaviour is confirmed.
 
 ## 12. Build order
