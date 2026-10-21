@@ -4,6 +4,7 @@ import path from "node:path"
 import { fitSections, formatDuration, git, gitRaw, globMatcher, type Section, splitZ, truncate } from "@mcp-horde/core"
 import { type AuditResult, audit, diffBase, type Finding } from "./audit.js"
 import { type Check, checkScripts, detectChecks, loadSettings, loadSettingsAt } from "./detect.js"
+import type { Failure } from "./extract.js"
 import { changedFiles, type Narrowing, planRelated } from "./related.js"
 import { type CheckResult, logDirFor, runChecks } from "./run.js"
 
@@ -44,6 +45,12 @@ export interface GateOptions {
   stage?: "work" | "land"
   /** Variables for every check, e.g. a task's HORDE_TASK and HORDE_WORKTREE. */
   env?: Record<string, string>
+  /**
+   * When checks fail, run the failing ones again at `commit`. A check whose failures all happen
+   * there too is the commit's problem, not the work's. `checkout` must return a checkout with
+   * dependencies ready; the gate calls it once per run, and always releases it.
+   */
+  baseline?: { commit: string; label: string; checkout: () => Promise<{ root: string; release: () => Promise<void> }> }
 }
 
 export interface Verdict {
@@ -89,6 +96,136 @@ export function defaultStateDir(env: NodeJS.ProcessEnv = process.env): string {
   return path.resolve(env.HORDE_VERIFY_STATE_DIR || path.join(env.XDG_STATE_HOME || path.join(home, ".local", "state"), "mcp-horde", "verify"))
 }
 
+interface BaselineOutcome {
+  pass: boolean
+  /** Failure keys, see failureKey. */
+  keys: string[]
+}
+
+interface BaselineRun {
+  root: string
+  timeoutMs: number
+  logBase: string
+  lockDir?: string
+}
+
+const baselineCache = new Map<string, { at: number; results: Promise<Map<string, BaselineOutcome>> }>()
+const BASELINE_TTL = 15 * 60_000
+
+/** A check's environment as the baseline key sees it: the task's variables point at the worktree being judged, not the commit. */
+function baselineEnv(env: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const k of Object.keys(env).sort()) if (k !== "HORDE_TASK" && k !== "HORDE_WORKTREE") out[k] = env[k]!
+  return out
+}
+
+/**
+ * Two gates asking about the same commit and the same checks get one checkout and one run: a
+ * baseline is expensive, and its answer belongs to the commit, not to the caller.
+ */
+async function baselineKey(directory: string, commit: string, checks: Check[], env: Record<string, string>): Promise<string> {
+  const root = await git(directory, "rev-parse", "--show-toplevel").catch(() => path.resolve(directory))
+  const common = await git(directory, "rev-parse", "--path-format=absolute", "--git-common-dir").catch(() => root)
+  const real = await fs.realpath(common).catch(() => common)
+  const list = checks
+    .map((c) => ({
+      name: c.name,
+      command: c.command,
+      cwd: path.relative(root, c.cwd).replace(/\\/g, "/"),
+      env: baselineEnv({ ...env, ...c.env }),
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name))
+  return createHash("sha256").update(real).update("\0").update(commit).update("\0").update(JSON.stringify(list)).digest("hex")
+}
+
+/** What makes two failures the same one: test and file, or the first message line. Digits are masked so counts and durations do not matter. */
+function failureKey(f: Failure): string {
+  const identity = f.test || f.file ? `${f.test ?? ""}\0${f.file ?? ""}` : (f.message.split("\n").find((l) => l.trim()) ?? "").trim()
+  return identity.replace(/\d+/g, "#")
+}
+
+/** Runs the failing checks at the baseline commit, sharing an in-flight run with other gates. */
+async function baselineOutcomes(opts: GateOptions, run: BaselineRun, checks: Check[]): Promise<Map<string, BaselineOutcome>> {
+  const spec = opts.baseline!
+  const env = opts.env ?? {}
+  const key = await baselineKey(run.root, spec.commit, checks, env)
+  const now = Date.now()
+  const hit = baselineCache.get(key)
+  if (hit && now - hit.at < BASELINE_TTL) return hit.results
+  for (const [k, v] of baselineCache) if (now - v.at >= BASELINE_TTL) baselineCache.delete(k)
+  const results = (async () => {
+    const co = await spec.checkout()
+    const logDir = logDirFor(run.logBase, co.root)
+    try {
+      const ran = await runChecks(
+        // The same commands in the same place relative to the repository root, so harnesses see the baseline as they see the work.
+        checks.map((c) => ({ ...c, cwd: path.resolve(co.root, path.relative(run.root, c.cwd)) })),
+        {
+          timeoutMs: run.timeoutMs,
+          logDir,
+          onProgress: opts.onProgress,
+          env: { ...env, HORDE_TASK: `base-${spec.commit.slice(0, 8)}`, HORDE_WORKTREE: co.root },
+          lockDir: run.lockDir,
+        },
+      )
+      const out = new Map<string, BaselineOutcome>()
+      for (const c of checks) {
+        const r = ran.find((x) => x.name === c.name)
+        if (!r) throw new Error(`the baseline run did not report ${c.name}`)
+        out.set(c.name, { pass: r.pass, keys: r.extracted.failures.map(failureKey) })
+      }
+      return out
+    } finally {
+      await fs.rm(logDir, { recursive: true, force: true })
+      await co.release()
+    }
+  })()
+  baselineCache.set(key, { at: now, results })
+  // A failed checkout or run is not the commit's answer: let the next gate try again.
+  results.catch(() => {
+    if (baselineCache.get(key)?.results === results) baselineCache.delete(key)
+  })
+  return results
+}
+
+/** Re-runs the failing checks at the baseline and drops failures the baseline has too. */
+async function compareBaseline(
+  checks: CheckResult[],
+  toRun: Check[],
+  opts: GateOptions,
+  run: BaselineRun,
+): Promise<{ checks: CheckResult[]; warnings: string[] }> {
+  const spec = opts.baseline
+  const failing = spec ? checks.filter((c) => !c.pass && !c.stopped) : []
+  if (!spec || !failing.length || opts.signal?.aborted) return { checks, warnings: [] }
+  const runnable = failing.map((c) => toRun.find((x) => x.name === c.name)).filter((c): c is Check => !!c)
+  try {
+    const outcomes = await baselineOutcomes(opts, run, runnable)
+    for (const c of failing) if (!outcomes.has(c.name)) throw new Error(`the baseline run did not report ${c.name}`)
+    const warnings: string[] = []
+    const compared = checks.map((c) => {
+      if (!failing.includes(c)) return c
+      const outcome = outcomes.get(c.name)!
+      if (outcome.pass) return { ...c, baseline: { label: spec.label, pass: true, known: 0 } }
+      const keys = new Set(outcome.keys)
+      const known = c.extracted.failures.filter((f) => keys.has(failureKey(f))).length
+      if (known === c.extracted.failures.length) {
+        warnings.push(`${c.name}: fails at ${spec.label} too, with the same failures (not caused by this change)`)
+        return { ...c, pass: true, baseline: { label: spec.label, pass: false, known } }
+      }
+      // Only the new failures are the change's to answer for.
+      return {
+        ...c,
+        baseline: { label: spec.label, pass: false, known },
+        extracted: { ...c.extracted, failures: c.extracted.failures.filter((f) => !keys.has(failureKey(f))) },
+      }
+    })
+    return { checks: compared, warnings }
+  } catch (err) {
+    return { checks, warnings: [`could not compare with ${spec.label}: ${(err as Error).message}`] }
+  }
+}
+
 export async function gate(directory: string, opts: GateOptions = {}): Promise<Verdict> {
   const dir = path.resolve(directory)
   // The diff starts where HEAD meets base; the rules are base's, so the work cannot rewrite them.
@@ -109,6 +246,7 @@ export async function gate(directory: string, opts: GateOptions = {}): Promise<V
     related: relatedMode ? (opts.relatedTo ?? true) : false,
     stage: opts.stage ?? null,
     env: opts.env ?? null,
+    baseline: opts.baseline?.commit ?? null,
   })
   const hit = key && !opts.fresh ? cache.get(key) : undefined
   if (hit) return { ...hit, cached: true, text: render(hit, budget, true) }
@@ -124,15 +262,19 @@ export async function gate(directory: string, opts: GateOptions = {}): Promise<V
   }
   if (opts.stage === "work") for (const c of selected) if (c.when === "land") plans.set(c, { tests: [], skipped: "runs before landing (when: land)" })
   const toRun = selected.filter((c) => !plans.get(c)?.skipped).map((c) => ({ ...c, command: plans.get(c)?.command ?? c.command }))
+  const stateDir = opts.stateDir ?? defaultStateDir()
+  const logBase = path.join(stateDir, "logs")
+  const root = await git(dir, "rev-parse", "--show-toplevel").catch(() => dir)
+  const lockDir = toRun.some((c) => c.slots || c.exclusive) ? await lockDirFor(dir, stateDir) : undefined
   const ran = await runChecks(toRun, {
     timeoutMs: settings.timeoutMs,
     signal: opts.signal,
-    logDir: logDirFor(path.join(opts.stateDir ?? defaultStateDir(), "logs"), dir),
+    logDir: logDirFor(logBase, dir),
     onProgress: opts.onProgress,
     env: opts.env,
-    lockDir: toRun.some((c) => c.slots || c.exclusive) ? await lockDirFor(dir, opts.stateDir ?? defaultStateDir()) : undefined,
+    lockDir,
   })
-  const checks = selected.flatMap((c): CheckResult[] => {
+  let checks = selected.flatMap((c): CheckResult[] => {
     const plan = plans.get(c)
     if (plan?.skipped)
       return [
@@ -141,6 +283,8 @@ export async function gate(directory: string, opts: GateOptions = {}): Promise<V
     const r = ran.find((x) => x.name === c.name)
     return r ? [{ ...r, related: plan }] : []
   })
+  const compared = await compareBaseline(checks, toRun, opts, { root, timeoutMs: settings.timeoutMs, logBase, lockDir })
+  checks = compared.checks
   const auditResult = doAudit
     ? await audit(dir, {
         base: base!,
@@ -158,7 +302,7 @@ export async function gate(directory: string, opts: GateOptions = {}): Promise<V
     ...checks.filter((c) => !c.pass).map((c) => `${c.name}: ${summary(c)}`),
     ...(auditResult?.findings.filter((f) => f.severity === "block").map(findingLine) ?? []),
   ]
-  const warnings = auditResult?.findings.filter((f) => f.severity === "warn").map(findingLine) ?? []
+  const warnings = [...(auditResult?.findings.filter((f) => f.severity === "warn").map(findingLine) ?? []), ...compared.warnings]
   const generated = globMatcher(settings.audit.generated)
   untested = untested.filter((f) => !generated(f))
   if (untested.length)
@@ -238,9 +382,12 @@ export function render(v: Omit<Verdict, "cached" | "text">, budget: number, cach
         ? ` · related tests only (${c.related.tests.length} file${c.related.tests.length === 1 ? "" : "s"})`
         : ` · full suite: ${c.related.full}`
       : ""
+    const atBaseline = !!(c.pass && c.baseline && !c.baseline.pass)
     sections.push({
-      text: `${c.pass ? "✓" : "✗"} ${c.name} · ${c.pass ? summaryPass(c) : summary(c)} · ${formatDuration(c.durationMs)}${scope}`,
-      required: !c.pass,
+      text: atBaseline
+        ? `! ${c.name} · fails at ${c.baseline!.label} too, same failures · ${formatDuration(c.durationMs)}${scope}`
+        : `${c.pass ? "✓" : "✗"} ${c.name} · ${c.pass ? summaryPass(c) : summary(c)} · ${formatDuration(c.durationMs)}${scope}`,
+      required: !c.pass || atBaseline,
     })
   }
   for (const c of failed) {
@@ -257,6 +404,8 @@ export function render(v: Omit<Verdict, "cached" | "text">, budget: number, cach
         omitted: (n) => `  … ${n} more failure${n > 1 ? "s" : ""} in ${c.name} not shown (verify_logs ${c.name})`,
       })
     }
+    if (c.baseline && !c.baseline.pass && c.baseline.known > 0)
+      sections.push({ text: `  (${c.baseline.known} more also fail at ${c.baseline.label})`, required: true })
   }
   for (const w of v.warnings.filter((x) => x.startsWith("tests: no test covers"))) sections.push({ text: `! ${w}` })
   if (v.audit) {

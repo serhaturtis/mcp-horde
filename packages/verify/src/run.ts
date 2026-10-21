@@ -19,6 +19,8 @@ export interface CheckResult {
   logFile?: string
   /** How a related-tests run narrowed (or skipped) this check. */
   related?: Narrowing
+  /** How this check compared with the baseline commit, when one was given. */
+  baseline?: { label: string; pass: boolean; known: number }
 }
 
 export interface RunChecksOptions {

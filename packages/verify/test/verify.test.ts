@@ -303,6 +303,143 @@ describe("gate", () => {
   })
 })
 
+describe("baseline", () => {
+  // A small check script that fails the tests named in failures.json, in node's TAP format.
+  const checkScript = [
+    'import fs from "node:fs"',
+    'const names = JSON.parse(fs.readFileSync("failures.json", "utf8"))',
+    'console.log("TAP version 13")',
+    "names.forEach((name, i) => {",
+    '  console.log("not ok " + (i + 1) + " - " + name)',
+    '  console.log("  ---")',
+    '  console.log("  location: \'test/" + name + ".test.mjs:" + (i + 3) + ":1\'")',
+    '  console.log("  error: \'boom " + name + "\'")',
+    '  console.log("  ...")',
+    "})",
+    'console.log("1.." + names.length)',
+    'console.log("# fail " + names.length)',
+    "if (names.length) process.exitCode = 1",
+  ].join("\n")
+
+  const project = (failures: string[]) =>
+    repo({
+      "horde.json": JSON.stringify({ verify: { checks: { test: "node check.mjs" } } }),
+      "check.mjs": checkScript,
+      "failures.json": JSON.stringify(failures),
+    })
+
+  const checkoutOf = (root: string, commit: string, calls: { n: number }, releases: { n: number }) => async () => {
+    calls.n++
+    const dir = path.join(tmp(), "checkout")
+    git(root, "worktree", "add", "--detach", "-q", dir, commit)
+    return {
+      root: dir,
+      release: async () => {
+        releases.n++
+        git(root, "worktree", "remove", "--force", dir)
+      },
+    }
+  }
+
+  test("a check that fails the same way at the baseline passes with a warning", async () => {
+    const { root, base } = project(["adds"])
+    const calls = { n: 0 }
+    const releases = { n: 0 }
+    const stateDir = tmp()
+    const v = await gate(root, {
+      baseline: { commit: base, label: "master's tip", checkout: checkoutOf(root, base, calls, releases) },
+      stateDir,
+    })
+    assert.equal(v.pass, true, v.text)
+    assert.match(v.text, /! test · fails at master's tip too, same failures · /)
+    assert.doesNotMatch(v.text, /1 check failed/)
+    assert.ok(v.warnings.includes("test: fails at master's tip too, with the same failures (not caused by this change)"), v.warnings.join("\n"))
+    assert.ok(!v.blockers.some((b) => b.startsWith("test:")))
+    assert.deepEqual(v.checks[0]!.baseline, { label: "master's tip", pass: false, known: 1 })
+    assert.equal(calls.n, 1)
+    assert.equal(releases.n, 1)
+    assert.equal(fs.readdirSync(path.join(stateDir, "logs")).length, 1, "the baseline's logs were deleted")
+  })
+
+  test("only the failures not seen at the baseline are listed", async () => {
+    const { root, base } = project(["adds"])
+    write(root, { "failures.json": JSON.stringify(["adds", "multiplies"]) })
+    const calls = { n: 0 }
+    const releases = { n: 0 }
+    const v = await gate(root, {
+      baseline: { commit: base, label: "master's tip", checkout: checkoutOf(root, base, calls, releases) },
+      stateDir: tmp(),
+    })
+    assert.equal(v.pass, false)
+    assert.match(v.text, /✗ test · 2 failed/)
+    assert.match(v.text, /✗ test: multiplies — test\/multiplies\.test\.mjs:4/)
+    assert.doesNotMatch(v.text, /✗ test: adds/)
+    assert.match(v.text, / {2}\(1 more also fail at master's tip\)/)
+    assert.deepEqual(v.checks[0]!.baseline, { label: "master's tip", pass: false, known: 1 })
+    assert.deepEqual(
+      v.checks[0]!.extracted.failures.map((f) => f.test),
+      ["multiplies"],
+    )
+    assert.equal(calls.n, 1)
+    assert.equal(releases.n, 1)
+  })
+
+  test("a check that passes at the baseline fails as before", async () => {
+    const { root, base } = project([])
+    write(root, { "failures.json": JSON.stringify(["adds"]) })
+    const calls = { n: 0 }
+    const releases = { n: 0 }
+    const v = await gate(root, {
+      baseline: { commit: base, label: "master's tip", checkout: checkoutOf(root, base, calls, releases) },
+      stateDir: tmp(),
+    })
+    assert.equal(v.pass, false)
+    assert.match(v.text, /✗ test · 1 failed/)
+    assert.doesNotMatch(v.text, /fails at master|also fail at master/)
+    assert.deepEqual(v.checks[0]!.baseline, { label: "master's tip", pass: true, known: 0 })
+    assert.equal(calls.n, 1)
+    assert.equal(releases.n, 1)
+  })
+
+  test("the checkout is skipped when every check passes, and shared by gates needing the same baseline", async () => {
+    const calls = { n: 0 }
+    const releases = { n: 0 }
+
+    const ok = project([])
+    const pass = await gate(ok.root, {
+      baseline: { commit: ok.base, label: "master's tip", checkout: checkoutOf(ok.root, ok.base, calls, releases) },
+      stateDir: tmp(),
+    })
+    assert.equal(pass.pass, true)
+    assert.equal(calls.n, 0, "nothing failed, so no checkout")
+
+    const { root, base } = project(["adds"])
+    const checkout = checkoutOf(root, base, calls, releases)
+    const baseline = { commit: base, label: "master's tip", checkout }
+    const [a, b] = await Promise.all([gate(root, { baseline, stateDir: tmp(), fresh: true }), gate(root, { baseline, stateDir: tmp(), fresh: true })])
+    assert.equal(a.pass, true, a.text)
+    assert.equal(b.pass, true, b.text)
+    assert.equal(calls.n, 1, "concurrent gates share one checkout")
+    assert.equal(releases.n, 1)
+
+    const later = await gate(root, { baseline, stateDir: tmp(), fresh: true })
+    assert.equal(later.pass, true)
+    assert.equal(calls.n, 1, "the baseline is cached for 15 minutes")
+  })
+
+  test("a checkout that throws leaves the verdict unchanged and warns", async () => {
+    const { root, base } = project(["adds"])
+    const v = await gate(root, {
+      baseline: { commit: base, label: "master's tip", checkout: async () => Promise.reject(new Error("deps are missing")) },
+      stateDir: tmp(),
+    })
+    assert.equal(v.pass, false)
+    assert.match(v.text, /✗ test · 1 failed/)
+    assert.ok(v.warnings.includes("could not compare with master's tip: deps are missing"), v.warnings.join("\n"))
+    assert.equal(v.checks[0]!.baseline, undefined)
+  })
+})
+
 describe("related tests", () => {
   const check = (command: string, cwd = "/p"): Check => ({ name: "test", command, kind: "test", cwd, source: "test" })
 
