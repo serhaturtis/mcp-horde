@@ -21,6 +21,38 @@ export interface Narrowing {
 const quote = (p: string) => (/^[\w./@-]+$/.test(p) ? p : process.platform === "win32" ? `"${p.replace(/"/g, '\\"')}"` : `'${p.replace(/'/g, "'\\''")}'`)
 
 const PYTEST = /(^|[\s/])(pytest|py\.test)(\s|$)|-m\s+pytest\b/
+/** Pytest options whose value is the next word when written without `=`. */
+const PYTEST_VALUES = new Set([
+  "--ignore",
+  "--ignore-glob",
+  "--deselect",
+  "--rootdir",
+  "-c",
+  "--confcutdir",
+  "--basetemp",
+  "--cov",
+  "--cov-config",
+  "-p",
+  "-k",
+  "-m",
+  "-n",
+  "--capture",
+  "--color",
+  "--durations",
+  "--import-mode",
+  "--junitxml",
+  "--maxfail",
+  "-o",
+  "--override-ini",
+  "-r",
+  "--tb",
+  "--timeout",
+  "-W",
+])
+/** Shell syntax that whitespace splitting cannot take apart safely. */
+const UNSAFE = /['"$;&|<>`]/
+/** Files that mark the root of a Python project (as in the code map). */
+const PY_ROOTS = ["pyproject.toml", "setup.py", "setup.cfg"]
 const TSCONFIG = /^(tsconfig|jsconfig)([.\w-]*)\.json$/
 const BUNDLER_CONFIG = /^(vite|vitest|webpack|rollup|rspack)\.config\.[cm]?[jt]s$/
 
@@ -34,7 +66,7 @@ export function narrowCommand(check: Check, tests: string[]): string | undefined
   const py = tests.filter((t) => t.endsWith(".py"))
   const js = tests.filter((t) => /\.[cm]?[jt]sx?$/.test(t))
   const go = [...new Set(tests.filter((t) => t.endsWith("_test.go")).map((t) => `./${path.posix.dirname(t)}`.replace(/^\.\/\.$/, ".")))]
-  if (PYTEST.test(cmd)) return py.length ? `${cmd} ${py.map(quote).join(" ")}` : undefined
+  if (PYTEST.test(cmd)) return narrowPytest(check, cmd, py)
   // jest takes its arguments as regular expressions unless told they are paths.
   const runner = cmd.match(/(?:^|\s)(?:npx\s+)?(vitest|jest)(?:\s|$)/)?.[1]
   const byPath = (r: string | undefined) => (r === "jest" ? "--runTestsByPath " : "")
@@ -48,6 +80,35 @@ export function narrowCommand(check: Check, tests: string[]): string | undefined
     if (m) return `${cmd} -- ${byPath(m[1])}${js.map(quote).join(" ")}`
   }
   return undefined
+}
+
+/**
+ * Narrow a pytest command: positional paths it already names are dropped, and only related
+ * tests inside one of them are appended. A command that names no paths gets them all.
+ */
+function narrowPytest(check: Check, cmd: string, py: string[]): string | undefined {
+  const tokens = cmd.split(/\s+/).filter(Boolean)
+  const at = tokens.findIndex((t) => /(?:^|[\\/])(pytest|py\.test)$/.test(t))
+  if (at < 0) return undefined
+  const exists = (t: string) => fs.existsSync(path.resolve(check.cwd, t))
+  const named = new Set<number>()
+  if (!UNSAFE.test(cmd)) {
+    for (let i = at + 1; i < tokens.length; i++) {
+      const t = tokens[i]!
+      if (t.startsWith("-")) {
+        if (!t.includes("=") && PYTEST_VALUES.has(t)) i++
+      } else if (exists(t)) named.add(i)
+    }
+  } else if (tokens.slice(at + 1).some((t) => !t.startsWith("-") && exists(t))) {
+    // Quotes or operators: the words cannot be trusted, so a path-looking one means no narrowing.
+    return undefined
+  }
+  if (!named.size) return py.length ? `${cmd} ${py.map(quote).join(" ")}` : undefined
+  const paths = [...named].map((i) => path.relative(check.cwd, path.resolve(check.cwd, tokens[i]!)).replace(/\\/g, "/") || ".")
+  const inside = (t: string) => paths.some((p) => p === "." || t === p || t.startsWith(`${p}/`))
+  const keep = py.filter(inside)
+  const rest = tokens.filter((_, i) => !named.has(i)).join(" ")
+  return keep.length ? `${rest} ${keep.map(quote).join(" ")}` : undefined
 }
 
 function npmScript(dir: string, name: string): string | undefined {
@@ -117,6 +178,18 @@ export function planRelated(root: string, changed: string[], checks: Check[]): {
     }
   }
   const realRoot = real(root)
+  const withinRoot = (p: string) => {
+    const r = path.relative(realRoot, p)
+    return r === "" || (r !== ".." && !r.startsWith(`..${path.sep}`) && !path.isAbsolute(r))
+  }
+  /** Is there a go.mod in `cwd` or a directory above it, up to the repository root? */
+  const goMod = (cwd: string) => {
+    for (let d = real(cwd); withinRoot(d); d = path.dirname(d)) {
+      if (fs.existsSync(path.join(d, "go.mod"))) return true
+      if (d === realRoot) break
+    }
+    return false
+  }
   const rel = (cwd: string, f: string) => path.relative(real(cwd), path.join(realRoot, f)).replace(/\\/g, "/")
   const inside = (cwd: string, f: string) => {
     const r = rel(cwd, f)
@@ -146,11 +219,12 @@ export function planRelated(root: string, changed: string[], checks: Check[]): {
       else plans.set(check, { tests: [], skipped: "no changes and no related tests under its directory" })
       continue
     }
-    // The code map resolves Python and Go imports from the repository root (and its go.mod):
-    // a project rooted elsewhere would have importers it cannot see.
-    const pyOrGo = go || PYTEST.test(check.command)
-    if (pyOrGo && (real(check.cwd) !== realRoot || (go && !fs.existsSync(path.join(root, "go.mod"))))) {
-      plans.set(check, { tests: mine, full: `its ${go ? "Go module" : "Python project"} is not at the repository root` })
+    // The code map resolves Go imports from the nearest go.mod and Python imports from the
+    // nearest project root: narrowing is safe only when the check runs at one of them.
+    const pyCheck = PYTEST.test(check.command)
+    const pyRoot = real(check.cwd) === realRoot || PY_ROOTS.some((n) => fs.existsSync(path.join(check.cwd, n)))
+    if (go ? !goMod(check.cwd) : pyCheck && !pyRoot) {
+      plans.set(check, { tests: mine, full: go ? "no go.mod at or above its directory" : "its directory is not a Python project root" })
       continue
     }
     const command = narrowCommand(check, mine)

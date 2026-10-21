@@ -485,6 +485,19 @@ describe("related tests", () => {
     assert.equal(narrowCommand(check("npm test", npm), ["src/a.test.ts"]), undefined, "node --test lists its own files")
   })
 
+  test("pytest commands that name paths keep only the related tests inside them", () => {
+    const dir = tmp()
+    write(dir, { "tests/test_a.py": "", "tests/test_slow.py": "", "scripts/run.py": "", "other/test_b.py": "" })
+    const narrow = (cmd: string) => narrowCommand(check(cmd, dir), ["tests/test_a.py", "other/test_b.py"])
+    assert.equal(narrow("python -m pytest tests scripts -q -n 8"), "python -m pytest -q -n 8 tests/test_a.py")
+    assert.equal(narrow("pytest -q tests"), "pytest -q tests/test_a.py", "flags are kept")
+    assert.equal(narrow("pytest --ignore tests/slow tests"), "pytest --ignore tests/slow tests/test_a.py", "an option's path value is kept")
+    assert.equal(narrow("pytest --deselect tests/test_a.py other"), "pytest --deselect tests/test_a.py other/test_b.py")
+    assert.equal(narrow("pytest -q scripts"), undefined, "no related test lies inside the named paths")
+    assert.equal(narrow("pytest -q"), "pytest -q tests/test_a.py other/test_b.py", "no named paths: append them all")
+    assert.equal(narrow("pytest -k 'test_a' tests"), undefined, "quoted arguments cannot be split safely")
+  })
+
   test("a gate runs only the tests for what changed, falls back to the full suite when unsure, and flags untested code", async () => {
     // A stand-in test runner named like jest: it prints what it was asked to run.
     const { root, base } = repo({
@@ -583,6 +596,24 @@ describe("related tests", () => {
     assert.equal(plans.get(py)?.command, "pytest tests/test_app.py")
     assert.equal(plans.get(py)?.full, undefined)
     assert.equal(plans.get(go)?.command, "go test .")
+    assert.equal(plans.get(go)?.full, undefined)
+  })
+
+  test("pytest and Go checks in subdirectory projects narrow to their own related tests", () => {
+    const { root } = repo({
+      "svc/pyproject.toml": "[tool.pytest.ini_options]\n",
+      "svc/app.py": "value = 1\n",
+      "svc/tests/test_app.py": "from app import value\n",
+      "api/go.mod": "module example.com/api\n",
+      "api/calc/calc.go": "package calc\n\nfunc Add(a, b int) int { return a + b }\n",
+      "api/calc/calc_test.go": "package calc\n",
+    })
+    const py = check("pytest", path.join(root, "svc"))
+    const go = check("go test ./...", path.join(root, "api"))
+    const plans = planRelated(root, ["svc/app.py", "api/calc/calc.go"], [py, go]).plans
+    assert.equal(plans.get(py)?.command, "pytest tests/test_app.py")
+    assert.equal(plans.get(py)?.full, undefined)
+    assert.equal(plans.get(go)?.command, "go test ./calc")
     assert.equal(plans.get(go)?.full, undefined)
   })
 })
@@ -862,8 +893,17 @@ describe("fixes", () => {
     const plan = (files: string[], c = test("npx jest")) => planRelated(root, files, [c]).plans.get(c)!
     assert.ok(plan(["src/a.js"]).command, "narrowed")
     assert.match(plan(["tests/conftest.py"]).full ?? "", /without related tests \(tests\/conftest\.py\)/)
-    write(root, { "svc/pyproject.toml": "[tool.pytest.ini_options]\n", "svc/tests/test_app.py": "def test_a(): pass\n" })
-    assert.equal(plan(["svc/tests/test_app.py"], test("pytest", path.join(root, "svc"))).full, "its Python project is not at the repository root")
+    write(root, {
+      "svc/pyproject.toml": "[tool.pytest.ini_options]\n",
+      "svc/tests/test_app.py": "def test_a(): pass\n",
+      "plain/tests/test_app.py": "def test_b(): pass\n",
+    })
+    assert.equal(plan(["svc/tests/test_app.py"], test("pytest", path.join(root, "svc"))).command, "pytest tests/test_app.py")
+    assert.equal(
+      plan(["plain/tests/test_app.py"], test("pytest", path.join(root, "plain"))).full,
+      "its directory is not a Python project root",
+      "a check outside a Python project root still runs everything",
+    )
     write(root, { "tsconfig.app.json": '{ "compilerOptions": { "paths": { "@/*": ["src/*"] } } }' })
     assert.match(plan(["src/a.js"]).full ?? "", /import aliases in tsconfig\.app\.json/)
   })

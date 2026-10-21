@@ -645,6 +645,10 @@ describe("import resolution details", () => {
       "svc/app/core.py": "def run():\n    return 1\n",
       "svc/tests/test_core.py": "from app.core import run\n",
       "svc/tests/test_smoke.py": "from app.core import run\n",
+      // The subdirectory project's own scripts/ wins over the repository root's.
+      "scripts/x.py": "y = 1\n",
+      "svc/scripts/x.py": "y = 2\n",
+      "svc/tests/test_scripts.py": "from scripts.x import y\n",
       // setup.py projects resolve from their src/ layout too.
       "libsvc/setup.py": "from setuptools import setup\nsetup()\n",
       "libsvc/src/app/core.py": "def run():\n    return 1\n",
@@ -663,6 +667,7 @@ describe("import resolution details", () => {
     const g = importGraph(p)
     assert.deepEqual(g.out.get("svc/tests/test_core.py"), ["svc/app/core.py"])
     assert.deepEqual(g.out.get("svc/tests/test_smoke.py"), ["svc/app/core.py"])
+    assert.deepEqual(g.out.get("svc/tests/test_scripts.py"), ["svc/scripts/x.py"], "the project root's scripts/ wins")
     assert.deepEqual(g.out.get("libsvc/tests/test_smoke.py"), ["libsvc/src/app/core.py"])
     assert.deepEqual(g.out.get("nest/inner/tests/test_inner.py"), ["nest/inner/app/inner.py"], "the nearest project root wins")
     assert.deepEqual(g.out.get("loose/tests/test_loose.py"), ["loose/tests/helper.py"])

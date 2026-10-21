@@ -282,11 +282,11 @@ function resolve(r: Resolver, from: string, spec: string, lang: Lang): string[] 
         const b = tail ? path.posix.join(d, tail) : d
         return first([`${b}.py`, `${b}/__init__.py`])
       }
-      // Absolute imports: from the root, a src/ layout, the importing file's package, then the
-      // nearest Python project root and its src/ layout (a project in a monorepo subdirectory).
+      // Absolute imports: a project in a monorepo subdirectory owns its imports, so its root and
+      // src/ layout come first; then the root, a src/ layout and the importing file's package.
       const root = r.pyRoot(dir)
       const bases = ["", "src/", "lib/", `${dir}/`]
-      if (root && root !== ".") bases.push(`${root}/`, `${root}/src/`)
+      if (root && root !== ".") bases.unshift(`${root}/`, `${root}/src/`)
       return first(bases.flatMap((p) => [`${p}${tail}.py`, `${p}${tail}/__init__.py`]))
     }
     case "go": {
