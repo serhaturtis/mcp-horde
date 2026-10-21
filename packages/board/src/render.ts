@@ -84,6 +84,7 @@ export function renderBrief(board: Board, t: Task, a: Attempt, budgetTokens = 60
         `- Before editing outside your scope: ${cmd} lock ${id} ${a.token} "path/one" "path/two"`,
         "- Last, when you are done:",
         `  ${cmd} report ${id} ${a.token} --summary "what you did and why" --changed "a.ts,b.ts" --tests "a.test.ts" --unverified "anything you did not run or check" --confidence high`,
+        "  --changed lists the files you changed and --tests the test files you added or changed; commands you ran go in --summary.",
         "  Use --confidence low, medium or high. Repeat --unverified, --decision or --question for more items. Put anything you did not actually run or verify under --unverified.",
       ].join("\n"),
       required: true,

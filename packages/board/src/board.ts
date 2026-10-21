@@ -363,8 +363,9 @@ export class Board {
     if (!r || !a?.workspace || !fs.existsSync(a.workspace.path)) return undefined
     const ws = a.workspace
     let diff: string[]
+    let root: string
     try {
-      const root = await git(ws.path, "rev-parse", "--show-toplevel")
+      root = await git(ws.path, "rev-parse", "--show-toplevel")
       const Q = ["-c", "core.quotePath=false"]
       // Both sides of a rename: a worker that renamed a.ts to b.ts changed both.
       const changed = await git(root, ...Q, "diff", "--name-only", "--no-renames", ws.base)
@@ -379,7 +380,14 @@ export class Board {
       const prefix = `${ws.path.replace(/\\/g, "/").replace(/\/+$/, "")}/`
       return normalize(abs.startsWith(prefix) ? abs.slice(prefix.length) : abs).replace(/^\.\//, "")
     }
-    const claimed = [...new Set([...r.filesChanged, ...r.testsAdded].map(norm).filter(Boolean))]
+    // A command a worker ran is not a path; neither is a test it only ran (an existing file
+    // outside the diff). A changed file missing from the diff, or a test that does not exist,
+    // is still a claim the diff does not support.
+    const isFile = (p: string) => fs.existsSync(path.join(root, p)) || fs.existsSync(path.join(ws.path, p))
+    const claimedPath = (p: string) => Boolean(p) && (!/\s/.test(p) || isFile(p))
+    const changed = r.filesChanged.map(norm).filter(claimedPath)
+    const tests = r.testsAdded.map(norm).filter((p) => claimedPath(p) && (diff.includes(p) || !isFile(p)))
+    const claimed = [...new Set([...changed, ...tests])]
     return {
       claimedNotChanged: claimed.filter((c) => !diff.includes(c)),
       changedNotReported: diff.filter((d) => !claimed.includes(d)),

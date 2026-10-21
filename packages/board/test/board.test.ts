@@ -382,6 +382,31 @@ describe("board", () => {
     assert.equal(await board.checkReport(t.id), undefined, "no workspace left: nothing to check")
   })
 
+  test("a report's commands and the tests it only ran are not false claims", async () => {
+    const root = repo()
+    fs.writeFileSync(path.join(root, "a.test.ts"), "test\n")
+    git(root, "add", "-A")
+    git(root, "commit", "-qm", "test")
+    const base = git(root, "rev-parse", "HEAD")
+    const board = new Board(tmp())
+    const t = (await board.plan([{ title: "x", goal: "y" }])).tasks[0]!
+    const { attempt } = await board.assign(t.id, "w")
+    await board.bindWorkspace(t.id, attempt.token, { path: root, base })
+    fs.writeFileSync(path.join(root, "b.ts"), "new\n")
+    await board.report(t.id, attempt.token, {
+      summary: "ran the tests",
+      filesChanged: ["b.ts", "npm test -w @mcp-horde/opencode"],
+      testsAdded: ["a.test.ts", "missing.test.ts"],
+    })
+    const check = (await board.checkReport(t.id))!
+    assert.deepEqual(check.claimedNotChanged, ["missing.test.ts"], "an existing test that was run is not a claim; a missing one still is")
+    assert.deepEqual(check.changedNotReported, [], "the command is not a path but b.ts is reported")
+    assert.match(
+      renderBrief(board, board.task(t.id), attempt),
+      /--changed lists the files you changed and --tests the test files you added or changed; commands you ran go in --summary\./,
+    )
+  })
+
   test("notes: duplicates collapse, recall ranks by overlap, forget hides", async () => {
     const board = new Board(tmp())
     const a = await board.remember("Use pnpm, not npm.", { tags: ["tooling"] })
