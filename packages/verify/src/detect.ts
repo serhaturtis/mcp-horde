@@ -100,7 +100,7 @@ function parseSettings(horde: HordeFile): VerifySettings {
       const s = (typeof spec === "string" ? { command: spec } : spec) as Record<string, unknown> | null
       const at = `${where}.checks.${name}`
       if (!s || typeof s.command !== "string" || !s.command.trim()) throw new Error(`${at} needs a command`)
-      const kind = (s.kind ?? kindOf(name)) as CheckKind
+      const kind = (s.kind ?? kindOf(name, s.command)) as CheckKind
       if (!["test", "typecheck", "lint", "build", "other"].includes(kind)) throw new Error(`${at}.kind is invalid`)
       const cwd = typeof s.cwd === "string" ? path.resolve(horde.root, s.cwd) : horde.root
       const env = s.env
@@ -149,12 +149,16 @@ function parseSettings(horde: HordeFile): VerifySettings {
   }
 }
 
-function kindOf(name: string): CheckKind {
+/** Test runners a command calls: they tell a test check apart when its name does not (`go`, `runtime`). */
+const TEST_RUNNER =
+  /(^|[\s/])(pytest|py\.test|vitest|jest|mocha)(\s|$)|-m\s+pytest\b|\bgo\s+test\b|\bcargo\s+(test|nextest)\b|\bnpm\s+(run\s+)?test\b|\bnode\s+--test\b/
+
+function kindOf(name: string, command: string): CheckKind {
   if (/test|spec|unit|integration|e2e/i.test(name)) return "test"
   if (/type|tsc|mypy|pyright/i.test(name)) return "typecheck"
   if (/lint|ruff|clippy|vet|format|fmt/i.test(name)) return "lint"
   if (/build|compile/i.test(name)) return "build"
-  return "other"
+  return TEST_RUNNER.test(command) ? "test" : "other"
 }
 
 const ORDER: Record<CheckKind, number> = { typecheck: 0, lint: 1, build: 2, test: 3, other: 4 }

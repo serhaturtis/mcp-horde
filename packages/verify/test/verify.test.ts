@@ -118,6 +118,21 @@ describe("detect", () => {
       ],
     )
     assert.equal(loadSettings(root).timeoutMs, 30_000)
+    // A name that says nothing: the command's test runner makes it a test check, anything else stays "other".
+    write(root, {
+      "horde.json": JSON.stringify({
+        verify: { checks: { go: "go test -race ./...", runtime: "uv run python -m pytest -q", ui: "npx vitest run", tier: "python scripts/run_gates.py" } },
+      }),
+    })
+    assert.deepEqual(
+      (await detectChecks(root)).map((c) => [c.name, c.kind]),
+      [
+        ["go", "test"],
+        ["runtime", "test"],
+        ["ui", "test"],
+        ["tier", "other"],
+      ],
+    )
     write(root, { "horde.json": JSON.stringify({ verify: { audit: { block: ["nonsense"] } } }) })
     assert.throws(() => loadSettings(root), /audit\.block must be a list of/)
     write(root, { "horde.json": JSON.stringify({ verify: { checks: { x: {} } } }) })
