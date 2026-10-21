@@ -98,10 +98,10 @@ export function defaultStateDir(env: NodeJS.ProcessEnv = process.env): string {
 
 interface BaselineOutcome {
   pass: boolean
-  /** Failure keys, see failureKey. */
-  keys: string[]
-  /** Failures the runner reported, which can exceed the ones the extractor listed. */
-  failed: number
+  /** Whether the baseline actually ran tests (not a missing runner, a timeout or a lost slot). */
+  ran: boolean
+  /** How many times each failure key occurred, see failureKey. */
+  keys: Map<string, number>
 }
 
 interface BaselineRun {
@@ -140,10 +140,36 @@ async function baselineKey(directory: string, commit: string, checks: Check[], e
   return createHash("sha256").update(real).update("\0").update(commit).update("\0").update(JSON.stringify(list)).digest("hex")
 }
 
-/** What makes two failures the same one: test and file, or the first message line. Digits are masked so counts and durations do not matter. */
+/** What makes two failures the same one: test and file, or the first message line. Digits matter in
+ *  test names and paths (test_limit_20 is not test_limit_10); they are masked only in free-text
+ *  messages, where line numbers and timings vary. */
 function failureKey(f: Failure): string {
-  const identity = f.test || f.file ? `${f.test ?? ""}\0${f.file ?? ""}` : (f.message.split("\n").find((l) => l.trim()) ?? "").trim()
-  return identity.replace(/\d+/g, "#")
+  if (f.test || f.file) return `${f.test ?? ""}\0${f.file ?? ""}`
+  const first = (f.message.split("\n").find((l) => l.trim()) ?? "").trim()
+  return first.replace(/\d+/g, "#")
+}
+
+/** How many times each failure key occurs. */
+function countKeys(failures: Failure[]): Map<string, number> {
+  const keys = new Map<string, number>()
+  for (const k of failures.map(failureKey)) keys.set(k, (keys.get(k) ?? 0) + 1)
+  return keys
+}
+
+/** Split failures into the ones the baseline also has (known) and the new ones, matching per key. */
+function splitFailures(failures: Failure[], baseCounts: Map<string, number>): { failures: Failure[]; known: number } {
+  const left = new Map(baseCounts)
+  const newFailures: Failure[] = []
+  let known = 0
+  for (const f of failures) {
+    const k = failureKey(f)
+    const n = left.get(k) ?? 0
+    if (n > 0) {
+      left.set(k, n - 1)
+      known++
+    } else newFailures.push(f)
+  }
+  return { failures: newFailures, known }
 }
 
 /** Runs the failing checks at the baseline commit, sharing an in-flight run with other gates. */
@@ -176,8 +202,8 @@ async function baselineOutcomes(opts: GateOptions, run: BaselineRun, checks: Che
         if (!r) throw new Error(`the baseline run did not report ${c.name}`)
         out.set(c.name, {
           pass: r.pass,
-          keys: r.extracted.failures.map(failureKey),
-          failed: r.extracted.counts?.failed ?? r.extracted.failures.length,
+          ran: !r.stopped && r.code !== null && r.code !== 127,
+          keys: countKeys(r.extracted.failures),
         })
       }
       return out
@@ -202,7 +228,21 @@ async function compareBaseline(
   run: BaselineRun,
 ): Promise<{ checks: CheckResult[]; warnings: string[] }> {
   const spec = opts.baseline
-  const failing = spec ? checks.filter((c) => !c.pass && !c.stopped) : []
+  // Only a check that ran tests and reported named failures can be rescued: a missing runner
+  // (exit 127), a timeout, a lost slot, or a run with no extracted failures fails the same way
+  // at the base without ever testing the work, so it is not compared.
+  const failing = spec
+    ? checks.filter(
+        (c) =>
+          !c.pass &&
+          !c.stopped &&
+          c.code !== null &&
+          c.code !== 127 &&
+          !c.extracted.truncated &&
+          c.extracted.failures.length > 0 &&
+          c.extracted.failures.every((f) => f.test || f.file),
+      )
+    : []
   if (!spec || !failing.length || opts.signal?.aborted) return { checks, warnings: [] }
   const runnable = failing.map((c) => toRun.find((x) => x.name === c.name)).filter((c): c is Check => !!c)
   try {
@@ -213,21 +253,21 @@ async function compareBaseline(
       if (!failing.includes(c)) return c
       const outcome = outcomes.get(c.name)!
       if (outcome.pass) return { ...c, baseline: { label: spec.label, pass: true, known: 0 } }
-      const keys = new Set(outcome.keys)
-      const failures = c.extracted.failures
-      const known = failures.filter((f) => keys.has(failureKey(f))).length
-      const failed = c.extracted.counts?.failed ?? failures.length
-      if (known === failures.length && failed <= outcome.failed) {
+      // The baseline did not run tests either, so "fails the same way" says nothing about the work.
+      if (!outcome.ran) return { ...c, baseline: { label: spec.label, pass: false, known: 0 } }
+      // More failures than the runner listed: which ones are new cannot be told, so judge as before.
+      const failed = c.extracted.counts?.failed ?? c.extracted.failures.length
+      if (failed > c.extracted.failures.length) return { ...c, baseline: { label: spec.label, pass: false, known: 0 } }
+      const { failures: newFailures, known } = splitFailures(c.extracted.failures, outcome.keys)
+      if (!newFailures.length) {
         warnings.push(`${c.name}: fails at ${spec.label} too, with the same failures (not caused by this change)`)
         return { ...c, pass: true, baseline: { label: spec.label, pass: false, known } }
       }
-      // More failures than the runner listed: which ones are new cannot be told, so judge as before.
-      if (known === failures.length) return { ...c, baseline: { label: spec.label, pass: false, known: 0 } }
       // Only the new failures are the change's to answer for.
       return {
         ...c,
         baseline: { label: spec.label, pass: false, known },
-        extracted: { ...c.extracted, failures: failures.filter((f) => !keys.has(failureKey(f))) },
+        extracted: { ...c.extracted, failures: newFailures },
       }
     })
     return { checks: compared, warnings }
@@ -276,6 +316,9 @@ export async function gate(directory: string, opts: GateOptions = {}): Promise<V
   const logBase = path.join(stateDir, "logs")
   const root = await git(dir, "rev-parse", "--show-toplevel").catch(() => dir)
   const lockDir = toRun.some((c) => c.slots || c.exclusive) ? await lockDirFor(dir, stateDir) : undefined
+  // The work is the files that existed before the checks ran: a check's own files (reports,
+  // __pycache__, coverage) first appear as untracked during the run and are not the worker's.
+  const preUntracked = doAudit ? await untracked(dir) : undefined
   const ran = await runChecks(toRun, {
     timeoutMs: settings.timeoutMs,
     signal: opts.signal,
@@ -306,6 +349,15 @@ export async function gate(directory: string, opts: GateOptions = {}): Promise<V
         generated: settings.audit.generated,
       })
     : undefined
+  // Files the checks wrote are not the work: drop them from the audit's account.
+  if (auditResult && preUntracked) {
+    const written = [...(await untracked(dir))].filter((p) => !preUntracked.has(p))
+    if (written.length) {
+      const set = new Set(written)
+      auditResult.files = auditResult.files.filter((p) => !set.has(p))
+      auditResult.findings = auditResult.findings.filter((f) => !f.file || !set.has(f.file))
+    }
+  }
   const blockers = [
     // Nothing ran, so nothing was judged: that is not a pass.
     ...(selected.length ? [] : [NO_CHECKS]),
@@ -348,6 +400,12 @@ function pick(all: Check[], names: string[]): Check[] {
   if (unknown.length)
     throw new Error(`unknown check${unknown.length > 1 ? "s" : ""} ${unknown.join(", ")}; available: ${all.map((c) => c.name).join(", ") || "none"}`)
   return all.filter((c) => names.includes(c.name))
+}
+
+/** Untracked files, repository-relative: a check's reports and caches are new ones, not the work. */
+async function untracked(dir: string): Promise<Set<string>> {
+  const root = await git(dir, "rev-parse", "--show-toplevel")
+  return new Set(splitZ(await gitRaw(root, ["-c", "core.quotePath=false", "ls-files", "--others", "--exclude-standard", "-z"])))
 }
 
 function summary(c: CheckResult): string {

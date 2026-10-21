@@ -326,6 +326,33 @@ describe("gate", () => {
     const fresh = gate(root, { signal: AbortSignal.timeout(300), stateDir: tmp() })
     assert.equal((await fresh).cached, false, "a cancelled verdict was not cached")
   })
+
+  test("files a check writes during the run are not audited, but a tracked file it modifies is", async () => {
+    const write = [
+      'import fs from "node:fs"',
+      'fs.writeFileSync("report.xml", "<testsuite/>")',
+      'fs.mkdirSync("__pycache__", { recursive: true })',
+      'fs.writeFileSync("__pycache__/x.pyc", "x")',
+      // Built at run time so the test file itself holds no literal secret the gate would flag.
+      'const secret = "sk-" + "AbCdEfGhIjKlMnOpQrStUv12"',
+      'fs.appendFileSync("src/out.txt", "key = " + JSON.stringify(secret) + "\\n")',
+    ].join("\n")
+    const { root, base } = repo({
+      "horde.json": JSON.stringify({ verify: { checks: { test: "node write.mjs" } } }),
+      "write.mjs": write,
+      "src/out.txt": "tracked\n",
+    })
+    const v = await gate(root, { base, allowed: ["src/**"], stateDir: tmp() })
+    assert.equal(v.pass, false, v.text)
+    // The check's own files are not the work, so the scope never blames the worker for them.
+    assert.ok(!v.blockers.some((b) => b.includes("report.xml")), v.blockers.join("\n"))
+    assert.ok(!v.blockers.some((b) => b.includes("__pycache__")), v.blockers.join("\n"))
+    // A tracked file the check modified still counts as the work.
+    assert.ok(
+      v.blockers.some((b) => b.includes("src/out.txt")),
+      v.blockers.join("\n"),
+    )
+  })
 })
 
 describe("baseline", () => {
@@ -482,6 +509,101 @@ describe("baseline", () => {
     assert.match(v.text, /✗ test · 1 failed/)
     assert.ok(v.warnings.includes("could not compare with master's tip: deps are missing"), v.warnings.join("\n"))
     assert.equal(v.checks[0]!.baseline, undefined)
+  })
+
+  test("a runner missing at both the work and the base stays failed", async () => {
+    const { root, base } = repo({
+      "horde.json": JSON.stringify({ verify: { checks: { test: "definitely-not-a-command" } } }),
+    })
+    const calls = { n: 0 }
+    const releases = { n: 0 }
+    const baseline = { commit: base, label: "master's tip", checkout: checkoutOf(root, base, calls, releases) }
+    // A task's rounds (base and stage "work"), then the landing gate's options (no base, audit off).
+    for (const opts of [
+      { base, stage: "work" as const, env: { HORDE_TASK: "t-1", HORDE_WORKTREE: root } },
+      { stage: "land" as const, audit: false, related: false, env: { HORDE_TASK: "t-1", HORDE_WORKTREE: root } },
+    ]) {
+      const v = await gate(root, { ...opts, baseline, stateDir: tmp() })
+      assert.equal(v.pass, false, v.text)
+      assert.match(v.text, /✗ test · exit 127/)
+      assert.doesNotMatch(v.text, /fails at master's tip/)
+      assert.equal(v.checks[0]!.baseline, undefined, "never rescued: it never ran")
+    }
+    assert.equal(calls.n, 0, "a check that never ran is not compared with a baseline")
+  })
+
+  test("a check that timed out is never rescued by the baseline", async () => {
+    const { root, base } = repo({
+      "horde.json": JSON.stringify({ verify: { checks: { slow: 'node -e "setTimeout(() => {}, 5000)"' }, timeoutSeconds: 1 } }),
+    })
+    const calls = { n: 0 }
+    const releases = { n: 0 }
+    const v = await gate(root, {
+      baseline: { commit: base, label: "master's tip", checkout: checkoutOf(root, base, calls, releases) },
+      stateDir: tmp(),
+    })
+    assert.equal(v.pass, false, v.text)
+    assert.match(v.text, /✗ slow · timed out/)
+    assert.equal(calls.n, 0, "a timed-out check is not compared with a baseline")
+  })
+
+  test("a failure whose name differs from the base only in digits is new", async () => {
+    const { root, base } = project(["test_limit_10"])
+    write(root, { "failures.json": JSON.stringify(["test_limit_20"]) })
+    const v = await gate(root, {
+      baseline: { commit: base, label: "master's tip", checkout: checkoutOf(root, base, { n: 0 }, { n: 0 }) },
+      stateDir: tmp(),
+    })
+    assert.equal(v.pass, false, v.text)
+    assert.match(v.text, /✗ test: test_limit_20/)
+    assert.deepEqual(v.checks[0]!.baseline, { label: "master's tip", pass: false, known: 0 })
+  })
+
+  test("a new failure after ten known at the base is reported as new", async () => {
+    const known = Array.from({ length: 10 }, (_, i) => `case ${i}`)
+    const { root, base } = project(known)
+    write(root, { "failures.json": JSON.stringify([...known, "case new"]) })
+    const v = await gate(root, {
+      baseline: { commit: base, label: "master's tip", checkout: checkoutOf(root, base, { n: 0 }, { n: 0 }) },
+      stateDir: tmp(),
+    })
+    assert.equal(v.pass, false, v.text)
+    assert.match(v.text, /✗ test: case new/)
+    assert.deepEqual(v.checks[0]!.baseline, { label: "master's tip", pass: false, known: 10 })
+    assert.deepEqual(
+      v.checks[0]!.extracted.failures.map((f) => f.test),
+      ["case new"],
+    )
+  })
+
+  test("a cut-off failure list is not treated as the same failures", async () => {
+    const script = [
+      'import fs from "node:fs"',
+      'const n = Number(fs.readFileSync("count.txt", "utf8"))',
+      "for (let i = 0; i < n; i++) {",
+      '  console.log("Error: boom " + i)',
+      '  console.log("  at a")',
+      '  console.log("  at b")',
+      '  console.log("  at c")',
+      '  console.log("  at d")',
+      '  console.log("  at e")',
+      "}",
+      "process.exitCode = 1",
+    ].join("\n")
+    const { root, base } = repo({
+      "horde.json": JSON.stringify({ verify: { checks: { test: "node check.mjs" } } }),
+      "check.mjs": script,
+      "count.txt": "11",
+    })
+    const calls = { n: 0 }
+    const releases = { n: 0 }
+    const v = await gate(root, {
+      baseline: { commit: base, label: "master's tip", checkout: checkoutOf(root, base, calls, releases) },
+      stateDir: tmp(),
+    })
+    assert.equal(v.pass, false, v.text)
+    assert.match(v.text, /✗ test · exit 1/)
+    assert.equal(calls.n, 0, "a cut-off failure list is not compared with a baseline")
   })
 })
 

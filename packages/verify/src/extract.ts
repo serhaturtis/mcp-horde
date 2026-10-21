@@ -42,6 +42,8 @@ export interface Extracted {
   runner: Runner
   failures: Failure[]
   counts?: Counts
+  /** The failure list was cut off (the extractor hit its cap), so more failures may follow. */
+  truncated?: boolean
 }
 
 const MESSAGE_LINES = 8
@@ -526,8 +528,13 @@ const GENERIC_MARKERS = /(\b(Error|Exception|FAIL(ED|URE)?|panic(ked)?|Traceback
 function generic(text: string, cwd?: string): Omit<Extracted, "runner"> {
   const lines = text.split("\n")
   const failures: Failure[] = []
-  for (let i = 0; i < lines.length && failures.length < 10; i++) {
+  let truncated = false
+  for (let i = 0; i < lines.length; i++) {
     if (!GENERIC_MARKERS.test(lines[i]!)) continue
+    if (failures.length >= 10) {
+      truncated = true
+      break
+    }
     const block = lines.slice(i, i + 6)
     failures.push({ message: message(block), frame: firstProjectFrame(lines.slice(i, i + 30), cwd) })
     i += 5
@@ -536,7 +543,7 @@ function generic(text: string, cwd?: string): Omit<Extracted, "runner"> {
     const tail = lines.filter((l) => l.trim()).slice(-40)
     if (tail.length) failures.push({ message: tail.join("\n").slice(-MESSAGE_CHARS * 2) })
   }
-  return { failures }
+  return truncated ? { failures, truncated } : { failures }
 }
 
 const EXTRACTORS: Record<Runner, Extractor> = {
