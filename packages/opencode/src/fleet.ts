@@ -381,6 +381,13 @@ export function checkSummary(c: Pick<CheckResult, "pass" | "extracted" | "stoppe
   return n ? `${n.failed} failed${n.passed !== undefined ? ` of ${n.failed + n.passed}` : ""}` : "failed"
 }
 
+/** A check's line in a stored verdict, with how it compared with the baseline when it was given one. */
+export type GateCheckSummary = Omit<GateCheck, "summary"> & { summary: string; baseline?: NonNullable<CheckResult["baseline"]> }
+
+function gateCheck(c: CheckResult): GateCheckSummary {
+  return { name: c.name, pass: c.pass, summary: checkSummary(c), ...(c.baseline ? { baseline: c.baseline } : {}) }
+}
+
 /** What the agent is told when the review finds criteria not met (the gate's lead line comes first). */
 export function reviewFeedback(r: ReviewSummary): string {
   return [
@@ -1429,11 +1436,11 @@ export class Fleet {
           related: false,
           stage: "land",
           env: { HORDE_TASK: task.id, HORDE_WORKTREE: wt.root },
+          baseline: this.baselineFor(wt.repo, tip, `${target}'s tip`),
           signal,
           stateDir: verifyStateDir(),
         })
-        if (!v.pass)
-          return { landed: false, target, why: "checks", text: v.text, checks: v.checks.map((c) => ({ name: c.name, pass: c.pass, summary: checkSummary(c) })) }
+        if (!v.pass) return { landed: false, target, why: "checks", text: v.text, checks: v.checks.map(gateCheck) }
         // 3. Your branch must still be where the checks saw it; otherwise go round again.
         if ((await git(wt.repo, "rev-parse", "HEAD")) !== tip) continue
         const start = workStart(wt)
@@ -1454,7 +1461,7 @@ export class Fleet {
           landed: true,
           target,
           commits: Number(commits) || 0,
-          checks: v.checks.map((c) => ({ name: c.name, pass: c.pass, summary: checkSummary(c) })),
+          checks: v.checks.map(gateCheck),
           branchKept: unmerged.length ? wt.branch : undefined,
         }
       }
@@ -1762,18 +1769,48 @@ export class Fleet {
     })
   }
 
+  /**
+   * A throwaway checkout of `commit` where verify re-runs checks that fail, so failures the
+   * commit already had are not blamed on the work. verify releases it after the run.
+   */
+  private baselineFor(repo: string, commit: string, label: string) {
+    return {
+      commit,
+      label,
+      checkout: async () => {
+        const name = `base-${commit.slice(0, 8)}-${randomBytes(2).toString("hex")}`
+        const workers = loadWorkers(repo)
+        const { worktree } = await createWorktree(repo, name, {
+          rootDir: this.config.worktreeDir,
+          includeUncommitted: false,
+          at: commit,
+          link: workers.link,
+          setup: workers.setup,
+        })
+        // verify deletes its own log dir; removeWorktree deletes the branch too (no commits).
+        return {
+          root: worktree.root,
+          release: async () => {
+            await removeWorktree(worktree, name, true)
+          },
+        }
+      },
+    }
+  }
+
   private async runGateFor(live: Live, turn: number, abort: AbortController) {
     const id = live.record.id
     const cfg = live.record.gate!
     const round = (live.record.gateState?.round ?? 0) + 1
     const wt = live.record.worktree
+    const start = wt ? workStart(wt) : undefined
     let pass = false
     let text: string
-    let checks: { name: string; pass: boolean; summary: string }[] | undefined
+    let checks: GateCheckSummary[] | undefined
     let review: ReviewSummary | undefined
     try {
       const v = await runGate(live.session?.location.directory ?? live.record.directory, {
-        base: wt ? workStart(wt) : cfg.base,
+        base: start ?? cfg.base,
         audit: cfg.audit,
         // Only an unaudited shared gate may use the human's working config; an audited one
         // must judge by the rules that were in force at base.
@@ -1783,12 +1820,13 @@ export class Fleet {
         related: cfg.related !== false,
         stage: "work",
         env: wt ? { HORDE_TASK: live.record.task?.id ?? live.record.name ?? live.record.id, HORDE_WORKTREE: wt.root } : undefined,
+        baseline: wt && start ? this.baselineFor(wt.repo, start, `${start.slice(0, 8)} where the task started`) : undefined,
         signal: abort.signal,
         stateDir: verifyStateDir(),
       })
       pass = v.pass
       text = v.text
-      checks = v.checks.map((c) => ({ name: c.name, pass: c.pass, summary: checkSummary(c) }))
+      checks = v.checks.map(gateCheck)
     } catch (err) {
       text = `the gate could not run: ${(err as Error).message}`
     }
@@ -2720,8 +2758,8 @@ export class Fleet {
 }
 
 export type LandResult =
-  | { landed: true; target: string; commits: number; checks: GateCheck[]; branchKept?: string }
-  | { landed: false; target: string; why: "conflict" | "checks" | "uncommitted"; text: string; checks?: GateCheck[] }
+  | { landed: true; target: string; commits: number; checks: GateCheckSummary[]; branchKept?: string }
+  | { landed: false; target: string; why: "conflict" | "checks" | "uncommitted"; text: string; checks?: GateCheckSummary[] }
 
 interface Prepared {
   files: { uri: string; name: string }[]

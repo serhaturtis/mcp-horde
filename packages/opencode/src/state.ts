@@ -70,7 +70,7 @@ export interface GateState {
     text: string
     at: number
     /** The checks that ran, one line each, for compact outcomes. */
-    checks?: { name: string; pass: boolean; summary: string }[]
+    checks?: { name: string; pass: boolean; summary: string; baseline?: { label: string; pass: boolean; known: number } }[]
     review?: ReviewSummary
   }
 }

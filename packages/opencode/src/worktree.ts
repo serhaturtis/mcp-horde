@@ -43,6 +43,8 @@ export interface WorktreeOptions {
   rootDir: string
   /** Carry over uncommitted (staged, unstaged and untracked) changes from the main checkout. */
   includeUncommitted: boolean
+  /** Commit to create the worktree at instead of HEAD. */
+  at?: string
   /** Paths (relative to the repo root) to symlink from the main checkout; default: dependencyLinks(repo).links, or none with a setup. */
   link?: string[]
   /** Shell command run in the new worktree before the agent starts, e.g. "npm ci". */
@@ -153,9 +155,13 @@ export async function createWorktree(directory: string, name: string, opts: Work
   const notes = [...(auto?.notes ?? [])]
   const slug = branchSlug(name)
   const repoKey = `${branchSlug(path.basename(repo))}-${createHash("sha1").update(repo).digest("hex").slice(0, 8)}`
-  const base = await git(repo, "rev-parse", "--verify", "HEAD^{commit}").catch(() => {
-    throw new Error(`isolation "worktree" needs at least one commit in ${repo}`)
-  })
+  const base = opts.at
+    ? await git(repo, "rev-parse", "--verify", `${opts.at}^{commit}`).catch(() => {
+        throw new Error(`commit ${opts.at} is not in ${repo}`)
+      })
+    : await git(repo, "rev-parse", "--verify", "HEAD^{commit}").catch(() => {
+        throw new Error(`isolation "worktree" needs at least one commit in ${repo}`)
+      })
 
   // Pick a free path/branch; retry if a concurrent spawn takes it first.
   let root = ""

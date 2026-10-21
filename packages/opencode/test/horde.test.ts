@@ -13,15 +13,23 @@ import { startMockLlm } from "./mock-llm.js"
 // The project's one check: every .txt file says "ok" (a hint fixes it, except for stubborn.txt),
 // and the guard file a test commits to master breaks it.
 const CHECK = `const fs = require("fs")
+const bad = []
 for (const f of fs.readdirSync(".").filter((f) => f.endsWith(".txt"))) {
   if (fs.readFileSync(f, "utf8").trim() === "ok") continue
-  console.log("Error: " + f + " must say ok." + (f === "stubborn.txt" ? "" : " TOOL: echo ok > " + f + " && git add -A && git commit -qm fix"))
-  process.exit(1)
+  bad.push([f, "Error: " + f + " must say ok." + (f === "stubborn.txt" ? "" : " TOOL: echo ok > " + f + " && git add -A && git commit -qm fix")])
 }
-if (fs.existsSync("broken.flag")) {
-  console.log("Error: broken.flag exists")
-  process.exit(1)
-}
+if (fs.existsSync("broken.flag")) bad.push(["broken.flag", "Error: broken.flag exists"])
+// Passes alone on either side, fails only once the worker's file and master's move meet.
+if (fs.existsSync("third.txt") && fs.existsSync("gate.txt")) bad.push(["third.txt+gate.txt", "Error: third.txt and gate.txt must not exist together"])
+// TAP so several failures are each reported (the generic extractor only sees one in a block).
+console.log("TAP version 13")
+bad.forEach(([f, message], i) => {
+  console.log("not ok " + (i + 1) + " - " + f)
+  console.log("  ---")
+  console.log("  message: " + message)
+  console.log("  ...")
+})
+if (bad.length) process.exit(1)
 `
 
 let h: Harness
@@ -31,6 +39,22 @@ let tmp: string
 const boardState = () => path.join(tmp, "board-state")
 const idOf = (text: string) => text.match(/\bt-[0-9a-f]+\b/)![0]
 const branches = () => git(repo, "branch", "--list", "horde/*")
+const baselineBranches = () => git(repo, "branch", "--list", "horde/base-*")
+
+/** Baseline checkouts left under the worktree directory (they are named base-<sha>-<hex>). */
+function baselineLeftovers(): string[] {
+  const root = path.join(tmp, "worktrees")
+  const out: string[] = []
+  const walk = (dir: string) => {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (!e.isDirectory()) continue
+      if (e.name.startsWith("base-")) out.push(path.join(dir, e.name))
+      walk(path.join(dir, e.name))
+    }
+  }
+  if (fs.existsSync(root)) walk(root)
+  return out
+}
 
 /** The next outcome other than a permission request; the test repo's OpenCode config asks before shell commands. */
 async function settle(id: string): Promise<string> {
@@ -146,19 +170,19 @@ describe("the simple path: horde_do, horde_wait, horde_land (real opencode, mock
       }),
     )
     assert.match(await settle(id), /READY/)
-    // Master moves on, in a way that only fails together with the worker's change... or at all.
-    fs.writeFileSync(path.join(repo, "broken.flag"), "x")
-    git(repo, "add", "broken.flag")
+    // Master moves on, in a way that only fails together with the worker's change.
+    fs.writeFileSync(path.join(repo, "gate.txt"), "ok\n")
+    git(repo, "add", "gate.txt")
     git(repo, "commit", "-qm", "master moves on")
     const head = git(repo, "rev-parse", "HEAD")
     const refused = await h.call("horde_land", { id })
     assert.match(refused, new RegExp(`^not landed: ${id}'s commits fail the checks on top of master:`), refused)
-    assert.match(refused, /broken\.flag exists/)
+    assert.match(refused, /third\.txt and gate\.txt must not exist together/)
     assert.match(refused, /master is unchanged; the worker is now on top of it\./)
     assert.equal(git(repo, "rev-parse", "HEAD"), head, "master did not move")
     assert.ok(!fs.existsSync(path.join(repo, "third.txt")))
     // Fixed on master: the same task lands now (its verdict stands; the landing re-checks).
-    git(repo, "rm", "-q", "broken.flag")
+    git(repo, "rm", "-q", "gate.txt")
     git(repo, "commit", "-qm", "fix master")
     assert.match(await h.call("horde_land", { id }), /^landed t-\w+ on master: 1 commit\(s\)/)
     assert.ok(fs.existsSync(path.join(repo, "third.txt")))
@@ -204,5 +228,46 @@ describe("the simple path: horde_do, horde_wait, horde_land (real opencode, mock
     assert.match(dropped, new RegExp(`^dropped ${task!.id}: it had no worker`), dropped)
     assert.equal((await Board.open(repo, boardState())).task(task!.id).status, "failed")
     await assert.rejects(h.call("horde_drop", { id: "t-0000" }), /unknown agent/)
+  })
+
+  test("a check that already fails where the task started does not block READY or landing", async () => {
+    // Master itself is broken in a file no task touches.
+    fs.writeFileSync(path.join(repo, "known.txt"), "bad\n")
+    git(repo, "add", "known.txt")
+    git(repo, "commit", "-qm", "already broken")
+    const start = git(repo, "rev-parse", "--short=8", "HEAD")
+    const id = idOf(
+      await h.call("horde_do", {
+        goal: "Write the second greeting.\nRUN: echo ok > hello2.txt && git add hello2.txt && git commit -qm hello2",
+        done: ["hello2.txt says ok"],
+        scope: ["hello2.txt"],
+      }),
+    )
+    const ready = await settle(id)
+    assert.match(ready, new RegExp(`^${id} READY`), ready)
+    assert.match(ready, new RegExp(`⚠ test fails at ${start} where the task started too \\(not caused by this work\\)`), ready)
+    const landed = await h.call("horde_land", { id })
+    assert.match(landed, new RegExp(`^landed ${id} on master:`), landed)
+    assert.match(landed, /⚠ test fails at master's tip too \(not caused by this work\)/, landed)
+    assert.equal(fs.readFileSync(path.join(repo, "hello2.txt"), "utf8").trim(), "ok")
+    assert.equal(fs.readFileSync(path.join(repo, "known.txt"), "utf8").trim(), "bad", "the known failure is left as it was")
+    assert.equal(branches(), "")
+    assert.deepEqual(baselineLeftovers(), [])
+  })
+
+  test("a new failure is still the task's, and only it is shown", async () => {
+    const id = idOf(
+      await h.call("horde_do", {
+        goal: "Break the stubborn file again.\nRUN: echo nope > stubborn.txt && git add stubborn.txt && git commit -qm break",
+        done: ["stubborn.txt says ok"],
+        scope: ["stubborn.txt"],
+      }),
+    )
+    const failed = await settle(id)
+    assert.match(failed, new RegExp(`^${id} FAILED · "Break the stubborn file again" \\(checks failed after 2 round\\(s\\)\\)`), failed)
+    assert.match(failed, /stubborn\.txt must say ok/, failed)
+    assert.doesNotMatch(failed, /known\.txt must say ok/, failed)
+    assert.equal(baselineBranches(), "")
+    assert.deepEqual(baselineLeftovers(), [])
   })
 })

@@ -307,6 +307,8 @@ export async function outcome(fleet: Fleet, ref: string): Promise<string> {
         : "",
     ].filter(Boolean)
     const lines = [say("READY"), `  ${head.join(" · ")}`]
+    for (const c of verdict?.checks ?? [])
+      if (c.baseline && !c.baseline.pass) lines.push(`  ⚠ ${c.name} fails at ${c.baseline.label} too (not caused by this work)`)
     if (changes) lines.push(`  ${changes.line}`)
     if (changes && wt) lines.push(`  branch ${wt.branch} · diff: git -C ${wt.root} diff ${workStart(wt).slice(0, 10)}`)
     if (workerSaid) lines.push(`  worker: ${truncate(workerSaid, 240)}`)
@@ -354,7 +356,11 @@ export async function outcome(fleet: Fleet, ref: string): Promise<string> {
 function renderLanding(id: string, r: LandResult): string {
   if (r.landed) {
     const kept = r.branchKept ? ` (branch ${r.branchKept} kept: not all of its commits are on ${r.target})` : ""
-    return `landed ${id} on ${r.target}: ${r.commits} commit(s) · ${checksLine(r.checks)} on ${r.target}'s tip before updating it · task done, worktree${r.branchKept ? "" : " and branch"} removed${kept}`
+    const lines = [
+      `landed ${id} on ${r.target}: ${r.commits} commit(s) · ${checksLine(r.checks)} on ${r.target}'s tip before updating it · task done, worktree${r.branchKept ? "" : " and branch"} removed${kept}`,
+    ]
+    for (const c of r.checks) if (c.baseline && !c.baseline.pass) lines.push(`⚠ ${c.name} fails at ${c.baseline.label} too (not caused by this work)`)
+    return lines.join("\n")
   }
   if (r.why === "checks")
     return [

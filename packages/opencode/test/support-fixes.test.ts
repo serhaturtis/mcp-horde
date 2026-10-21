@@ -391,6 +391,22 @@ describe("worktree fixes", () => {
     assert.ok((await dependencyLinks(r)).links.includes(".venv"))
   })
 
+  test("createWorktree at a commit creates the worktree there instead of HEAD", async () => {
+    const r = repo()
+    fs.writeFileSync(path.join(r, "one.txt"), "one\n")
+    git(r, "add", ".")
+    git(r, "commit", "-qm", "one")
+    const first = git(r, "rev-parse", "HEAD")
+    fs.writeFileSync(path.join(r, "two.txt"), "two\n")
+    git(r, "add", ".")
+    git(r, "commit", "-qm", "two")
+    const { worktree } = await createWorktree(r, "old", { rootDir: path.join(tmpDir(), "wt"), includeUncommitted: false, at: first })
+    assert.equal(worktree.base, first)
+    assert.equal(git(worktree.root, "rev-parse", "HEAD"), first)
+    assert.ok(fs.existsSync(path.join(worktree.root, "one.txt")))
+    assert.ok(!fs.existsSync(path.join(worktree.root, "two.txt")), "the later commit is not in the worktree")
+  })
+
   test("createWorktree links dependency directories by default and only those given explicitly", async () => {
     const r = repo()
     fs.writeFileSync(path.join(r, ".gitignore"), "node_modules/\n.venv/\n")
