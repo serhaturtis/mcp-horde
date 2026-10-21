@@ -1,6 +1,6 @@
 import fs from "node:fs"
 import path from "node:path"
-import { langOf, openProject, testsFor } from "@mcp-horde/context"
+import { langOf, openProject, stripJsonComments, testsFor } from "@mcp-horde/context"
 import { git, gitRaw, isTestPath, splitZ } from "@mcp-horde/core"
 import { diffBase, isRunnableTest } from "./audit.js"
 import type { Check } from "./detect.js"
@@ -226,95 +226,38 @@ function tsPaths(dir: string): string[] {
   for (const n of ["tsconfig.json", "jsconfig.json"]) {
     const file = path.join(dir, n)
     if (!fs.existsSync(file)) continue
-    const data = jsonc(read(file)) as { compilerOptions?: { paths?: unknown } } | undefined
-    const paths = data?.compilerOptions?.paths
-    // The code map reads only an object of patterns; anything else covers nothing.
-    return paths && typeof paths === "object" && !Array.isArray(paths) ? Object.keys(paths) : []
+    try {
+      const data = JSON.parse(stripJsonComments(read(file))) as { compilerOptions?: { paths?: unknown } }
+      const paths = data.compilerOptions?.paths
+      // The code map reads only an object of patterns; anything else covers nothing.
+      return paths && typeof paths === "object" && !Array.isArray(paths) ? Object.keys(paths) : []
+    } catch {
+      return []
+    }
   }
   return []
 }
 
 /** Why a bundler config's aliases are unsafe, or undefined when it has none or all are covered. */
 function bundlerAlias(text: string, paths: string[]): string | undefined {
-  const word = /\balias\b/g
-  let i = 0
+  const src = stripJsonComments(text)
+  // Only a flat object literal is readable; nested braces leave the alias word outside a match.
+  const alias = /\balias\s*:\s*\{([^{}]*)\}/g
+  let last = 0
   while (true) {
-    word.lastIndex = i
-    const hit = word.exec(text)
-    if (!hit) return undefined
-    const j = skipTrivia(text, hit.index + hit[0].length)
-    if (text[j] !== ":") return "an alias that is not a plain object literal"
-    const end = objectKeys(text, skipTrivia(text, j + 1), paths)
-    if (end === undefined) return paths.length ? "a bundler alias not covered by tsconfig.json paths" : "a bundler alias without tsconfig.json paths"
-    i = end
+    const m = alias.exec(src)
+    if (!m) break
+    if (/\balias\b/.test(src.slice(last, m.index))) return "an alias that is not a plain object literal"
+    const body = m[1]!
+    if (/\.\.\.|\[/.test(body)) return "an alias that is not a plain object literal"
+    const keys = [...body.matchAll(/(?:^|,)\s*(?:"([^"]+)"|'([^']+)'|([A-Za-z_$][\w$-]*))\s*:/g)].map((k) => k[1] ?? k[2] ?? k[3])
+    if (!keys.length && body.trim()) return "an alias that is not a plain object literal"
+    if (!keys.every((key) => paths.some((p) => covers(p, key!))))
+      return paths.length ? "a bundler alias not covered by tsconfig.json paths" : "a bundler alias without tsconfig.json paths"
+    last = alias.lastIndex
   }
-}
-
-/**
- * The end of a plain object literal starting at `start`, when every key is covered by a
- * `paths` pattern. Undefined for anything else: arrays, variables, spreads, computed keys.
- */
-function objectKeys(s: string, start: number, paths: string[]): number | undefined {
-  if (s[start] !== "{") return undefined
-  let i = start + 1
-  while (true) {
-    i = skipTrivia(s, i)
-    if (i >= s.length) return undefined
-    if (s[i] === "}") return i + 1
-    if (s[i] === "." || s[i] === "[") return undefined
-    let key: string
-    if (s[i] === '"' || s[i] === "'") {
-      const end = s.indexOf(s[i]!, i + 1)
-      if (end < 0) return undefined
-      key = s.slice(i + 1, end)
-      if (key.includes("\\")) return undefined
-      i = end + 1
-    } else {
-      const m = /^[A-Za-z_$][\w$-]*/.exec(s.slice(i))
-      if (!m) return undefined
-      key = m[0]
-      i += key.length
-    }
-    i = skipTrivia(s, i)
-    if (s[i] !== ":" || !paths.some((p) => covers(p, key))) return undefined
-    i++
-    // Skip the value to the next top-level comma or the object's closing brace.
-    let depth = 0
-    while (i < s.length) {
-      const c = s[i]!
-      if (c === '"' || c === "'" || c === "`") {
-        const end = skipString(s, i)
-        if (end < 0) return undefined
-        i = end
-        continue
-      }
-      if (c === "/" && s[i + 1] === "/") {
-        const end = s.indexOf("\n", i)
-        i = end < 0 ? s.length : end + 1
-        continue
-      }
-      if (c === "/" && s[i + 1] === "*") {
-        const end = s.indexOf("*/", i + 2)
-        if (end < 0) return undefined
-        i = end + 2
-        continue
-      }
-      if (c === "{" || c === "(" || c === "[") {
-        depth++
-      } else if (c === "}" || c === ")" || c === "]") {
-        if (depth === 0) {
-          if (c !== "}") return undefined
-          return i + 1
-        }
-        depth--
-      } else if (c === "," && depth === 0) {
-        i++
-        break
-      }
-      i++
-    }
-    if (i >= s.length) return undefined
-  }
+  if (/\balias\b/.test(src.slice(last))) return "an alias that is not a plain object literal"
+  return undefined
 }
 
 /** Is alias key `key` covered by tsconfig `paths` pattern `pattern` (`@` by `@/*` or `@`)? */
@@ -328,63 +271,10 @@ function covers(pattern: string, key: string): boolean {
   return key.length >= prefix.length + suffix.length && key.startsWith(prefix) && key.endsWith(suffix)
 }
 
-function skipTrivia(s: string, i: number): number {
-  while (i < s.length) {
-    if (/\s/.test(s[i]!)) {
-      i++
-    } else if (s[i] === "/" && s[i + 1] === "/") {
-      const end = s.indexOf("\n", i)
-      i = end < 0 ? s.length : end + 1
-    } else if (s[i] === "/" && s[i + 1] === "*") {
-      const end = s.indexOf("*/", i + 2)
-      i = end < 0 ? s.length : end + 2
-    } else break
-  }
-  return i
-}
-
-/** The index after a string literal; -1 for a template with interpolation we cannot read. */
-function skipString(s: string, i: number): number {
-  const q = s[i]!
-  i++
-  while (i < s.length) {
-    if (s[i] === "\\") i += 2
-    else if (q === "`" && s[i] === "$" && s[i + 1] === "{") return -1
-    else if (s[i] === q) return i + 1
-    else i++
-  }
-  return -1
-}
-
 function read(file: string): string {
   try {
     return fs.readFileSync(file, "utf8")
   } catch {
     return ""
-  }
-}
-
-/** JSONC (comments and trailing commas), as tsconfig.json is; undefined when unreadable. */
-function jsonc(text: string): unknown {
-  let out = ""
-  for (let i = 0; i < text.length; i++) {
-    const c = text[i]!
-    if (c === '"') {
-      let j = i + 1
-      while (j < text.length && text[j] !== '"') j += text[j] === "\\" ? 2 : 1
-      out += text.slice(i, j + 1)
-      i = j
-    } else if (c === "/" && text[i + 1] === "/") {
-      while (i < text.length && text[i] !== "\n") i++
-      out += "\n"
-    } else if (c === "/" && text[i + 1] === "*") {
-      const end = text.indexOf("*/", i + 2)
-      i = end < 0 ? text.length : end + 1
-    } else out += c
-  }
-  try {
-    return JSON.parse(out.replace(/,(\s*[}\]])/g, "$1"))
-  } catch {
-    return undefined
   }
 }

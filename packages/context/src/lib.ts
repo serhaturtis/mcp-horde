@@ -1,6 +1,6 @@
 /** Library entry point: what other horde packages use (board briefs, verify's related tests). */
 export { type ContextSettings, loadContextSettings, openProject, type Project, readText, relPath, select } from "./files.js"
-export { fileInfo, type Graph, importGraph, type TestLink, testsFor } from "./graph.js"
+export { fileInfo, type Graph, importGraph, stripJsonComments, type TestLink, testsFor } from "./graph.js"
 export { type Definition, type DefKind, importSpecs, type Lang, langOf, patternDefinitions } from "./lang.js"
 export { entryPoints, projectMap } from "./map.js"
 export { goalTerms, type PackOptions, pack } from "./pack.js"
