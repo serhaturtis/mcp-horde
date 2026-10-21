@@ -637,6 +637,44 @@ describe("import resolution details", () => {
     assert.deepEqual(g2.out.get("app/src/main.ts"), [])
   })
 
+  test("Python: absolute imports resolve from the nearest project root and its src layout", () => {
+    const dir = fixture({
+      // A project in a monorepo subdirectory: app.* resolves from svc/, not only the repository root.
+      "svc/pyproject.toml": '[project]\nname = "svc"\n',
+      "svc/app/__init__.py": "",
+      "svc/app/core.py": "def run():\n    return 1\n",
+      "svc/tests/test_core.py": "from app.core import run\n",
+      "svc/tests/test_smoke.py": "from app.core import run\n",
+      // setup.py projects resolve from their src/ layout too.
+      "libsvc/setup.py": "from setuptools import setup\nsetup()\n",
+      "libsvc/src/app/core.py": "def run():\n    return 1\n",
+      "libsvc/tests/test_smoke.py": "from app.core import run\n",
+      // Nested projects: the nearest root wins over the outer one.
+      "nest/setup.cfg": "[metadata]\n",
+      "nest/app/core.py": "A = 1\n",
+      "nest/inner/pyproject.toml": '[project]\nname = "inner"\n',
+      "nest/inner/app/inner.py": "B = 2\n",
+      "nest/inner/tests/test_inner.py": "from app.inner import B\n",
+      // No project marker: the importing file's own directory still resolves, as before.
+      "loose/tests/helper.py": "y = 1\n",
+      "loose/tests/test_loose.py": "from helper import y\n",
+    })
+    const p = openProject(dir)
+    const g = importGraph(p)
+    assert.deepEqual(g.out.get("svc/tests/test_core.py"), ["svc/app/core.py"])
+    assert.deepEqual(g.out.get("svc/tests/test_smoke.py"), ["svc/app/core.py"])
+    assert.deepEqual(g.out.get("libsvc/tests/test_smoke.py"), ["libsvc/src/app/core.py"])
+    assert.deepEqual(g.out.get("nest/inner/tests/test_inner.py"), ["nest/inner/app/inner.py"], "the nearest project root wins")
+    assert.deepEqual(g.out.get("loose/tests/test_loose.py"), ["loose/tests/helper.py"])
+    // testsFor narrows pytest runs: the test importing svc/app/core.py covers it.
+    assert.deepEqual(
+      testsFor(p, ["svc/app/core.py"])
+        .get("svc/app/core.py")!
+        .map((t) => `${t.test} (${t.why})`),
+      ["svc/tests/test_core.py (mirror)", "svc/tests/test_smoke.py (imports it)"],
+    )
+  })
+
   test("C# tests mirror the project they test", () => {
     const dir = fixture({
       "src/Shop/Billing/Invoice.cs": "namespace Shop.Billing;\npublic class Invoice {}\n",

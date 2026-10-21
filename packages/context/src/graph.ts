@@ -45,6 +45,9 @@ export function fileInfo(project: Project, rel: string): FileInfo | undefined {
 
 const JS_EXTS = [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"]
 
+/** Files that mark the root of a Python project. */
+const PY_ROOTS = ["pyproject.toml", "setup.py", "setup.cfg"]
+
 interface TsConfig {
   /** Directory non-relative imports resolve against (baseUrl), if set. */
   baseUrl?: string
@@ -54,8 +57,9 @@ interface TsConfig {
 
 /**
  * What one import-graph build knows about the project, computed once per build: the file
- * set, files by directory and by name, workspace packages, go.mod and tsconfig files. Every
- * non-source file it reads is recorded, so a cached graph can tell when to build again.
+ * set, files by directory and by name, workspace packages, go.mod, Python project roots and
+ * tsconfig files. Every non-source file it reads is recorded, so a cached graph can tell when
+ * to build again.
  */
 class Resolver {
   readonly files: Set<string>
@@ -67,6 +71,7 @@ class Resolver {
   readonly deps = new Map<string, string | undefined>()
   private packages?: Map<string, { dir: string; entry?: string }>
   private readonly goMods = new Map<string, { dir: string; mod: string } | null>()
+  private readonly pyRoots = new Map<string, string | null>()
   private readonly tsConfigs = new Map<string, TsConfig | null>()
 
   constructor(readonly project: Project) {
@@ -130,6 +135,17 @@ class Resolver {
     }
     if (!found && dir !== ".") found = this.goModule(path.posix.dirname(dir)) ?? null
     this.goMods.set(dir, found)
+    return found ?? undefined
+  }
+
+  /** The root of the nearest Python project (pyproject.toml, setup.py or setup.cfg) at or above `dir`. */
+  pyRoot(dir: string): string | undefined {
+    const memo = this.pyRoots.get(dir)
+    if (memo !== undefined) return memo ?? undefined
+    let found: string | null = null
+    if (PY_ROOTS.some((name) => this.files.has(dir === "." ? name : `${dir}/${name}`))) found = dir
+    if (!found && dir !== ".") found = this.pyRoot(path.posix.dirname(dir)) ?? null
+    this.pyRoots.set(dir, found)
     return found ?? undefined
   }
 
@@ -266,8 +282,12 @@ function resolve(r: Resolver, from: string, spec: string, lang: Lang): string[] 
         const b = tail ? path.posix.join(d, tail) : d
         return first([`${b}.py`, `${b}/__init__.py`])
       }
-      // Absolute imports: from the root, a src/ layout, or the importing file's package.
-      return first(["", "src/", "lib/", `${dir}/`].flatMap((p) => [`${p}${tail}.py`, `${p}${tail}/__init__.py`]))
+      // Absolute imports: from the root, a src/ layout, the importing file's package, then the
+      // nearest Python project root and its src/ layout (a project in a monorepo subdirectory).
+      const root = r.pyRoot(dir)
+      const bases = ["", "src/", "lib/", `${dir}/`]
+      if (root && root !== ".") bases.push(`${root}/`, `${root}/src/`)
+      return first(bases.flatMap((p) => [`${p}${tail}.py`, `${p}${tail}/__init__.py`]))
     }
     case "go": {
       const m = r.goModule(dir)
