@@ -148,7 +148,7 @@ async function remove(flags: Flags): Promise<string> {
   for (const p of ours) await git(root, "worktree", "remove", "--force", p).catch((e: Error) => failed.push(e.message.split("\n")[0]!))
   for (const p of worktrees) fs.rmSync(p, { recursive: true, force: true })
   fs.rmSync(worktreeRoot, { recursive: true, force: true })
-  await git(root, "worktree", "prune").catch(() => undefined)
+  await git(root, "worktree", "prune").catch((e: Error) => failed.push(e.message.split("\n")[0]!))
   for (const b of branches) await git(root, "branch", "-D", b.name).catch((e: Error) => failed.push(e.message.split("\n")[0]!))
   for (const p of boards) fs.rmSync(p, { recursive: true, force: true })
   for (const p of logs) fs.rmSync(p, { recursive: true, force: true })
