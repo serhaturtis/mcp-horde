@@ -94,6 +94,26 @@ $2.73 for the pass.
 
 **What it suggests.** The calmer wording lost the delegation of single sizeable tasks, and the agents' own words point at the size threshold. "One-line edit" is a concrete line. "More than a few edits" and "small edits" let the model call a feature slice small. The hook text changed in the same run, so this run cannot attribute the drop to one text. One run per case, but three flips with stated reasons are unlikely to be noise [inference]. Wording the guidance calls best practice was worse here, which is the reason to measure.
 
+## Eval pass with a concrete line
+
+d03669d keeps 8fa4876's factual hook and drops the blanket defaults, but states the line concretely. The horde suits "any change you can state as a goal, done-criteria and files: a fix, a feature, tests, docs, a refactor, or several independent pieces". It is quicker to work directly when it is "a one- or two-line edit, a question, work you are still investigating, or something you need the result of right away". Direct cases now stop at 8 turns.
+
+| Case | Expected | Result |
+| --- | --- | --- |
+| status-json, core-text-tests | delegate | delegated |
+| three-pieces | delegate | delegated ×3 |
+| ledger-duration | delegate (borderline) | by hand |
+| servers-log, one-line, question, two-file-fix, vague-speedup | direct | direct |
+
+8/9, $2.84 for all nine cases.
+
+**The miss.** In ledger-duration the agent read eight files, decided "Small enough to do directly", and after the edit-count note said "The change is nearly done, so I'll finish it directly". That is the note's own exception, and the first sign that the note reaches the model. Once an agent has done the reading itself, the remaining edit is modest, so this borderline case may be labelled too strictly [inference].
+
+**What the three passes show together:**
+- The size line decides single-task delegation. A concrete line ("one- or two-line edit") keeps it, and a vague one ("more than a few edits") loses it.
+- The factual hook did not cost anything measurable.
+- No wording made an agent delegate a direct case.
+
 ## Earlier subagent run
 
 Before the tools were loaded upfront (779d122), a general-purpose subagent was given a plain request to write `ci.sh`. It did not delegate. In its report it cited:
