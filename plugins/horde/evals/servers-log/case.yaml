@@ -5,7 +5,7 @@ tags: [direct]
 context:
   scaffold_script: scaffold.sh
 execution:
-  max_turns: 10
+  max_turns: 8
   allowed_tools: [Read, Glob, Grep, Skill]
   prompt: |
     The test suites' servers write their start and exit lines into my real ~/.local/state/mcp-horde/servers.log. Make the tests keep those lines in a temporary directory instead.

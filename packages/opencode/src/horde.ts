@@ -20,10 +20,11 @@ export interface HordeOptions {
   progress: (extra: unknown) => ((snaps: Snapshot[], elapsedMs: number) => void) | undefined
 }
 
-// Instructions explain the tools; the docs warn that superiority claims and blanket defaults
-// ("reach for it first") make current models over-trigger (docs/research/vendor-guidance.md).
+// Instructions explain the tools, without superiority claims or "reach for it first", which make
+// current models over-trigger (docs/research/vendor-guidance.md). The exclusions stay concrete:
+// "more than a few edits" let agents call a feature slice small (docs/research/experiments.md).
 export const HORDE_INSTRUCTIONS = `horde: hands coding tasks to cheaper worker models and returns them checked.
-It fits changes that touch several files, tests or docs for code that is understood, and independent pieces that can run in parallel. One-line edits, work that is still mostly investigation, and results needed right away are quicker done directly.
+It suits any change that can be stated as a goal, done-criteria and the files it may change: a fix, a feature, tests, docs, a refactor, or several independent pieces in parallel. One- or two-line edits, questions, work that is still being investigated, and results needed right away are quicker done directly.
 A task is a goal, done-criteria and the files it may change. Workers do not see the conversation, take minutes, and cost a fraction of a frontier model's tokens; subagents can use the same tools.
 - horde_do {goal, done, scope} starts a worker in its own git worktree with the project's dependencies; when it finishes, the project's checks run and a reviewer judges each done-criterion against the diff, and failures go back to the worker.
 - horde_wait returns outcomes: READY → horde_land, NEEDS YOU → horde_tell, FAILED → horde_tell or horde_drop.
@@ -40,7 +41,7 @@ const timeout = z
 export function registerHorde(tool: Tool, opts: HordeOptions) {
   tool(
     "horde_do",
-    "Hand a coding task to a cheaper worker model and get it back checked. Use it for a change you can state as a goal, done-criteria and the files it may change, when writing it yourself would take more than a few edits: a change across several files, tests or docs for code you understand, or several independent pieces at once (one call each; they run in parallel). Small edits, work that is still mostly investigation, and anything you need the result of right away are quicker done directly. The worker does not see this conversation, so describe the task the way you would to a new colleague: goal (what and why), done (how you will know it is finished), scope (the files it may change). It gets its own git worktree with the project's dependencies, and code context from the repository; when it finishes, the project's tests, typecheck and lint run, a reviewer model checks each done-criterion against the diff, and failures go back to the worker to fix (2 rounds). Returns at once with the task id; call horde_wait for the outcome, or pass wait: true to block until it is done (like a subagent).",
+    "Hand a coding task to a cheaper worker model and get it back checked. Use it for any change you can state as a goal, done-criteria and the files it may change: a fix, a feature, tests, docs, a refactor, or several independent pieces at once (one call each; they run in parallel). Do it directly instead when it is a one- or two-line edit, a question, work you are still investigating, or something you need the result of right away. The worker does not see this conversation, so describe the task the way you would to a new colleague: goal (what and why), done (how you will know it is finished), scope (the files it may change). It gets its own git worktree with the project's dependencies, and code context from the repository; when it finishes, the project's tests, typecheck and lint run, a reviewer model checks each done-criterion against the diff, and failures go back to the worker to fix (2 rounds). Returns at once with the task id; call horde_wait for the outcome, or pass wait: true to block until it is done (like a subagent).",
     {
       goal: z
         .string()

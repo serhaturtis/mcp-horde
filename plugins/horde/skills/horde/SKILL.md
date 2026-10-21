@@ -1,6 +1,6 @@
 ---
 name: horde
-description: Delegate coding work to cheap, fast OpenCode workers (DeepSeek, Kimi, GLM, Qwen, local models) and stay the reviewer. Use it when a change touches several files, when there are tests or docs to write for code you understand, when a request has several independent pieces, and when the user asks to parallelize work, use cheaper models, run a "horde", or split a feature into tasks. Not for one-line edits, work that is still mostly investigation, or results you need right away. Three calls per task (horde_do, horde_wait, horde_land): workers run in their own worktrees, their work is checked and reviewed before you see it, and landing never breaks your branch.
+description: Delegate coding work to cheap, fast OpenCode workers (DeepSeek, Kimi, GLM, Qwen, local models) and stay the reviewer. Use it for any change you can state as a goal, done-criteria and files (a fix, a feature, tests, docs, a refactor, several independent pieces), and when the user asks to parallelize work, use cheaper models, run a "horde", or split a feature into tasks. Not for one- or two-line edits, questions, work you are still investigating, or results you need right away. Three calls per task (horde_do, horde_wait, horde_land): workers run in their own worktrees, their work is checked and reviewed before you see it, and landing never breaks your branch.
 ---
 
 # Running the horde

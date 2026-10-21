@@ -15,8 +15,8 @@ const ABOUT = [
   "This session has the horde plugin. horde_do hands a change, written as a goal, done-criteria and the files it may change, to a cheaper worker model in its own git worktree;",
   "the project's checks and a reviewer judge the work before horde_wait returns it, and horde_land applies it to the branch.",
   "A worker costs a fraction of this session's tokens and runs while the session does other things.",
-  "It suits changes that touch several files, tests or docs for code that is understood, and independent pieces that can run in parallel;",
-  "one-line edits, work that is still mostly investigation, and results needed right away are quicker done directly.",
+  "It suits any change that can be written down that way: a fix, a feature, tests, docs, a refactor, or several independent pieces in parallel.",
+  "One- or two-line edits, questions, work that is still being investigated, and results needed right away are quicker done directly.",
 ].join(" ")
 const FOR_SUBAGENTS =
   "Subagents have the same tools: a worker is a cheaper model, not another Claude agent, so one piece of an assignment can go to a worker while the rest goes on here."
