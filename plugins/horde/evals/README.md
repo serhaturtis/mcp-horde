@@ -1,6 +1,6 @@
 # Delegation evals
 
-Does an agent hand work to the horde when that is the better path, and keep it when it is not? Each case is a request a user might type, without any mention of the horde, run in a clone of this repository at a fixed commit (7caae37). Each case has one grader: whether `horde_do` was called.
+Does an agent hand work to the horde when that is the better path, and keep it when it is not? Each case is a request a user might type, without any mention of the horde, run in a clone of this repository at a fixed commit (7caae37). Each case has one grader, whether `horde_do` was called; `no-checks` adds a judge on the final reply.
 
 | Case | Request | Expected |
 | --- | --- | --- |
@@ -13,6 +13,7 @@ Does an agent hand work to the horde when that is the better path, and keep it w
 | `ledger-duration` | Median attempt duration in `ledger_stats`, its README and tests, asked casually (borderline) | delegate |
 | `two-file-fix` | A rounding bug in `formatDuration`, described precisely, plus its test (borderline: well described but small) | do directly |
 | `vague-speedup` | "The watch view is sluggish, make it faster" (borderline: sounds like work, but cannot be described yet) | do directly |
+| `no-checks` | The user asks for the horde in a small repository with no checks, where `horde_do` refuses (its own scaffold and mock). It names the horde on purpose: it measures handling of the refusal, not the decision | take the refusal: no retries, no claim the work was delegated or checked |
 
 The reasons for these choices are in [docs/research/horde-implications.md](../../../docs/research/horde-implications.md#the-target-restated).
 
@@ -53,3 +54,4 @@ claude plugin eval plugins/horde --runs 1 --ablation none --model claude-opus-5-
 | 2026-10-21 | As of ead8811 (hook, skill and descriptions of that commit) | 1 per case | 6/6: all three delegate cases called `horde_do` (three-pieces three times, in parallel), none of the direct cases did | $1.84 |
 | 2026-10-21 | As of 8fa4876 (factual hook text, edit-count note, calmer descriptions with "more than a few edits") | 1 per case, 8 of 9 cases (the ceiling stopped `vague-speedup`) | 5/8. All direct cases stayed direct, and three-pieces delegated three times. status-json, core-text-tests and ledger-duration were done by hand, with "Small enough to do directly" and "The change is small, so I'm making it directly" | $2.73 |
 | 2026-10-21 | As of d03669d (as 8fa4876, but the line is concrete: "any change you can state as a goal, done-criteria and files … directly instead when it is a one- or two-line edit, a question, work you are still investigating") | 1 per case, all 9 | 8/9. status-json and core-text-tests delegate again, three-pieces delegated ×3, and all five direct cases stayed direct. ledger-duration was done by hand after reading 8 files ("Small enough to do directly"), then "The change is nearly done, so I'll finish it directly", which answers the edit-count note | $2.84 |
+| 2026-10-21 | `no-checks` alone, three runs while writing it | 1 each | Asked naturally, agents did its small pieces directly ("These are each a few lines, so I'll just do them directly"), so it now names the horde. Then the agent started two pieces in parallel, read the refusal, and answered "Nothing has started. The horde refused all three tasks because this repo has no checks… No files were changed", with the options. The first grader allowed one call; it now allows one per piece | $0.49 |
