@@ -11,14 +11,14 @@ You plan and judge; workers do the typing. Your context is the scarce resource: 
 
 1. `horde_do { goal, done, scope }` for each independent piece of work; start several at once.
 2. `horde_wait` returns outcomes, and each one names the calls that fit next:
-   - **READY** → `horde_land`. First look at what the outcome flags: an "unproven" criterion (send its ready-made `horde_tell` if it matters), "⚠ the report claims …" (the worker described work it did not do), files you did not expect.
+   - **READY** → `horde_land`. First look at what the outcome flags: an "unproven" criterion (send its ready-made `horde_tell` if it matters), "⚠ the worker's report names …" (it claims changes the diff does not have), files you did not expect. "⚠ <check> fails at … too" means that check already fails where the task started or on your branch: not the worker's doing and no reason to hold the task, but tell the user their branch is broken.
    - **NEEDS YOU** → `horde_tell`: an answer, or `approve` true/false. Questions about intent are yours to answer from the plan; refuse requests that go beyond the task, with a reason.
    - **FAILED** → read why, then one precise `horde_tell` hint; `model` for the stronger tier it names; `scope` when the fix is outside the task's files; `horde_drop` when the task itself was wrong.
 3. Land in dependency order. `horde_land` checks the work on top of your branch first; when it refuses, tell the worker what changed on your branch, then land again.
 
 ## Setting up a repository
 
-The project's checks judge every task, so `horde_do` refuses in a repository where none are found, or where they are not committed. The setup skill (`/horde:setup`) writes `horde.json` for a repository: the checks CI runs, what a new worktree needs, the resources checks share (database, ports, test slots). Run `verify_gate` once before the first task: a check that fails on a clean tree fails every task.
+The project's checks judge every task, so `horde_do` refuses in a repository where none are found, or where they are not committed. The setup skill (`/horde:setup`) writes `horde.json` for a repository: the checks CI runs, what a new worktree needs, the resources checks share (database, ports, test slots). Run `verify_gate` once before the first task: a check that fails on a clean tree is flagged on every task and costs each one a second run.
 
 ## Writing a task: where cheap models waste money
 
