@@ -247,6 +247,23 @@ describe("imports and tests", () => {
 })
 
 describe("syntax trees: what line patterns get wrong", () => {
+  test("a minified file's definitions keep little memory", () => {
+    // 3000 functions on one 200 KB line, like a bundle: each signature once kept a copy of the line.
+    const lib = JSON.stringify(path.resolve(import.meta.dirname, "../src/lib.ts"))
+    const body = `const { loadSyntax, definitions } = await import(${lib}); await loadSyntax()
+      const text = Array.from({ length: 3000 }, (_, i) => "function f" + i + "(a,b){return a+b+" + i + "}").join(";") + "\\n"
+      gc(); const before = process.memoryUsage().heapUsed
+      const defs = definitions(text, "ts")
+      gc(); console.log(JSON.stringify({ defs: defs.length, sig: defs[0].signature.length, mb: (process.memoryUsage().heapUsed - before) / 1e6 }))`
+    const out = execFileSync(process.execPath, ["--expose-gc", "--conditions=source", "--import", "tsx", "--input-type=module", "-e", body], {
+      encoding: "utf8",
+    })
+    const r = JSON.parse(out.trim().split("\n").pop()!)
+    assert.equal(r.defs, 3000)
+    assert.ok(r.sig <= 240, `signatures stay short (${r.sig})`)
+    assert.ok(r.mb < 50, `kept ${r.mb.toFixed(0)} MB`)
+  })
+
   test("definitions follow the grammar, not the line shape", () => {
     assert.equal(syntaxStatus(), "tree-sitter")
     const names = (text: string, lang: Lang, file?: string) =>

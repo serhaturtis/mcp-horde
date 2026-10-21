@@ -322,12 +322,18 @@ const clean = (ls: string[]) => {
   return text ? text.split("\n").slice(0, 8).join("\n") : undefined
 }
 
+/** How much of a line a signature looks at. */
+const SIGNATURE_LINE = 1000
+
 export function signatureOf(lines: string[], i: number): string {
-  const out = [lines[i]!.trim()]
+  // Lines are cut first: a minified file's one line is hundreds of KB, and the signature, a
+  // slice of what is built here, would keep a copy of it alive for every definition on it.
+  const line = (j: number) => lines[j]!.slice(0, SIGNATURE_LINE).trim()
+  const out = [line(i)]
   // Parameters spanning lines: continue until the parentheses balance (at most 6 lines).
   let open = (out[0]!.match(/\(/g)?.length ?? 0) - (out[0]!.match(/\)/g)?.length ?? 0)
   for (let j = i + 1; open > 0 && j < lines.length && j - i < 6; j++) {
-    const l = lines[j]!.trim()
+    const l = line(j)
     out.push(l)
     open += (l.match(/\(/g)?.length ?? 0) - (l.match(/\)/g)?.length ?? 0)
   }
