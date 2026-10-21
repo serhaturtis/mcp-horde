@@ -34,7 +34,18 @@ import { type Config, inProject, type PermissionPolicy } from "./config.js"
 import { type Detail, inputSummary, renderTranscript } from "./render.js"
 import { type AgentRecord, type GateConfig, type Limits, ownerAlive, type ReviewSummary, SELF, type Store } from "./state.js"
 import { buildTrack, type CostEstimator, costSince, currentTurn, emptyTrack, latestTool, stablePrefix, type Track, type Turn, turnsSince } from "./tracker.js"
-import { commitAll, createWorktree, mergeWorktree, removeWorktree, syncWorktree, type Worktree, workStart, worktreeDiff } from "./worktree.js"
+import {
+  commitAll,
+  commitMsgHook,
+  createWorktree,
+  mergeWorktree,
+  removeWorktree,
+  squashWorktree,
+  syncWorktree,
+  type Worktree,
+  workStart,
+  worktreeDiff,
+} from "./worktree.js"
 
 /**
  * running      – the agent loop is executing (or about to start on a fresh prompt)
@@ -1387,8 +1398,11 @@ export class Fleet {
    * your branch has not moved meanwhile, are the same commits replayed onto your branch. Then the
    * task is accepted and the worktree and branch are removed. Anything that fails leaves your branch
    * as it was; the agent is then on top of your branch and can be told to fix it.
+   *
+   * With `message`, the task's own commits are squashed into one commit with it, judged first by the
+   * repository's commit-msg hook; a repository that has one needs the message.
    */
-  async land(ref: string, signal?: AbortSignal): Promise<LandResult> {
+  async land(ref: string, signal?: AbortSignal, message?: string): Promise<LandResult> {
     const live = await this.get(ref)
     const id = live.record.id
     const name = live.record.name ?? id
@@ -1408,6 +1422,9 @@ export class Fleet {
         let wt = live.record.worktree!
         const target = await git(wt.repo, "symbolic-ref", "-q", "--short", "HEAD").catch(() => "")
         if (!target) throw new Error(`your checkout ${wt.repo} is on a detached HEAD; switch to a branch first`)
+        // Landing as one commit is judged by the hook, so it needs the message before anything moves.
+        const hook = await commitMsgHook(wt.repo)
+        if (hook && !message) return { landed: false, target, why: "hook", text: hook }
         const tip = await git(wt.repo, "rev-parse", "HEAD")
         // 1. Onto your branch's tip, inside the worktree. A conflict leaves both as they were.
         try {
@@ -1429,6 +1446,11 @@ export class Fleet {
               .filter((l) => !/^Tell the agent/.test(l))
               .join("\n"),
           }
+        }
+        // 1b. With a message: the task's own commits become one, which the hook just judged.
+        if (message) {
+          const squashed = await squashWorktree(wt, message)
+          if (squashed.refused !== undefined) return { landed: false, target, why: "message", text: squashed.refused, hook }
         }
         // 2. The project's checks on exactly the tree your branch would get.
         const v = await runGate(wt.root, {
@@ -2759,7 +2781,19 @@ export class Fleet {
 
 export type LandResult =
   | { landed: true; target: string; commits: number; checks: GateCheckSummary[]; branchKept?: string }
-  | { landed: false; target: string; why: "conflict" | "checks" | "uncommitted"; text: string; checks?: GateCheckSummary[] }
+  | {
+      landed: false
+      target: string
+      /**
+       * message: the repository's commit-msg hook refused the message; hook: the repository has
+       * one and landing as one commit needs the message before anything moves.
+       */
+      why: "conflict" | "checks" | "uncommitted" | "message" | "hook"
+      text: string
+      checks?: GateCheckSummary[]
+      /** why "message": the hook that refused it. */
+      hook?: string
+    }
 
 interface Prepared {
   files: { uri: string; name: string }[]

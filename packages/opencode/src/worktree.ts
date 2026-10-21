@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process"
-import { existsSync } from "node:fs"
+import { constants, existsSync } from "node:fs"
 import fs from "node:fs/promises"
+import os from "node:os"
 import path from "node:path"
 import { branchSlug, GIT_ENV, git, gitRaw, repoKey, runCommand, splitZ } from "@mcp-horde/core"
 
@@ -459,6 +460,74 @@ export async function commitAll(wt: Worktree, message: string): Promise<string |
   const identity = (await hasIdentity(wt.root)) ? [] : IDENTITY
   await git(wt.root, ...NO_SIGN, ...identity, "commit", "-q", "--no-verify", "-m", message)
   return `committed uncommitted work to ${wt.branch} (${await git(wt.root, "rev-parse", "--short", "HEAD")})`
+}
+
+/** The repository's own commit-msg hook, when git would run it (`core.hooksPath` honoured). */
+export async function commitMsgHook(repo: string): Promise<string | undefined> {
+  const rel = await git(repo, "rev-parse", "--git-path", "hooks/commit-msg").catch(() => "")
+  if (!rel) return undefined
+  const hook = path.resolve(repo, rel)
+  if (!(await exists(hook))) return undefined
+  if (
+    !isWindows &&
+    !(await fs.access(hook, constants.X_OK).then(
+      () => true,
+      () => false,
+    ))
+  )
+    return undefined
+  return hook
+}
+
+/** Run a commit-msg hook on `file` in `cwd`; its output when it refused the message, else undefined. */
+function runCommitMsgHook(hook: string, cwd: string, file: string): Promise<string | undefined> {
+  return new Promise((resolve) => {
+    const child = spawn(isWindows ? "sh" : hook, isWindows ? [hook, file] : [file], {
+      cwd,
+      env: GIT_ENV,
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 60_000,
+    })
+    let out = ""
+    child.stdout.on("data", (c: Buffer) => (out += c.toString()))
+    child.stderr.on("data", (c: Buffer) => (out += c.toString()))
+    child.on("error", (err) => resolve(`${err.message}\n`))
+    child.on("close", (code, signal) => resolve(code === 0 ? undefined : out || `the commit-msg hook exited with ${signal ?? `code ${code}`}`))
+  })
+}
+
+/**
+ * Squash the agent's own commits (everything after workStart) into one commit with `message`,
+ * after the repository's commit-msg hook has judged it with the changes staged. A refusal puts
+ * the branch back where it was and changes nothing else; the hook's output is returned.
+ */
+export async function squashWorktree(wt: Worktree, message: string): Promise<{ refused?: string }> {
+  const before = await git(wt.root, "rev-parse", "HEAD")
+  const hook = await commitMsgHook(wt.repo)
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "horde-message-"))
+  const file = path.join(dir, "COMMIT_EDITMSG")
+  // Only the ref moves on a refusal, so putting it back leaves the files and index as they were.
+  const restore = () => git(wt.root, "reset", "--soft", before)
+  try {
+    await fs.writeFile(file, message.endsWith("\n") ? message : `${message}\n`)
+    await git(wt.root, "reset", "--soft", workStart(wt))
+    const refused = hook ? await runCommitMsgHook(hook, wt.root, file) : undefined
+    if (refused !== undefined) {
+      await restore()
+      return { refused }
+    }
+    const identity = (await hasIdentity(wt.root)) ? [] : IDENTITY
+    try {
+      // -F reads the file after the hook ran, so a trailer it added is kept.
+      await git(wt.root, ...NO_SIGN, ...identity, "commit", "-q", "--no-verify", "-F", file)
+    } catch (err) {
+      await restore().catch(() => undefined)
+      throw err
+    }
+    return {}
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true })
+  }
 }
 
 /** Run git and keep at most maxChars of stdout (the rest is not buffered). */

@@ -203,6 +203,78 @@ describe("the simple path: horde_do, horde_wait, horde_land (real opencode, mock
     await assert.rejects(h.call("horde_wait", { ids: [id] }), /unknown agent|no longer tracked|disposed/)
   })
 
+  test("landing as one commit: the repository's commit-msg hook judges the message first", async () => {
+    const { tmp: at, repo: hooked } = makeRepo(mock.url)
+    const marker = path.join(at, "land-check.ran")
+    fs.writeFileSync(path.join(hooked, "old.txt"), "stale\n")
+    fs.writeFileSync(
+      path.join(hooked, "horde.json"),
+      JSON.stringify({
+        verify: {
+          checks: {
+            ok: "true",
+            // Landing-only, so seeing it run proves the checks ran after the hook accepted the message.
+            land: { command: `node -e "require('fs').writeFileSync(process.argv[1], 'ran')" ${JSON.stringify(marker)}`, when: "land" },
+          },
+        },
+        tiers: ["mock/mock", "mock/pricey"],
+      }),
+    )
+    git(hooked, "add", ".")
+    git(hooked, "commit", "-qm", "checks")
+    // Carried over as the worktree's baseline: it must not land with the task.
+    fs.writeFileSync(path.join(hooked, "carried.txt"), "carried\n")
+    const hooks = path.join(at, "hooks")
+    fs.mkdirSync(hooks)
+    fs.writeFileSync(
+      path.join(hooks, "commit-msg"),
+      '#!/bin/sh\nif git diff --cached --name-status | grep -q "^D"; then\n  grep -q "^DELETE:" "$1" || { echo "commit-msg: removing a file needs a DELETE: line" >&2; exit 1; }\nfi\nprintf "\\nCo-authored-by: commit-msg hook\\n" >> "$1"\n',
+    )
+    if (process.platform !== "win32") fs.chmodSync(path.join(hooks, "commit-msg"), 0o755)
+    git(hooked, "config", "core.hooksPath", hooks)
+
+    const started = await h.call("horde_do", {
+      directory: hooked,
+      goal: 'Delete the stale file.\nRUN: rm old.txt && git add -A && git commit -qm "DELETE: drop old.txt"',
+      done: ["old.txt is gone"],
+      scope: ["old.txt"],
+    })
+    const id = idOf(started)
+    const branch = started.match(/worktree (horde\/[\w-]+)/)![1]!
+    assert.match(await settle(id), /READY/)
+    const head = git(hooked, "rev-parse", "HEAD")
+    const workerHead = git(hooked, "rev-parse", branch)
+
+    // No message: refused before anything moves, naming the hook.
+    const need = await h.call("horde_land", { id })
+    assert.match(need, /^not landed: .*commit-msg hook checks/, need)
+    assert.ok(need.includes(path.join(hooks, "commit-msg")), need)
+    assert.match(need, new RegExp(`horde_land \\{id: "${id}", message:`))
+    assert.equal(git(hooked, "rev-parse", "HEAD"), head, "master did not move")
+    assert.equal(git(hooked, "rev-parse", branch), workerHead, "the worker's branch did not move")
+    assert.ok(!fs.existsSync(marker), "no check ran")
+
+    // The hook rejects the message: the branch is restored and the checks never run.
+    const refused = await h.call("horde_land", { id, message: "drop the stale file" })
+    assert.match(refused, /did not pass the repository's commit-msg hook/, refused)
+    assert.match(refused, /removing a file needs a DELETE: line/, refused)
+    assert.match(refused, new RegExp(`horde_land \\{id: "${id}", message:`))
+    assert.equal(git(hooked, "rev-parse", "HEAD"), head, "master did not move")
+    assert.equal(git(hooked, "rev-parse", branch), workerHead, "the worker's branch is back where it was")
+    assert.ok(!fs.existsSync(marker), "the checks did not run")
+
+    // Accepted (and edited by the hook): one commit with that message, the baseline left out.
+    const landed = await h.call("horde_land", { id, message: "DELETE: drop old.txt" })
+    assert.match(landed, new RegExp(`^landed ${id} on master: 1 commit\\(s\\)`), landed)
+    assert.ok(fs.existsSync(marker), "the checks ran")
+    assert.equal(git(hooked, "rev-list", "--count", `${head}..HEAD`), "1", "exactly one commit")
+    assert.equal(git(hooked, "log", "-1", "--format=%s"), "DELETE: drop old.txt")
+    assert.match(git(hooked, "log", "-1", "--format=%B"), /Co-authored-by: commit-msg hook/, "the hook's edit is in the landed commit")
+    assert.ok(!fs.existsSync(path.join(hooked, "old.txt")))
+    assert.equal(git(hooked, "status", "--porcelain"), "?? carried.txt", "the carried-over change stays uncommitted, never landed")
+    assert.equal(git(hooked, "branch", "--list", "horde/*"), "", "the merged branch is gone")
+  })
+
   test("horde_do refuses up front in a repository without checks, and says how to add them", async () => {
     const bare = path.join(tmp, "no-checks")
     fs.mkdirSync(bare)

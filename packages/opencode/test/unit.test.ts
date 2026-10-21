@@ -14,7 +14,7 @@ import { questionAnswers, questionSchema } from "../src/hooks.js"
 import { type AgentRecord, Store } from "../src/state.js"
 import { price } from "../src/tools.js"
 import { buildTrack, costSince, currentTurn, latestTool, stablePrefix, turnsSince } from "../src/tracker.js"
-import { branchSlug, validateLink } from "../src/worktree.js"
+import { branchSlug, commitMsgHook, squashWorktree, validateLink, type Worktree } from "../src/worktree.js"
 // Fixes from the support-module audit (hooks, tracker, worktree, backend, supervisor, ask, config).
 import "./support-fixes.test.js"
 
@@ -497,4 +497,92 @@ test("waitedOut: a read that failed once is retried; one unreadable for a minute
   assert.equal(waitedOut(["a"], new Set(), new Map([["a", now - 60_000]]), now), true)
   assert.equal(waitedOut(["a", "b"], new Set(["b"]), new Map(), now), false, "a is still working")
   assert.equal(waitedOut(["a", "b"], new Set(["a", "b"]), new Map(), now), true)
+})
+
+describe("landing as one commit: squash and the repository's commit-msg hook", () => {
+  const gitIn = (cwd: string, ...args: string[]) =>
+    execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", ...args], { cwd })
+      .toString()
+      .trim()
+  const makeRepo = () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "horde-squash-"))
+    gitIn(dir, "init", "-q")
+    fs.writeFileSync(path.join(dir, "a.txt"), "a\n")
+    gitIn(dir, "add", "-A")
+    gitIn(dir, "commit", "-qm", "base")
+    const wt: Worktree = { path: dir, root: dir, branch: gitIn(dir, "symbolic-ref", "--short", "HEAD"), base: gitIn(dir, "rev-parse", "HEAD"), repo: dir }
+    fs.writeFileSync(path.join(dir, "b.txt"), "b\n")
+    gitIn(dir, "add", "-A")
+    gitIn(dir, "commit", "-qm", "baseline")
+    wt.baseline = gitIn(dir, "rev-parse", "HEAD")
+    fs.writeFileSync(path.join(dir, "own.txt"), "own\n")
+    gitIn(dir, "add", "-A")
+    gitIn(dir, "commit", "-qm", "own one")
+    fs.writeFileSync(path.join(dir, "more.txt"), "more\n")
+    gitIn(dir, "add", "-A")
+    gitIn(dir, "commit", "-qm", "own two")
+    return wt
+  }
+  const hookIn = (dir: string, body: string) => {
+    const hooks = fs.mkdtempSync(path.join(os.tmpdir(), "horde-hooks-"))
+    const hook = path.join(hooks, "commit-msg")
+    fs.writeFileSync(hook, body)
+    if (process.platform !== "win32") fs.chmodSync(hook, 0o755)
+    gitIn(dir, "config", "core.hooksPath", hooks)
+    return hook
+  }
+
+  test("the agent's own commits become one; the carried-over baseline stays out", async () => {
+    const wt = makeRepo()
+    assert.deepEqual(await squashWorktree(wt, "feat: the task"), {})
+    assert.equal(gitIn(wt.root, "log", "-1", "--format=%s"), "feat: the task")
+    assert.equal(gitIn(wt.root, "rev-list", "--count", `${wt.baseline!}..HEAD`), "1", "exactly the squashed commit")
+    assert.equal(gitIn(wt.root, "rev-list", "--count", `${wt.base}..HEAD`), "2", "the baseline is kept separate")
+    assert.equal(gitIn(wt.root, "merge-base", "--is-ancestor", wt.baseline!, "HEAD"), "", "the baseline is still its parent")
+    assert.equal(fs.readFileSync(path.join(wt.root, "own.txt"), "utf8"), "own\n")
+    assert.equal(fs.readFileSync(path.join(wt.root, "more.txt"), "utf8"), "more\n")
+  })
+
+  test("the hook sees the changes staged, refuses a message it rejects, and its edits are kept", async () => {
+    const wt = makeRepo()
+    gitIn(wt.root, "rm", "-q", "a.txt")
+    gitIn(wt.root, "commit", "-qm", "drop a")
+    const hook = hookIn(
+      wt.root,
+      '#!/bin/sh\nif git diff --cached --name-status | grep -q "^D"; then\n  grep -q "^DELETE:" "$1" || { echo "commit-msg: removing a file needs a DELETE: line" >&2; exit 1; }\nfi\nprintf "\\nCo-authored-by: commit-msg hook\\n" >> "$1"\n',
+    )
+    assert.equal(await commitMsgHook(wt.root), hook)
+    const before = gitIn(wt.root, "rev-parse", "HEAD")
+    const refused = await squashWorktree(wt, "feat: drop a file")
+    assert.match(refused.refused ?? "", /removing a file needs a DELETE: line/)
+    assert.equal(gitIn(wt.root, "rev-parse", "HEAD"), before, "the branch is back where it was")
+    assert.equal(gitIn(wt.root, "status", "--porcelain"), "", "and nothing else changed")
+    assert.deepEqual(await squashWorktree(wt, "DELETE: drop the stale file"), {})
+    assert.equal(gitIn(wt.root, "log", "-1", "--format=%s"), "DELETE: drop the stale file")
+    assert.match(gitIn(wt.root, "log", "-1", "--format=%B"), /Co-authored-by: commit-msg hook/, "the hook's trailer is kept")
+    assert.equal(gitIn(wt.root, "rev-list", "--count", `${wt.baseline!}..HEAD`), "1")
+  })
+
+  test("commitMsgHook honours core.hooksPath and only counts an executable hook", async () => {
+    const wt = makeRepo()
+    const hooks = fs.mkdtempSync(path.join(os.tmpdir(), "horde-hooks-"))
+    const hook = path.join(hooks, "commit-msg")
+    fs.writeFileSync(hook, "#!/bin/sh\n")
+    gitIn(wt.root, "config", "core.hooksPath", hooks)
+    assert.equal(await commitMsgHook(wt.root), process.platform === "win32" ? hook : undefined, "a non-executable hook is ignored")
+    if (process.platform !== "win32") {
+      fs.chmodSync(hook, 0o755)
+      assert.equal(await commitMsgHook(wt.root), hook)
+    }
+    // A relative core.hooksPath is resolved against the checkout, as git does.
+    const local = path.join(wt.root, "hooks-here")
+    fs.mkdirSync(local)
+    fs.writeFileSync(path.join(local, "commit-msg"), "#!/bin/sh\n")
+    if (process.platform !== "win32") fs.chmodSync(path.join(local, "commit-msg"), 0o755)
+    gitIn(wt.root, "config", "core.hooksPath", "hooks-here")
+    assert.equal(await commitMsgHook(wt.root), path.join(local, "commit-msg"))
+    // Without one, nothing to run.
+    gitIn(wt.root, "config", "--unset", "core.hooksPath")
+    assert.equal(await commitMsgHook(wt.root), undefined)
+  })
 })

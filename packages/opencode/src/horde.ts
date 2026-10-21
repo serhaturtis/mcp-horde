@@ -175,9 +175,17 @@ export function registerHorde(tool: Tool, opts: HordeOptions) {
 
   tool(
     "horde_land",
-    "Land a READY task. Its commits are replayed onto your current branch's tip inside its worktree and the project's checks run there; only if they pass is your branch updated, with exactly those commits. Your uncommitted changes stay as they are. Then the task is marked done and its worktree and branch are removed. If the commits conflict with your branch or the checks fail, your branch is not touched: the answer shows why, and the worker, now on top of your branch, can fix it (horde_tell, then horde_land again).",
-    { id: z.string().describe("Task id (t-…).") },
-    async (a, fleet, extra) => renderLanding(a.id, await fleet.land(a.id, extra.mcpReq.signal)),
+    "Land a READY task. Its commits are replayed onto your current branch's tip inside its worktree and the project's checks run there; only if they pass is your branch updated, with exactly those commits. Your uncommitted changes stay as they are. Then the task is marked done and its worktree and branch are removed. If the commits conflict with your branch or the checks fail, your branch is not touched: the answer shows why, and the worker, now on top of your branch, can fix it (horde_tell, then horde_land again). Pass message to land the task's commits as one commit with that message, judged first by the repository's commit-msg hook: a repository that has one needs it.",
+    {
+      id: z.string().describe("Task id (t-…)."),
+      message: z
+        .string()
+        .optional()
+        .describe(
+          'The one commit\'s message, e.g. "feat(auth): add token refresh". Required when the repository has a commit-msg hook (the answer names it), which checks the message before the checks run.',
+        ),
+    },
+    async (a, fleet, extra) => renderLanding(a.id, await fleet.land(a.id, extra.mcpReq.signal, a.message)),
   )
 
   tool(
@@ -362,6 +370,17 @@ function renderLanding(id: string, r: LandResult): string {
     for (const c of r.checks) if (c.baseline && !c.baseline.pass) lines.push(`⚠ ${c.name} fails at ${c.baseline.label} too (not caused by this work)`)
     return lines.join("\n")
   }
+  if (r.why === "hook")
+    return [
+      `not landed: ${id} lands as one commit whose message the repository's commit-msg hook checks (${r.text}).`,
+      `→ horde_land {id: "${id}", message: "<the commit message>"} (the task lands as one commit with it, checked by that hook) · horde_drop {id: "${id}"}`,
+    ].join("\n")
+  if (r.why === "message")
+    return [
+      `not landed: ${id}'s commit message did not pass the repository's commit-msg hook${r.hook ? ` ${r.hook}` : ""}; ${r.target} is unchanged:`,
+      indent(truncate(r.text, 1200), "  "),
+      `→ fix the message, then horde_land {id: "${id}", message: "..."}`,
+    ].join("\n")
   if (r.why === "checks")
     return [
       `not landed: ${id}'s commits fail the checks on top of ${r.target}:`,
