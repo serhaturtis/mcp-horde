@@ -52,6 +52,20 @@ To follow the horde from a terminal: `node <plugin dir>/servers/cli.js watch` in
 - Node.js 20 or newer.
 - [OpenCode](https://opencode.ai) on your `PATH` (OpenCode 2: `opencode --version`; tested with 2.1.1), with the providers you want workers to use (`opencode auth login`). Set `HORDE_OPENCODE_BIN` in the server's environment if it lives elsewhere.
 
+## Removing it
+
+Each task cleans up after itself: landing or dropping it removes its worktree, branch, OpenCode session and check logs. A task whose server stopped midway is still listed by `opencode_status`, and `horde_drop` removes it. What stays is small and kept on purpose: the task history the ledger learns from.
+
+To remove the horde entirely:
+
+```sh
+claude plugin uninstall horde@mcp-horde --scope user
+claude plugin marketplace remove mcp-horde
+rm -rf ~/.local/state/mcp-horde ~/.local/share/mcp-horde ~/.config/mcp-horde   # history and logs, worktrees, your defaults
+```
+
+The last three live under `$XDG_STATE_HOME`, `$XDG_DATA_HOME` and `$XDG_CONFIG_HOME` when those are set. In each repository, `horde.json` is yours to keep or delete, and `git branch --list 'horde/*'` shows any branch a task left.
+
 ## From a clone instead
 
 The same servers, from a checkout of this repository (useful while changing them):

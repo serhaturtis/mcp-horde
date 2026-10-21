@@ -3,6 +3,7 @@ import fs from "node:fs"
 import path from "node:path"
 import { after, before, describe, test } from "node:test"
 import { Board } from "@mcp-horde/board"
+import { logDirFor } from "@mcp-horde/verify"
 import { connect, git, type Harness, isolatedEnv, type Mock, makeRepo } from "./harness.js"
 import { startMockLlm } from "./mock-llm.js"
 
@@ -94,12 +95,15 @@ describe("the simple path: horde_do, horde_wait, horde_land (real opencode, mock
     assert.match(ready, new RegExp(`→ horde_land \\{id: "${id}"\\}`))
 
     const before = git(repo, "rev-parse", "HEAD")
+    const logs = logDirFor(path.join(tmp, "xdg-state", "mcp-horde", "verify", "logs"), ready.match(/diff: git -C (\S+) diff/)![1]!)
+    assert.ok(fs.existsSync(logs), "the gate kept its check logs while the task lived")
     const landed = await h.call("horde_land", { id })
     assert.match(
       landed,
       new RegExp(`^landed ${id} on master: 1 commit\\(s\\) · checks ✓ test on master's tip before updating it · task done, worktree and branch removed`),
       landed,
     )
+    assert.ok(!fs.existsSync(logs), "and they went with the worktree")
     assert.equal(fs.readFileSync(path.join(repo, "hello.txt"), "utf8").trim(), "ok")
     assert.equal(git(repo, "rev-parse", "HEAD~1"), before, "exactly the worker's commit, on top of master")
     assert.equal(branches(), "", "the merged branch is gone")

@@ -16,7 +16,7 @@ import {
   reviewPrompt,
   type Verdict,
 } from "@mcp-horde/review"
-import { type CheckResult, gate as runGate, defaultStateDir as verifyStateDir } from "@mcp-horde/verify"
+import { type CheckResult, logDirFor, gate as runGate, defaultStateDir as verifyStateDir } from "@mcp-horde/verify"
 import type {
   AgentInfo,
   FormInfo,
@@ -1304,6 +1304,8 @@ export class Fleet {
         // Let OpenCode release the directory (again before each retry) before it disappears.
         const release = () => this.api.debug.location.evict({ location: { directory: wt.path } }).catch(() => undefined)
         notes.push(await removeWorktree(wt, name, mode === "discard", release))
+        // Its check logs go too: nothing reads them once the worktree is gone.
+        for (const dir of new Set([wt.path, wt.root])) await fs.rm(logDirFor(path.join(verifyStateDir(), "logs"), dir), { recursive: true, force: true })
       }
     }
     if (!opts.deleteSession) notes.push(`the session ${id} stays in OpenCode history`)
