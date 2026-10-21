@@ -56,7 +56,9 @@ To follow the horde from a terminal: `node <plugin dir>/servers/cli.js watch` in
 
 Each task cleans up after itself: landing or dropping it removes its worktree, branch, OpenCode session and check logs. A task whose server stopped midway is still listed by `opencode_status`, and `horde_drop` removes it. What stays is small and kept on purpose: the task history the ledger learns from.
 
-To remove everything the horde keeps for one repository — its worktrees, its `horde/*` branches (listed with the commits they hold that are not on the current branch), its board (task history, findings and memory), and its check logs and locks — run this from a checkout or worktree of it:
+**`/horde:remove`** in Claude Code takes the horde out of a repository, the reverse of `/horde:setup`: it shows what will go, asks once, then removes the horde's state for that repository and, with your go-ahead, `horde.json` and the delegation line in `CLAUDE.md`. To start a repository over, run `/horde:remove`, then `/horde:setup`.
+
+Underneath it is the CLI, which you can also run yourself. To remove everything the horde keeps for one repository — its worktrees, its `horde/*` branches (listed with the commits they hold that are not on the current branch), its board (task history, findings and memory), and its check logs and locks — run this from a checkout or worktree of it:
 
 ```sh
 node <plugin dir>/servers/cli.js remove [--repo <dir>] [--yes]
@@ -86,6 +88,6 @@ claude mcp add verify   -- node "$PWD/plugins/horde/servers/verify.js"
 claude mcp add context  -- node "$PWD/plugins/horde/servers/context.js"
 ```
 
-Copy `skills/horde` and `skills/setup` into your project's `.claude/skills/` for the procedure and the repository setup.
+Copy `skills/horde`, `skills/setup` and `skills/remove` into your project's `.claude/skills/` for the procedure and the repository setup.
 
 The bundles are generated from `packages/*` by `npm run bundle` (esbuild); `./ci.sh` fails when they do not match the sources. Do not edit them by hand.

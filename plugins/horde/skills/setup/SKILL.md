@@ -5,7 +5,7 @@ description: Set a repository up for the horde. Finds the commands that really c
 
 # Setting a repository up for the horde
 
-Every task runs in its own worktree, a fresh checkout of HEAD, and the project's checks judge its work there. `horde.json` at the repository root says what those checks are, what a new worktree needs, and what checks share. Without it, checks are guessed from package.json, pyproject.toml, Cargo.toml, go.mod or a Makefile at the root; `verify_detect` shows what is found.
+Every task runs in its own worktree, a fresh checkout of HEAD, and the project's checks judge its work there. `horde.json` at the repository root says what those checks are, what a new worktree needs, and what checks share. Without it, checks are guessed from package.json, pyproject.toml, Cargo.toml, go.mod or a Makefile at the root; `verify_detect` shows what is found. `/horde:remove` undoes all of this.
 
 ## Steps
 
