@@ -56,6 +56,14 @@ To follow the horde from a terminal: `node <plugin dir>/servers/cli.js watch` in
 
 Each task cleans up after itself: landing or dropping it removes its worktree, branch, OpenCode session and check logs. A task whose server stopped midway is still listed by `opencode_status`, and `horde_drop` removes it. What stays is small and kept on purpose: the task history the ledger learns from.
 
+To remove everything the horde keeps for one repository — its worktrees, its `horde/*` branches (listed with the commits they hold that are not on the current branch), its board (task history, findings and memory), and its check logs and locks — run this from a checkout or worktree of it:
+
+```sh
+node <plugin dir>/servers/cli.js remove [--repo <dir>] [--yes]
+```
+
+Without `--yes` it prints what would be removed and changes nothing. With `--yes` it removes those and nothing else: `horde.json`, other tracked files and your uncommitted changes stay, as do OpenCode's own session history and user-level config. `horde.json` is yours: `git rm horde.json` to drop the configuration.
+
 To remove the horde entirely:
 
 ```sh
@@ -64,7 +72,7 @@ claude plugin marketplace remove mcp-horde
 rm -rf ~/.local/state/mcp-horde ~/.local/share/mcp-horde ~/.config/mcp-horde   # history and logs, worktrees, your defaults
 ```
 
-The last three live under `$XDG_STATE_HOME`, `$XDG_DATA_HOME` and `$XDG_CONFIG_HOME` when those are set. In each repository, `horde.json` is yours to keep or delete, and `git branch --list 'horde/*'` shows any branch a task left.
+The last three live under `$XDG_STATE_HOME`, `$XDG_DATA_HOME` and `$XDG_CONFIG_HOME` when those are set.
 
 ## From a clone instead
 

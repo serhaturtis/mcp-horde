@@ -191,6 +191,8 @@ export class Store {
     for (const f of fs.readdirSync(this.agentsDir)) {
       if (!f.endsWith(".json")) continue
       const r = readJson<AgentRecord>(path.join(this.agentsDir, f))
+      // A worktree removed from disk (e.g. `horde remove`) is no longer an agent to show.
+      if (r?.worktree && !fs.existsSync(r.worktree.root)) continue
       if (r?.id && r.server === server) out.push(r)
     }
     return out

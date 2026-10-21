@@ -11,7 +11,7 @@ import { isLoopback, shimTarget } from "../src/backend.js"
 import { loadConfig } from "../src/config.js"
 import { defaultQuestionPolicy, defined, dismissAnswer, formAnswer, formatModel, parseModel, waitedOut } from "../src/fleet.js"
 import { questionAnswers, questionSchema } from "../src/hooks.js"
-import { Store } from "../src/state.js"
+import { type AgentRecord, Store } from "../src/state.js"
 import { price } from "../src/tools.js"
 import { buildTrack, costSince, currentTurn, latestTool, stablePrefix, turnsSince } from "../src/tracker.js"
 import { branchSlug, validateLink } from "../src/worktree.js"
@@ -430,6 +430,31 @@ describe("state store", () => {
     assert.equal(store.get("ses_a")?.name, undefined)
     assert.equal(store.get("ses_a")?.reportedSeq, 4)
     assert.throws(() => store.get("../escape"), /invalid session id/)
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+
+  test("a record whose worktree directory is gone is dropped", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "horde-state-gone-"))
+    const worktree = fs.mkdtempSync(path.join(os.tmpdir(), "horde-worktree-"))
+    const store = new Store(dir)
+    const record: AgentRecord = {
+      id: "ses_gone",
+      server: "local",
+      directory: worktree,
+      policy: "user",
+      questions: "user",
+      worktree: { path: worktree, root: worktree, branch: "horde/x", base: "0".repeat(40), repo: "/w" },
+      limits: {},
+      createdAt: 1,
+      reportedSeq: 0,
+    }
+    store.put(record)
+    assert.deepEqual(
+      store.agents("local").map((r) => r.id),
+      ["ses_gone"],
+    )
+    fs.rmSync(worktree, { recursive: true, force: true })
+    assert.deepEqual(store.agents("local"), [], "a removed worktree leaves no stale agent")
     fs.rmSync(dir, { recursive: true, force: true })
   })
 

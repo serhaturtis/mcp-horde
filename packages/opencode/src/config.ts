@@ -1,6 +1,6 @@
 import os from "node:os"
 import path from "node:path"
-import { loadHordeFile, loadUserHordeFile } from "@mcp-horde/core"
+import { defaultWorktreeDir, loadHordeFile, loadUserHordeFile } from "@mcp-horde/core"
 
 /**
  * How permission requests (and questions) from an agent are handled.
@@ -92,7 +92,6 @@ function maxRunning(env: NodeJS.ProcessEnv, directory: string): { maxRunning: nu
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const home = os.homedir()
   const stateHome = env.XDG_STATE_HOME || path.join(home, ".local", "state")
-  const dataHome = env.XDG_DATA_HOME || path.join(home, ".local", "share")
   const directory = path.resolve(env.HORDE_OPENCODE_DIRECTORY || process.cwd())
   return {
     url: env.HORDE_OPENCODE_URL || undefined,
@@ -105,7 +104,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     defaultPermissions: policy(env.HORDE_OPENCODE_PERMISSIONS),
     ...maxRunning(env, directory),
     stateDir: path.resolve(env.HORDE_OPENCODE_STATE_DIR || path.join(stateHome, "mcp-horde", "opencode")),
-    worktreeDir: path.resolve(env.HORDE_OPENCODE_WORKTREE_DIR || path.join(dataHome, "mcp-horde", "worktrees")),
+    worktreeDir: defaultWorktreeDir(env),
     channel: bool(env.HORDE_OPENCODE_CHANNEL, "HORDE_OPENCODE_CHANNEL"),
     elicitTimeoutMs: int(env.HORDE_OPENCODE_DIALOG_TIMEOUT, 600, "HORDE_OPENCODE_DIALOG_TIMEOUT") * 1000,
   }

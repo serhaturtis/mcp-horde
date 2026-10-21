@@ -9,13 +9,18 @@
  * board, and `horde watch` the same live in the terminal (both read-only; not worker
  * commands, so never approved automatically).
  */
+import fs from "node:fs"
 import path from "node:path"
-import { loadTiers } from "@mcp-horde/core"
-import { Board, type Report } from "./board.js"
+import { defaultWorktreeDir, git, loadTiers, repoKey } from "@mcp-horde/core"
+import { defaultStateDir, lockDirFor, logDirFor } from "@mcp-horde/verify"
+import { Board, defaultStateRoot, projectOf, type Report } from "./board.js"
 import { renderNotes, renderSummary, renderTask } from "./render.js"
 import { printable, watch } from "./watch.js"
 
 type Flags = Record<string, string[]>
+
+/** Flags that stand alone (no value follows). */
+const BOOLEAN_FLAGS = new Set(["yes"])
 
 /** Flags that take a value: the next word is always the value, even when it starts with "--". */
 const VALUE_FLAGS = new Set([
@@ -43,6 +48,10 @@ function parse(argv: string[]): { positional: string[]; flags: Flags } {
     if (a.startsWith("--")) {
       const eq = a.indexOf("=")
       const key = eq > 0 ? a.slice(2, eq) : a.slice(2)
+      if (BOOLEAN_FLAGS.has(key)) {
+        flags[key] = [...(flags[key] ?? []), eq > 0 ? a.slice(eq + 1) : "true"]
+        continue
+      }
       if (!VALUE_FLAGS.has(key)) throw new Error(`unknown flag --${key}`)
       if (eq < 0 && argv[i + 1] === undefined) throw new Error(`--${key} needs a value`)
       const value = eq > 0 ? a.slice(eq + 1) : argv[++i]!
@@ -58,7 +67,7 @@ const csv = (values?: string[]) =>
     .map((s) => s.trim())
     .filter(Boolean)
 const USAGE =
-  "usage: horde --state <dir> task|progress|report|finding|findings|recall|lock|unlock …\n       horde status [task id] | watch [--interval <seconds>]  [--repo <dir> | --state <dir>]"
+  "usage: horde --state <dir> task|progress|report|finding|findings|recall|lock|unlock …\n       horde status [task id] | watch [--interval <seconds>]  [--repo <dir> | --state <dir>]\n       horde remove [--repo <dir>] [--yes]"
 
 /** The board a person asked for: --state, else the one of --repo or the current directory's repository. */
 async function humanBoard(flags: Flags) {
@@ -73,9 +82,91 @@ async function status(args: string[], flags: Flags): Promise<string> {
   return renderSummary(board, 6000)
 }
 
+/** Everything the horde keeps for one repository: board, worktrees, horde/* branches, check logs and locks. */
+async function remove(flags: Flags): Promise<string> {
+  const dir = path.resolve(flags.repo?.[0] ?? process.cwd())
+  const { root, key, legacyKey } = await projectOf(dir)
+  const stateRoot = defaultStateRoot()
+  const verifyRoot = defaultStateDir()
+  const worktreeRoot = path.join(defaultWorktreeDir(), repoKey(root))
+
+  const boards = [...new Set([key, ...(legacyKey ? [legacyKey] : [])])].map((k) => path.join(stateRoot, k)).filter((p) => fs.existsSync(p))
+
+  // Worktrees git knows about under our folder, plus anything left there (the repoKey is ours alone).
+  const registered = (await git(root, "worktree", "list", "--porcelain"))
+    .split("\n")
+    .filter((l) => l.startsWith("worktree "))
+    .map((l) => l.slice("worktree ".length))
+  const within = (p: string) => {
+    const rel = path.relative(worktreeRoot, p)
+    return rel === "" || (rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel))
+  }
+  const ours = registered.filter(within)
+  const left = fs.existsSync(worktreeRoot)
+    ? fs
+        .readdirSync(worktreeRoot, { withFileTypes: true })
+        .filter((e) => e.isDirectory())
+        .map((e) => path.join(worktreeRoot, e.name))
+    : []
+  const worktrees = [...new Set([...ours, ...left])]
+
+  // Each branch's commits that never landed on the current one are work the user may still want.
+  const branches = await Promise.all(
+    (await git(root, "for-each-ref", "--format=%(refname:short)", "refs/heads/horde/"))
+      .split("\n")
+      .filter(Boolean)
+      .map(async (name) => ({
+        name,
+        ahead: Number(await git(root, "rev-list", "--count", `HEAD..${name}`).catch(() => "0")),
+      })),
+  )
+
+  const logBase = path.join(verifyRoot, "logs")
+  const logs = [...new Set([root, ...worktrees].map((d) => logDirFor(logBase, d)))].filter((p) => fs.existsSync(p))
+  const locks = await lockDirFor(root, verifyRoot)
+  const yes = flags.yes !== undefined && flags.yes.at(-1) !== "false"
+
+  const rows = [
+    `horde remove ${root}`,
+    "",
+    yes ? "Removed:" : "Would remove:",
+    "  board",
+    ...(boards.length ? boards.map((p) => `    ${p}`) : ["    (none)"]),
+    "  worktrees",
+    ...(worktrees.length ? worktrees.map((p) => `    ${p}`) : ["    (none)"]),
+    "  branches",
+    ...(branches.length ? branches.map((b) => `    ${b.name} (${b.ahead} commit${b.ahead === 1 ? "" : "s"} not on the current branch)`) : ["    (none)"]),
+    "  check logs",
+    ...(logs.length ? logs.map((p) => `    ${p}`) : ["    (none)"]),
+    "  locks",
+    `    ${locks}${fs.existsSync(locks) ? "" : " (none)"}`,
+    "",
+  ]
+  if (!yes) return [...rows, "Nothing removed. Run with --yes to remove it.", "horde.json is yours: git rm horde.json to drop the configuration."].join("\n")
+
+  const failed: string[] = []
+  for (const p of ours) await git(root, "worktree", "remove", "--force", p).catch((e: Error) => failed.push(e.message.split("\n")[0]!))
+  for (const p of worktrees) fs.rmSync(p, { recursive: true, force: true })
+  fs.rmSync(worktreeRoot, { recursive: true, force: true })
+  await git(root, "worktree", "prune").catch(() => undefined)
+  for (const b of branches) await git(root, "branch", "-D", b.name).catch((e: Error) => failed.push(e.message.split("\n")[0]!))
+  for (const p of boards) fs.rmSync(p, { recursive: true, force: true })
+  for (const p of logs) fs.rmSync(p, { recursive: true, force: true })
+  fs.rmSync(locks, { recursive: true, force: true })
+  return [
+    ...rows,
+    ...(failed.length ? ["could not remove:", ...failed.map((f) => `  ${f}`), ""] : []),
+    "horde.json is yours: git rm horde.json to drop the configuration.",
+  ].join("\n")
+}
+
 async function main(argv: string[]): Promise<string> {
   const { positional, flags } = parse(argv)
   if (positional[0] === "status") return printable(await status(positional.slice(1), flags))
+  if (positional[0] === "remove") {
+    if (positional.length > 1) throw new Error("remove takes no arguments")
+    return remove(flags)
+  }
   if (positional[0] === "watch") {
     const { board, tiers, repo } = await humanBoard(flags)
     const seconds = Number(flags.interval?.[0] ?? 1)

@@ -1,9 +1,8 @@
 import { spawn } from "node:child_process"
-import { createHash } from "node:crypto"
 import { existsSync } from "node:fs"
 import fs from "node:fs/promises"
 import path from "node:path"
-import { GIT_ENV, git, gitRaw, runCommand, splitZ } from "@mcp-horde/core"
+import { branchSlug, GIT_ENV, git, gitRaw, repoKey, runCommand, splitZ } from "@mcp-horde/core"
 
 const isWindows = process.platform === "win32"
 
@@ -13,7 +12,7 @@ const IDENTITY = ["-c", "user.name=mcp-horde", "-c", "user.email=mcp-horde@local
 /** Diff output that does not depend on the user's config (prefixes, colors, external tools). */
 const DIFF = ["-c", "color.ui=never", "-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", "diff", "--no-ext-diff", "--no-color", "--no-textconv"]
 
-export { git, gitRaw }
+export { branchSlug, git, gitRaw }
 
 export interface Worktree {
   /** The agent's working directory (inside the worktree). */
@@ -65,18 +64,6 @@ export async function repoRoot(directory: string): Promise<string> {
   } catch {
     throw new Error(`isolation "worktree" needs a git repository, but ${directory} is not inside one`)
   }
-}
-
-/** A slug git accepts in `horde/<slug>` (no "..", leading ".", trailing "." or ".lock"). */
-export function branchSlug(name: string): string {
-  let s = name
-    .replace(/[^A-Za-z0-9._-]+/g, "-")
-    .replace(/\.{2,}/g, "-")
-    .replace(/^[.-]+/, "")
-    .replace(/(\.lock|\.)+$/i, "")
-    .replace(/-+$/, "")
-  if (!s) s = "agent"
-  return s.slice(0, 80)
 }
 
 /** Validate a link path: relative, inside the repo, not "." and not tracked by git. */
@@ -154,7 +141,7 @@ export async function createWorktree(directory: string, name: string, opts: Work
   const links = await Promise.all((opts.link ?? auto?.links ?? []).map((l) => validateLink(repo, l)))
   const notes = [...(auto?.notes ?? [])]
   const slug = branchSlug(name)
-  const repoKey = `${branchSlug(path.basename(repo))}-${createHash("sha1").update(repo).digest("hex").slice(0, 8)}`
+  const folder = repoKey(repo)
   const base = opts.at
     ? await git(repo, "rev-parse", "--verify", `${opts.at}^{commit}`).catch(() => {
         throw new Error(`commit ${opts.at} is not in ${repo}`)
@@ -168,7 +155,7 @@ export async function createWorktree(directory: string, name: string, opts: Work
   let branch = ""
   for (let i = 1; ; i++) {
     const suffix = i === 1 ? "" : `-${i}`
-    root = path.join(opts.rootDir, repoKey, `${slug}${suffix}`)
+    root = path.join(opts.rootDir, folder, `${slug}${suffix}`)
     branch = `horde/${slug}${suffix}`
     if ((await exists(root)) || (await branchExists(repo, branch))) continue
     await fs.mkdir(path.dirname(root), { recursive: true })

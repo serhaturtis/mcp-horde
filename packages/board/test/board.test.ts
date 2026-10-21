@@ -4,6 +4,8 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { after, describe, test } from "node:test"
+import { repoKey } from "@mcp-horde/core"
+import { lockDirFor, logDirFor } from "@mcp-horde/verify"
 import { Client } from "@modelcontextprotocol/client"
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio"
 import {
@@ -421,6 +423,90 @@ describe("board", () => {
       false,
     )
     await assert.rejects(board.forget("n-nothing"), /no note/)
+  })
+})
+
+describe("horde remove", () => {
+  test("lists one repository's horde state, then removes it and nothing else", async () => {
+    const xdgState = tmp()
+    const xdgData = tmp()
+    const state = path.join(xdgState, "mcp-horde", "board")
+    const verifyState = path.join(xdgState, "mcp-horde", "verify")
+    const worktrees = path.join(xdgData, "mcp-horde", "worktrees")
+    const repoA = repo()
+    const repoB = repo()
+    const a = await projectOf(repoA)
+    const b = await projectOf(repoB)
+
+    // Boards, including the legacy key an older checkout may have used.
+    fs.mkdirSync(path.join(state, a.key, "tasks"), { recursive: true })
+    if (a.legacyKey) fs.mkdirSync(path.join(state, a.legacyKey), { recursive: true })
+    fs.mkdirSync(path.join(state, b.key), { recursive: true })
+
+    // horde.json is tracked and must stay; uncommitted work must stay too.
+    fs.writeFileSync(path.join(repoA, "horde.json"), "{}\n")
+    git(repoA, "add", "horde.json")
+    git(repoA, "commit", "-qm", "horde config")
+    fs.writeFileSync(path.join(repoA, "notes.txt"), "uncommitted\n")
+
+    // Worktrees and branches made the way the horde makes them.
+    const wtA = path.join(worktrees, repoKey(a.root), "task-a")
+    const wtB = path.join(worktrees, repoKey(b.root), "task-b")
+    fs.mkdirSync(path.dirname(wtA), { recursive: true })
+    fs.mkdirSync(path.dirname(wtB), { recursive: true })
+    git(repoA, "worktree", "add", "-q", "-b", "horde/a", wtA)
+    git(repoB, "worktree", "add", "-q", "-b", "horde/b", wtB)
+    fs.writeFileSync(path.join(wtA, "work.txt"), "work\n")
+    git(wtA, "add", "-A")
+    git(wtA, "commit", "-qm", "work")
+    git(repoA, "branch", "horde/empty")
+
+    // Verify logs and lock directories.
+    const logsA = logDirFor(path.join(verifyState, "logs"), repoA)
+    const logsWtA = logDirFor(path.join(verifyState, "logs"), wtA)
+    const logsB = logDirFor(path.join(verifyState, "logs"), repoB)
+    for (const d of [logsA, logsWtA, logsB]) fs.mkdirSync(d, { recursive: true })
+    const locksA = await lockDirFor(repoA, verifyState)
+    const locksB = await lockDirFor(repoB, verifyState)
+    fs.mkdirSync(locksA, { recursive: true })
+    fs.mkdirSync(locksB, { recursive: true })
+
+    const env = {
+      ...process.env,
+      XDG_STATE_HOME: xdgState,
+      XDG_DATA_HOME: xdgData,
+      HORDE_BOARD_STATE_DIR: state,
+      HORDE_VERIFY_STATE_DIR: verifyState,
+    }
+    const run = (args: string[], cwd = repoA) => execFileSync(cliArgv()[0]!, [...cliArgv().slice(1), "remove", ...args], { cwd, env, encoding: "utf8" })
+
+    const preview = run(["--repo", repoA])
+    assert.ok(run(["--repo", wtA]).includes(path.join(state, a.key)), "a worktree resolves to the same repository")
+    for (const p of [path.join(state, a.key), path.join(worktrees, repoKey(a.root)), logsA, locksA])
+      assert.ok(preview.includes(p), `${p} is listed:\n${preview}`)
+    if (a.legacyKey) assert.ok(preview.includes(path.join(state, a.legacyKey)))
+    assert.match(preview, /horde\/a \(1 commit not on the current branch\)/)
+    assert.match(preview, /horde\/empty \(0 commits not on the current branch\)/)
+    assert.match(preview, /Nothing removed\. Run with --yes/)
+    assert.match(preview, /horde\.json is yours: git rm horde\.json to drop the configuration/)
+    assert.ok(fs.existsSync(path.join(state, a.key)), "preview removes nothing")
+    assert.ok(fs.existsSync(wtA))
+    assert.ok(fs.existsSync(path.join(repoA, "notes.txt")))
+
+    const done = run(["--yes"])
+    assert.match(done, /Removed:/)
+    assert.ok(!fs.existsSync(path.join(state, a.key)), "the board is gone")
+    if (a.legacyKey) assert.ok(!fs.existsSync(path.join(state, a.legacyKey)), "the legacy board is gone")
+    assert.ok(!fs.existsSync(path.join(worktrees, repoKey(a.root))), "the repository's worktree folder is gone")
+    assert.ok(!fs.existsSync(logsA) && !fs.existsSync(logsWtA) && !fs.existsSync(locksA))
+    assert.equal(git(repoA, "branch", "--list", "horde/*"), "", "horde branches are gone")
+    assert.ok(fs.existsSync(path.join(repoA, "horde.json")), "horde.json is the user's")
+    assert.equal(fs.readFileSync(path.join(repoA, "notes.txt"), "utf8"), "uncommitted\n", "uncommitted changes stay")
+
+    assert.ok(fs.existsSync(path.join(state, b.key)), "another repository's board stays")
+    assert.ok(fs.existsSync(wtB), "another repository's worktree stays")
+    assert.ok(fs.existsSync(logsB) && fs.existsSync(locksB), "another repository's logs and locks stay")
+    assert.match(git(repoB, "branch", "--list", "horde/*"), /horde\/b/)
   })
 })
 

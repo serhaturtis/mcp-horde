@@ -26,3 +26,4 @@ export {
   truncate,
   truncateHead,
 } from "./text.js"
+export { branchSlug, defaultWorktreeDir, repoKey } from "./worktree.js"

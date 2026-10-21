@@ -337,7 +337,7 @@ export async function gate(directory: string, opts: GateOptions = {}): Promise<V
 const NO_CHECKS = "no checks to run (configure verify.checks in horde.json)"
 
 /** Locks for checks' slots: one directory per repository (its common git dir), shared by all its worktrees. */
-async function lockDirFor(dir: string, stateDir: string): Promise<string> {
+export async function lockDirFor(dir: string, stateDir: string): Promise<string> {
   const common = await git(dir, "rev-parse", "--path-format=absolute", "--git-common-dir").catch(() => dir)
   const real = await fs.realpath(common).catch(() => common)
   return path.join(stateDir, "locks", createHash("sha256").update(real).digest("hex").slice(0, 16))
