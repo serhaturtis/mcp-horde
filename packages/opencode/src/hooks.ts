@@ -1,5 +1,5 @@
 import { truncate } from "@mcp-horde/core"
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
+import type { McpServer } from "@modelcontextprotocol/server"
 import type { FormInfo, PermissionRequest } from "@opencode/client"
 import type { Config } from "./config.js"
 import type { FormAnswer, Hooks, Snapshot } from "./fleet.js"

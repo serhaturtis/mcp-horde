@@ -2,9 +2,9 @@
 import path from "node:path"
 import { loadSyntax } from "@mcp-horde/context"
 import { loadTiers, packageVersion, recordLifecycle, tierLabel } from "@mcp-horde/core"
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js"
+import type { CallToolResult } from "@modelcontextprotocol/server"
+import { McpServer } from "@modelcontextprotocol/server"
+import { StdioServerTransport } from "@modelcontextprotocol/server/stdio"
 import { z } from "zod"
 import { Board, defaultStateRoot } from "./board.js"
 import { renderBrief, renderNotes, renderSummary, renderTask } from "./render.js"
@@ -41,7 +41,7 @@ const tool = <S extends z.ZodRawShape>(
   run: (args: z.infer<z.ZodObject<S>>, board: Board, repo: string) => Promise<string>,
   readOnly = false,
 ) => {
-  server.registerTool(name, { description, inputSchema: shape, annotations: { openWorldHint: false, readOnlyHint: readOnly } }, (async (
+  server.registerTool(name, { description, inputSchema: z.object(shape), annotations: { openWorldHint: false, readOnlyHint: readOnly } }, (async (
     args: z.infer<z.ZodObject<S>> & { directory?: string },
   ) => {
     try {

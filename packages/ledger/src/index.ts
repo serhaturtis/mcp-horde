@@ -2,9 +2,9 @@
 import path from "node:path"
 import { Board, defaultStateRoot } from "@mcp-horde/board"
 import { loadTiers, packageVersion, recordLifecycle } from "@mcp-horde/core"
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js"
+import type { CallToolResult } from "@modelcontextprotocol/server"
+import { McpServer } from "@modelcontextprotocol/server"
+import { StdioServerTransport } from "@modelcontextprotocol/server/stdio"
 import { z } from "zod"
 import { allBoards, type Outcome, outcomesOf, renderStats, stats, suggest, suggestTiers } from "./ledger.js"
 
@@ -49,12 +49,12 @@ server.registerTool(
   {
     description:
       "How attempts went, grouped by model (default), tier, kind of work (test, fix, refactor, docs, build, feature), area (scope directories) or repository: accepted/attempts, mean gate rounds, cost per accepted task, and a warning when a model's latest attempts pass clearly less often than before.",
-    inputSchema: {
+    inputSchema: z.object({
       directory,
       by: z.enum(["model", "tier", "kind", "area", "repo"]).optional(),
       all_repos: z.boolean().optional().describe("Every repository's board, not just this one's (default false)."),
       since_days: z.number().positive().optional().describe("Only attempts closed in the last N days."),
-    },
+    }),
     annotations: { readOnlyHint: true, openWorldHint: false },
   },
   async (a) => {
@@ -84,7 +84,7 @@ server.registerTool(
   {
     description:
       "The tier a task should start on: the cheapest one that similar work (same area of this repository, same kind of work; other repositories by kind) has not shown to fail, with the evidence. For board tasks (default: every open, untried task) or a draft not on the board yet. apply: true raises the tier of untried tasks to the suggestion (never lowers one).",
-    inputSchema: {
+    inputSchema: z.object({
       directory,
       ids: z.array(z.string()).optional().describe("Board task ids (default: open tasks with no attempt yet)."),
       draft: z
@@ -93,7 +93,7 @@ server.registerTool(
         .describe("A task you are about to plan, instead of board tasks."),
       apply: z.boolean().optional(),
       all_repos: z.boolean().optional().describe("Use every repository's history as well (default true)."),
-    },
+    }),
     annotations: { openWorldHint: false },
   },
   async (a) => {

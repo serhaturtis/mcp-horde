@@ -1,6 +1,6 @@
 import { formatTokens, formatUsd, indent, oneLine, truncate, truncateHead } from "@mcp-horde/core"
-import { type McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js"
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js"
+import type { CallToolResult, McpServer, ServerContext } from "@modelcontextprotocol/server"
+import { ResourceTemplate } from "@modelcontextprotocol/server"
 import { z } from "zod"
 import { type JsonSchema, unsupportedSchema } from "./ask.js"
 import type { Backend } from "./backend.js"
@@ -10,11 +10,7 @@ import { defined, formatModel, SETTLED, unsupportedReason } from "./fleet.js"
 import { HORDE_INSTRUCTIONS, registerHorde } from "./horde.js"
 import type { Turn } from "./tracker.js"
 
-type Extra = {
-  signal: AbortSignal
-  _meta?: { progressToken?: string | number }
-  sendNotification: (n: { method: "notifications/progress"; params: Record<string, unknown> }) => Promise<void>
-}
+type Extra = ServerContext
 
 export interface Context {
   fleet: () => Promise<Fleet>
@@ -214,22 +210,22 @@ export function attachCommand(url: string, passwordFile: string, username = "ope
 
 /** Progress notifications for long single operations (e.g. worktree setup). */
 function progressMessage(extra: Extra) {
-  const token = extra._meta?.progressToken
+  const token = extra.mcpReq._meta?.progressToken
   if (token === undefined) return undefined
   let n = 0
   return (message: string) => {
-    void extra.sendNotification({ method: "notifications/progress", params: { progressToken: token, progress: ++n, message } }).catch(() => undefined)
+    void extra.mcpReq.notify({ method: "notifications/progress", params: { progressToken: token, progress: ++n, message } }).catch(() => undefined)
   }
 }
 
 function progress(extra: Extra) {
-  const token = extra._meta?.progressToken
+  const token = extra.mcpReq._meta?.progressToken
   if (token === undefined) return undefined
   let n = 0
   return (snaps: Snapshot[], elapsed: number) => {
     const running = snaps.filter((s) => !SETTLED.has(s.state)).map((s) => `${s.name ?? s.id}${s.activity ? ` (${truncate(s.activity, 60)})` : ""}`)
-    void extra
-      .sendNotification({
+    void extra.mcpReq
+      .notify({
         method: "notifications/progress",
         params: { progressToken: token, progress: ++n, message: `${Math.round(elapsed / 1000)}s · ${running.join(", ")}` },
       })
@@ -258,7 +254,7 @@ export function registerTools(server: McpServer, ctx: Context) {
   ) => {
     // Claude Code defers MCP tools behind a search; the few an agent should see at once load upfront.
     const _meta = opts.alwaysLoad ? { "anthropic/alwaysLoad": true } : undefined
-    server.registerTool(name, { description, inputSchema: shape, annotations: { openWorldHint: false, ...annotations }, _meta }, (async (
+    server.registerTool(name, { description, inputSchema: z.object(shape), annotations: { openWorldHint: false, ...annotations }, _meta }, (async (
       args: z.infer<z.ZodObject<S>>,
       extra: Extra,
     ) => {
@@ -275,7 +271,7 @@ export function registerTools(server: McpServer, ctx: Context) {
 
   const waitAndRender = async (fleet: Fleet, ids: string[], mode: "any" | "all", seconds: number | undefined, extra: Extra, chars: number) => {
     const secs = seconds ?? defaultWait(ctx)
-    const r = await fleet.waitFor(ids, mode, secs * 1000, { signal: extra.signal, onTick: progress(extra) })
+    const r = await fleet.waitFor(ids, mode, secs * 1000, { signal: extra.mcpReq.signal, onTick: progress(extra) })
     const news = r.snapshots.filter((s) => r.news.has(s.id))
     const running = r.snapshots.filter((s) => !SETTLED.has(s.state))
     const quiet = r.snapshots.filter((s) => SETTLED.has(s.state) && !r.news.has(s.id))
@@ -429,7 +425,7 @@ export function registerTools(server: McpServer, ctx: Context) {
         files: a.files,
         gate: gateIn(a.gate),
         scope: a.scope,
-        signal: extra.signal,
+        signal: extra.mcpReq.signal,
         onProgress: progressMessage(extra),
       })
       const noteText = notes.length ? `\n${notes.map((n) => `  · ${n}`).join("\n")}` : ""
@@ -609,7 +605,7 @@ export function registerTools(server: McpServer, ctx: Context) {
         schema: a.schema as JsonSchema | undefined,
         directory: a.directory,
         timeoutMs: (a.timeout_seconds ?? Math.min(defaultWait(ctx), 300)) * 1000,
-        signal: extra.signal,
+        signal: extra.mcpReq.signal,
       })
       const meta = `(${formatModel(r.model)} · ${formatUsd(r.cost)}${r.retried ? " · retried once for the schema" : ""}${r.guarded ? " · read-only tools offered: this provider refuses tool-less sessions" : ""})`
       return r.json !== undefined ? `${JSON.stringify(r.json, null, 2)}\n${meta}` : `${r.text}\n${meta}`
@@ -637,7 +633,7 @@ export function registerTools(server: McpServer, ctx: Context) {
         base: a.base,
         maxDiffChars: a.max_diff_chars,
         timeoutMs: (a.timeout_seconds ?? Math.min(defaultWait(ctx), 300)) * 1000,
-        signal: extra.signal,
+        signal: extra.mcpReq.signal,
       }),
   )
 
@@ -711,7 +707,7 @@ export function registerTools(server: McpServer, ctx: Context) {
       max_chars: z.number().int().min(500).max(200_000).optional(),
       check: z.boolean().optional().describe("merge: run the project's checks in your checkout afterwards (default true; no audit)."),
     },
-    async (a, fleet, extra) => fleet.worktree(a.id, a.action, { strategy: a.strategy, maxChars: a.max_chars, check: a.check, signal: extra.signal }),
+    async (a, fleet, extra) => fleet.worktree(a.id, a.action, { strategy: a.strategy, maxChars: a.max_chars, check: a.check, signal: extra.mcpReq.signal }),
   )
 
   tool(
@@ -731,7 +727,7 @@ export function registerTools(server: McpServer, ctx: Context) {
     {
       description:
         'The OpenCode server behind the agents: "info" shows its URL, version and the command to watch agents live in the OpenCode TUI; "stop" stops the server this MCP server manages (and every agent on it); the next call starts a fresh one.',
-      inputSchema: { action: z.enum(["info", "stop"]) },
+      inputSchema: z.object({ action: z.enum(["info", "stop"]) }),
       annotations: { openWorldHint: false },
     },
     (async (a: { action: "info" | "stop" }) => {

@@ -89,7 +89,7 @@ OpenCode 2's prompt order is: agent prompt → Code Mode guidance → MCP and sk
 ## What this means for the horde's servers
 
 Repository state checked on 2026-10-21 [checked]:
-- All packages use `@modelcontextprotocol/sdk ^1.32.1`.
+- All packages use the v2 SDK (`@modelcontextprotocol/server` and `/client` 2.3.1, since 2026-10-21; it was `@modelcontextprotocol/sdk` 1.32.1 before), still on the legacy era (see below).
 - Tools set annotations, including `openWorldHint: false`.
 - No tool returns `structuredContent`.
 - `fleet.waitFor` calls its `onTick` on every loop pass (every 1–2 s). When the client sent a `progressToken`, `horde_wait` and `opencode_wait` turn each tick into `notifications/progress`.
@@ -100,6 +100,31 @@ Repository state checked on 2026-10-21 [checked]:
    - In subagents and `-p` runs the call blocks for its whole duration. The 30-minute stdio idle window then matters if no progress is sent, for example when the client sent no `progressToken`. Whether Claude Code always sends one is not documented [inference].
    - A per-server `timeout` is not extended by progress.
 3. **`structuredContent`.** If it is ever added, anything the model must read (the READY/NEEDS YOU/FAILED line, the next calls) has to be inside the JSON as well. The text is not shown on success.
-4. **Migrate to SDK 2 and 2026-07-28 at some point.** Claude Code negotiates it by default for stdio. Do not use sampling (deprecated). Channel messages break on 2026-07-28. Mid-task user input would go through elicitation via MRTR.
+4. **The packages are on SDK 2, on the legacy era.** Moving to 2026-07-28 is a separate step. Do not use sampling (deprecated).
 5. **Lead with the trigger.** Claude Code cuts instructions and upfront descriptions at 4,096 characters, and Codex reads the first 512 with priority. The first sentences should say when to use the server.
 6. **Workers in OpenCode 2 read AGENTS.md, never CLAUDE.md.** Project guidance for workers has to come from AGENTS.md or the brief. The `context` plugin hook is OpenCode 2's per-call injection point if one is needed.
+
+## The SDK v2 migration
+
+Done on 2026-10-21. The findings below were tested with a v2 client over stdio in a scratch clone, not in Claude Code, except where noted [read].
+
+**What it took:**
+- The SDK's codemod (`@modelcontextprotocol/codemod`) handled the imports and wrapped raw shapes in `z.object`.
+- Four fixes by hand followed:
+  - `setNotificationHandler` takes the method name;
+  - `z.object` in the generic tool helpers;
+  - `allowImportingTsExtensions` in the test tsconfigs, because a client dependency exports a `source` condition that our `customConditions` picks up;
+  - zod `^4.2.0`, because older 4.x loses `.describe()` text in tool schemas.
+- **The trap.** Handlers typed with a hand-written context (`extra.signal`, `extra._meta`, `extra.sendNotification`) compile, but progress goes quiet and cancellation stops reaching the checks. Typing the context as `ServerContext` and using `ctx.mcpReq.*` fixes that. A verify test now holds both.
+
+**The wire stayed the same.** `server.connect(new StdioServerTransport())` keeps a v2 server on the legacy (2025) handshake only. In Claude Code 2.1.305 all five servers connect and list their tools as before [checked]. The tool schemas now name JSON Schema 2020-12 instead of draft-07, and `execution.taskSupport` is gone.
+
+**Serving 2026-07-28 too** takes `serveStdio(factory)` from `@modelcontextprotocol/server/stdio`. The factory must build a fresh `McpServer` on each call, because a probe can create one and throw it away. What that would change:
+- **Elicitation.** Requests from server to client do not exist on 2026-07-28 (`Server-to-client requests are not available`). The opencode server asks the human from the background (`askPermission` / `askQuestion`, outside any tool call), so the default `user` policy would quietly hand every prompt to the orchestrator instead. A tool call can still ask, but only by returning `input_required` with a sealed `requestState`. Whether Claude Code shows those prompts was not checked.
+- **Channels.** The SDK still sends `notifications/claude/channel`, but Claude Code drops them on 2026-07-28.
+- **Progress, `_meta` (`anthropic/alwaysLoad`), annotations and instructions** all work on both eras.
+- **Client identity.** With no `initialize` there is no `getClientVersion()`, so `defaultWait`'s Claude Code check fails, and waits drop to 50 s. The client info is in each request's envelope instead (`ctx.mcpReq.envelope["io.modelcontextprotocol/clientInfo"]`).
+
+**The order this suggests:**
+1. board, context, ledger and verify can move to `serveStdio` with little change. They use only instructions, annotations and progress.
+2. opencode should stay on legacy until Claude Code delivers channels on 2026-07-28 (or the horde drops them) and its handling of `input_required` is confirmed.

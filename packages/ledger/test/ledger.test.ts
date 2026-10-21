@@ -5,8 +5,8 @@ import os from "node:os"
 import path from "node:path"
 import { describe, test } from "node:test"
 import { Board } from "@mcp-horde/board"
-import { Client } from "@modelcontextprotocol/sdk/client/index.js"
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
+import { Client } from "@modelcontextprotocol/client"
+import { StdioClientTransport } from "@modelcontextprotocol/client/stdio"
 import { areasOf, kindOf, outcomesOf, renderStats, stats, suggest, suggestTiers } from "../src/lib.js"
 
 const tmp = () => fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "horde-ledger-")))

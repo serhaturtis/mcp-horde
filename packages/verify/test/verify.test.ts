@@ -4,8 +4,8 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { after, describe, test } from "node:test"
-import { Client } from "@modelcontextprotocol/sdk/client/index.js"
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
+import { Client } from "@modelcontextprotocol/client"
+import { StdioClientTransport } from "@modelcontextprotocol/client/stdio"
 import {
   type AuditCategory,
   type AuditOptions,
@@ -694,7 +694,7 @@ describe("MCP server", () => {
     )
     try {
       const call = async (name: string, args: Record<string, unknown> = {}) => {
-        const res = (await client.callTool({ name, arguments: args }, undefined, { timeout: 120_000 })) as { content: { text: string }[]; isError?: boolean }
+        const res = (await client.callTool({ name, arguments: args }, { timeout: 120_000 })) as { content: { text: string }[]; isError?: boolean }
         return { text: res.content.map((c) => c.text).join("\n"), isError: !!res.isError }
       }
       const tools = (await client.listTools()).tools.map((t) => t.name).sort()
@@ -708,6 +708,39 @@ describe("MCP server", () => {
       // TAP on Node 20/22, spec on Node 24.
       assert.match((await call("verify_logs", { check: "test", max_chars: 4000 })).text, /(?:not ok 1 - adds|✖ adds)/)
       assert.match((await call("verify_audit", { base })).text, /0 files changed, 0 commits since \w+; no findings\./)
+    } finally {
+      await client.close()
+    }
+  })
+
+  // Moving to SDK v2 once left the handlers on v1's context fields: tsc said nothing, progress went
+  // quiet and a cancelled gate's check ran on. This holds both ends.
+  test("a gate sends progress, and cancelling it stops the check", async () => {
+    const late = "node -e \"setTimeout(() => require('fs').writeFileSync('late.txt', 'x'), 3000)\""
+    const { root } = repo({ "horde.json": JSON.stringify({ verify: { checks: { test: late } } }) })
+    const client = new Client({ name: "test", version: "0" })
+    await client.connect(
+      new StdioClientTransport({
+        command: process.execPath,
+        args: ["--conditions=source", "--import", "tsx", path.join(pkg, "src/index.ts")],
+        cwd: pkg,
+        env: { ...(process.env as Record<string, string>), HORDE_VERIFY_DIRECTORY: root, HORDE_VERIFY_STATE_DIR: tmp() },
+        stderr: "inherit",
+      }),
+    )
+    try {
+      const seen: string[] = []
+      const ac = new AbortController()
+      setTimeout(() => ac.abort(), 1500)
+      await client
+        .callTool({ name: "verify_gate", arguments: { fresh: true } }, { onprogress: (p) => seen.push(String(p.message)), signal: ac.signal, timeout: 60_000 })
+        .catch(() => undefined)
+      assert.ok(
+        seen.some((m) => m.includes("test")),
+        `progress: ${JSON.stringify(seen)}`,
+      )
+      await new Promise((r) => setTimeout(r, 2500))
+      assert.equal(fs.existsSync(path.join(root, "late.txt")), false, "the cancelled check kept running")
     } finally {
       await client.close()
     }

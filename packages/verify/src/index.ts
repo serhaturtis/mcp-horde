@@ -3,9 +3,9 @@ import fs from "node:fs"
 import path from "node:path"
 import { loadSyntax } from "@mcp-horde/context"
 import { git, packageVersion, recordLifecycle, truncateHead } from "@mcp-horde/core"
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js"
+import type { CallToolResult, ServerContext } from "@modelcontextprotocol/server"
+import { McpServer } from "@modelcontextprotocol/server"
+import { StdioServerTransport } from "@modelcontextprotocol/server/stdio"
 import { z } from "zod"
 import { audit, diffBase } from "./audit.js"
 import { checkScripts, detectChecks, loadSettings, loadSettingsAt } from "./detect.js"
@@ -22,11 +22,7 @@ process.on("unhandledRejection", (err) => {
 const DEFAULT_DIR = path.resolve(process.env.HORDE_VERIFY_DIRECTORY || process.cwd())
 const STATE_DIR = defaultStateDir()
 
-type Extra = {
-  signal: AbortSignal
-  _meta?: { progressToken?: string | number }
-  sendNotification: (n: { method: "notifications/progress"; params: Record<string, unknown> }) => Promise<void>
-}
+type Extra = ServerContext
 
 const ok = (text: string): CallToolResult => ({ content: [{ type: "text", text }] })
 const fail = (err: unknown): CallToolResult => ({
@@ -36,11 +32,11 @@ const fail = (err: unknown): CallToolResult => ({
 
 /** Progress notifications keep long check runs alive in clients with idle timeouts. */
 function progress(extra: Extra) {
-  const token = extra._meta?.progressToken
+  const token = extra.mcpReq._meta?.progressToken
   if (token === undefined) return undefined
   let n = 0
   return (message: string) => {
-    void extra.sendNotification({ method: "notifications/progress", params: { progressToken: token, progress: ++n, message } }).catch(() => undefined)
+    void extra.mcpReq.notify({ method: "notifications/progress", params: { progressToken: token, progress: ++n, message } }).catch(() => undefined)
   }
 }
 
@@ -62,7 +58,7 @@ const tool = <S extends z.ZodRawShape>(
   run: (args: z.infer<z.ZodObject<S>>, extra: Extra) => Promise<string>,
   annotations: { readOnlyHint?: boolean } = {},
 ) => {
-  server.registerTool(name, { description, inputSchema: shape, annotations: { openWorldHint: false, ...annotations } }, (async (
+  server.registerTool(name, { description, inputSchema: z.object(shape), annotations: { openWorldHint: false, ...annotations } }, (async (
     args: z.infer<z.ZodObject<S>>,
     extra: Extra,
   ) => {
@@ -127,7 +123,7 @@ tool(
       fresh: a.fresh,
       related: a.related,
       budgetChars: a.budget_chars,
-      signal: extra.signal,
+      signal: extra.mcpReq.signal,
       onProgress: progress(extra),
       stateDir: STATE_DIR,
     })
@@ -155,7 +151,7 @@ tool(
       audit: false,
       fresh: a.fresh,
       budgetChars: a.budget_chars,
-      signal: extra.signal,
+      signal: extra.mcpReq.signal,
       onProgress: progress(extra),
       stateDir: STATE_DIR,
     })

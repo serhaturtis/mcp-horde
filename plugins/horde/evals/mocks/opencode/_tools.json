@@ -55,13 +55,10 @@
         "required": [
           "goal"
         ],
-        "$schema": "http://json-schema.org/draft-07/schema#"
+        "$schema": "https://json-schema.org/draft/2020-12/schema"
       },
       "annotations": {
         "openWorldHint": false
-      },
-      "execution": {
-        "taskSupport": "forbidden"
       },
       "_meta": {
         "anthropic/alwaysLoad": true
@@ -87,13 +84,10 @@
             "description": "How long to block (default 25 min in Claude Code, 50 s elsewhere); on a timeout the workers keep going."
           }
         },
-        "$schema": "http://json-schema.org/draft-07/schema#"
+        "$schema": "https://json-schema.org/draft/2020-12/schema"
       },
       "annotations": {
         "openWorldHint": false
-      },
-      "execution": {
-        "taskSupport": "forbidden"
       },
       "_meta": {
         "anthropic/alwaysLoad": true
@@ -130,13 +124,10 @@
         "required": [
           "id"
         ],
-        "$schema": "http://json-schema.org/draft-07/schema#"
+        "$schema": "https://json-schema.org/draft/2020-12/schema"
       },
       "annotations": {
         "openWorldHint": false
-      },
-      "execution": {
-        "taskSupport": "forbidden"
       },
       "_meta": {
         "anthropic/alwaysLoad": true
@@ -156,13 +147,10 @@
         "required": [
           "id"
         ],
-        "$schema": "http://json-schema.org/draft-07/schema#"
+        "$schema": "https://json-schema.org/draft/2020-12/schema"
       },
       "annotations": {
         "openWorldHint": false
-      },
-      "execution": {
-        "taskSupport": "forbidden"
       },
       "_meta": {
         "anthropic/alwaysLoad": true
@@ -185,13 +173,10 @@
         "required": [
           "id"
         ],
-        "$schema": "http://json-schema.org/draft-07/schema#"
+        "$schema": "https://json-schema.org/draft/2020-12/schema"
       },
       "annotations": {
         "openWorldHint": false
-      },
-      "execution": {
-        "taskSupport": "forbidden"
       },
       "_meta": {
         "anthropic/alwaysLoad": true

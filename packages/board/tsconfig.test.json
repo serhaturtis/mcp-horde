@@ -3,7 +3,8 @@
   "compilerOptions": {
     "noEmit": true,
     "declaration": false,
-    "customConditions": ["source"]
+    "customConditions": ["source"],
+    "allowImportingTsExtensions": true
   },
   "include": ["src", "test"]
 }

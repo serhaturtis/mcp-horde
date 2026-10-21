@@ -42,10 +42,11 @@
   "dependencies": {
     "@mcp-horde/context": "^0.1.0",
     "@mcp-horde/core": "^0.1.0",
-    "@modelcontextprotocol/sdk": "^1.32.1",
-    "zod": "^4.0.0"
+    "@modelcontextprotocol/server": "^2.3.1",
+    "zod": "^4.2.0"
   },
   "devDependencies": {
+    "@modelcontextprotocol/client": "^2.3.1",
     "@types/node": "^22.20.5",
     "tsx": "^4.23.15",
     "typescript": "^5.9.3"

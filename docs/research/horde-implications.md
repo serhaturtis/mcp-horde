@@ -39,6 +39,17 @@ What already matches the guidance:
 
 The eval baseline changes the order of these recommendations. The texts below depart from the guidance, yet they produced the target behaviour in every case measured. So recommendations 2 and 3 are now about robustness and risk, not about fixing a measured failure. Change a text only with an eval run before and after, at three runs per case for anything subtle.
 
+**Status on 2026-10-21:**
+
+| # | Recommendation | Status | Where |
+| --- | --- | --- | --- |
+| 1 | Eval | Built: nine cases, about $2.84 a pass | `plugins/horde/evals` |
+| 2 | Texts | Rewritten. The first rewrite lost delegation (5/8), and a concrete size line restored it (8/9) | d03669d, [experiments](experiments.md#eval-pass-with-a-concrete-line) |
+| 3 | Nudge | Option 1, a PostToolUse note at the fourth file edited by hand | 389bd93 |
+| 4 | Opt-in | A CLAUDE.md line in the plugin README, plus `install.sh --default-model` | |
+| 5 | Subagents | Read-only types get no hook text, and `horde_wait` says it blocks in a subagent | 389bd93, 5676e77 |
+| 6 | Protocol | 25-minute wait default, SDK 2 on the legacy era, and briefs point workers at cut instruction files | 5676e77 |
+
 ### 1. Build the eval before changing more wording
 
 Done: [`plugins/horde/evals`](../../plugins/horde/evals/README.md), with the baseline in [experiments](experiments.md#eval-baseline). The rest of this section is the design it follows. Two runs of one task cannot tell a better text from a worse one ([experiments](experiments.md)). `claude plugin eval` runs each case three times with and without the plugin, and supports "must not call" graders ([claude-code](claude-code.md#measuring-claude-plugin-eval)).
@@ -96,7 +107,7 @@ See [mcp-protocol](mcp-protocol.md#what-this-means-for-the-hordes-servers):
 - keep the task-id handles;
 - keep progress flowing during waits;
 - carry model-facing text inside any future `structuredContent`;
-- plan the SDK 2 / 2026-07-28 migration;
+- the packages are on SDK 2, on the legacy era; moving to 2026-07-28 has an order ([mcp-protocol](mcp-protocol.md#the-sdk-v2-migration));
 - avoid sampling and channels on 2026-07-28;
 - give workers their project guidance through AGENTS.md or the brief.
 

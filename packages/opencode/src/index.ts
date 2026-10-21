@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 import { loadSyntax } from "@mcp-horde/context"
 import { packageVersion, recordLifecycle } from "@mcp-horde/core"
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
+import { McpServer } from "@modelcontextprotocol/server"
+import { StdioServerTransport } from "@modelcontextprotocol/server/stdio"
 import { Backend, sharedServerAlive, stopServer } from "./backend.js"
 import { type Config, inProject, loadConfig } from "./config.js"
 import { Fleet } from "./fleet.js"

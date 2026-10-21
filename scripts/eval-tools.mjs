@@ -9,8 +9,8 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
-import { Client } from "@modelcontextprotocol/sdk/client/index.js"
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
+import { Client } from "@modelcontextprotocol/client"
+import { StdioClientTransport } from "@modelcontextprotocol/client/stdio"
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..")
 const file = path.join(root, "plugins", "horde", "evals", "mocks", "opencode", "_tools.json")

@@ -5,13 +5,14 @@
  */
 import { Board } from "@mcp-horde/board"
 import { formatDuration, formatUsd, git, indent, loadTiers, oneLine, truncate } from "@mcp-horde/core"
+import type { ServerContext } from "@modelcontextprotocol/server"
 import { z } from "zod"
 import { type Fleet, formatModel, formText, type LandResult, SETTLED, type Snapshot } from "./fleet.js"
 import type { AgentRecord, ReviewSummary } from "./state.js"
 import { workStart } from "./worktree.js"
 
 // biome-ignore lint/suspicious/noExplicitAny: the registration helper is generic over each tool's schema
-type Tool = (name: string, description: string, shape: z.ZodRawShape, run: (args: any, fleet: Fleet, extra: any) => Promise<string>) => void
+type Tool = (name: string, description: string, shape: z.ZodRawShape, run: (args: any, fleet: Fleet, extra: ServerContext) => Promise<string>) => void
 
 export interface HordeOptions {
   /** Default seconds a wait blocks for the connected client. */
@@ -88,7 +89,7 @@ export function registerHorde(tool: Tool, opts: HordeOptions) {
           // Questions are about intent: they are the caller's.
           questions: "ask",
           gate: { review: true, ...(task.scope.length ? { allowed: task.scope } : {}) },
-          signal: extra.signal,
+          signal: extra.mcpReq.signal,
         })
         .catch(async (err: Error) => {
           // Nothing started: the plan entry must not linger as an open task.
@@ -169,7 +170,7 @@ export function registerHorde(tool: Tool, opts: HordeOptions) {
     "horde_land",
     "Land a READY task. Its commits are replayed onto your current branch's tip inside its worktree and the project's checks run there; only if they pass is your branch updated, with exactly those commits. Your uncommitted changes stay as they are. Then the task is marked done and its worktree and branch are removed. If the commits conflict with your branch or the checks fail, your branch is not touched: the answer shows why, and the worker, now on top of your branch, can fix it (horde_tell, then horde_land again).",
     { id: z.string().describe("Task id (t-…).") },
-    async (a, fleet, extra) => renderLanding(a.id, await fleet.land(a.id, extra.signal)),
+    async (a, fleet, extra) => renderLanding(a.id, await fleet.land(a.id, extra.mcpReq.signal)),
   )
 
   tool(
@@ -212,8 +213,8 @@ export function registerHorde(tool: Tool, opts: HordeOptions) {
 }
 
 /** Wait, then one outcome block per task with news, a line per task still working. */
-async function collect(fleet: Fleet, ids: string[], mode: "any" | "all", seconds: number, extra: { signal?: AbortSignal }, opts: HordeOptions) {
-  const r = await fleet.waitFor(ids, mode, seconds * 1000, { signal: extra.signal, onTick: opts.progress(extra) })
+async function collect(fleet: Fleet, ids: string[], mode: "any" | "all", seconds: number, extra: ServerContext, opts: HordeOptions) {
+  const r = await fleet.waitFor(ids, mode, seconds * 1000, { signal: extra.mcpReq.signal, onTick: opts.progress(extra) })
   const news = r.snapshots.filter((s) => r.news.has(s.id))
   const working = r.snapshots.filter((s) => !r.news.has(s.id) && !SETTLED.has(s.state))
   const parts: string[] = []

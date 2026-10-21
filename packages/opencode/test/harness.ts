@@ -3,9 +3,9 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
-import { Client } from "@modelcontextprotocol/sdk/client/index.js"
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
-import { ElicitRequestSchema, type ElicitResult } from "@modelcontextprotocol/sdk/types.js"
+import type { ElicitResult } from "@modelcontextprotocol/client"
+import { Client } from "@modelcontextprotocol/client"
+import { StdioClientTransport } from "@modelcontextprotocol/client/stdio"
 import { z } from "zod"
 import type { startMockLlm } from "./mock-llm.js"
 
@@ -90,16 +90,17 @@ export async function connect(env: Record<string, string>, opts: { elicitation?:
   const elicit: Harness["elicit"] = { answer: () => ({ action: "cancel" }), seen: [] }
   const channel: Harness["channel"] = []
   if (opts.elicitation) {
-    client.setRequestHandler(ElicitRequestSchema, async (req) => {
+    client.setRequestHandler("elicitation/create", async (req) => {
       const params = req.params as { message: string; requestedSchema: unknown }
       elicit.seen.push(params.message)
       return elicit.answer(params)
     })
   }
   client.setNotificationHandler(
-    z.object({ method: z.literal("notifications/claude/channel"), params: z.object({ content: z.string(), meta: z.record(z.string(), z.string()) }) }) as never,
-    (n: { params: { content: string; meta: Record<string, string> } }) => {
-      channel.push(n.params)
+    "notifications/claude/channel",
+    { params: z.object({ content: z.string(), meta: z.record(z.string(), z.string()) }) },
+    (params) => {
+      channel.push(params)
     },
   )
   // A worker's shell inherits the server's credentials; a test only gets them from its own env.
@@ -121,7 +122,7 @@ export async function connect(env: Record<string, string>, opts: { elicitation?:
     }),
   )
   const call = async (name: string, args: Record<string, unknown> = {}) => {
-    const res = (await client.callTool({ name, arguments: args }, undefined, { timeout: 180_000 })) as { content: { text: string }[]; isError?: boolean }
+    const res = (await client.callTool({ name, arguments: args }, { timeout: 180_000 })) as { content: { text: string }[]; isError?: boolean }
     const text = res.content.map((c) => c.text).join("\n")
     if (process.env.SHOW_OUTPUT) console.error(`\n>>> ${name} ${JSON.stringify(args)}\n${text}`)
     if (res.isError) throw new Error(text)
