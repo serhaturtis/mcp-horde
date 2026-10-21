@@ -308,6 +308,7 @@ describe("baseline", () => {
   const checkScript = [
     'import fs from "node:fs"',
     'const names = JSON.parse(fs.readFileSync("failures.json", "utf8"))',
+    'const count = fs.existsSync("count.txt") ? Number(fs.readFileSync("count.txt", "utf8")) : names.length',
     'console.log("TAP version 13")',
     "names.forEach((name, i) => {",
     '  console.log("not ok " + (i + 1) + " - " + name)',
@@ -317,8 +318,8 @@ describe("baseline", () => {
     '  console.log("  ...")',
     "})",
     'console.log("1.." + names.length)',
-    'console.log("# fail " + names.length)',
-    "if (names.length) process.exitCode = 1",
+    'console.log("# fail " + count)',
+    "if (count) process.exitCode = 1",
   ].join("\n")
 
   const project = (failures: string[]) =>
@@ -380,6 +381,25 @@ describe("baseline", () => {
       v.checks[0]!.extracted.failures.map((f) => f.test),
       ["multiplies"],
     )
+    assert.equal(calls.n, 1)
+    assert.equal(releases.n, 1)
+  })
+
+  test("a larger failure count than the baseline keeps the check failing", async () => {
+    // The runner says two tests failed but lists only one; the baseline lists that same one and says one failed.
+    const { root, base } = project(["adds"])
+    write(root, { "count.txt": "2" })
+    const calls = { n: 0 }
+    const releases = { n: 0 }
+    const v = await gate(root, {
+      baseline: { commit: base, label: "master's tip", checkout: checkoutOf(root, base, calls, releases) },
+      stateDir: tmp(),
+    })
+    assert.equal(v.pass, false)
+    assert.match(v.text, /✗ test · 2 failed/)
+    assert.match(v.text, /✗ test: adds/)
+    assert.doesNotMatch(v.text, /fails at master|also fail at master/)
+    assert.deepEqual(v.checks[0]!.baseline, { label: "master's tip", pass: false, known: 0 })
     assert.equal(calls.n, 1)
     assert.equal(releases.n, 1)
   })

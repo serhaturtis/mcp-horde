@@ -100,6 +100,8 @@ interface BaselineOutcome {
   pass: boolean
   /** Failure keys, see failureKey. */
   keys: string[]
+  /** Failures the runner reported, which can exceed the ones the extractor listed. */
+  failed: number
 }
 
 interface BaselineRun {
@@ -172,7 +174,11 @@ async function baselineOutcomes(opts: GateOptions, run: BaselineRun, checks: Che
       for (const c of checks) {
         const r = ran.find((x) => x.name === c.name)
         if (!r) throw new Error(`the baseline run did not report ${c.name}`)
-        out.set(c.name, { pass: r.pass, keys: r.extracted.failures.map(failureKey) })
+        out.set(c.name, {
+          pass: r.pass,
+          keys: r.extracted.failures.map(failureKey),
+          failed: r.extracted.counts?.failed ?? r.extracted.failures.length,
+        })
       }
       return out
     } finally {
@@ -208,16 +214,20 @@ async function compareBaseline(
       const outcome = outcomes.get(c.name)!
       if (outcome.pass) return { ...c, baseline: { label: spec.label, pass: true, known: 0 } }
       const keys = new Set(outcome.keys)
-      const known = c.extracted.failures.filter((f) => keys.has(failureKey(f))).length
-      if (known === c.extracted.failures.length) {
+      const failures = c.extracted.failures
+      const known = failures.filter((f) => keys.has(failureKey(f))).length
+      const failed = c.extracted.counts?.failed ?? failures.length
+      if (known === failures.length && failed <= outcome.failed) {
         warnings.push(`${c.name}: fails at ${spec.label} too, with the same failures (not caused by this change)`)
         return { ...c, pass: true, baseline: { label: spec.label, pass: false, known } }
       }
+      // More failures than the runner listed: which ones are new cannot be told, so judge as before.
+      if (known === failures.length) return { ...c, baseline: { label: spec.label, pass: false, known: 0 } }
       // Only the new failures are the change's to answer for.
       return {
         ...c,
         baseline: { label: spec.label, pass: false, known },
-        extracted: { ...c.extracted, failures: c.extracted.failures.filter((f) => !keys.has(failureKey(f))) },
+        extracted: { ...c.extracted, failures: failures.filter((f) => !keys.has(failureKey(f))) },
       }
     })
     return { checks: compared, warnings }
