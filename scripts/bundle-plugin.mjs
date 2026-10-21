@@ -13,7 +13,8 @@ import * as esbuild from "esbuild"
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..")
 const out = path.join(root, "plugins", "horde", "servers")
-const version = JSON.parse(fs.readFileSync(path.join(root, "plugins", "horde", ".claude-plugin", "plugin.json"), "utf8")).version
+// The servers report the opencode package's version; plugin.json has none, so installs follow new commits.
+const version = JSON.parse(fs.readFileSync(path.join(root, "packages", "opencode", "package.json"), "utf8")).version
 
 // Every bundle lands in the same directory: the board finds its worker CLI (cli.js) and
 // opencode its private-server supervisor (supervisor.js) next to the running module.

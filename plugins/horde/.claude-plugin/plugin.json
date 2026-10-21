@@ -1,7 +1,6 @@
 {
   "name": "horde",
   "displayName": "mcp-horde",
-  "version": "0.1.0",
   "description": "Orchestrate cheap, fast OpenCode workers from Claude: a task board, briefs, mechanical gates and structured reports, with the procedure to run them.",
   "author": {
     "name": "serhaturtis"

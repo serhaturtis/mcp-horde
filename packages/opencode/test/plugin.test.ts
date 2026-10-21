@@ -12,7 +12,7 @@ import { connect, git, type Harness, isolatedEnv, type Mock, makeRepo, opencodeB
 import { startMockLlm } from "./mock-llm.js"
 
 const servers = path.join(import.meta.dirname, "..", "..", "..", "plugins", "horde", "servers")
-const pluginVersion = JSON.parse(fs.readFileSync(path.join(servers, "..", ".claude-plugin", "plugin.json"), "utf8")).version as string
+const pluginVersion = JSON.parse(fs.readFileSync(path.join(import.meta.dirname, "..", "package.json"), "utf8")).version as string
 
 let mock: Mock
 let h: Harness
