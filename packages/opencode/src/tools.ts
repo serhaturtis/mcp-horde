@@ -277,7 +277,7 @@ export function registerTools(server: McpServer, ctx: Context) {
     const quiet = r.snapshots.filter((s) => SETTLED.has(s.state) && !r.news.has(s.id))
     const head = r.timedOut
       ? `Timed out after ${secs}s: ${news.length} with news, ${running.length} still running (they keep working; wait again).`
-      : r.nothingToWaitFor
+      : r.nothingToWaitFor && !r.errors.length
         ? "Nothing new: no listed agent is running, and their results were already reported."
         : `${news.length} with news, ${running.length} still running.`
     const parts = [head, ...news.map((s) => renderSnapshot(s, { resultChars: chars, mode: "news" })), ...running.map((s) => renderSnapshot(s))]

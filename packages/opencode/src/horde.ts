@@ -244,7 +244,7 @@ async function collect(fleet: Fleet, ids: string[], mode: "any" | "all", seconds
   for (const s of news) parts.push(await outcome(fleet, s.id).catch((err: Error) => `${s.name ?? s.id}: could not read its outcome: ${err.message}`))
   for (const s of working) parts.push(await outcome(fleet, s.id).catch(() => `${s.name ?? s.id} working`))
   if (r.timedOut && !news.length) parts.unshift(`Nothing finished within ${seconds}s; the workers keep going (horde_wait again):`)
-  else if (!news.length && r.nothingToWaitFor) parts.unshift("Nothing new: every outcome was already reported.")
+  else if (!news.length && r.nothingToWaitFor && !r.errors.length) parts.unshift("Nothing new: every outcome was already reported.")
   if (r.errors.length) parts.push(`Could not read: ${r.errors.join("; ")}`)
   return { text: parts.join("\n\n") }
 }

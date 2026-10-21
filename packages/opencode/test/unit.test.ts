@@ -9,7 +9,7 @@ import type { FormInfo, SessionInboxInfo, SessionMessageInfo } from "@opencode/c
 import { extractJson, validate } from "../src/ask.js"
 import { isLoopback, shimTarget } from "../src/backend.js"
 import { loadConfig } from "../src/config.js"
-import { defaultQuestionPolicy, defined, dismissAnswer, formAnswer, formatModel, parseModel } from "../src/fleet.js"
+import { defaultQuestionPolicy, defined, dismissAnswer, formAnswer, formatModel, parseModel, waitedOut } from "../src/fleet.js"
 import { questionAnswers, questionSchema } from "../src/hooks.js"
 import { Store } from "../src/state.js"
 import { price } from "../src/tools.js"
@@ -463,4 +463,13 @@ describe("state store", () => {
     assert.ok(fs.existsSync(path.join(dir, "x.lock")), "someone else's lock is left alone")
     fs.rmSync(dir, { recursive: true, force: true })
   })
+})
+
+test("waitedOut: a read that failed once is retried; one unreadable for a minute ends the wait", () => {
+  const now = 1_000_000
+  assert.equal(waitedOut(["a"], new Set(), new Map([["a", now]]), now), false, "the first failed read")
+  assert.equal(waitedOut(["a"], new Set(), new Map([["a", now - 59_000]]), now), false)
+  assert.equal(waitedOut(["a"], new Set(), new Map([["a", now - 60_000]]), now), true)
+  assert.equal(waitedOut(["a", "b"], new Set(["b"]), new Map(), now), false, "a is still working")
+  assert.equal(waitedOut(["a", "b"], new Set(["a", "b"]), new Map(), now), true)
 })

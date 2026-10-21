@@ -121,6 +121,14 @@ export interface GateView {
   queued?: boolean
 }
 
+/** How long a wait keeps retrying an agent it cannot read (a blip of the OpenCode server is retried). */
+const UNREADABLE_MS = 60_000
+
+/** Whether a wait is over for every id: settled, or unreadable since `unreadableSince` for UNREADABLE_MS. */
+export function waitedOut(ids: string[], settled: Set<string>, unreadableSince: Map<string, number>, now: number): boolean {
+  return ids.every((id) => settled.has(id) || now - (unreadableSince.get(id) ?? now) >= UNREADABLE_MS)
+}
+
 /** A gate that has not decided yet: the agent is not done, whatever its session says. */
 export function gateUndecided(s: Snapshot): boolean {
   return !!s.gate && s.gate.state !== "pass" && s.gate.state !== "fail"
@@ -2370,6 +2378,7 @@ export class Fleet {
     const start = Date.now()
     const deadline = start + timeoutMs
     let last: Snapshot[] = []
+    const unreadableSince = new Map<string, number>()
     for (;;) {
       // One round of reads, given up at the deadline or on abort even if a request hangs.
       const round = await this.untilDeadline(
@@ -2393,10 +2402,14 @@ export class Fleet {
       const results = round.value
       const snaps = results.filter((r): r is PromiseFulfilledResult<Snapshot> => r.status === "fulfilled").map((r) => r.value)
       const errors = results.flatMap((r, i) => (r.status === "rejected" ? [`${ids[i]}: ${(r.reason as Error).message}`] : []))
+      results.forEach((r, i) => {
+        if (r.status === "fulfilled") unreadableSince.delete(ids[i]!)
+        else if (!unreadableSince.has(ids[i]!)) unreadableSince.set(ids[i]!, Date.now())
+      })
       // An idle agent is not done while its gate is undecided; anything needing attention still surfaces.
       const settled = snaps.filter((s) => SETTLED.has(s.state) && !(s.state === "idle" && gateUndecided(s)))
       const news = settled.filter((s) => this.hasNews(s))
-      const allSettled = settled.length === snaps.length
+      const allSettled = waitedOut(ids, new Set(settled.map((s) => s.id)), unreadableSince, Date.now())
       const done = mode === "any" ? news.length > 0 || allSettled : allSettled
       const timedOut = !done && (Date.now() >= deadline || !!opts.signal?.aborted)
       if (done || timedOut) {
