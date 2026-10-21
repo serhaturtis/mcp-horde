@@ -153,12 +153,15 @@ function parseSettings(horde: HordeFile): VerifySettings {
 const TEST_RUNNER =
   /(^|[\s/])(pytest|py\.test|vitest|jest|mocha)(\s|$)|-m\s+pytest\b|\bgo\s+test\b|\bcargo\s+(test|nextest)\b|\bnpm\s+(run\s+)?test\b|\bnode\s+--test\b/
 
+/** A compound command runs more than one program, so a test runner in it is not the whole check. */
+const COMPOUND = /[\n\r;&|]/
+
 function kindOf(name: string, command: string): CheckKind {
   if (/test|spec|unit|integration|e2e/i.test(name)) return "test"
   if (/type|tsc|mypy|pyright/i.test(name)) return "typecheck"
   if (/lint|ruff|clippy|vet|format|fmt/i.test(name)) return "lint"
   if (/build|compile/i.test(name)) return "build"
-  return TEST_RUNNER.test(command) ? "test" : "other"
+  return TEST_RUNNER.test(command) && !COMPOUND.test(command) ? "test" : "other"
 }
 
 const ORDER: Record<CheckKind, number> = { typecheck: 0, lint: 1, build: 2, test: 3, other: 4 }

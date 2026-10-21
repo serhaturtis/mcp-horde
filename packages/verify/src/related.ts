@@ -21,36 +21,59 @@ export interface Narrowing {
 const quote = (p: string) => (/^[\w./@-]+$/.test(p) ? p : process.platform === "win32" ? `"${p.replace(/"/g, '\\"')}"` : `'${p.replace(/'/g, "'\\''")}'`)
 
 const PYTEST = /(^|[\s/])(pytest|py\.test)(\s|$)|-m\s+pytest\b/
-/** Pytest options whose value is the next word when written without `=`. */
-const PYTEST_VALUES = new Set([
-  "--ignore",
-  "--ignore-glob",
-  "--deselect",
-  "--rootdir",
-  "-c",
-  "--confcutdir",
-  "--basetemp",
-  "--cov",
-  "--cov-config",
-  "-p",
-  "-k",
-  "-m",
-  "-n",
-  "--capture",
-  "--color",
-  "--durations",
-  "--import-mode",
-  "--junitxml",
-  "--maxfail",
-  "-o",
-  "--override-ini",
-  "-r",
-  "--tb",
-  "--timeout",
-  "-W",
+/** Pytest options that take no value; any other option's value is the next word unless it is written with `=`. */
+const PYTEST_FLAGS = new Set([
+  "-q",
+  "--quiet",
+  "-v",
+  "--verbose",
+  "-vv",
+  "-vvv",
+  "-s",
+  "-x",
+  "--exitfirst",
+  "-l",
+  "--showlocals",
+  "--lf",
+  "--last-failed",
+  "--ff",
+  "--failed-first",
+  "--nf",
+  "--new-first",
+  "--sw",
+  "--stepwise",
+  "--sw-skip",
+  "--stepwise-skip",
+  "--strict",
+  "--strict-markers",
+  "--strict-config",
+  "--no-header",
+  "--no-summary",
+  "--co",
+  "--collect-only",
+  "--collect-in-virtualenv",
+  "--continue-on-collection-errors",
+  "--pdb",
+  "--trace",
+  "--full-trace",
+  "--setup-show",
+  "--setup-plan",
+  "--setup-only",
+  "--disable-warnings",
+  "--disable-pytest-warnings",
+  "--force-short-summary",
+  "--no-fold-skipped",
+  "--fixtures",
+  "--funcargs",
+  "--trace-config",
+  "--version",
+  "-h",
+  "--help",
 ])
-/** Shell syntax that whitespace splitting cannot take apart safely. */
-const UNSAFE = /['"$;&|<>`]/
+/** Shell syntax: the words around an operator belong to other commands, not to the runner. */
+const SHELL = /['"$;&|<>`\n\r]/
+/** A `cd` at the start of the command: the runner's paths are relative to another directory. */
+const CD = /^cd(?:\s|$)/
 /** Files that mark the root of a Python project (as in the code map). */
 const PY_ROOTS = ["pyproject.toml", "setup.py", "setup.cfg"]
 const TSCONFIG = /^(tsconfig|jsconfig)([.\w-]*)\.json$/
@@ -85,23 +108,28 @@ export function narrowCommand(check: Check, tests: string[]): string | undefined
 /**
  * Narrow a pytest command: positional paths it already names are dropped, and only related
  * tests inside one of them are appended. A command that names no paths gets them all.
+ * Compound commands and anything that does not split into plain words are never narrowed.
  */
 function narrowPytest(check: Check, cmd: string, py: string[]): string | undefined {
+  if (SHELL.test(cmd) || CD.test(cmd)) return undefined
   const tokens = cmd.split(/\s+/).filter(Boolean)
   const at = tokens.findIndex((t) => /(?:^|[\\/])(pytest|py\.test)$/.test(t))
   if (at < 0) return undefined
   const exists = (t: string) => fs.existsSync(path.resolve(check.cwd, t))
   const named = new Set<number>()
-  if (!UNSAFE.test(cmd)) {
-    for (let i = at + 1; i < tokens.length; i++) {
-      const t = tokens[i]!
-      if (t.startsWith("-")) {
-        if (!t.includes("=") && PYTEST_VALUES.has(t)) i++
-      } else if (exists(t)) named.add(i)
+  for (let i = at + 1; i < tokens.length; i++) {
+    const t = tokens[i]!
+    // Everything after `--` is positional, whatever it looks like.
+    if (t === "--") {
+      for (i++; i < tokens.length; i++) if (exists(tokens[i]!)) named.add(i)
+      break
     }
-  } else if (tokens.slice(at + 1).some((t) => !t.startsWith("-") && exists(t))) {
-    // Quotes or operators: the words cannot be trusted, so a path-looking one means no narrowing.
-    return undefined
+    if (t.startsWith("-")) {
+      // Only a flag that takes no value leaves the next word as an argument of its own.
+      if (!t.includes("=") && !PYTEST_FLAGS.has(t)) i++
+      continue
+    }
+    if (exists(t)) named.add(i)
   }
   if (!named.size) return py.length ? `${cmd} ${py.map(quote).join(" ")}` : undefined
   const paths = [...named].map((i) => path.relative(check.cwd, path.resolve(check.cwd, tokens[i]!)).replace(/\\/g, "/") || ".")

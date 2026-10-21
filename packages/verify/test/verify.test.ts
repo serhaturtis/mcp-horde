@@ -119,9 +119,18 @@ describe("detect", () => {
     )
     assert.equal(loadSettings(root).timeoutMs, 30_000)
     // A name that says nothing: the command's test runner makes it a test check, anything else stays "other".
+    // A compound command runs more than a test, so it stays "other" too (work rounds may skip it).
     write(root, {
       "horde.json": JSON.stringify({
-        verify: { checks: { go: "go test -race ./...", runtime: "uv run python -m pytest -q", ui: "npx vitest run", tier: "python scripts/run_gates.py" } },
+        verify: {
+          checks: {
+            go: "go test -race ./...",
+            runtime: "uv run python -m pytest -q",
+            ui: "npx vitest run",
+            tier: "python scripts/run_gates.py",
+            both: "npm test && npm run build",
+          },
+        },
       }),
     })
     assert.deepEqual(
@@ -131,6 +140,7 @@ describe("detect", () => {
         ["runtime", "test"],
         ["ui", "test"],
         ["tier", "other"],
+        ["both", "other"],
       ],
     )
     write(root, { "horde.json": JSON.stringify({ verify: { audit: { block: ["nonsense"] } } }) })
@@ -502,15 +512,41 @@ describe("related tests", () => {
 
   test("pytest commands that name paths keep only the related tests inside them", () => {
     const dir = tmp()
-    write(dir, { "tests/test_a.py": "", "tests/test_slow.py": "", "scripts/run.py": "", "other/test_b.py": "" })
+    write(dir, { "tests/test_a.py": "", "tests/test_slow.py": "", "scripts/run.py": "", "other/test_b.py": "", "pytest.log": "" })
     const narrow = (cmd: string) => narrowCommand(check(cmd, dir), ["tests/test_a.py", "other/test_b.py"])
     assert.equal(narrow("python -m pytest tests scripts -q -n 8"), "python -m pytest -q -n 8 tests/test_a.py")
     assert.equal(narrow("pytest -q tests"), "pytest -q tests/test_a.py", "flags are kept")
     assert.equal(narrow("pytest --ignore tests/slow tests"), "pytest --ignore tests/slow tests/test_a.py", "an option's path value is kept")
     assert.equal(narrow("pytest --deselect tests/test_a.py other"), "pytest --deselect tests/test_a.py other/test_b.py")
+    assert.equal(
+      narrow("pytest --log-file pytest.log tests"),
+      "pytest --log-file pytest.log tests/test_a.py",
+      "an option's value is never taken for a positional path",
+    )
     assert.equal(narrow("pytest -q scripts"), undefined, "no related test lies inside the named paths")
     assert.equal(narrow("pytest -q"), "pytest -q tests/test_a.py other/test_b.py", "no named paths: append them all")
     assert.equal(narrow("pytest -k 'test_a' tests"), undefined, "quoted arguments cannot be split safely")
+    assert.equal(narrow("cd backend && pytest"), undefined, "paths in a compound command belong to another directory")
+    assert.equal(narrow("pytest | tee log"), undefined, "nothing is appended after a pipe to another command")
+    assert.equal(narrow("pytest -q; pytest -q tests"), undefined)
+  })
+
+  test("a compound pytest check runs the full suite, and the plan says why", () => {
+    const { root } = repo({
+      "pyproject.toml": "[tool.pytest.ini_options]\n",
+      "app.py": "value = 1\n",
+      "tests/test_app.py": "from app import value\n",
+    })
+    const plan = (command: string) => {
+      const c = check(command, root)
+      return planRelated(root, ["app.py"], [c]).plans.get(c)!
+    }
+    assert.equal(plan("pytest").command, "pytest tests/test_app.py")
+    for (const cmd of ["cd backend && pytest", "pytest | tee log"]) {
+      const p = plan(cmd)
+      assert.equal(p.command, undefined, cmd)
+      assert.match(p.full ?? "", /cannot be narrowed/, cmd)
+    }
   })
 
   test("a gate runs only the tests for what changed, falls back to the full suite when unsure, and flags untested code", async () => {
