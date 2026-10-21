@@ -135,13 +135,17 @@
     },
     {
       "name": "horde_land",
-      "description": "Land a READY task. Its commits are replayed onto your current branch's tip inside its worktree and the project's checks run there; only if they pass is your branch updated, with exactly those commits. Your uncommitted changes stay as they are. Then the task is marked done and its worktree and branch are removed. If the commits conflict with your branch or the checks fail, your branch is not touched: the answer shows why, and the worker, now on top of your branch, can fix it (horde_tell, then horde_land again).",
+      "description": "Land a READY task. Its commits are replayed onto your current branch's tip inside its worktree and the project's checks run there; only if they pass is your branch updated, with exactly those commits. Your uncommitted changes stay as they are. Then the task is marked done and its worktree and branch are removed. If the commits conflict with your branch or the checks fail, your branch is not touched: the answer shows why, and the worker, now on top of your branch, can fix it (horde_tell, then horde_land again). Pass message to land the task's commits as one commit with that message, judged first by the repository's commit-msg hook: a repository that has one needs it.",
       "inputSchema": {
         "type": "object",
         "properties": {
           "id": {
             "type": "string",
             "description": "Task id (t-…)."
+          },
+          "message": {
+            "description": "The one commit's message, e.g. \"feat(auth): add token refresh\". Required when the repository has a commit-msg hook (the answer names it), which checks the message before the checks run.",
+            "type": "string"
           }
         },
         "required": [
