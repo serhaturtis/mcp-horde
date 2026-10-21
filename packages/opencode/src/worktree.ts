@@ -43,7 +43,7 @@ export interface WorktreeOptions {
   rootDir: string
   /** Carry over uncommitted (staged, unstaged and untracked) changes from the main checkout. */
   includeUncommitted: boolean
-  /** Paths (relative to the repo root) to symlink from the main checkout; default: dependencyLinks(repo).links. */
+  /** Paths (relative to the repo root) to symlink from the main checkout; default: dependencyLinks(repo).links, or none with a setup. */
   link?: string[]
   /** Shell command run in the new worktree before the agent starts, e.g. "npm ci". */
   setup?: string
@@ -146,8 +146,10 @@ async function intoCheckout(root: string, dir: string): Promise<string | undefin
  */
 export async function createWorktree(directory: string, name: string, opts: WorktreeOptions): Promise<{ worktree: Worktree; notes: string[] }> {
   const repo = await repoRoot(directory)
-  const auto = opts.link ? undefined : await dependencyLinks(repo)
-  const links = await Promise.all((opts.link ?? auto!.links).map((l) => validateLink(repo, l)))
+  // With a setup, only what workers.link names: an install there would write through a linked
+  // directory into the checkout (npm ci empties it).
+  const auto = opts.link || opts.setup ? undefined : await dependencyLinks(repo)
+  const links = await Promise.all((opts.link ?? auto?.links ?? []).map((l) => validateLink(repo, l)))
   const notes = [...(auto?.notes ?? [])]
   const slug = branchSlug(name)
   const repoKey = `${branchSlug(path.basename(repo))}-${createHash("sha1").update(repo).digest("hex").slice(0, 8)}`

@@ -410,5 +410,9 @@ describe("worktree fixes", () => {
     const bare = await createWorktree(r, "no-deps", { rootDir, includeUncommitted: false, link: [] })
     assert.equal(fs.existsSync(path.join(bare.worktree.root, "node_modules")), false)
     assert.equal(fs.existsSync(path.join(bare.worktree.root, ".venv")), false)
+    // A setup installs into the worktree; through a link it would write into the checkout.
+    const setUp = await createWorktree(r, "setup", { rootDir, includeUncommitted: false, setup: "mkdir node_modules && touch node_modules/own" })
+    assert.ok(!fs.lstatSync(path.join(setUp.worktree.root, "node_modules")).isSymbolicLink())
+    assert.ok(fs.existsSync(path.join(r, "node_modules", "pkg", "index.js")), "the checkout's node_modules is untouched")
   })
 })
