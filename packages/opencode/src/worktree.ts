@@ -3,7 +3,7 @@ import { constants, existsSync } from "node:fs"
 import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
-import { branchSlug, GIT_ENV, git, gitRaw, repoKey, runCommand, splitZ } from "@mcp-horde/core"
+import { branchSlug, GIT_ENV, git, gitRaw, repoKey, runCommand, splitZ, type Workers } from "@mcp-horde/core"
 
 const isWindows = process.platform === "win32"
 
@@ -663,6 +663,36 @@ export async function mergeWorktree(wt: Worktree, name: string, strategy: "merge
 const BASELINE_MESSAGE = "horde: uncommitted changes carried over from the main checkout"
 
 /**
+ * Where the worker's branch really starts now: the merge-base of its HEAD and the checkout's
+ * current branch, when that is a strict descendant of the recorded base. After a landing conflict
+ * told the worker to rebase onto the target and it did, the recorded base lags behind; moving it
+ * forward stops later gates and the next landing from counting the target's commits as the worker's.
+ */
+export async function followRebase(wt: Worktree): Promise<Worktree> {
+  const head = await git(wt.root, "rev-parse", "HEAD").catch(() => "")
+  if (!head) return wt
+  const target = await git(wt.repo, "rev-parse", "HEAD").catch(() => "")
+  if (!target) return wt
+  const base = await git(wt.repo, "merge-base", head, target).catch(() => "")
+  if (!base || base === wt.base) return wt
+  const descendant = await git(wt.repo, "merge-base", "--is-ancestor", wt.base, base).then(
+    () => true,
+    () => false,
+  )
+  if (!descendant) return wt
+  return { ...wt, base, baseline: wt.baseline ? await baselineReplay(wt.root, base) : undefined }
+}
+
+/** The replayed carried-over baseline commit after `base`, or none when the worker's rebase dropped it. */
+async function baselineReplay(root: string, base: string): Promise<string | undefined> {
+  const commits = (await git(root, "rev-list", "--reverse", `${base}..HEAD`)).split("\n").filter(Boolean)
+  for (const commit of commits) {
+    if ((await git(root, "log", "-1", "--format=%s", commit)) === BASELINE_MESSAGE) return commit
+  }
+  return undefined
+}
+
+/**
  * Bring the agent's branch up to date with the main checkout's current branch: its commits
  * (the carried-over baseline first) are replayed onto that branch's tip inside the worktree,
  * so the agent continues on top of everything merged since it started and its own merge
@@ -749,6 +779,53 @@ export async function landSync(wt: Worktree, name: string): Promise<{ text: stri
     `rebased ${replayed.length} commit(s) of ${wt.branch} onto ${target} (${tip.slice(0, 10)})${wt.baseline ? "; the carried-over changes stay in your checkout" : ""}`,
   )
   return { text: notes.join("\n"), worktree: { ...wt, base: tip, baseline: undefined, merged: undefined } }
+}
+
+/**
+ * Run horde.json "workers.land" at the worktree root and commit whatever it changed on top, judged
+ * by the repository's hooks (a plain `git commit`). Returns the new HEAD. Throws when the command
+ * fails or is stopped, or when a hook refuses the commit, so the caller can restore the branch.
+ */
+export async function runLandStep(wt: Worktree, task: string, target: string, land: NonNullable<Workers["land"]>): Promise<string> {
+  const command = typeof land === "string" ? land : land.command
+  const r = await runCommand(command, {
+    cwd: wt.root,
+    env: { HORDE_TASK: task, HORDE_WORKTREE: wt.root },
+    timeoutMs: 15 * 60_000,
+    stripEnv: ["OPENCODE_SERVER_"],
+    maxChars: 8_000,
+  })
+  if (r.code !== 0 || r.stopped) {
+    const why = r.stopped === "timeout" ? "timed out after 15 minutes" : r.stopped === "cancelled" ? "cancelled" : `failed (exit ${r.code})`
+    throw new Error(`workers.land \`${command}\` ${why}:\n${r.output.slice(-4000)}`)
+  }
+  return commitLandStep(wt, target, typeof land === "string" ? undefined : land.message)
+}
+
+/** Commit what workers.land changed, judged by the repository's hooks; throws when a hook refuses. */
+async function commitLandStep(wt: Worktree, target: string, message?: string): Promise<string> {
+  const excludes: string[] = []
+  for (const l of wt.links ?? []) {
+    const rel = l.replace(/\/+$/, "")
+    const ignored = await git(wt.root, "check-ignore", "-q", "--", rel).then(
+      () => true,
+      () => false,
+    )
+    if (!ignored) excludes.push(`:(exclude)${rel}`)
+  }
+  await git(wt.root, "add", "-A", "--", ".", ...excludes)
+  if (!(await git(wt.root, "diff", "--cached", "--name-only"))) return git(wt.root, "rev-parse", "HEAD")
+  const identity = (await hasIdentity(wt.root)) ? [] : IDENTITY
+  await git(wt.root, ...NO_SIGN, ...identity, "commit", "-q", "-m", message ?? `Update files that depend on ${target} after rebasing onto it`)
+  return git(wt.root, "rev-parse", "HEAD")
+}
+
+/** Put the worktree's branch back on `commit` and drop any files a failed land step left, links untouched. */
+export async function restoreWorktree(wt: Worktree, commit: string) {
+  await git(wt.root, "reset", "--hard", "-q", commit)
+  // -fd leaves ignored files (the links) alone; -e also protects links git does not ignore.
+  const excludes = (wt.links ?? []).flatMap((l) => ["-e", l.replace(/\/+$/, "")])
+  await git(wt.root, "clean", "-fdq", ...excludes)
 }
 
 /** Remove the worktree. Uncommitted work is committed to the branch first unless discard is set. */

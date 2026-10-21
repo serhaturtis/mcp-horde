@@ -38,10 +38,13 @@ import {
   commitAll,
   commitMsgHook,
   createWorktree,
+  followRebase,
   hasUncommitted,
   landSync,
   mergeWorktree,
   removeWorktree,
+  restoreWorktree,
+  runLandStep,
   squashWorktree,
   syncWorktree,
   type Worktree,
@@ -1410,6 +1413,17 @@ export class Fleet {
     if (board && a?.workspace && !a.endedAt) await board.bindWorkspace(task.id, a.token, { ...a.workspace, base: workStart(wt) }).catch(() => undefined)
   }
 
+  /** After a landing conflict the worker rebases its branch onto the target: move the recorded base
+   * (and baseline) forward with it, before the next gate or landing counts the target's commits as
+   * the worker's. Persists like a sync. */
+  private async followRebase(live: Live, wt: Worktree): Promise<Worktree> {
+    const followed = await followRebase(wt)
+    if (followed === wt) return wt
+    this.updateRecord(live.record.id, { worktree: followed })
+    await this.rebindTaskBase(live, followed)
+    return followed
+  }
+
   /**
    * Land a task-bound agent's work without ever breaking your branch. Its own commits (everything
    * after the carried-over baseline) are rebased onto your branch's tip inside its worktree, the
@@ -1441,6 +1455,9 @@ export class Fleet {
     return this.withoutGate(live, async () => {
       for (let attempt = 0; attempt < 3; attempt++) {
         let wt = live.record.worktree!
+        // After a landing conflict the worker rebased its branch onto the target: the recorded base
+        // must follow it or the next gate and landing count the target's commits as the worker's.
+        wt = await this.followRebase(live, wt)
         const target = await git(wt.repo, "symbolic-ref", "-q", "--short", "HEAD").catch(() => "")
         if (!target) throw new Error(`your checkout ${wt.repo} is on a detached HEAD; switch to a branch first`)
         // A repository with a commit-msg hook judges every commit: our own --no-verify commit
@@ -1477,8 +1494,25 @@ export class Fleet {
           const squashed = await squashWorktree(wt, message)
           if (squashed.refused !== undefined) return { landed: false, target, why: "message", text: squashed.refused, hook }
         }
-        // 2. The exact commit the checks judge; nothing is committed in the worktree after this.
-        const judged = await git(wt.root, "rev-parse", "HEAD")
+        // 2. workers.land, after the rebase and the optional squash: run it, commit its changes on
+        // top (judged by the repository's hooks), keeping the branch's pre-step commit to restore if
+        // this attempt does not fast-forward, so the worker's branch never keeps the land step's
+        // commit or files.
+        const land = loadWorkers(wt.repo).land
+        let judged = ""
+        let beforeLand: string | undefined
+        if (land) {
+          const before = await git(wt.root, "rev-parse", "HEAD")
+          beforeLand = before
+          try {
+            judged = await runLandStep(wt, task.id, target, land)
+          } catch (err) {
+            await restoreWorktree(wt, before).catch(() => undefined)
+            return { landed: false, target, why: "land", text: (err as Error).message }
+          }
+        } else {
+          judged = await git(wt.root, "rev-parse", "HEAD")
+        }
         const commits = (await git(wt.repo, "rev-list", "--count", `${tip}..${judged}`).catch(() => "0")).trim()
         const v = await runGate(wt.root, {
           audit: false,
@@ -1489,7 +1523,10 @@ export class Fleet {
           signal,
           stateDir: verifyStateDir(),
         })
-        if (!v.pass) return { landed: false, target, why: "checks", text: v.text, checks: v.checks.map(gateCheck) }
+        if (!v.pass) {
+          if (beforeLand) await restoreWorktree(wt, beforeLand).catch(() => undefined)
+          return { landed: false, target, why: "checks", text: v.text, checks: v.checks.map(gateCheck) }
+        }
         // 3. Under a per-repository lock, fast-forward your branch only if it is still at the tip the
         // checks saw; otherwise go round again (rebase onto the new tip, check again).
         const lockDir = await lockDirFor(wt.repo, verifyStateDir())
@@ -1502,6 +1539,7 @@ export class Fleet {
             return true
           })
         } catch (err) {
+          if (beforeLand) await restoreWorktree(wt, beforeLand).catch(() => undefined)
           // The tip was still where the checks saw it, so only the user's uncommitted changes can
           // refuse the fast-forward; the refusal names them.
           const changed = await git(wt.repo, "status", "--porcelain").catch(() => "")
@@ -1513,7 +1551,10 @@ export class Fleet {
             text: `${detail}${changed ? `\nuncommitted changes:\n${changed}` : ""}`,
           }
         }
-        if (!advanced) continue
+        if (!advanced) {
+          if (beforeLand) await restoreWorktree(wt, beforeLand).catch(() => undefined)
+          continue
+        }
         const board = await Board.open(wt.repo)
         await board.accept(task.id, { note: `landed on ${target}` }).catch(() => undefined)
         // The branch goes only once every one of its commits is on your branch (they all are, after a fast-forward).
@@ -1865,7 +1906,8 @@ export class Fleet {
     const id = live.record.id
     const cfg = live.record.gate!
     const round = (live.record.gateState?.round ?? 0) + 1
-    const wt = live.record.worktree
+    let wt = live.record.worktree
+    if (wt) wt = await this.followRebase(live, wt)
     const start = wt ? workStart(wt) : undefined
     let pass = false
     let text: string
@@ -2841,9 +2883,10 @@ export type LandResult =
       target: string
       /**
        * message: the repository's commit-msg hook refused the message; leftovers: the worktree
-       * still has uncommitted changes in a repository whose hook would judge the commit.
+       * still has uncommitted changes in a repository whose hook would judge the commit; land:
+       * horde.json "workers.land" failed or its commit was refused by the repository's hooks.
        */
-      why: "conflict" | "checks" | "uncommitted" | "message" | "leftovers"
+      why: "conflict" | "checks" | "uncommitted" | "message" | "leftovers" | "land"
       text: string
       checks?: GateCheckSummary[]
       /** why "message": the hook that refused it. */

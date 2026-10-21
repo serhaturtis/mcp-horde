@@ -124,6 +124,8 @@ export interface Workers {
   setup?: string
   /** Repository-relative files every worker brief includes in full (house rules). */
   brief?: string[]
+  /** A command run at the worktree root while landing, after the rebase onto the branch's tip; files it changes are committed on top and landed with the task. */
+  land?: string | { command: string; message?: string }
 }
 
 export function loadWorkers(directory: string): Workers {
@@ -132,11 +134,17 @@ export function loadWorkers(directory: string): Workers {
   if (raw === undefined) return {}
   const where = `${file}: "workers"`
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error(`${where} must be an object { "link"?: [...], "setup"?: "…", "brief"?: [...] }`)
-  const { link, setup, brief } = raw as Workers
+  const { link, setup, brief, land } = raw as Workers
   if (link !== undefined && (!Array.isArray(link) || link.some((l) => typeof l !== "string"))) throw new Error(`${where}.link must be an array of paths`)
   if (setup !== undefined && typeof setup !== "string") throw new Error(`${where}.setup must be a command string`)
   if (brief !== undefined && (!Array.isArray(brief) || brief.some((f) => typeof f !== "string"))) throw new Error(`${where}.brief must be an array of paths`)
-  return { ...(link ? { link } : {}), ...(setup ? { setup } : {}), ...(brief ? { brief } : {}) }
+  if (land !== undefined && typeof land !== "string") {
+    if (!land || typeof land !== "object" || Array.isArray(land) || typeof (land as { command?: unknown }).command !== "string")
+      throw new Error(`${where}.land must be a command string or { "command": "…", "message"?: "…" }`)
+    if ((land as { message?: unknown }).message !== undefined && typeof (land as { message?: unknown }).message !== "string")
+      throw new Error(`${where}.land.message must be a string`)
+  }
+  return { ...(link ? { link } : {}), ...(setup ? { setup } : {}), ...(brief ? { brief } : {}), ...(land ? { land } : {}) }
 }
 
 /** "tier 1 (deepseek/deepseek-chat high)", or just "tier 1" without a model for it. */
