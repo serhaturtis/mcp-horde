@@ -36,7 +36,7 @@ const timeout = z
   .int()
   .min(1)
   .max(86_400)
-  .describe("How long to block (default 30 min in Claude Code, 50 s elsewhere); on a timeout the workers keep going.")
+  .describe("How long to block (default 25 min in Claude Code, 50 s elsewhere); on a timeout the workers keep going.")
 
 export function registerHorde(tool: Tool, opts: HordeOptions) {
   tool(
@@ -65,7 +65,9 @@ export function registerHorde(tool: Tool, opts: HordeOptions) {
       model: z
         .string()
         .optional()
-        .describe('"provider/model" for the worker. Default: the project\'s cheapest tier (horde.json "tiers"), else OpenCode\'s default model.'),
+        .describe(
+          '"provider/model" for the worker. Default: the cheapest tier of the repository\'s horde.json "tiers", else of the user-level ~/.config/mcp-horde/horde.json, else OpenCode\'s default model.',
+        ),
       variant: z.string().optional().describe('Effort level the model offers, e.g. "low", "high", "max".'),
       directory: z.string().optional().describe("The repository (default: the server's directory)."),
       wait: z.boolean().optional().describe("Block until the outcome. Default false."),
@@ -108,7 +110,7 @@ export function registerHorde(tool: Tool, opts: HordeOptions) {
 
   tool(
     "horde_wait",
-    "Wait for delegated tasks. Returns every outcome that is ready, each once; if none is, it blocks until the first one (up to timeout_seconds). READY: checks passed and the work was reviewed (what changed, cost) → horde_land. NEEDS YOU: the worker asks a question or for permission → horde_tell. FAILED: why, what the worker changed, and any edits refused outside its scope → horde_tell with a hint, or horde_drop. With no ids it waits for any task you started; on a timeout it says what each worker is doing (they keep working).",
+    "Wait for delegated tasks. Returns every outcome that is ready, each once; if none is, it blocks until the first one (up to timeout_seconds). READY: checks passed and the work was reviewed (what changed, cost) → horde_land. NEEDS YOU: the worker asks a question or for permission → horde_tell. FAILED: why, what the worker changed, and any edits refused outside its scope → horde_tell with a hint, or horde_drop. With no ids it waits for any task you started; on a timeout it says what each worker is doing (they keep working). In a subagent the call blocks the whole time (Claude Code moves only main-conversation calls to the background), so start the subagent's other work before waiting.",
     {
       ids: z.array(z.string()).optional().describe("Task ids (t-…) from horde_do. Default: every task you started."),
       timeout_seconds: timeout.optional(),
@@ -175,7 +177,15 @@ export function registerHorde(tool: Tool, opts: HordeOptions) {
     "Give up on a task: stop its worker, record the attempt as failed (tier suggestions learn from it), and remove its worktree and branch (the answer names the last commit, in case you want it back). To try again differently, horde_do again with a clearer goal, or horde_tell {model} for a stronger model on the same work.",
     { id: z.string().describe("Task id (t-…)."), reason: z.string().optional() },
     async (a, fleet) => {
-      const { snapshot: s, record } = await fleet.inspect(a.id)
+      const found = await fleet.inspect(a.id).catch(async (err: Error) => {
+        // A task whose worker never started (a stale claim) has no agent to stop: close it on the board.
+        const board = await Board.open(fleet.resolveDir())
+        if (!/^t-/.test(a.id) || !board.tasks().some((t) => t.id === a.id)) throw err
+        await board.fail(a.id, { reason: a.reason ?? "dropped by the orchestrator", retry: false })
+        return undefined
+      })
+      if (!found) return `dropped ${a.id}: it had no worker, and the task is closed on the board as failed.`
+      const { snapshot: s, record } = found
       if (s.state === "running" || s.state === "needs_input") await fleet.interrupt(a.id, "now", "dropped")
       const task = record.task
       const wt = record.worktree

@@ -151,11 +151,14 @@ export function pack(project: Project, opts: PackOptions): string {
   for (const f of INSTRUCTION_FILES) {
     const text = readText(project, f)
     if (!text) continue
-    const lines = text.split(/\r?\n/)
+    const lines = text.replace(/\r?\n$/, "").split(/\r?\n/)
     sections.push({
-      text: `### ${f} (project conventions${lines.length > CONVENTION_LINES ? `, first ${CONVENTION_LINES} of ${lines.length} lines` : ""})\n${lines.slice(0, CONVENTION_LINES).join("\n")}`,
+      // OpenCode 2 loads AGENTS.md itself but never CLAUDE.md, so a cut or dropped file is the
+      // worker's to read (docs/research/mcp-protocol.md).
+      text: `### ${f} (project conventions${lines.length > CONVENTION_LINES ? `, first ${CONVENTION_LINES} of ${lines.length} lines; read the rest before changing code` : ""})\n${lines.slice(0, CONVENTION_LINES).join("\n")}`,
       group: "conventions",
-      omitted: (k) => `(${k} instruction file(s) not shown: ${INSTRUCTION_FILES.filter((x) => project.files.includes(x)).join(", ")})`,
+      omitted: (k) =>
+        `(${k} instruction file(s) not shown: ${INSTRUCTION_FILES.filter((x) => project.files.includes(x)).join(", ")}; read them before changing code)`,
     })
   }
   if (!sections.length) return ""

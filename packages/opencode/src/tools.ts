@@ -36,11 +36,12 @@ const fail = (err: unknown): CallToolResult => ({
 })
 
 /**
- * Claude Code keeps long tool calls alive (and backgrounds them after 2 min);
- * most other clients time out after 60 s, so default to less there.
+ * Claude Code keeps long tool calls alive (and backgrounds them after 2 min), but aborts a stdio
+ * call that sends nothing for 30 min, and progress counts only when the client asked for it: 25 min
+ * returns "still working" before that. Most other clients time out after 60 s, so 50 s there.
  */
 function defaultWait(ctx: Context): number {
-  return /claude/i.test(ctx.clientName() ?? "") ? 1800 : 50
+  return /claude/i.test(ctx.clientName() ?? "") ? 1500 : 50
 }
 
 const id = z.string().describe("Agent name (given at spawn) or session id (ses_…).")
@@ -105,7 +106,7 @@ const timeout = z
   .min(1)
   .max(86_400)
   .describe(
-    "Max seconds to block (default 1800 in Claude Code, which backgrounds long calls; 50 elsewhere, to stay under the usual 60 s client timeout). Agents keep working after a timeout.",
+    "Max seconds to block (default 1500 in Claude Code, which backgrounds long calls; 50 elsewhere, to stay under the usual 60 s client timeout). Agents keep working after a timeout.",
   )
 const files = z.array(z.string()).describe("Files to attach (paths relative to the agent's directory, or absolute).")
 

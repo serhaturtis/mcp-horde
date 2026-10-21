@@ -109,9 +109,9 @@ ${L.join(`
 `)}`:""}`}f.push({text:E,group:"files",omitted:c(j=>`(${j} more file(s) in scope not shown; ask context_file for them)`,"omitted")})}l.length>d.length&&f.push({text:`Also in scope: ${l.slice(d.length,d.length+40).join(", ")}${l.length>d.length+40?", \u2026":""}`}),f.push(...p);let v=[...a.length?cm(e,a.slice(0,200)):new Map].filter(([b,$])=>$.length&&!$.every(S=>S.test===b)).map(([b,$])=>`- ${b}: ${$.map(S=>`${S.test} (${S.why})`).join(", ")}`);v.length?f.push({text:`### Tests that cover the scope
 ${v.slice(0,30).join(`
 `)}`}):a.length&&f.push({text:`### Tests that cover the scope
-None found: add tests next to the code, following the project's conventions.`});for(let b of um){let $=$t(e,b);if(!$)continue;let S=$.split(/\r?\n/);f.push({text:`### ${b} (project conventions${S.length>yb?`, first ${yb} of ${S.length} lines`:""})
+None found: add tests next to the code, following the project's conventions.`});for(let b of um){let $=$t(e,b);if(!$)continue;let S=$.replace(/\r?\n$/,"").split(/\r?\n/);f.push({text:`### ${b} (project conventions${S.length>yb?`, first ${yb} of ${S.length} lines; read the rest before changing code`:""})
 ${S.slice(0,yb).join(`
-`)}`,group:"conventions",omitted:c(E=>`(${E} instruction file(s) not shown: ${um.filter(j=>e.files.includes(j)).join(", ")})`,"omitted")})}return f.length?(f.unshift({text:"## Code context",required:!0}),Go(f,(t.budgetTokens??3e3)*4,`
+`)}`,group:"conventions",omitted:c(E=>`(${E} instruction file(s) not shown: ${um.filter(j=>e.files.includes(j)).join(", ")}; read them before changing code)`,"omitted")})}return f.length?(f.unshift({text:"## Code context",required:!0}),Go(f,(t.budgetTokens??3e3)*4,`
 
 `)):""}c(qP,"pack");var JP=dm(import.meta.url);hm("context",JP);process.on("unhandledRejection",e=>{process.stderr.write(`[mcp-horde/context] unhandled rejection: ${e instanceof Error?e.stack??e.message:String(e)}
 `)});var BP=HP.resolve(process.env.HORDE_CONTEXT_DIRECTORY||process.cwd()),$L=c(e=>({content:[{type:"text",text:e}]}),"ok"),bL=c(e=>({content:[{type:"text",text:`Error: ${e instanceof Error?e.message:String(e)}`}],isError:!0}),"fail"),wL=`context: precise code context instead of exploration (no index to build; answers come from the current files).

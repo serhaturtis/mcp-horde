@@ -32,7 +32,7 @@ function Add (exported) — internal/calc/calc.go:4-6
 1. **The scoped files**, ranked by how much they mention the goal: whole when small, otherwise their outline plus the lines that mention the task.
 2. **Definitions of symbols the goal names** (`backticked`, camelCase, PascalCase or snake_case words), wherever they are defined.
 3. **The tests that cover the scope**, or a note that there are none.
-4. **The project's conventions**: the first 60 lines of each instruction file.
+4. **The project's conventions**: the first 60 lines of each instruction file. When a file is longer, or the budget leaves it out, the brief tells the worker to read it before changing code: OpenCode 2 loads `AGENTS.md` itself, but never `CLAUDE.md`.
 
 `@mcp-horde/board` appends a pack to every brief (`board_brief`), within the brief's budget; the orchestrator does not have to call this itself.
 

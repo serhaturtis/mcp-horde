@@ -134,7 +134,7 @@ claude --dangerously-load-development-channels server:opencode
 
 Requirements: claude.ai or Console auth, and on Team/Enterprise plans the org setting `channelsEnabled`. Pushes are best effort, so `opencode_wait` still returns every result once, even if a push was already delivered.
 
-Without channels, `opencode_wait` is the way to get notified. Claude Code moves MCP calls that run longer than 2 minutes to a background task and notifies on completion. So a long `opencode_wait` (default timeout 30 min in Claude Code, with progress notifications that keep it alive) behaves much like a background-agent notification. Other clients get a 50 s default, below the usual 60 s client timeout. When a wait times out, it still returns whatever news it has.
+Without channels, `opencode_wait` is the way to get notified. Claude Code moves MCP calls that run longer than 2 minutes to a background task and notifies on completion. So a long `opencode_wait` (default timeout 25 min in Claude Code, under its 30-minute limit for a stdio call that sends nothing; progress notifications keep it alive when the client asks for them) behaves much like a background-agent notification. Other clients get a 50 s default, below the usual 60 s client timeout. When a wait times out, it still returns whatever news it has.
 
 ## Setup
 

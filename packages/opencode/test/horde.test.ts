@@ -173,4 +173,13 @@ describe("the simple path: horde_do, horde_wait, horde_land (real opencode, mock
     assert.equal((await Board.open(repo, boardState())).task(id).status, "failed")
     await assert.rejects(h.call("horde_wait", { ids: [id] }), /unknown agent|no longer tracked|disposed/)
   })
+
+  test("horde_drop closes a task whose worker never started", async () => {
+    const board = await Board.open(repo, boardState())
+    const [task] = (await board.plan([{ title: "Stale claim", goal: "Never started.", acceptance: [], scope: [] }])).tasks
+    const dropped = await h.call("horde_drop", { id: task!.id, reason: "stale" })
+    assert.match(dropped, new RegExp(`^dropped ${task!.id}: it had no worker`), dropped)
+    assert.equal((await Board.open(repo, boardState())).task(task!.id).status, "failed")
+    await assert.rejects(h.call("horde_drop", { id: "t-0000" }), /unknown agent/)
+  })
 })

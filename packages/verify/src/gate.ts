@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto"
 import fs from "node:fs/promises"
 import path from "node:path"
-import { fitSections, formatDuration, git, gitRaw, type Section, splitZ, truncate } from "@mcp-horde/core"
+import { fitSections, formatDuration, git, gitRaw, globMatcher, type Section, splitZ, truncate } from "@mcp-horde/core"
 import { type AuditResult, audit, diffBase, type Finding } from "./audit.js"
 import { type Check, checkScripts, detectChecks, loadSettings, loadSettingsAt } from "./detect.js"
 import { changedFiles, type Narrowing, planRelated } from "./related.js"
@@ -140,6 +140,7 @@ export async function gate(directory: string, opts: GateOptions = {}): Promise<V
         block: settings.audit.block,
         warn: settings.audit.warn,
         ruleScripts: checkScripts(all),
+        generated: settings.audit.generated,
       })
     : undefined
   const blockers = [
@@ -149,6 +150,8 @@ export async function gate(directory: string, opts: GateOptions = {}): Promise<V
     ...(auditResult?.findings.filter((f) => f.severity === "block").map(findingLine) ?? []),
   ]
   const warnings = auditResult?.findings.filter((f) => f.severity === "warn").map(findingLine) ?? []
+  const generated = globMatcher(settings.audit.generated)
+  untested = untested.filter((f) => !generated(f))
   if (untested.length)
     warnings.push(`tests: no test covers ${untested.length} changed source file(s): ${untested.slice(0, 5).join(", ")}${untested.length > 5 ? ", …" : ""}`)
   const verdict = {

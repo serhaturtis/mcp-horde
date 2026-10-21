@@ -22,6 +22,11 @@ export interface AuditOptions {
   warn: AuditCategory[]
   /** package.json scripts the checks run (see checkScripts): changing one changes what the gate checks. */
   ruleScripts?: string[]
+  /**
+   * Generated output (horde.json verify.audit.generated, read at base like the other rules, so the
+   * work cannot add to it): regenerated bundles are not binaries, and minified code is not source.
+   */
+  generated?: string[]
 }
 
 export interface AuditResult {
@@ -440,7 +445,9 @@ export async function audit(directory: string, opts: AuditOptions): Promise<Audi
     }
   }
 
+  const generated = globMatcher(opts.generated ?? [])
   for (const c of all) {
+    if (opts.generated?.length && generated(c.path)) continue
     const test = isTestPath(c.path)
     if (c.status === "D" && (test || isRunnableTest(c.path))) add("tests", { file: c.path, text: "deletes a test file" })
     // x.test.ts → x.test.ts.bak stays in a test directory but no runner picks it up any more.

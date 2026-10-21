@@ -182,6 +182,7 @@ tool(
       block: settings.audit.block,
       warn: settings.audit.warn,
       ruleScripts: checkScripts(await detectChecks(d, settings)),
+      generated: settings.audit.generated,
     })
     const head = `${r.files.length} file${r.files.length === 1 ? "" : "s"} changed, ${r.commits} commit${r.commits === 1 ? "" : "s"} since ${r.base.slice(0, 8)}`
     if (!r.findings.length) return `${head}; no findings.`

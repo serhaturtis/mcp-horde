@@ -7,6 +7,8 @@ import { after, describe, test } from "node:test"
 import { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import {
+  type AuditCategory,
+  type AuditOptions,
   audit,
   type Check,
   changedFiles,
@@ -190,6 +192,19 @@ describe("audit", () => {
     has(/^block binaries assets\/logo\.bin adds or changes a binary file/)
     assert.ok(!lines.join("\n").includes("AKIAABCDEFGHIJKLMNOP"), "the secret itself is never printed")
     assert.equal(r.commits, 1)
+  })
+
+  test("generated output is not audited as source, but stays in scope; real binaries still block", async () => {
+    // A bundle git treats as binary (-diff), holding text that would otherwise read as a secret.
+    const { root, base } = repo({ ".gitattributes": "dist/** -diff\n", "dist/app.js": "var a=1\n", "src/a.ts": "export const a = 1\n" })
+    write(root, { "dist/app.js": 'var a=2;var k="AKIAABCDEFGHIJKLMNOP"\n', "assets/logo.bin": Buffer.from([0, 1, 2, 3, 0, 255]) })
+    const opts = { base, block: ["scope", "tests", "secrets", "binaries"] as AuditCategory[], warn: [] as AuditCategory[] }
+    const lines = async (o: Partial<AuditOptions>) => (await audit(root, { ...opts, ...o })).findings.map((f) => `${f.category} ${f.file}`)
+    assert.ok((await lines({})).includes("binaries dist/app.js"), "without the setting the bundle reads as a binary")
+    const found = await lines({ generated: ["dist/**"] })
+    assert.ok(!found.some((l) => l.endsWith(" dist/app.js")), found.join("\n"))
+    assert.ok(found.includes("binaries assets/logo.bin"), found.join("\n"))
+    assert.ok((await lines({ generated: ["dist/**"], allowed: ["src/**"] })).includes("scope dist/app.js"))
   })
 
   test("merge commits are flagged; categories can be switched off", async () => {
@@ -392,12 +407,17 @@ describe("fixes", () => {
   test("a horde.json added after base cannot choose the gate's rules", async () => {
     const { root, base } = repo({ "README.md": "# x\n" })
     write(root, {
-      "horde.json": JSON.stringify({ verify: { checks: { fake: 'node -e "process.exit(0)"' }, audit: { off: ["secrets"] } } }),
+      "horde.json": JSON.stringify({ verify: { checks: { fake: 'node -e "process.exit(0)"' }, audit: { off: ["secrets"], generated: ["**"] } } }),
     })
     const s = await loadSettingsAt(root, base)
     assert.equal(s.configFile, undefined)
     assert.equal(s.checks, undefined)
     assert.deepEqual(s.audit.block, ["scope", "tests", "secrets", "binaries"])
+    // The work cannot declare its own files generated either.
+    assert.deepEqual(s.audit.generated, [])
+    assert.deepEqual(loadSettings(root).audit.generated, ["**"])
+    write(root, { "horde.json": JSON.stringify({ verify: { audit: { generated: "dist/**" } } }) })
+    assert.throws(() => loadSettings(root), /verify\.audit\.generated must be a list of globs/)
   })
 
   test("a shared gate can use the working config when the caller says so", async () => {

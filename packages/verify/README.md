@@ -95,13 +95,14 @@ From `horde.json` at the repository root when it defines them (with `base`, hord
       "allowed": ["src/**", "test/**"],
       "block": ["scope", "tests", "secrets", "binaries"],
       "warn": ["suppressions", "dependencies", "git"],
-      "off": []
+      "off": [],
+      "generated": ["dist/**"]
     }
   }
 }
 ```
 
-A category in neither `block` nor `off` warns. Globs take `*`, `**`, `?`, `[a-z]` classes and `{a,b}` alternatives.
+A category in neither `block` nor `off` warns. `generated` names generated output that is committed, such as bundles. A change to it is not reported as a binary, a big file, a secret or a suppression, and it does not count as untested source; scope still applies. Like every audit rule, it is read from `horde.json` as of the work's base commit, so the work cannot declare its own files generated. Globs take `*`, `**`, `?`, `[a-z]` classes and `{a,b}` alternatives.
 
 Checks run one at a time, in their own process group (killed as a whole on timeout or cancel), with `CI=1` and colour disabled. These inherited variables are removed: `FORCE_COLOR` (some tools treat any value as "force colour on"), `NODE_TEST_CONTEXT` (a `node --test` that inherits it reports to a parent that is not listening and exits 0), `OPENCODE_SERVER_*` and `HORDE_*`.
 

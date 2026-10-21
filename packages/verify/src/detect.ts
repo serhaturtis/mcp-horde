@@ -32,6 +32,8 @@ export interface VerifySettings {
     warn: AuditCategory[]
     /** Paths every change must stay within; empty means no scope restriction. */
     allowed: string[]
+    /** Generated output (bundles): no binary, size, secret or suppression findings, though scope still applies. */
+    generated: string[]
   }
 }
 
@@ -105,6 +107,8 @@ function parseSettings(horde: HordeFile): VerifySettings {
   for (const c of AUDIT_CATEGORIES) if (!block.includes(c) && !off.includes(c) && !warn.includes(c)) warn.push(c)
   const allowed = audit.allowed ?? []
   if (!Array.isArray(allowed) || allowed.some((a) => typeof a !== "string")) throw new Error(`${where}.audit.allowed must be a list of globs`)
+  const generated = audit.generated ?? []
+  if (!Array.isArray(generated) || generated.some((a) => typeof a !== "string")) throw new Error(`${where}.audit.generated must be a list of globs`)
   const timeout = v.timeoutSeconds ?? 600
   if (typeof timeout !== "number" || timeout <= 0) throw new Error(`${where}.timeoutSeconds must be a positive number`)
   return {
@@ -116,6 +120,7 @@ function parseSettings(horde: HordeFile): VerifySettings {
       block: block.filter((c) => !off.includes(c)),
       warn: warn.filter((c) => !block.includes(c) && !off.includes(c)),
       allowed: allowed as string[],
+      generated: generated as string[],
     },
   }
 }
