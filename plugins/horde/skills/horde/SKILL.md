@@ -18,27 +18,7 @@ You plan and judge; workers do the typing. Your context is the scarce resource: 
 
 ## Setting up a repository
 
-The project's checks judge every task, so `horde_do` refuses in a repository where none are found; `verify_detect` shows what is found. Everything lives in `horde.json` at the repository root, versioned with the code:
-
-```json
-{
-  "tiers": ["deepseek/deepseek-flash", "deepseek/deepseek-v4-pro"],
-  "workers": { "setup": "uv sync --frozen && npm ci --prefix web", "brief": ["docs/lane_brief.md"] },
-  "verify": {
-    "checks": {
-      "go": { "command": "go test -race ./...", "env": { "AUTH_PROVIDER": "local" }, "slots": 2 },
-      "web": { "command": "npm test", "cwd": "web" },
-      "pg": { "command": "uv run pytest -n 8 tests/pg", "when": "land", "exclusive": "dev-stack" }
-    }
-  }
-}
-```
-
-- **Checks** run in a shell from the repository root (or `cwd`), with `env` added. While a task works, only the tests related to its change run; `"when": "land"` keeps a slow check for the gate before landing. `"slots": n` caps how many runs of a check overlap across all of this repository's tasks; checks naming the same `"exclusive"` resource never overlap.
-- **Checks and setup see `HORDE_TASK` and `HORDE_WORKTREE`** (the task id, its checkout): name per-task databases, ports or caches with them, e.g. `createdb app_$HORDE_TASK`.
-- **`workers.setup`** prepares each new worktree; dependency directories git ignores (`node_modules`, `.venv`) are linked from your checkout instead. **`workers.brief`** lists files every worker reads in full, for house rules; `CLAUDE.md`, `AGENTS.md` and `CONTRIBUTING.md` are included anyway.
-- **`tiers`** are the worker models, cheapest first; a failing task moves up. Your defaults for every repository go in `~/.config/mcp-horde/horde.json` (`tiers`, `opencode`). Worktrees live in `~/.local/share/mcp-horde/worktrees` unless `HORDE_OPENCODE_WORKTREE_DIR` says otherwise.
-- Run `verify_gate` once before the first task: a check that fails on a clean tree fails every task.
+The project's checks judge every task, so `horde_do` refuses in a repository where none are found, or where they are not committed. The setup skill (`/horde:setup`) writes `horde.json` for a repository: the checks CI runs, what a new worktree needs, the resources checks share (database, ports, test slots). Run `verify_gate` once before the first task: a check that fails on a clean tree fails every task.
 
 ## Writing a task: where cheap models waste money
 

@@ -37,7 +37,7 @@ Optional, in the repository's `horde.json`: the worker models per tier, cheapest
 }
 ```
 
-Checks take `cwd`, `env`, `"when": "land"` (only before landing), `slots` and `exclusive`, and see `HORDE_TASK` and `HORDE_WORKTREE` when they run for a task; the skill's "Setting up a repository" has a full example. `workers.brief` lists repository-relative files (house rules) that every worker brief includes in full under `## House rules (<path>)`, right after its scope; each file is capped at 300 lines, and a listed file that does not exist is named in the brief rather than failing it.
+Checks take `cwd`, `env`, `"when": "land"` (only before landing), `slots` and `exclusive`, and see `HORDE_TASK` and `HORDE_WORKTREE` when they run for a task; the setup skill (`/horde:setup`) writes `horde.json` for a repository and has a full example. `workers.brief` lists repository-relative files (house rules) that every worker brief includes in full under `## House rules (<path>)`, right after its scope; each file is capped at 300 lines, and a listed file that does not exist is named in the brief rather than failing it.
 
 To use the same worker defaults in every repository, put `tiers` and `opencode` in `$XDG_CONFIG_HOME/mcp-horde/horde.json` (`~/.config/mcp-horde/horde.json` when `XDG_CONFIG_HOME` is unset). They apply only where the repository's `horde.json` does not set that key, and every other key is ignored. This makes `deepseek/deepseek-flash` the default worker model everywhere:
 
@@ -64,6 +64,6 @@ claude mcp add verify   -- node "$PWD/plugins/horde/servers/verify.js"
 claude mcp add context  -- node "$PWD/plugins/horde/servers/context.js"
 ```
 
-Copy `skills/horde/SKILL.md` into your project's `.claude/skills/horde/` for the procedure.
+Copy `skills/horde` and `skills/setup` into your project's `.claude/skills/` for the procedure and the repository setup.
 
 The bundles are generated from `packages/*` by `npm run bundle` (esbuild); `./ci.sh` fails when they do not match the sources. Do not edit them by hand.

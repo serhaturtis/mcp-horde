@@ -188,6 +188,9 @@ describe("the simple path: horde_do, horde_wait, horde_land (real opencode, mock
       return true
     })
     assert.deepEqual((await Board.open(bare, boardState())).tasks(), [], "no task was planned")
+    // Checks only in the working tree: the workers' gates read HEAD's horde.json and would find none.
+    fs.writeFileSync(path.join(bare, "horde.json"), JSON.stringify({ verify: { checks: { test: "true" } } }))
+    await assert.rejects(h.call("horde_do", { goal: "Change the README.", directory: bare }), /horde\.json are not committed, so nothing was started/)
   })
 
   test("horde_drop closes a task whose worker never started", async () => {

@@ -5,7 +5,7 @@
  */
 import { Board } from "@mcp-horde/board"
 import { formatDuration, formatUsd, git, indent, loadTiers, oneLine, truncate } from "@mcp-horde/core"
-import { type Check, detectChecks } from "@mcp-horde/verify"
+import { type Check, detectChecks, loadSettingsAt } from "@mcp-horde/verify"
 import type { ServerContext } from "@modelcontextprotocol/server"
 import { z } from "zod"
 import { type Fleet, formatModel, formText, type LandResult, SETTLED, type Snapshot } from "./fleet.js"
@@ -78,8 +78,9 @@ export function registerHorde(tool: Tool, opts: HordeOptions) {
     async (a, fleet, extra) => {
       const repo = fleet.resolveDir(a.directory)
       // The checks judge the work: with none the gate can never pass, so say so before a worker spends anything.
-      const checks = await detectChecks(repo)
-      if (!checks.length) throw new Error(noChecks(repo))
+      // Workers start from HEAD and their gates read HEAD's horde.json, so look there too.
+      const checks = await detectChecks(repo, await loadSettingsAt(repo, "HEAD"))
+      if (!checks.length) throw new Error(noChecks(repo, (await detectChecks(repo)).length > 0))
       const board = await Board.open(repo)
       const { tasks, warnings } = await board.plan([{ title: a.title ?? titleOf(a.goal), goal: a.goal, acceptance: a.done ?? [], scope: a.scope ?? [] }])
       const task = tasks[0]!
@@ -224,11 +225,13 @@ function plannedChecks(checks: Check[]): string {
   return `checked by: ${list} · the tests related to the change after each round, every check before landing`
 }
 
-function noChecks(repo: string): string {
+function noChecks(repo: string, uncommitted: boolean): string {
+  if (uncommitted)
+    return `the checks in ${repo}/horde.json are not committed, so nothing was started: workers start from HEAD, and their gates run the checks HEAD's horde.json names. Commit it, then horde_do again.`
   return [
     `no checks found in ${repo}, so nothing was started: a task's work is judged by the project's checks, and with none its gate can never pass.`,
-    'Add them to horde.json at the repository root, e.g. {"verify": {"checks": {"test": "AUTH_PROVIDER=local go test -race ./...", "web": {"command": "npm test", "cwd": "web"}}}}.',
-    "Each command runs in a shell from the repository root (or its cwd), so environment prefixes work. Then horde_do again; verify_detect shows what is found.",
+    "The horde's setup skill (/horde:setup) writes horde.json for this repository: the checks CI runs, what a new worktree needs, the resources checks share.",
+    'By hand: horde.json at the repository root, e.g. {"verify": {"checks": {"test": "AUTH_PROVIDER=local go test -race ./...", "web": {"command": "npm test", "cwd": "web"}}}}; each command runs in a shell from the root (or its cwd). Commit it, then horde_do again; verify_detect shows what is found.',
   ].join("\n")
 }
 
