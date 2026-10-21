@@ -363,6 +363,40 @@ describe("helpers", () => {
     fs.writeFileSync(path.join(dir, "horde.json"), JSON.stringify({ opencode: 4 }))
     assert.throws(() => at(), /"opencode" must be an object/)
   })
+
+  test("the running-agent limit falls back to the user-level horde.json", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "horde-limit-user-"))
+    fs.mkdirSync(path.join(dir, ".git"))
+    const config = fs.mkdtempSync(path.join(os.tmpdir(), "horde-config-"))
+    const userFile = path.join(config, "mcp-horde", "horde.json")
+    fs.mkdirSync(path.dirname(userFile), { recursive: true })
+    fs.writeFileSync(userFile, JSON.stringify({ opencode: { maxRunning: 5 }, tiers: ["deepseek/deepseek-flash"], workers: { setup: "echo ignored" } }))
+    const xdg = process.env.XDG_CONFIG_HOME
+    process.env.XDG_CONFIG_HOME = config
+    const at = (env: Record<string, string> = {}) => loadConfig({ HORDE_OPENCODE_DIRECTORY: dir, ...env } as NodeJS.ProcessEnv)
+    try {
+      assert.deepEqual([at().maxRunning, at().maxRunningFrom], [5, `${userFile} opencode.maxRunning`])
+      fs.writeFileSync(path.join(dir, "horde.json"), JSON.stringify({ opencode: { maxRunning: 3 } }))
+      assert.deepEqual([at().maxRunning, at().maxRunningFrom], [3, "horde.json opencode.maxRunning"], "the repository wins")
+      assert.equal(at({ HORDE_OPENCODE_MAX_RUNNING: "1" }).maxRunning, 1, "the environment wins")
+      fs.unlinkSync(path.join(dir, "horde.json"))
+      fs.writeFileSync(userFile, "{ nope")
+      assert.throws(
+        () => at(),
+        (err: Error) => err.message.includes(userFile) && /not valid JSON/.test(err.message),
+      )
+      fs.writeFileSync(userFile, JSON.stringify({ opencode: { maxRunning: "lots" } }))
+      assert.throws(
+        () => at(),
+        (err: Error) => err.message.includes(userFile) && /"opencode\.maxRunning"/.test(err.message),
+      )
+      fs.writeFileSync(userFile, JSON.stringify({ tiers: ["deepseek/deepseek-flash"] }))
+      assert.deepEqual([at().maxRunning, at().maxRunningFrom], [8, "default"], "keys other than opencode are ignored")
+    } finally {
+      if (xdg === undefined) delete process.env.XDG_CONFIG_HOME
+      else process.env.XDG_CONFIG_HOME = xdg
+    }
+  })
 })
 
 describe("state store", () => {

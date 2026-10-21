@@ -33,6 +33,12 @@ Optional, in the repository's `horde.json`: the worker models per tier, cheapest
 }
 ```
 
+To use the same worker defaults in every repository, put `tiers` and `opencode` in `$XDG_CONFIG_HOME/mcp-horde/horde.json` (`~/.config/mcp-horde/horde.json` when `XDG_CONFIG_HOME` is unset). They apply only where the repository's `horde.json` does not set that key, and every other key is ignored. This makes `deepseek/deepseek-flash` the default worker model everywhere:
+
+```json
+{ "tiers": ["deepseek/deepseek-flash"] }
+```
+
 To follow the horde from a terminal: `node <plugin dir>/servers/cli.js watch` in the repository shows the board live (tasks, their agents' state and gate verdicts, costs, locks, recent events); `status` prints it once (add a task id for one task in full).
 
 ## Requirements

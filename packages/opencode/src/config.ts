@@ -1,6 +1,6 @@
 import os from "node:os"
 import path from "node:path"
-import { loadHordeFile } from "@mcp-horde/core"
+import { loadHordeFile, loadUserHordeFile } from "@mcp-horde/core"
 
 /**
  * How permission requests (and questions) from an agent are handled.
@@ -72,19 +72,21 @@ function bool(value: string | undefined, name: string): boolean {
 
 /**
  * The running-agent limit: HORDE_OPENCODE_MAX_RUNNING, else horde.json `opencode.maxRunning`
- * (found from the default directory), else 8.
+ * (found from the default directory), else the user-level horde.json's, else 8.
  */
 function maxRunning(env: NodeJS.ProcessEnv, directory: string): { maxRunning: number; maxRunningFrom: string } {
   if (env.HORDE_OPENCODE_MAX_RUNNING)
     return { maxRunning: int(env.HORDE_OPENCODE_MAX_RUNNING, 8, "HORDE_OPENCODE_MAX_RUNNING"), maxRunningFrom: "HORDE_OPENCODE_MAX_RUNNING" }
-  const { file, data } = loadHordeFile(directory)
-  const section = data.opencode
+  const project = loadHordeFile(directory)
+  const user = project.data.opencode === undefined ? loadUserHordeFile({ ...process.env, ...env }) : undefined
+  const file = project.data.opencode === undefined ? user?.file : project.file
+  const section = project.data.opencode === undefined ? user?.data.opencode : project.data.opencode
   if (section === undefined) return { maxRunning: 8, maxRunningFrom: "default" }
   if (!section || typeof section !== "object" || Array.isArray(section)) throw new Error(`${file}: "opencode" must be an object`)
   const n = (section as Record<string, unknown>).maxRunning
   if (n === undefined) return { maxRunning: 8, maxRunningFrom: "default" }
   if (typeof n !== "number" || !Number.isInteger(n) || n < 0) throw new Error(`${file}: "opencode.maxRunning" must be a non-negative integer (0 = unlimited)`)
-  return { maxRunning: n, maxRunningFrom: "horde.json opencode.maxRunning" }
+  return { maxRunning: n, maxRunningFrom: project.data.opencode === undefined ? `${file} opencode.maxRunning` : "horde.json opencode.maxRunning" }
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {

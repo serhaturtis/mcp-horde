@@ -1,4 +1,15 @@
-export { type HordeFile, loadHordeFile, loadTiers, loadWorkers, packageVersion, type Tier, tierLabel, tierModel, type Workers } from "./config.js"
+export {
+  type HordeFile,
+  loadHordeFile,
+  loadTiers,
+  loadUserHordeFile,
+  loadWorkers,
+  packageVersion,
+  type Tier,
+  tierLabel,
+  tierModel,
+  type Workers,
+} from "./config.js"
 export { pidAlive, readJson, SELF, sleepSync, withLock, writeAtomic, writeJson } from "./files.js"
 export { GIT_ENV, git, gitRaw, splitZ } from "./git.js"
 export { globMatcher, isTestPath } from "./paths.js"

@@ -10,5 +10,6 @@ if (!process.env.HORDE_TEST_STATE_HOME) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "horde-test-state-"))
   process.env.HORDE_TEST_STATE_HOME = dir
   process.env.XDG_STATE_HOME = dir
+  process.env.XDG_CONFIG_HOME = dir
   process.on("exit", () => fs.rmSync(dir, { recursive: true, force: true }))
 }

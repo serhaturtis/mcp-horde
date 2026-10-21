@@ -283,6 +283,58 @@ describe("horde.json", () => {
     assert.throws(() => loadTiers(repo), /"tiers"\[0\] needs "model": "provider\/model"/)
   })
 
+  test("user-level horde.json supplies tiers unless the repository sets them", () => {
+    const repo = tmp()
+    fs.mkdirSync(path.join(repo, ".git"))
+    const config = tmp()
+    const userFile = path.join(config, "mcp-horde", "horde.json")
+    fs.mkdirSync(path.dirname(userFile), { recursive: true })
+    const xdg = process.env.XDG_CONFIG_HOME
+    process.env.XDG_CONFIG_HOME = config
+    try {
+      fs.writeFileSync(userFile, JSON.stringify({ tiers: ["deepseek/deepseek-flash"], workers: { setup: "echo ignored" } }))
+      assert.deepEqual(loadTiers(repo), [{ model: "deepseek/deepseek-flash" }])
+      assert.deepEqual(loadWorkers(repo), {}, "keys other than tiers and opencode are ignored")
+      fs.writeFileSync(path.join(repo, "horde.json"), JSON.stringify({ tiers: ["moonshot/kimi-k2"] }))
+      assert.deepEqual(loadTiers(repo), [{ model: "moonshot/kimi-k2" }], "the repository's tiers win")
+      fs.writeFileSync(path.join(repo, "horde.json"), JSON.stringify({}))
+      fs.writeFileSync(userFile, JSON.stringify({ tiers: [{ model: "no-provider" }] }))
+      assert.throws(
+        () => loadTiers(repo),
+        (err: Error) => err.message.includes(userFile) && /"tiers"\[0\]/.test(err.message),
+      )
+      fs.writeFileSync(userFile, "{ nope")
+      assert.throws(
+        () => loadTiers(repo),
+        (err: Error) => err.message.includes(userFile) && /not valid JSON/.test(err.message),
+      )
+    } finally {
+      if (xdg === undefined) delete process.env.XDG_CONFIG_HOME
+      else process.env.XDG_CONFIG_HOME = xdg
+    }
+  })
+
+  test("the user-level horde.json falls back to ~/.config when XDG_CONFIG_HOME is unset", () => {
+    const repo = tmp()
+    fs.mkdirSync(path.join(repo, ".git"))
+    const home = tmp()
+    const userFile = path.join(home, ".config", "mcp-horde", "horde.json")
+    fs.mkdirSync(path.dirname(userFile), { recursive: true })
+    fs.writeFileSync(userFile, JSON.stringify({ tiers: ["deepseek/deepseek-flash"] }))
+    const xdg = process.env.XDG_CONFIG_HOME
+    const previousHome = process.env.HOME
+    delete process.env.XDG_CONFIG_HOME
+    process.env.HOME = home
+    try {
+      assert.deepEqual(loadTiers(repo), [{ model: "deepseek/deepseek-flash" }])
+    } finally {
+      if (xdg === undefined) delete process.env.XDG_CONFIG_HOME
+      else process.env.XDG_CONFIG_HOME = xdg
+      if (previousHome === undefined) delete process.env.HOME
+      else process.env.HOME = previousHome
+    }
+  })
+
   test("worker setup: link and setup, validated; absent means the defaults", () => {
     const repo = tmp()
     fs.mkdirSync(path.join(repo, ".git"))

@@ -1,4 +1,5 @@
 import fs from "node:fs"
+import os from "node:os"
 import path from "node:path"
 
 /**
@@ -64,6 +65,26 @@ export function packageVersion(moduleUrl: string): string {
   }
 }
 
+/**
+ * The user-level horde.json: `$XDG_CONFIG_HOME/mcp-horde/horde.json`, or
+ * `~/.config/mcp-horde/horde.json` when XDG_CONFIG_HOME is unset. Only `tiers`
+ * and `opencode` apply from it, and only where the repository's file leaves
+ * them unset; everything else describes a project. A malformed file throws.
+ */
+export function loadUserHordeFile(env: NodeJS.ProcessEnv = process.env): { file: string; data: Record<string, unknown> } {
+  const home = env.HOME || os.homedir()
+  const file = path.join(env.XDG_CONFIG_HOME || path.join(home, ".config"), "mcp-horde", "horde.json")
+  if (!fs.existsSync(file)) return { file, data: {} }
+  let data: unknown
+  try {
+    data = JSON.parse(fs.readFileSync(file, "utf8"))
+  } catch (err) {
+    throw new Error(`${file} is not valid JSON: ${(err as Error).message}`)
+  }
+  if (!data || typeof data !== "object" || Array.isArray(data)) throw new Error(`${file} must contain a JSON object`)
+  return { file, data: data as Record<string, unknown> }
+}
+
 /** One model tier: what a task at this tier runs on. Tier 0 is the cheapest. */
 export interface Tier {
   /** "provider/model", as opencode_models lists it. */
@@ -78,9 +99,11 @@ export interface Tier {
  * orchestrator does the work itself. Empty when there is no list.
  */
 export function loadTiers(directory: string): Tier[] {
-  const { file, data } = loadHordeFile(directory)
-  const raw = data.tiers
+  const project = loadHordeFile(directory)
+  const user = project.data.tiers === undefined ? loadUserHordeFile() : undefined
+  const raw = project.data.tiers === undefined ? user?.data.tiers : project.data.tiers
   if (raw === undefined) return []
+  const file = project.data.tiers === undefined ? user?.file : project.file
   const where = `${file}: "tiers"`
   if (!Array.isArray(raw)) throw new Error(`${where} must be an array of { "model": "provider/model", "variant"?: "…" }`)
   return raw.map((t, i) => {
