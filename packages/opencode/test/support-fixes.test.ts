@@ -358,7 +358,37 @@ describe("worktree fixes", () => {
     git(r, "add", ".gitignore")
     git(r, "add", "-f", "tracked/node_modules/keep.txt")
     git(r, "commit", "-qm", "ignore deps")
-    assert.deepEqual(await dependencyLinks(r), [".venv", "node_modules", "packages/a/node_modules"])
+    assert.deepEqual(await dependencyLinks(r), { links: [".venv", "node_modules", "packages/a/node_modules"], notes: [] })
+  })
+
+  test("dependencyLinks leaves out directories that point back into the checkout", async () => {
+    const r = repo()
+    fs.writeFileSync(path.join(r, ".gitignore"), "node_modules/\n.venv/\n")
+    fs.mkdirSync(path.join(r, "packages", "b"), { recursive: true })
+    fs.writeFileSync(path.join(r, "packages", "b", "package.json"), "{}\n")
+    git(r, "add", ".")
+    git(r, "commit", "-qm", "workspace")
+    // npm workspaces: node_modules/@s/b is a link to packages/b; another package's own deps are fine.
+    fs.mkdirSync(path.join(r, "node_modules", "@s"), { recursive: true })
+    fs.mkdirSync(path.join(r, "node_modules", "left-pad"))
+    fs.symlinkSync(path.join(r, "packages", "b"), path.join(r, "node_modules", "@s", "b"), "junction")
+    fs.mkdirSync(path.join(r, "packages", "b", "node_modules", "dep"), { recursive: true })
+    // uv/pip editable install: a .pth naming the checkout's sources.
+    const site = path.join(r, ".venv", "lib", "python3.12", "site-packages")
+    fs.mkdirSync(site, { recursive: true })
+    fs.writeFileSync(path.join(site, "distutils-precedence.pth"), "import os\n")
+    fs.writeFileSync(path.join(site, "_app.pth"), `${fs.realpathSync(r)}/src\n`)
+    const { links, notes } = await dependencyLinks(r)
+    assert.deepEqual(links, [])
+    assert.match(
+      notes.join("\n"),
+      /^\.venv not linked: it has an editable install of this checkout \(_app\.pth\), which the worktree must take from its own checkout; install dependencies in horde\.json "workers\.setup"$/m,
+    )
+    assert.match(notes.join("\n"), /^node_modules not linked: its @s\/b is the workspace package packages\/b, /m)
+    assert.match(notes.join("\n"), /^packages\/b\/node_modules not linked: part of the same workspace install as node_modules$/m)
+    // A path that only starts like the checkout's is someone else's.
+    fs.writeFileSync(path.join(site, "_app.pth"), `${fs.realpathSync(r)}-other/src\n`)
+    assert.ok((await dependencyLinks(r)).links.includes(".venv"))
   })
 
   test("createWorktree links dependency directories by default and only those given explicitly", async () => {

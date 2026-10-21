@@ -43,7 +43,7 @@ export interface WorktreeOptions {
   rootDir: string
   /** Carry over uncommitted (staged, unstaged and untracked) changes from the main checkout. */
   includeUncommitted: boolean
-  /** Paths (relative to the repo root) to symlink from the main checkout; default: dependencyLinks(repo). */
+  /** Paths (relative to the repo root) to symlink from the main checkout; default: dependencyLinks(repo).links. */
   link?: string[]
   /** Shell command run in the new worktree before the agent starts, e.g. "npm ci". */
   setup?: string
@@ -88,12 +88,56 @@ export async function validateLink(repo: string, rel: string): Promise<string> {
   return norm
 }
 
-/** Dependency directories ignored by git in this checkout, so a worktree can link them. */
-export async function dependencyLinks(repo: string): Promise<string[]> {
+/**
+ * Dependency directories ignored by git in this checkout that a worktree can link, and a note for
+ * each one it cannot: one that points back into the checkout (workspace packages, an editable
+ * install) would run the checkout's code in the worktree, and `uv run` there would even repoint
+ * the checkout's own environment at the worktree.
+ */
+export async function dependencyLinks(repo: string): Promise<{ links: string[]; notes: string[] }> {
   const out = await gitRaw(repo, ["ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"])
-  return splitZ(out)
+  const found = splitZ(out)
     .map((p) => p.replace(/\/+$/, ""))
     .filter((p) => ["node_modules", ".venv", "venv"].includes(path.posix.basename(p)))
+  const root = await fs.realpath(repo)
+  const notes: string[] = []
+  const skip = new Set<string>()
+  for (const rel of found) {
+    const why = await intoCheckout(root, path.join(repo, rel))
+    if (why) notes.push(`${rel} not linked: ${why}, which the worktree must take from its own checkout; install dependencies in horde.json "workers.setup"`)
+    if (why) skip.add(rel)
+  }
+  // A workspace install is one unit: npm in the worktree would write through its packages' links.
+  const install = [...skip].find((rel) => path.posix.basename(rel) === "node_modules")
+  const rest = install ? found.filter((rel) => !skip.has(rel) && path.posix.basename(rel) === "node_modules") : []
+  if (rest.length) notes.push(`${rest.join(", ")} not linked: part of the same workspace install as ${install}`)
+  for (const rel of rest) skip.add(rel)
+  return { links: found.filter((rel) => !skip.has(rel)), notes }
+}
+
+/** What in a dependency directory points into the checkout at `root`, if anything. */
+async function intoCheckout(root: string, dir: string): Promise<string | undefined> {
+  const list = (d: string) => fs.readdir(d, { withFileTypes: true }).catch(() => [])
+  if (path.basename(dir) === "node_modules") {
+    for (const e of await list(dir)) {
+      const names = e.name.startsWith("@") && e.isDirectory() ? (await list(path.join(dir, e.name))).map((s) => `${e.name}/${s.name}`) : [e.name]
+      for (const name of names) {
+        const target = path.relative(root, await fs.realpath(path.join(dir, name)).catch(() => root))
+        if (target && !target.startsWith("..") && !path.isAbsolute(target) && !target.split(path.sep).includes("node_modules"))
+          return `its ${name} is the workspace package ${target.replace(/\\/g, "/")}`
+      }
+    }
+    return undefined
+  }
+  // A virtualenv: editable installs are .pth files (or setuptools' finders) naming source paths.
+  const here = new RegExp(`${root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:[\\\\/'"]|$)`, "m")
+  const lib = path.join(dir, "lib")
+  const sites = [path.join(dir, "Lib", "site-packages"), ...(await list(lib)).map((e) => path.join(lib, e.name, "site-packages"))]
+  for (const site of sites)
+    for (const e of await list(site))
+      if (/\.pth$|^__editable__.*\.py$/.test(e.name) && here.test(await fs.readFile(path.join(site, e.name), "utf8").catch(() => "")))
+        return `it has an editable install of this checkout (${e.name})`
+  return undefined
 }
 
 /**
@@ -102,8 +146,9 @@ export async function dependencyLinks(repo: string): Promise<string[]> {
  */
 export async function createWorktree(directory: string, name: string, opts: WorktreeOptions): Promise<{ worktree: Worktree; notes: string[] }> {
   const repo = await repoRoot(directory)
-  const links = await Promise.all((opts.link ?? (await dependencyLinks(repo))).map((l) => validateLink(repo, l)))
-  const notes: string[] = []
+  const auto = opts.link ? undefined : await dependencyLinks(repo)
+  const links = await Promise.all((opts.link ?? auto!.links).map((l) => validateLink(repo, l)))
+  const notes = [...(auto?.notes ?? [])]
   const slug = branchSlug(name)
   const repoKey = `${branchSlug(path.basename(repo))}-${createHash("sha1").update(repo).digest("hex").slice(0, 8)}`
   const base = await git(repo, "rev-parse", "--verify", "HEAD^{commit}").catch(() => {

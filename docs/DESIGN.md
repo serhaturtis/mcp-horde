@@ -287,7 +287,7 @@ The gate proves the code builds and its tests pass; it cannot tell whether the c
 
 **Defaults the agent no longer chooses.**
 1. Always a worktree, on branch `horde/<id>`.
-2. Dependencies: `horde.json` `"workers": { "link": [...], "setup": "…" }` when present; otherwise every untracked dependency directory git ignores in the checkout (`node_modules` anywhere, `.venv`, `venv`) is linked.
+2. Dependencies: `horde.json` `"workers": { "link": [...], "setup": "…" }` when present; otherwise every untracked dependency directory git ignores in the checkout (`node_modules` anywhere, `.venv`, `venv`) is linked, except one that points back into the checkout: a `node_modules` holding workspace packages (with every other `node_modules` of that install) or a virtualenv with an editable install. Linked, those run the checkout's code in the worktree, and `uv run` there repoints the checkout's own environment at the worktree (both reproduced); the worktree notes name what was left out, for `workers.setup` to install.
 3. The task's scope confines edits (session rules, outside denied) as well as the audit, for every task-bound spawn.
 4. The model is the task's tier from `horde.json`, else OpenCode's default model; the answer says which.
 5. The gate is the project's checks, the audit and the **review**: once the checks pass, a reviewer model (the next tier's, else the default) judges each criterion with cited lines, and it sees the checks' verdict, so "tests pass" can be met by citing a passed check. A criterion it finds not met goes back to the worker like a failing check while rounds remain (2 by default); criteria it cannot decide become "check yourself" lines.

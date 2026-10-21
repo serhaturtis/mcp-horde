@@ -1,7 +1,7 @@
 {
   "tiers": ["deepseek/deepseek-flash", "deepseek/deepseek-v4-pro"],
   "workers": {
-    "setup": "npm run build"
+    "setup": "npm ci --prefer-offline --no-audit --no-fund && npm run build"
   },
   "verify": {
     "audit": {
