@@ -8,10 +8,13 @@ Bundles the horde for Claude Code:
 - **Hooks** (`hooks/delegate.mjs`): at session start, and at the start of each subagent that can edit, a paragraph in the agent's context on what the horde does and what work it suits. Once per prompt, when an agent has edited four files by hand without delegating, a note next to that edit says a separate piece of the remaining work could go to a worker.
 - **Evals** (`evals/`): requests that should and should not be delegated, graded on whether `horde_do` was called; see [`evals/README.md`](evals/README.md).
 
-```text
-/plugin marketplace add serhaturtis/mcp-horde
-/plugin install horde@mcp-horde
+To install it for every project, run `./install.sh` in a clone of this repository, or without one:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/serhaturtis/mcp-horde/master/install.sh | bash -s -- --github
 ```
+
+It checks Node.js and OpenCode, adds the marketplace and installs the plugin at user scope; `--default-model deepseek/deepseek-flash` also writes the user-level `horde.json` below. Or from inside Claude Code: `/plugin marketplace add serhaturtis/mcp-horde`, then `/plugin install horde@mcp-horde`.
 
 ## Delegating by default
 

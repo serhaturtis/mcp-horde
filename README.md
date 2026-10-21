@@ -26,10 +26,15 @@ A worker model gets its own worktree, the project's dependencies and code contex
 
 [`plugins/horde`](plugins/horde) bundles the servers with the orchestration skill (`/horde:horde`), the judgement calls for delegating well (writing goals, splitting work, escalating):
 
-```text
-/plugin marketplace add serhaturtis/mcp-horde
-/plugin install horde@mcp-horde
+To have it in every project, run the installer. It checks Node.js and OpenCode, adds the marketplace, installs the plugin at user scope, and is safe to run again:
+
+```sh
+./install.sh                                          # from a clone; Claude Code reads the plugin in place, so git pull updates it
+./install.sh --default-model deepseek/deepseek-flash  # also make that the default worker model in every repository
+curl -fsSL https://raw.githubusercontent.com/serhaturtis/mcp-horde/master/install.sh | bash -s -- --github   # without a clone
 ```
+
+Or from inside Claude Code: `/plugin marketplace add serhaturtis/mcp-horde`, then `/plugin install horde@mcp-horde`.
 
 The plugin carries its servers as self-contained bundles (`plugins/horde/servers/`), so installing it is all it takes: no npm install, no build. It needs Node.js 20+ and [OpenCode](https://opencode.ai) on your `PATH`. The packages are not published to npm; see [`plugins/horde/README.md`](plugins/horde/README.md).
 
