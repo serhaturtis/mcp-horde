@@ -1455,11 +1455,11 @@ export class Fleet {
     return this.withoutGate(live, async () => {
       for (let attempt = 0; attempt < 3; attempt++) {
         let wt = live.record.worktree!
+        const target = await git(wt.repo, "symbolic-ref", "-q", "--short", "HEAD").catch(() => "")
+        if (!target) throw new Error(`your checkout ${wt.repo} is on a detached HEAD; switch to a branch first`)
         // After a landing conflict the worker rebased its branch onto the target: the recorded base
         // must follow it or the next gate and landing count the target's commits as the worker's.
         wt = await this.followRebase(live, wt)
-        const target = await git(wt.repo, "symbolic-ref", "-q", "--short", "HEAD").catch(() => "")
-        if (!target) throw new Error(`your checkout ${wt.repo} is on a detached HEAD; switch to a branch first`)
         // A repository with a commit-msg hook judges every commit: our own --no-verify commit
         // would bypass it, so leftover work is refused until the worker commits it or a message
         // squashes everything into one commit the hook checks.
