@@ -37,7 +37,7 @@ Optional, in the repository's `horde.json`: the worker models per tier, cheapest
 }
 ```
 
-Checks take `cwd`, `env`, `"when": "land"` (only before landing), `slots` and `exclusive`, and see `HORDE_TASK` and `HORDE_WORKTREE` when they run for a task; the setup skill (`/horde:setup`) writes `horde.json` for a repository and has a full example. `workers.brief` lists repository-relative files (house rules) that every worker brief includes in full under `## House rules (<path>)`, right after its scope; each file is capped at 300 lines, and a listed file that does not exist is named in the brief rather than failing it.
+Checks take `cwd`, `env`, `"when": "land"` (only before landing), `slots` and `exclusive`, and see `HORDE_TASK` and `HORDE_WORKTREE` when they run for a task; the setup skill (`/horde:setup`) writes `horde.json` for a repository and has a full example. `workers.brief` lists repository-relative files (house rules) that every worker brief includes in full under `## House rules (<path>)`, right after its scope; each file is capped at 300 lines, and a listed file that does not exist is named in the brief rather than failing it. `workers.land` is a command run while a task lands, after its commits are rebased onto your branch and before the checks, for files that must be regenerated on the new base; its changes are committed on top and land with the task.
 
 To use the same worker defaults in every repository, put `tiers` and `opencode` in `$XDG_CONFIG_HOME/mcp-horde/horde.json` (`~/.config/mcp-horde/horde.json` when `XDG_CONFIG_HOME` is unset). They apply only where the repository's `horde.json` does not set that key, and every other key is ignored. This makes `deepseek/deepseek-flash` the default worker model everywhere:
 

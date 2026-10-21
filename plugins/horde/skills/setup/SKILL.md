@@ -40,6 +40,7 @@ Every task runs in its own worktree, a fresh checkout of HEAD, and the project's
 ```
 
 - **Checks** run in a shell from the repository root (or `cwd`), with `env` added, so a plain string works too: `"test": "AUTH_PROVIDER=local go test ./..."`. They also get `CI=1`, `NO_COLOR=1` and `TERM=dumb` (no colour, prompts or watch mode), and `FORCE_COLOR` is removed. Checks and `workers.setup` see `HORDE_TASK` and `HORDE_WORKTREE` (the task id, its checkout).
+- **`workers.land`** runs while a task lands, at its worktree root after its commits are rebased onto your branch and before the checks; what it changes is committed on top through your hooks and lands with the task, and a landing that does not complete leaves no trace of it on the worker's branch (a command string, or `{ "command": …, "message": … }`). Use it for files that depend on the commit they sit on and that the project regenerates after a rebase: re-chained migrations, schema digests, docs pinned to the commit that last touched their code.
 - **`slots` and `exclusive`** hold across every process and worktree of the repository; a dead holder frees its slot, and a waiting run says what it waits for.
 - **`verify.timeoutSeconds`** is the limit per check run, 600 by default; a run also waits at most that long for a slot.
 - **`tiers`** are the worker models, cheapest first; a failing task moves up.
