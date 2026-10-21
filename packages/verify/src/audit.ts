@@ -340,7 +340,7 @@ const RULE_SCRIPTS = ["test", "typecheck", "type-check", "check-types", "tsc", "
 const RUNNER_CONFIG =
   /(^|\/)(jest\.config\.[\w.]+|vitest\.(config|workspace)\.[\w.]+|pytest\.ini|tox\.ini|\.mocharc(\.[\w]+)?|karma\.conf(\.[\w]+)?|\.c8rc(\.json)?|\.nycrc(\.[\w]+)?)$/
 
-/** Text of the INI/TOML sections whose header matches `header`. */
+/** Text of the INI/TOML sections whose header matches `header`, without trailing whitespace or blank lines. */
 function sections(text: string, header: RegExp): string {
   let keep = false
   return text
@@ -349,7 +349,33 @@ function sections(text: string, header: RegExp): string {
       if (/^\s*\[/.test(l)) keep = header.test(l.trim())
       return keep
     })
+    .map((l) => l.trimEnd())
     .join("\n")
+    .trimEnd()
+}
+
+/** Tables of pyproject.toml and Cargo.toml that hold dependencies; `[project]`'s `dependencies = [...]` is handled separately. */
+const DEP_TABLE =
+  /^(?:dependencies|dev-dependencies|build-dependencies|workspace\.dependencies|target\..*\.(?:dev-|build-)?dependencies|project\.optional-dependencies|dependency-groups|tool\.poetry\.(?:dev-)?dependencies|tool\.poetry\.group\.[^.]+\.dependencies|tool\.pdm\.dev-dependencies|tool\.uv\.(?:dev-)?dependencies)(?:\..+)?$/
+
+/**
+ * 1-based lines of a pyproject.toml/Cargo.toml inside a dependency list or table: a `version =
+ * "0.1.1"` in [project]/[package] is not a dependency change, an entry in one of these is.
+ */
+function dependencyLines(text: string): Set<number> {
+  const out = new Set<number>()
+  let table = ""
+  let list = false
+  text.split(/\r?\n/).forEach((line, i) => {
+    const header = line.match(/^\s*\[+([^\]]+)\]+/)
+    if (header && !list) table = header[1]!.trim()
+    const project = table === "project" && /^\s*dependencies\s*=/.test(line)
+    if (!header && (list || project || DEP_TABLE.test(table))) out.add(i + 1)
+    if (list) {
+      if (/^\s*\]/.test(line)) list = false
+    } else if (project && /\[/.test(line) && !/\]/.test(line)) list = true
+  })
+  return out
 }
 
 /**
@@ -359,7 +385,7 @@ function sections(text: string, header: RegExp): string {
  */
 async function ruleChanges(root: string, base: string, all: Change[], scripts: string[]): Promise<{ file: string; what: string }[]> {
   const out: { file: string; what: string }[] = []
-  const before = (f: string) => git(root, "show", `${base}:${f}`).catch(() => "")
+  const before = (f: string) => gitRaw(root, ["show", `${base}:${f}`]).catch(() => "")
   const after = (f: string) => fs.readFile(path.join(root, f), "utf8").catch(() => "")
   const json = (t: string) => {
     try {
@@ -488,8 +514,18 @@ export async function audit(directory: string, opts: AuditOptions): Promise<Audi
     } else if (/(^|\/)requirements[^/]*\.txt$/.test(c.path)) {
       const pkgs = c.added.map((a) => a.text.trim()).filter((t) => t && !t.startsWith("#"))
       if (pkgs.length) add("dependencies", { file: c.path, text: `adds ${pkgs.join(", ")}` })
-    } else if (/(^|\/)(Cargo\.toml|pyproject\.toml|go\.mod)$/.test(c.path)) {
-      const deps = c.added.map((a) => a.text.trim()).filter((t) => /^(require\s+)?[\w.@/-]+\s*(=|\s+v\d)|^"[\w.-]+(\[[\w,]+\])?\s*[<>=~!]/.test(t))
+    } else if (/(^|\/)(Cargo\.toml|pyproject\.toml)$/.test(c.path)) {
+      // Only entries inside a dependency table or list count: versions and other keys do not.
+      const dependency = c.status === "D" ? new Set<number>() : dependencyLines(await fs.readFile(path.join(root, c.path), "utf8").catch(() => ""))
+      const deps = c.added
+        .filter((a) => dependency.has(a.line))
+        .map((a) => a.text.trim().replace(/,$/, ""))
+        // Container lines (`dependencies = [`, `]`) are not entries.
+        .filter((t) => t && !t.startsWith("#") && !/^[[\]]$/.test(t) && !/^[\w.-]+\s*=\s*\[\s*$/.test(t))
+      if (deps.length)
+        add("dependencies", { file: c.path, text: `adds or changes ${deps.slice(0, 5).join("; ")}${deps.length > 5 ? ` (+${deps.length - 5})` : ""}` })
+    } else if (/(^|\/)go\.mod$/.test(c.path)) {
+      const deps = c.added.map((a) => a.text.trim()).filter((t) => /^(require\s+)?[\w.@/-]+\s*(=|\s+v\d)/.test(t))
       if (deps.length)
         add("dependencies", { file: c.path, text: `adds or changes ${deps.slice(0, 5).join("; ")}${deps.length > 5 ? ` (+${deps.length - 5})` : ""}` })
     } else if (LOCKFILES.test(c.path)) add("dependencies", { file: c.path, text: "updates a lockfile" }, true)

@@ -704,6 +704,24 @@ describe("fixes", () => {
     assert.ok(!v.blockers.some((b) => /pyproject.*\[project\]/.test(b)), "other pyproject sections are not rules")
   })
 
+  test("an ordinary pyproject.toml or Cargo.toml edit is not a rule or dependency change", async () => {
+    const { root, base } = repo({
+      "pyproject.toml": "[project]\nname = 'x'\nversion = '0.1.0'\n\n[tool.pytest.ini_options]\naddopts = '-q'\n",
+      "Cargo.toml": "[package]\nname = 'x'\nversion = '0.1.0'\n\n[dependencies]\nserde = '1'\n",
+    })
+    write(root, {
+      "pyproject.toml":
+        "[project]\nname = 'x'\nversion = '0.1.1'\ndependencies = [\n  'requests',\n]\n\n[project.optional-dependencies]\ndev = [\n  'ruff',\n]\n\n[tool.pytest.ini_options]\naddopts = '-q'\n",
+      "Cargo.toml": "[package]\nname = 'x'\nversion = '0.1.1'\n\n[dependencies]\nserde = '1'\nanyhow = '1'\n",
+    })
+    const l = await lines(root, base)
+    assert.ok(!l.some((x) => /changes the rules/.test(x)), l.join("\n"))
+    const added = l.filter((x) => / dependencies /.test(x)).join("\n")
+    assert.match(added, /pyproject\.toml adds or changes 'requests'; 'ruff'/, added)
+    assert.match(added, /Cargo\.toml adds or changes anyhow = '1'/, added)
+    assert.doesNotMatch(added, /version/, "a version bump is not a dependency")
+  })
+
   test("a horde.json added after base cannot choose the gate's rules", async () => {
     const { root, base } = repo({ "README.md": "# x\n" })
     write(root, {
