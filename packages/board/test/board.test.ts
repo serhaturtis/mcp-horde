@@ -374,7 +374,7 @@ describe("board", () => {
     fs.writeFileSync(path.join(root, "extra.ts"), "new\n")
     await board.report(t.id, attempt.token, { summary: "did it", filesChanged: ["./README.md"], testsAdded: ["readme.test.ts"] })
     const check = (await board.checkReport(t.id))!
-    assert.deepEqual(check, { claimedNotChanged: ["readme.test.ts"], changedNotReported: ["extra.ts"], diff: ["README.md", "extra.ts"] })
+    assert.deepEqual(check, { claimedNotChanged: ["readme.test.ts"], listedNotChanged: [], changedNotReported: ["extra.ts"], diff: ["README.md", "extra.ts"] })
     const shown = renderTask(board.task(t.id), "brief", Date.now(), check)
     assert.match(shown, /⚠ claimed but not in the diff: readme\.test\.ts\n {2}⚠ in the diff but not in the report: extra\.ts/)
     fs.rmSync(path.join(root, "extra.ts"))
@@ -401,12 +401,58 @@ describe("board", () => {
       testsAdded: ["a.test.ts", "missing.test.ts"],
     })
     const check = (await board.checkReport(t.id))!
-    assert.deepEqual(check.claimedNotChanged, ["missing.test.ts"], "an existing test that was run is not a claim; a missing one still is")
+    assert.deepEqual(check.claimedNotChanged, ["missing.test.ts"], "a missing test is still a claim")
+    assert.deepEqual(check.listedNotChanged, ["a.test.ts"], "an existing test that was only run is listed, not called a claim")
     assert.deepEqual(check.changedNotReported, [], "the command is not a path but b.ts is reported")
     assert.match(
       renderBrief(board, board.task(t.id), attempt),
       /--changed lists the files you changed and --tests the test files you added or changed; commands you ran go in --summary\./,
     )
+  })
+
+  test("a test file that was only run is listed as unchanged and never matches the diff", async () => {
+    const root = repo()
+    fs.mkdirSync(path.join(root, "test"), { recursive: true })
+    fs.mkdirSync(path.join(root, "src"), { recursive: true })
+    fs.writeFileSync(path.join(root, "test/login.test.ts"), "test\n")
+    fs.writeFileSync(path.join(root, "src/login.ts"), "old\n")
+    git(root, "add", "-A")
+    git(root, "commit", "-qm", "base")
+    const base = git(root, "rev-parse", "HEAD")
+    const board = new Board(tmp())
+    const t = (await board.plan([{ title: "x", goal: "y" }])).tasks[0]!
+    const { attempt } = await board.assign(t.id, "w")
+    await board.bindWorkspace(t.id, attempt.token, { path: root, base })
+    fs.writeFileSync(path.join(root, "src/login.ts"), "new\n")
+    await board.report(t.id, attempt.token, { summary: "changed login", filesChanged: ["src/login.ts"], testsAdded: ["test/login.test.ts"] })
+    const check = (await board.checkReport(t.id))!
+    assert.deepEqual(check.listedNotChanged, ["test/login.test.ts"])
+    assert.deepEqual(check.claimedNotChanged, [])
+    assert.deepEqual(check.changedNotReported, [])
+    const shown = renderTask(board.task(t.id), "brief", Date.now(), check)
+    assert.match(shown, /⚠ listed under tests but unchanged \(only run\?\): test\/login\.test\.ts/)
+    assert.doesNotMatch(shown, /✓ the report matches the diff/)
+  })
+
+  test("a report from a workspace subdirectory matches root-relative diff paths", async () => {
+    const root = repo()
+    const ws = path.join(root, "packages/api")
+    fs.mkdirSync(path.join(ws, "src"), { recursive: true })
+    fs.writeFileSync(path.join(ws, "src/a.ts"), "old\n")
+    git(root, "add", "-A")
+    git(root, "commit", "-qm", "api")
+    const base = git(root, "rev-parse", "HEAD")
+    const board = new Board(tmp())
+    const t = (await board.plan([{ title: "x", goal: "y" }])).tasks[0]!
+    const { attempt } = await board.assign(t.id, "w")
+    await board.bindWorkspace(t.id, attempt.token, { path: ws, base })
+    fs.writeFileSync(path.join(ws, "src/a.ts"), "new\n")
+    await board.report(t.id, attempt.token, { summary: "changed a", filesChanged: ["src/a.ts"] })
+    const check = (await board.checkReport(t.id))!
+    assert.deepEqual(check.claimedNotChanged, [])
+    assert.deepEqual(check.listedNotChanged, [])
+    assert.deepEqual(check.changedNotReported, [])
+    assert.deepEqual(check.diff, ["packages/api/src/a.ts"])
   })
 
   test("notes: duplicates collapse, recall ranks by overlap, forget hides", async () => {
@@ -664,6 +710,23 @@ describe("board rules found in review", () => {
     git(root, "mv", "a.ts", "b.ts")
     await board.report(t2.id, a2.token, { summary: "renamed", filesChanged: ["a.ts", path.join(root, "b.ts")] })
     assert.deepEqual((await board.checkReport(t2.id))?.claimedNotChanged, [])
+  })
+
+  test("a long summary and several long lists still fit the report cap", async () => {
+    const board = new Board(tmp())
+    const t = (await board.plan([{ title: "x", goal: "y" }])).tasks[0]!
+    const { attempt } = await board.assign(t.id)
+    const items = (name: string) => Array.from({ length: 40 }, (_, i) => `${name}${i}-${"x".repeat(300 - name.length - String(i).length - 1)}`)
+    await board.report(t.id, attempt.token, {
+      summary: "s".repeat(2000),
+      filesChanged: items("changed"),
+      testsAdded: items("test"),
+      decisions: items("decision"),
+      questions: items("question"),
+      unverifiedClaims: items("unverified"),
+    })
+    const r = board.task(t.id).reports[0]!
+    assert.ok(JSON.stringify(r).length <= 4000, String(JSON.stringify(r).length))
   })
 
   test("CLI flag values may start with dashes; the brief always keeps its reporting commands", async () => {

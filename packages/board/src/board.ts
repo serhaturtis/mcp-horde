@@ -49,8 +49,10 @@ export interface Attempt {
 
 /** A report's claims against the attempt's actual diff. */
 export interface ReportCheck {
-  /** Files the report names (changed or tests added) that the diff does not touch. */
+  /** Files the report names (changed, or tests added that do not exist) that the diff does not touch. */
   claimedNotChanged: string[]
+  /** Existing test files the report lists that the diff does not touch (likely only run). */
+  listedNotChanged: string[]
   /** Files the diff touches that the report does not mention. */
   changedNotReported: string[]
   /** Every file in the diff. */
@@ -374,22 +376,22 @@ export class Board {
     } catch {
       return undefined
     }
-    // Claims may be absolute paths inside the workspace.
-    const norm = (p: string) => {
-      const abs = p.replace(/\\/g, "/")
-      const prefix = `${ws.path.replace(/\\/g, "/").replace(/\/+$/, "")}/`
-      return normalize(abs.startsWith(prefix) ? abs.slice(prefix.length) : abs).replace(/^\.\//, "")
-    }
+    // Claims may be absolute paths, or relative to the workspace when it is a subdirectory of
+    // the repository; the diff always names paths relative to the repository root.
+    const norm = (p: string) => normalize(path.relative(root, path.resolve(ws.path, p)).replace(/\\/g, "/"))
     // A command a worker ran is not a path; neither is a test it only ran (an existing file
     // outside the diff). A changed file missing from the diff, or a test that does not exist,
     // is still a claim the diff does not support.
     const isFile = (p: string) => fs.existsSync(path.join(root, p)) || fs.existsSync(path.join(ws.path, p))
     const claimedPath = (p: string) => Boolean(p) && (!/\s/.test(p) || isFile(p))
     const changed = r.filesChanged.map(norm).filter(claimedPath)
-    const tests = r.testsAdded.map(norm).filter((p) => claimedPath(p) && (diff.includes(p) || !isFile(p)))
+    const testPaths = r.testsAdded.map(norm).filter(claimedPath)
+    const tests = testPaths.filter((p) => diff.includes(p) || !isFile(p))
+    const listedNotChanged = testPaths.filter((p) => !diff.includes(p) && isFile(p))
     const claimed = [...new Set([...changed, ...tests])]
     return {
       claimedNotChanged: claimed.filter((c) => !diff.includes(c)),
+      listedNotChanged: [...new Set(listedNotChanged)],
       changedNotReported: diff.filter((d) => !claimed.includes(d)),
       diff,
     }
@@ -555,6 +557,18 @@ export class Board {
         const longest = lists.filter((k) => report[k].length > 3).sort((x, y) => report[y].length - report[x].length)[0]
         if (!longest) break
         report[longest].pop()
+      }
+      // Lists are at their floor and the report is still too long: shorten the longest text.
+      while (JSON.stringify(report).length > MAX_REPORT * 2) {
+        const texts = [
+          { length: () => report.summary.length, cut: (n: number) => (report.summary = report.summary.slice(0, n)) },
+          ...lists.flatMap((k) =>
+            report[k].map((_, i) => ({ length: () => report[k][i]!.length, cut: (n: number) => (report[k][i] = report[k][i]!.slice(0, n)) })),
+          ),
+        ].sort((x, y) => y.length() - x.length())
+        const biggest = texts[0]!
+        if (biggest.length() < 2) break
+        biggest.cut(Math.floor(biggest.length() / 2))
       }
       t.reports.push(report)
       a.seenAt = report.at

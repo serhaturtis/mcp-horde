@@ -216,7 +216,8 @@ export function renderTask(t: Task, detail: "brief" | "full" = "brief", now = Da
     if (check) {
       if (check.claimedNotChanged.length) lines.push(`  ⚠ claimed but not in the diff: ${check.claimedNotChanged.join(", ")}`)
       if (check.changedNotReported.length) lines.push(`  ⚠ in the diff but not in the report: ${check.changedNotReported.join(", ")}`)
-      if (!check.claimedNotChanged.length && !check.changedNotReported.length)
+      if (check.listedNotChanged.length) lines.push(`  ⚠ listed under tests but unchanged (only run?): ${check.listedNotChanged.join(", ")}`)
+      if (!check.claimedNotChanged.length && !check.changedNotReported.length && !check.listedNotChanged.length)
         lines.push(`  ✓ the report matches the diff (${check.diff.length} file${check.diff.length === 1 ? "" : "s"})`)
     }
   }

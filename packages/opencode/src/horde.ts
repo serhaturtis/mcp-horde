@@ -426,7 +426,9 @@ export async function outcome(fleet: Fleet, ref: string): Promise<string> {
       report
         ? report.claimedNotChanged.length
           ? `⚠ the worker's report names ${report.claimedNotChanged.join(", ")}, which its diff does not touch`
-          : "report matches the diff"
+          : report.listedNotChanged.length
+            ? `⚠ listed under tests but unchanged (only run?): ${report.listedNotChanged.join(", ")}`
+            : "report matches the diff"
         : "",
     ].filter(Boolean)
     const lines = [say("READY"), `  ${head.join(" · ")}`]
