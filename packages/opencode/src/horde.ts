@@ -149,7 +149,7 @@ export function registerHorde(tool: Tool, opts: HordeOptions) {
       if (a.wait) return (await collect(fleet, [snapshot.id], "all", a.timeout_seconds ?? opts.waitSeconds(), extra, opts)).text
       const tiers = loadTiers(repo)
       const model = snapshot.model ? formatModel(snapshot.model) : "OpenCode's default model"
-      const tier = tiers.length ? ` (tier ${task.tier} of ${tiers.length})` : ""
+      const tier = tiers.length ? ` (tier ${board.task(task.id).tier} of ${tiers.length})` : ""
       const setup = notes.filter((n) => !/^working t-/.test(n)).map((n) => n.replace(/ from the main checkout$/, ""))
       return [
         `${task.id} working: "${task.title}" · ${model}${tier} · worktree ${snapshot.worktree?.branch ?? "(none)"}`,
@@ -211,7 +211,7 @@ export function registerHorde(tool: Tool, opts: HordeOptions) {
       if (a.wait) return (await collect(fleet, [snapshot.id], "all", a.timeout_seconds ?? opts.waitSeconds(), extra, opts)).text
       const tiers = loadTiers(repo)
       const model = snapshot.model ? formatModel(snapshot.model) : "OpenCode's default model"
-      const tier = tiers.length ? ` (tier ${task.tier} of ${tiers.length})` : ""
+      const tier = tiers.length ? ` (tier ${board.task(task.id).tier} of ${tiers.length})` : ""
       const setup = notes.filter((n) => !/^working t-/.test(n)).map((n) => n.replace(/ from the main checkout$/, ""))
       return [
         `${task.id} investigating: "${task.title}" · ${model}${tier} · worktree ${snapshot.worktree?.branch ?? "(none)"}`,

@@ -936,8 +936,12 @@ export class Fleet {
           throw new Error(`${taskId} is being worked by ${holder.record.name ?? holder.record.id}; wait, interrupt or dispose it first`)
       }
     }
+    const tiers = loadTiers(directory)
+    // An explicit model that is one of the tiers records that tier (the highest, if listed twice),
+    // so the outcome footer and the escalation hint name the real one.
+    const matched = input.model ? tiers.reduce((found, t, i) => (t.model === input.model ? i : found), -1) : -1
     // Without an explicit model, the task's tier picks one from horde.json "tiers".
-    const tier = input.model ? undefined : tierModel(current.tier, loadTiers(directory), taskId)
+    const tier = input.model ? undefined : tierModel(current.tier, tiers, taskId)
     const effective: SpawnInput = {
       ...input,
       name,
@@ -951,6 +955,8 @@ export class Fleet {
     // Everything that can be checked is checked before the board records an attempt.
     const checked = await this.checkSpawn(effective)
     try {
+      // Only an accepted spawn moves the task to the tier its explicit model names.
+      if (matched >= 0 && current.tier !== matched) await board.edit(taskId, { tier: matched })
       const { task, attempt } = await board.assign(taskId, name)
       const extra = input.prompt.trim()
       // An investigation's prompt is the whole instruction (no board reporting commands).
@@ -972,7 +978,7 @@ export class Fleet {
       return {
         snapshot: await this.snapshot(snap.id),
         notes: [
-          `working ${task.id} "${task.title}" (attempt ${attempt.n}${tier ? `, ${tierLabel(task.tier, loadTiers(directory))}` : ""}); its report lands on the board`,
+          `working ${task.id} "${task.title}" (attempt ${attempt.n}${tier || matched >= 0 ? `, ${tierLabel(task.tier, tiers)}` : ""}); its report lands on the board`,
           ...result.notes,
         ],
       }
@@ -2521,6 +2527,8 @@ export class Fleet {
     const snapshots: Snapshot[] = []
     const errors: string[] = []
     results.forEach((r, i) => {
+      // Disposed since the ids were captured: no longer an agent to list, and not an error.
+      if (this.gone.has(ids[i]!)) return
       if (r.status === "fulfilled") snapshots.push(r.value)
       else errors.push(`${ids[i]}: ${(r.reason as Error).message}`)
     })
@@ -2627,7 +2635,9 @@ export class Fleet {
       if (!round.done) {
         // What we knew last, as of the previous round; nothing new is marked as reported.
         return {
-          snapshots: last.length ? last : ids.flatMap((id) => (this.live.get(id) ? [this.build(this.live.get(id)!)] : [])),
+          snapshots: (last.length ? last : ids.flatMap((id) => (this.live.get(id) ? [this.build(this.live.get(id)!)] : []))).filter(
+            (s) => !this.gone.has(s.id),
+          ),
           news: new Set(),
           errors: ["the agents' status could not be read before the wait ended (the OpenCode server is not answering)"],
           timedOut: true,
@@ -2635,16 +2645,29 @@ export class Fleet {
         }
       }
       const results = round.value
-      const snaps = results.filter((r): r is PromiseFulfilledResult<Snapshot> => r.status === "fulfilled").map((r) => r.value)
-      const errors = results.flatMap((r, i) => (r.status === "rejected" ? [`${ids[i]}: ${(r.reason as Error).message}`] : []))
+      const snaps: Snapshot[] = []
+      const errors: string[] = []
       results.forEach((r, i) => {
-        if (r.status === "fulfilled") unreadableSince.delete(ids[i]!)
-        else if (!unreadableSince.has(ids[i]!)) unreadableSince.set(ids[i]!, Date.now())
+        const id = ids[i]!
+        // A session disposed during the wait (its task landed or was dropped) is the normal end of
+        // that task, not an error; one disposed before the wait still fails at the get above.
+        if (this.gone.has(id)) {
+          unreadableSince.delete(id)
+          return
+        }
+        if (r.status === "fulfilled") {
+          snaps.push(r.value)
+          unreadableSince.delete(id)
+        } else {
+          errors.push(`${id}: ${(r.reason as Error).message}`)
+          if (!unreadableSince.has(id)) unreadableSince.set(id, Date.now())
+        }
       })
       // An idle agent is not done while its gate is undecided; anything needing attention still surfaces.
       const settled = snaps.filter((s) => SETTLED.has(s.state) && !(s.state === "idle" && gateUndecided(s)))
       const news = settled.filter((s) => this.hasNews(s))
-      const allSettled = waitedOut(ids, new Set(settled.map((s) => s.id)), unreadableSince, Date.now())
+      const waiting = ids.filter((id) => !this.gone.has(id))
+      const allSettled = waitedOut(waiting, new Set(settled.map((s) => s.id)), unreadableSince, Date.now())
       const done = mode === "any" ? news.length > 0 || allSettled : allSettled
       const timedOut = !done && (Date.now() >= deadline || !!opts.signal?.aborted)
       if (done || timedOut) {

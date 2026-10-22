@@ -814,6 +814,80 @@ console.log("1..0")
     assert.match(fs.readFileSync(path.join(r, "horde.json"), "utf8"), /echo uncommitted/, "the edit stays in the checkout")
     await h.call("horde_drop", { id })
   })
+
+  test("a wait without ids ignores a task disposed while it waits", async () => {
+    // A task already reported READY is dropped while the wait blocks on another: its disposed
+    // session is the normal end of it, not a "Could not read" error.
+    const done = idOf(
+      await h.call("horde_do", {
+        goal: "Write the reported file.\nRUN: echo ok > reported.txt && git add reported.txt && git commit -qm reported",
+        done: ["reported.txt says ok"],
+        scope: ["reported.txt"],
+      }),
+    )
+    assert.match(await settle(done), / READY /)
+    const finishing = idOf(
+      await h.call("horde_do", {
+        goal: "Finish soon.\nRUN: sleep 3 && echo ok > finish.txt && git add finish.txt && git commit -qm finish",
+        done: ["finish.txt says ok"],
+        scope: ["finish.txt"],
+      }),
+    )
+    assert.match(await h.call("horde_wait", { ids: [finishing], timeout_seconds: 120 }), / NEEDS YOU /)
+    await h.call("horde_tell", { id: finishing, approve: true })
+    const waiting = h.call("horde_wait", { timeout_seconds: 120 })
+    await new Promise((r) => setTimeout(r, 1_000))
+    await h.call("horde_drop", { id: done, reason: "not needed" })
+    const out = await waiting
+    assert.doesNotMatch(out, /Could not read/, out)
+    assert.doesNotMatch(out, /disposed or deleted/, out)
+    assert.match(out, new RegExp(`^${finishing} READY`), out)
+    await h.call("horde_drop", { id: finishing })
+  })
+
+  test("an explicit model that is a tier records it, so escalation does not name the same model", async () => {
+    const { repo: r } = makeRepo(mock.url)
+    fs.writeFileSync(path.join(r, "check.js"), CHECK)
+    fs.writeFileSync(path.join(r, "horde.json"), JSON.stringify({ verify: { checks: { test: "node check.js" } }, tiers: ["mock/mock", "mock/pricey"] }))
+    git(r, "add", ".")
+    git(r, "commit", "-qm", "checks")
+    const started = await h.call("horde_do", {
+      directory: r,
+      model: "mock/pricey",
+      goal: "Write the stubborn file.\nRUN: echo nope > stubborn.txt && git add stubborn.txt && git commit -qm stubborn",
+      done: ["stubborn.txt says ok"],
+      scope: ["stubborn.txt"],
+    })
+    assert.match(started, /mock\/pricey \(tier 1 of 2\)/, started)
+    const id = idOf(started)
+    const failed = await settle(id)
+    assert.match(failed, new RegExp(`^${id} FAILED`), failed)
+    assert.match(failed, /mock\/pricey \(tier 1\)/, failed)
+    assert.doesNotMatch(failed, /tier 2 is/, failed)
+    assert.doesNotMatch(failed, /model: "mock\/pricey"/, failed)
+    assert.equal((await Board.open(r, boardState())).task(id).tier, 1)
+    await h.call("horde_drop", { id })
+  })
+
+  test("an explicit model that matches no tier keeps tier 0", async () => {
+    const { repo: r } = makeRepo(mock.url)
+    fs.writeFileSync(path.join(r, "horde.json"), JSON.stringify({ verify: { checks: { test: "true" } }, tiers: ["mock/mock", "mock/pricey"] }))
+    git(r, "add", "horde.json")
+    git(r, "commit", "-qm", "checks")
+    const started = await h.call("horde_do", {
+      directory: r,
+      model: "mock/other",
+      goal: "Write fine.txt.\nRUN: echo ok > fine.txt && git add fine.txt && git commit -qm fine",
+      done: ["fine.txt says ok"],
+      scope: ["fine.txt"],
+    })
+    assert.match(started, /mock\/other \(tier 0 of 2\)/, started)
+    const id = idOf(started)
+    const ready = await settle(id)
+    assert.match(ready, /mock\/other \(tier 0; tier 1 is mock\/pricey\)/, ready)
+    assert.equal((await Board.open(r, boardState())).task(id).tier, 0)
+    await h.call("horde_drop", { id })
+  })
 })
 
 describe("the gate review runs outside the worker limit and its failure fails the task", { timeout: 600_000 }, () => {
