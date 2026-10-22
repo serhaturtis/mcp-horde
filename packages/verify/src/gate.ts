@@ -378,8 +378,9 @@ export async function gate(directory: string, opts: GateOptions = {}): Promise<V
     warnings,
     durationMs: Date.now() - started,
   }
-  // A cancelled run says nothing about the tree; never cache it.
-  if (key && !opts.signal?.aborted) {
+  // A cancelled run and a failing one both say nothing worth replaying: a failure may be the
+  // environment's, and a retry on the same tree must run again.
+  if (key && !opts.signal?.aborted && verdict.pass) {
     cache.set(key, verdict)
     if (cache.size > CACHE_LIMIT) cache.delete(cache.keys().next().value!)
   }

@@ -346,8 +346,9 @@ describe("gate", () => {
     assert.deepEqual(bad.blockers, ["test: 1 failed, 0 passed"])
 
     const again = await gate(root, { base, stateDir })
-    assert.equal(again.cached, true, "same tree, same checks: not re-run")
-    assert.match(again.text, /\(cached: tree unchanged\)/)
+    assert.equal(again.cached, false, "a failure is never reused: the same tree runs again")
+    assert.equal(again.pass, false)
+    assert.match(again.text, /^FAIL · /)
 
     write(root, { "test/math.test.mjs": passing })
     const good = await gate(root, { base, stateDir })
@@ -355,6 +356,10 @@ describe("gate", () => {
     assert.equal(good.cached, false, "the tree changed")
     assert.match(good.text, /^PASS · /)
     assert.match(good.text, /✓ test · 1 passed/)
+
+    const cached = await gate(root, { base, stateDir })
+    assert.equal(cached.cached, true, "a pass on the same tree is reused")
+    assert.match(cached.text, /\(cached: tree unchanged\)/)
 
     const logs = fs.readdirSync(path.join(stateDir, "logs"))
     assert.equal(logs.length, 1, "one log directory for this project")

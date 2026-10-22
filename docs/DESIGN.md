@@ -173,7 +173,7 @@ Mechanical judgement with a compact verdict. Library + MCP server; both orchestr
 
 **Execution.** Each check runs through the shell in the directory with a timeout (default 600 s, from config), in its own process group, killed as a tree on timeout or abort; `OPENCODE_SERVER_*` and `HORDE_*` are stripped from the environment; `CI=1` is set; output is capped at 8 MB per check with the head and tail kept. Checks run sequentially by default (shared `node_modules`, ports); `parallel: true` in config opts in.
 
-**Cache.** A verdict is keyed by (directory, HEAD, working-tree hash, checks). Re-running a gate on an unchanged tree returns the cached verdict instantly; `opencode_wait` polling never re-runs tests.
+**Cache.** A verdict is keyed by (directory, HEAD, working-tree hash, checks). A passing verdict on an unchanged tree is served from the cache instantly; a failing verdict is never cached and is re-run on the same tree (a failure may be the environment's). `opencode_wait` polling never re-runs passing tests.
 
 ### 4.4 `@mcp-horde/board`
 

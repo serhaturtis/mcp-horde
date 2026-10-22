@@ -47,7 +47,7 @@ export const INSTRUCTIONS = `verify: mechanical judgement of code changes, with 
 - The verdict is short on purpose: failing tests with their assertion and location, exact counts. Read a full log with verify_logs only when the verdict is not enough.
 - Checks come from horde.json ("verify.checks") or are detected from package.json, pyproject.toml, Cargo.toml, go.mod or a Makefile; verify_detect shows which.
 - related (gate, with base) or related_to (run) runs only the tests that cover the changed files, when every change is covered and the runner takes paths; the verdict says which.
-- An unchanged tree is not re-run: the cached verdict comes back instantly (pass fresh: true to force a run).`
+- A passing verdict on an unchanged tree is served from the cache instantly; a failing one is always re-run (pass fresh: true to force a run).`
 
 const server = new McpServer({ name: "verify", version: VERSION }, { instructions: INSTRUCTIONS })
 
