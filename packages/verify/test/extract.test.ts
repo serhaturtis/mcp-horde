@@ -247,3 +247,28 @@ describe("extract: guessing and fallback", () => {
     assert.match(silent.failures[0]!.message, /line 2\nexit 1$/, "falls back to the tail")
   })
 })
+
+describe("extract: 1 MiB output lines stay fast", () => {
+  // 768 KiB of 0xFF is exactly 1 MiB of "/": base64 where every character starts a frame match.
+  const base64 = Buffer.alloc(768 * 1024, 0xff).toString("base64")
+  const paths = "a/".repeat(512 * 1024)
+
+  const timed = (line: string) => {
+    const started = performance.now()
+    const r = extract(`Error: x\n${line}\n`, "./run-tests.sh")
+    const elapsed = performance.now() - started
+    assert.equal(r.runner, "generic")
+    assert.match(r.failures[0]!.message, /^Error: x/)
+    assert.ok(elapsed < 2000, `extraction took ${Math.round(elapsed)} ms`)
+  }
+
+  test("a 1 MiB base64 line", () => {
+    assert.equal(base64.length, 1024 * 1024)
+    timed(base64)
+  })
+
+  test("a 1 MiB path-like line with no ':line' suffix", () => {
+    assert.equal(paths.length, 1024 * 1024)
+    timed(paths)
+  })
+})

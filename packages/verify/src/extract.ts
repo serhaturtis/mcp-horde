@@ -70,9 +70,14 @@ const FOREIGN_FRAME = [
   /[\\/]lib[\\/]python[0-9.]+[\\/]/,
 ]
 
+// The frame regexes backtrack over the rest of the line from every slash, so a
+// 1 MiB base64 or minified line takes seconds. Real frames are far shorter.
+const FRAME_SCAN = 1000
+
 function isProjectFrame(line: string) {
-  return /[\\/][^\s:]+\.\w+:\d+/.test(line) || /^\.{0,2}[\w.-]+[\\/][^\s:]+:\d+/.test(line.trim()) || /\(\S+\.\w+:\d+:\d+\)/.test(line)
-    ? !FOREIGN_FRAME.some((r) => r.test(line))
+  const s = line.length > FRAME_SCAN ? line.slice(0, FRAME_SCAN) : line
+  return /[\\/][^\s:]+\.\w+:\d+/.test(s) || /^\.{0,2}[\w.-]+[\\/][^\s:]+:\d+/.test(s.trim()) || /\(\S+\.\w+:\d+:\d+\)/.test(s)
+    ? !FOREIGN_FRAME.some((r) => r.test(s))
     : false
 }
 
