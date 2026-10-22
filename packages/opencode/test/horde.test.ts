@@ -219,6 +219,69 @@ describe("the simple path: horde_do, horde_wait, horde_land (real opencode, mock
     await assert.rejects(h.call("horde_wait", { ids: [id] }), /unknown agent|no longer tracked|disposed/)
   })
 
+  test("horde_tell with done replaces the done-criteria and the worker is told them", async () => {
+    const id = idOf(
+      await h.call("horde_do", {
+        goal: "Write the greeting file.\nRUN: echo ok > greet.txt && git add greet.txt && git commit -qm greet",
+        done: ["greet.txt says ok", "a second criterion", "a third criterion"],
+        scope: ["greet.txt"],
+      }),
+    )
+    const failed = await settle(id)
+    assert.match(failed, new RegExp(`^${id} FAILED`), failed)
+    assert.match(failed, /a third criterion/, failed)
+    const told = await h.call("horde_tell", {
+      id,
+      message: "The work is finished; keep it as it is.",
+      done: ["greet.txt says ok"],
+    })
+    assert.match(told, /its done-criteria are now: 1\. greet\.txt says ok/, told)
+    assert.deepEqual((await Board.open(repo, boardState())).task(id).acceptance, ["greet.txt says ok"])
+    // The worker's next turn carries the new criteria in the message it received.
+    assert.match(await h.call("opencode_output", { id, scope: "all" }), /Your task's done-criteria changed; they are now:\n1\. greet\.txt says ok/)
+    const ready = await settle(id)
+    assert.match(ready, new RegExp(`^${id} READY`), ready)
+    assert.match(ready, /review: 1 of 1 criteria met/, ready)
+    await h.call("horde_drop", { id })
+  })
+
+  test("horde_tell with done alone re-judges a review-failed task under the new criteria", async () => {
+    const id = idOf(
+      await h.call("horde_do", {
+        goal: "Write the second greeting.\nRUN: echo ok > greet2.txt && git add greet2.txt && git commit -qm greet2",
+        done: ["greet2.txt says ok", "another criterion", "one more criterion"],
+        scope: ["greet2.txt"],
+      }),
+    )
+    const failed = await settle(id)
+    assert.match(failed, new RegExp(`^${id} FAILED`), failed)
+    assert.match(failed, /one more criterion/, failed)
+    const told = await h.call("horde_tell", { id, done: ["greet2.txt says ok"] })
+    assert.match(told, /its done-criteria are now: 1\. greet2\.txt says ok/, told)
+    assert.match(told, /re-checking the finished work under the new done-criteria/, told)
+    assert.deepEqual((await Board.open(repo, boardState())).task(id).acceptance, ["greet2.txt says ok"])
+    // The same work is judged again: horde_wait reports a new outcome, READY under the new criteria.
+    const ready = await settle(id)
+    assert.match(ready, new RegExp(`^${id} READY`), ready)
+    assert.match(ready, /review: 1 of 1 criteria met/, ready)
+    await h.call("horde_drop", { id })
+  })
+
+  test("horde_tell refuses done with no criteria and the 'nothing to tell' error names it", async () => {
+    const id = idOf(
+      await h.call("horde_do", {
+        goal: "Write the empty file.\nRUN: echo ok > empty.txt && git add empty.txt && git commit -qm empty",
+        done: ["empty.txt says ok"],
+        scope: ["empty.txt"],
+      }),
+    )
+    assert.match(await settle(id), new RegExp(`^${id} READY`))
+    await assert.rejects(h.call("horde_tell", { id, done: [] }), /done needs at least one criterion/)
+    assert.deepEqual((await Board.open(repo, boardState())).task(id).acceptance, ["empty.txt says ok"])
+    await assert.rejects(h.call("horde_tell", { id }), /nothing to tell: pass message, approve, model, scope or done/)
+    await h.call("horde_drop", { id })
+  })
+
   test("landing as one commit: the repository's commit-msg hook judges the message first", async () => {
     const { tmp: at, repo: hooked } = makeRepo(mock.url)
     const marker = path.join(at, "land-check.ran")

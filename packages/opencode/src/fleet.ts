@@ -1653,6 +1653,15 @@ export class Fleet {
     if (task) await (await Board.open(live.record.worktree?.repo ?? live.record.directory)).edit(task.id, { scope: paths })
   }
 
+  /** Replace a task's done-criteria, the board acceptance the review judges each round. */
+  async setDone(ref: string, criteria: string[]): Promise<void> {
+    if (!criteria.length) throw new Error("done needs at least one criterion")
+    const live = await this.get(ref)
+    const task = live.record.task
+    if (!task) throw new Error(`${live.record.name ?? live.record.id} has no task on the board`)
+    await (await Board.open(live.record.worktree?.repo ?? live.record.directory)).edit(task.id, { acceptance: criteria })
+  }
+
   /**
    * Re-judge a finished, failed turn under the agent's (possibly changed) rules, as the next
    * gate round. A scope change that lets the audit pass then produces a fresh verdict, instead

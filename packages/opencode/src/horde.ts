@@ -237,51 +237,64 @@ export function registerHorde(tool: Tool, opts: HordeOptions) {
 
   tool(
     "horde_tell",
-    "Reply to a worker: answer its question (message), allow or refuse what it asks permission for (approve true or false, with an optional message; a message alone refuses it and says what to do instead), or ask for changes to finished or failed work (message: it works again and is checked again, with fresh rounds). While it is working, a message steers it. model switches it to another model first, e.g. the stronger tier a FAILED outcome names. scope replaces the files it may change (approving a request never widens it). After a failed horde_land, tell it what to fix, then land again.",
+    "Reply to a worker: answer its question (message), allow or refuse what it asks permission for (approve true or false, with an optional message; a message alone refuses it and says what to do instead), or ask for changes to finished or failed work (message: it works again and is checked again, with fresh rounds). While it is working, a message steers it. model switches it to another model first, e.g. the stronger tier a FAILED outcome names. scope replaces the files it may change (approving a request never widens it); done replaces the task's done-criteria, which the reviewer judges each round. After a failed horde_land, tell it what to fix, then land again.",
     {
       id: z.string().describe("Task id (t-…)."),
       message: z.string().optional(),
       approve: z.boolean().optional(),
       model: z.string().optional().describe('"provider/model" to switch the worker to first.'),
       scope: z.array(z.string()).optional().describe("The files or globs it may change from now on (replaces the current scope)."),
+      done: z
+        .array(z.string())
+        .optional()
+        .describe("The task's done-criteria from now on: what the reviewer judges each round (replaces the current criteria)."),
     },
     async (a, fleet) => {
       const { snapshot: s } = await fleet.inspect(a.id)
-      const done: string[] = []
+      const told: string[] = []
+      const criteria = a.done?.map((c: string, i: number) => `${i + 1}. ${c}`).join("\n") ?? ""
+      const withCriteria = (text: string) => (criteria ? `${text}\n\nYour task's done-criteria changed; they are now:\n${criteria}` : text)
+      if (a.done) {
+        await fleet.setDone(a.id, a.done)
+        told.push(`its done-criteria are now: ${a.done.map((c: string, i: number) => `${i + 1}. ${c}`).join(" ")}`)
+      }
       if (a.scope) {
         await fleet.setScope(a.id, a.scope)
-        done.push(`its scope is now ${a.scope.join(", ")}`)
+        told.push(`its scope is now ${a.scope.join(", ")}`)
       }
       const perm = s.pending.permissions[0]
       const question = s.pending.questions[0]
       if (perm && (a.approve !== undefined || a.message)) {
-        await fleet.respond(a.id, perm.id, { decision: a.approve ? "once" : "reject", message: a.message })
-        done.push(`${a.approve ? "allowed" : "refused"}: ${perm.action} ${perm.resources.join(" ; ")}`)
-      } else if (perm && !a.scope) {
+        await fleet.respond(a.id, perm.id, { decision: a.approve ? "once" : "reject", message: a.message ? withCriteria(a.message) : undefined })
+        told.push(`${a.approve ? "allowed" : "refused"}: ${perm.action} ${perm.resources.join(" ; ")}`)
+      } else if (perm && !a.scope && !a.done) {
         throw new Error(
           `${a.id} asks permission for ${perm.action} ${perm.resources.join(" ; ")}: pass approve true or false (with a message saying what to do instead)`,
         )
       } else if (question && a.message) {
-        await fleet.respond(a.id, question.id, { answers: question.fields.map(() => [a.message!]) })
-        done.push("answered its question")
-      } else if (question && !a.scope && !a.model) {
+        await fleet.respond(a.id, question.id, { answers: question.fields.map(() => [withCriteria(a.message!)]) })
+        told.push("answered its question")
+      } else if (question && !a.scope && !a.model && !a.done) {
         throw new Error(`${a.id} asks: ${formText(question)}. Pass message with your answer.`)
       } else if (a.message || a.model) {
-        await fleet.message(a.id, a.message ?? "Continue with the task.", a.model ? { model: a.model } : {})
-        done.push(
+        await fleet.message(a.id, withCriteria(a.message ?? "Continue with the task."), a.model ? { model: a.model } : {})
+        told.push(
           `${a.model ? `switched it to ${a.model} and ` : ""}${SETTLED.has(s.state) && s.state !== "needs_input" ? "it works again; its checks run again when it finishes" : "steered it"}`,
         )
-      } else if (a.scope) {
-        // A scope change alone must re-judge the failed turn under the new scope, or the task
+      } else if (a.scope || a.done) {
+        // A rules change alone must re-judge the failed turn under the new rules, or the task
         // stays stuck: horde_wait would report nothing new.
         if (s.gate?.state === "fail") {
           await fleet.regate(a.id)
-          done.push("re-checking the finished work under the new scope")
+          told.push(`re-checking the finished work under the new ${a.done ? "done-criteria" : "scope"}`)
+        } else if (a.done && !SETTLED.has(s.state)) {
+          await fleet.message(a.id, withCriteria("Continue with the task."))
+          told.push("steered it with the new done-criteria")
         }
       } else {
-        throw new Error("nothing to tell: pass message, approve, model or scope")
+        throw new Error("nothing to tell: pass message, approve, model, scope or done")
       }
-      return `${a.id}: ${done.join("; ")}.\n→ horde_wait {ids: ["${a.id}"]}`
+      return `${a.id}: ${told.join("; ")}.\n→ horde_wait {ids: ["${a.id}"]}`
     },
   )
 
