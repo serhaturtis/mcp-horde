@@ -729,6 +729,80 @@ describe("import resolution details", () => {
     )
   })
 
+  test("go.work: an import resolves across modules, so a dependent's tests cover the source", () => {
+    const dir = fixture({
+      "go.work": "go 1.22\n\nuse (\n\t./a\n\t./b\n)\n",
+      "a/go.mod": "module example.com/a\n\ngo 1.22\n",
+      "a/x/x.go": "package x\n\n// X is x.\nfunc X() int { return 1 }\n",
+      "a/x/x_test.go": 'package x\n\nimport "testing"\n\nfunc TestX(t *testing.T) {}\n',
+      "b/go.mod": "module example.com/b\n\ngo 1.22\n",
+      "b/y/y.go": 'package y\n\nimport "example.com/a/x"\n\nfunc Y() int { return x.X() }\n',
+      "b/y/y_test.go": 'package y\n\nimport "testing"\n\nfunc TestY(t *testing.T) {}\n',
+    })
+    const p = openProject(dir)
+    assert.deepEqual(importGraph(p).out.get("b/y/y.go"), ["a/x/x.go"])
+    assert.deepEqual(
+      testsFor(p, ["a/x/x.go"], { transitive: true })
+        .get("a/x/x.go")!
+        .map((t) => `${t.test} (${t.why})`)
+        .sort(),
+      ["a/x/x_test.go (naming)", "b/y/y_test.go (same package)"],
+    )
+  })
+
+  test("Python workspace: an absolute import resolves across uv members", () => {
+    const dir = fixture({
+      "pyproject.toml": '[project]\nname = "ws"\n\n[tool.uv.workspace]\nmembers = ["packages/*"]\n',
+      "packages/core/pyproject.toml": '[project]\nname = "core"\n',
+      "packages/core/src/core/__init__.py": "",
+      "packages/core/src/core/calc.py": "def add(a, b):\n    return a + b\n",
+      "packages/app/pyproject.toml": '[project]\nname = "app"\n',
+      "packages/app/src/app/main.py": "from core.calc import add\n\ndef run():\n    return add(1, 2)\n",
+      "packages/app/tests/test_main.py": "from app.main import run\n",
+    })
+    const p = openProject(dir)
+    const g = importGraph(p)
+    assert.deepEqual(g.out.get("packages/app/src/app/main.py"), ["packages/core/src/core/calc.py"])
+    assert.deepEqual(g.out.get("packages/app/tests/test_main.py"), ["packages/app/src/app/main.py"])
+    assert.deepEqual(
+      testsFor(p, ["packages/core/src/core/calc.py"], { transitive: true })
+        .get("packages/core/src/core/calc.py")!
+        .map((t) => `${t.test} (${t.why})`),
+      ["packages/app/tests/test_main.py (imports it via packages/app/src/app/main.py)"],
+    )
+  })
+
+  test("TypeScript: nested tsconfig extends chain, nearer paths override, and cycles terminate", () => {
+    // baseUrl on the nearest config makes grandparent paths resolve from the root.
+    const dir = fixture({
+      "tsconfig.json": '{ "extends": "./config/tsconfig.base.json", "compilerOptions": { "baseUrl": "." } }\n',
+      "config/tsconfig.base.json": '{ "extends": "./tsconfig.paths.json", "compilerOptions": { "strict": true } }\n',
+      "config/tsconfig.paths.json": '{ "compilerOptions": { "paths": { "@lib/*": ["src/lib/*"] } } }\n',
+      "src/lib/x.ts": "export const x = 1\n",
+      "src/app.ts": "import { x } from '@lib/x'\n",
+    })
+    assert.deepEqual(importGraph(openProject(dir)).out.get("src/app.ts"), ["src/lib/x.ts"])
+    // A nearer config's paths override a grandparent's.
+    const override = fixture({
+      "tsconfig.json": '{ "extends": "./config/tsconfig.base.json", "compilerOptions": { "paths": { "@lib/*": ["src/local/*"] } } }\n',
+      "config/tsconfig.base.json": '{ "extends": "./tsconfig.paths.json" }\n',
+      "config/tsconfig.paths.json": '{ "compilerOptions": { "paths": { "@lib/*": ["src/lib/*"] } } }\n',
+      "src/local/x.ts": "export const x = 1\n",
+      "src/lib/x.ts": "export const x = 1\n",
+      "src/app.ts": "import { x } from '@lib/x'\n",
+    })
+    assert.deepEqual(importGraph(openProject(override)).out.get("src/app.ts"), ["src/local/x.ts"])
+    // A cycle in the extends chain does not hang.
+    const cyclic = fixture({
+      "tsconfig.json": '{ "extends": "./a.json" }\n',
+      "a.json": '{ "extends": "./b.json", "compilerOptions": { "paths": { "@a/*": ["a/*"] } } }\n',
+      "b.json": '{ "extends": "./a.json" }\n',
+      "a/x.ts": "export const x = 1\n",
+      "src/main.ts": "import { x } from '@a/x'\n",
+    })
+    assert.deepEqual(importGraph(openProject(cyclic)).out.get("src/main.ts"), ["a/x.ts"])
+  })
+
   test("C# tests mirror the project they test", () => {
     const dir = fixture({
       "src/Shop/Billing/Invoice.cs": "namespace Shop.Billing;\npublic class Invoice {}\n",

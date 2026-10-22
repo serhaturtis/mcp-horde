@@ -70,8 +70,9 @@ class Resolver {
   /** Non-source files read while resolving, with the text seen. */
   readonly deps = new Map<string, string | undefined>()
   private packages?: Map<string, { dir: string; entry?: string }>
-  private readonly goMods = new Map<string, { dir: string; mod: string } | null>()
+  private goModsAll?: { dir: string; mod: string }[]
   private readonly pyRoots = new Map<string, string | null>()
+  private pyPkgs?: Map<string, string[]>
   private readonly tsConfigs = new Map<string, TsConfig | null>()
 
   constructor(readonly project: Project) {
@@ -123,19 +124,16 @@ class Resolver {
     return packages
   }
 
-  /** The module of the nearest go.mod at or above `dir`. */
-  goModule(dir: string): { dir: string; mod: string } | undefined {
-    const memo = this.goMods.get(dir)
-    if (memo !== undefined) return memo ?? undefined
-    let found: { dir: string; mod: string } | null = null
-    const rel = dir === "." ? "go.mod" : `${dir}/go.mod`
-    if (this.files.has(rel)) {
-      const mod = /^module\s+(\S+)/m.exec(this.read(rel) ?? "")?.[1]
-      if (mod) found = { dir, mod }
+  /** Every go.mod module path with its directory (go.work resolves imports across modules). */
+  allGoModules(): { dir: string; mod: string }[] {
+    if (this.goModsAll) return this.goModsAll
+    const out: { dir: string; mod: string }[] = []
+    for (const f of this.byName.get("go.mod") ?? []) {
+      const mod = /^module\s+(\S+)/m.exec(this.read(f) ?? "")?.[1]
+      if (mod) out.push({ dir: path.posix.dirname(f), mod })
     }
-    if (!found && dir !== ".") found = this.goModule(path.posix.dirname(dir)) ?? null
-    this.goMods.set(dir, found)
-    return found ?? undefined
+    this.goModsAll = out
+    return out
   }
 
   /** The root of the nearest Python project (pyproject.toml, setup.py or setup.cfg) at or above `dir`. */
@@ -147,6 +145,24 @@ class Resolver {
     if (!found && dir !== ".") found = this.pyRoot(path.posix.dirname(dir)) ?? null
     this.pyRoots.set(dir, found)
     return found ?? undefined
+  }
+
+  /** Top-level package name → its directory, for every Python project root (uv workspaces). */
+  pyPackages(): Map<string, string[]> {
+    if (this.pyPkgs) return this.pyPkgs
+    const roots = new Set<string>()
+    for (const name of PY_ROOTS) for (const f of this.byName.get(name) ?? []) roots.add(path.posix.dirname(f))
+    const pkgs = new Map<string, string[]>()
+    for (const init of this.byName.get("__init__.py") ?? []) {
+      const d = path.posix.dirname(init)
+      if (d === ".") continue
+      const parent = path.posix.dirname(d)
+      // A top-level package of a project root: <root>/<pkg>/ or <root>/src/<pkg>/.
+      const top = roots.has(parent) || (path.posix.basename(parent) === "src" && roots.has(path.posix.dirname(parent)))
+      if (top) push(pkgs, path.posix.basename(d), d)
+    }
+    this.pyPkgs = pkgs
+    return pkgs
   }
 
   /** compilerOptions.paths and baseUrl from the nearest tsconfig.json or jsconfig.json at or above `dir`. */
@@ -177,22 +193,29 @@ class Resolver {
     }
     const own = load(rel)
     if (!own) return null
-    const dir = path.posix.dirname(rel)
     const at = (d: string, p: string) => path.posix.normalize(path.posix.join(d, p))
-    // One level of `extends`, when it names a project file.
-    let base: { dir: string; options: Options } | undefined
-    if (typeof own.extends === "string" && own.extends.startsWith(".")) {
-      let f = at(dir, own.extends)
+    // Follow `extends` to its end (nearest config first), guarding against cycles and depth.
+    const chain: { dir: string; options: Options }[] = []
+    const seen = new Set<string>()
+    let f: string | undefined = rel
+    for (let depth = 0; f && depth <= 10 && !seen.has(f); depth++) {
+      seen.add(f)
+      const config = load(f)
+      if (!config) break
+      chain.push({ dir: path.posix.dirname(f), options: config.compilerOptions ?? {} })
+      const ext = config.extends
+      if (typeof ext !== "string" || !ext.startsWith(".")) break
+      f = at(path.posix.dirname(f), ext)
       if (!f.endsWith(".json") && !this.files.has(f)) f += ".json"
-      const parent = this.files.has(f) ? load(f) : undefined
-      if (parent?.compilerOptions) base = { dir: path.posix.dirname(f), options: parent.compilerOptions }
+      if (!this.files.has(f)) break
     }
-    const opts = own.compilerOptions ?? {}
-    const baseUrl =
-      typeof opts.baseUrl === "string" ? at(dir, opts.baseUrl) : typeof base?.options.baseUrl === "string" ? at(base.dir, base.options.baseUrl) : undefined
-    const paths = (opts.paths ?? base?.options.paths) as Record<string, unknown> | undefined
+    // A nearer config's compilerOptions override a farther one's (as TypeScript inheritance).
+    const base = chain.find((c) => typeof c.options.baseUrl === "string")
+    const baseUrl = base ? at(base.dir, base.options.baseUrl as string) : undefined
+    const pathsSrc = chain.find((c) => c.options.paths && typeof c.options.paths === "object")
+    const paths = pathsSrc?.options.paths as Record<string, unknown> | undefined
     // Paths are relative to baseUrl, or else to the config that declares them.
-    const pathsDir = baseUrl ?? (opts.paths ? dir : (base?.dir ?? dir))
+    const pathsDir = baseUrl ?? pathsSrc?.dir ?? path.posix.dirname(rel)
     const out: TsConfig = { baseUrl, paths: [] }
     if (paths && typeof paths === "object")
       for (const [pattern, targets] of Object.entries(paths)) {
@@ -287,12 +310,25 @@ function resolve(r: Resolver, from: string, spec: string, lang: Lang): string[] 
       const root = r.pyRoot(dir)
       const bases = ["", "src/", "lib/", `${dir}/`]
       if (root && root !== ".") bases.unshift(`${root}/`, `${root}/src/`)
-      return first(bases.flatMap((p) => [`${p}${tail}.py`, `${p}${tail}/__init__.py`]))
+      const hit = first(bases.flatMap((p) => [`${p}${tail}.py`, `${p}${tail}/__init__.py`]))
+      if (hit.length) return hit
+      // A top-level package owned by another project in a workspace (uv members): <pkg>.sub.
+      const top = parts[0]
+      for (const pkgDir of r.pyPackages().get(top ?? "") ?? []) {
+        const rest = parts.slice(1).join("/")
+        const h = first(rest ? [`${pkgDir}/${rest}.py`, `${pkgDir}/${rest}/__init__.py`] : [`${pkgDir}/__init__.py`])
+        if (h.length) return h
+      }
+      return []
     }
     case "go": {
-      const m = r.goModule(dir)
-      if (!m || !(spec === m.mod || spec.startsWith(`${m.mod}/`))) return []
-      const pkg = path.posix.join(m.dir, spec.slice(m.mod.length).replace(/^\//, ""))
+      // The longest matching module path wins; in a go.work layout that module may not be this file's.
+      const mod = r
+        .allGoModules()
+        .filter((x) => spec === x.mod || spec.startsWith(`${x.mod}/`))
+        .sort((a, b) => b.mod.length - a.mod.length)[0]
+      if (!mod) return []
+      const pkg = path.posix.join(mod.dir, spec.slice(mod.mod.length).replace(/^\//, ""))
       return (r.byDir.get(pkg) ?? []).filter((f) => f.endsWith(".go") && !f.endsWith("_test.go"))
     }
     case "rs": {
