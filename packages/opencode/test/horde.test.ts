@@ -109,7 +109,7 @@ describe("the simple path: horde_do, horde_wait, horde_land (real opencode, mock
     // The mock's canned report names files it never touched: the outcome says so.
     assert.match(
       ready,
-      /checks ✓ test · review: 1 of 2 criteria met, 1 unproven · ⚠ the worker's report names a\.ts, b\.ts, a\.test\.ts, which its diff does not touch/,
+      /checks ✓ test · review: 1 of 2 criteria met, 1 unproven \(by mock\/pricey\) · ⚠ the worker's report names a\.ts, b\.ts, a\.test\.ts, which its diff does not touch/,
     )
     assert.match(ready, /changed 1 file\(s\) \(\+1 −0\): hello\.txt/)
     assert.match(ready, /branch horde\/t-\w+ · diff: git -C \S+ diff [0-9a-f]{10}/)
@@ -241,7 +241,7 @@ describe("the simple path: horde_do, horde_wait, horde_land (real opencode, mock
     assert.match(await h.call("opencode_output", { id, scope: "all" }), /Your task's done-criteria changed; they are now:\n1\. greet\.txt says ok/)
     const ready = await settle(id)
     assert.match(ready, new RegExp(`^${id} READY`), ready)
-    assert.match(ready, /review: 1 of 1 criteria met/, ready)
+    assert.match(ready, /review: 1 of 1 criteria met \(by mock\/pricey\)/, ready)
     await h.call("horde_drop", { id })
   })
 
@@ -1062,7 +1062,7 @@ describe("the gate review runs outside the worker limit and its failure fails th
     const id = rid(started)
     const failed = await rsettle(id)
     assert.match(failed, new RegExp(`^${id} FAILED`), failed)
-    assert.match(failed, /1 criterion not met/, failed)
+    assert.match(failed, /1 criterion not met, by mock\/pricey/, failed)
     assert.match(failed, /third\.txt says ok/, failed)
   })
 

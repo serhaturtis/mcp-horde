@@ -401,6 +401,7 @@ export async function outcome(fleet: Fleet, ref: string): Promise<string> {
   const title = task?.title ?? s.title
   const verdict = record.gateState?.verdict
   const footer = await footerLine(s, record, repo, task?.tier)
+  const workerModel = s.model ? `${s.model.providerID}/${s.model.id}` : undefined
   const say = (label: string, extra = "") => `${id} ${label} · "${title}"${extra}`
   const next = (...calls: string[]) => `→ ${calls.join(" · ")}`
 
@@ -442,7 +443,7 @@ export async function outcome(fleet: Fleet, ref: string): Promise<string> {
     const report = task && board ? await board.checkReport(task.id).catch(() => undefined) : undefined
     const head = [
       verdict?.checks?.length ? checksLine(verdict.checks) : "checks ✓",
-      review ? reviewLine(review) : "",
+      review ? reviewLine(review, workerModel) : "",
       report
         ? report.claimedNotChanged.length
           ? `⚠ the worker's report names ${report.claimedNotChanged.join(", ")}, which its diff does not touch`
@@ -471,10 +472,11 @@ export async function outcome(fleet: Fleet, ref: string): Promise<string> {
   // criterion unmet, a fix round that errored or was interrupted, or an unchecked finish.
   const reviewError = verdict?.review?.error
   const notMet = reviewError ? 0 : (verdict?.review?.notMet?.length ?? 0)
+  const by = reviewerNote(verdict?.review?.model ?? "", workerModel)
   const why = reviewError
     ? `review could not run: ${truncate(oneLine(reviewError), 200)}`
     : notMet
-      ? `${notMet} ${notMet === 1 ? "criterion" : "criteria"} not met`
+      ? `${notMet} ${notMet === 1 ? "criterion" : "criteria"} not met${by ? `, ${by}` : ""}`
       : s.state === "error"
         ? `error: ${truncate(oneLine(s.error ?? "unknown"), 200)}`
         : s.state === "interrupted"
@@ -568,12 +570,18 @@ function scopeFiles(text?: string): string[] {
   return [...new Set(files)]
 }
 
-function reviewLine(r: ReviewSummary): string {
+/** "by mock/pricey", or "by mock/mock, the model that did the work"; empty when no model judged. */
+function reviewerNote(model: string, worker?: string): string {
+  return model ? `by ${model}${model === worker ? ", the model that did the work" : ""}` : ""
+}
+
+function reviewLine(r: ReviewSummary, worker?: string): string {
   if (r.error) return `review could not run (${truncate(r.error, 120)})`
   const parts = [`${r.met} of ${r.total} criteria met`]
   if (r.notMet.length) parts.push(`${r.notMet.length} not met`)
   if (r.unclear.length) parts.push(`${r.unclear.length} unproven`)
-  return `review: ${parts.join(", ")}`
+  const by = reviewerNote(r.model, worker)
+  return `review: ${parts.join(", ")}${by ? ` (${by})` : ""}`
 }
 
 /** "$0.03 · 4m · deepseek/deepseek-flash (tier 0; tier 1 is …)" */

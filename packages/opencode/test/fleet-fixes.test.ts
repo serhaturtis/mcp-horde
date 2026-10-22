@@ -231,7 +231,7 @@ describe("fleet fixes: gates, tasks and worktrees (real opencode, mock LLM)", { 
     await h.call("horde_tell", { id, message: "carry on" })
     const out = await h.call("horde_wait", { ids: [id], timeout_seconds: 120 })
     assert.match(out, new RegExp(`^${id} READY`), out)
-    assert.match(out, /review: 1 of 1 criteria met/, out)
+    assert.match(out, /review: 1 of 1 criteria met \(by mock\/mock, the model that did the work\)/, out)
     // A second gate would spawn another reviewer: wait past a tick and count them.
     await new Promise((resolve) => setTimeout(resolve, 3000))
     const reviews = mock.requests.filter((b) => {
@@ -258,7 +258,7 @@ describe("fleet fixes: gates, tasks and worktrees (real opencode, mock LLM)", { 
     const id = idOf(started)
     const out = await h.call("horde_wait", { ids: [id], timeout_seconds: 180 })
     assert.match(out, new RegExp(`^${id} READY`), out)
-    assert.match(out, /review: 1 of 1 criteria met/, out)
+    assert.match(out, /review: 1 of 1 criteria met \(by mock\/other\)/, out)
     const reviews = mock.requests.filter((b) => {
       const msgs = (b as { messages?: { role: string; content: unknown }[] }).messages ?? []
       return msgs.some(

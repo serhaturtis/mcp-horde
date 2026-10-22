@@ -834,7 +834,7 @@ export class Fleet {
   }
 
   private async reviewGate(live: Live, taskId: string, checks: GateCheck[], signal: AbortSignal, model?: string): Promise<ReviewSummary> {
-    const { results, worker } = await this.reviewAttempt({
+    const { results } = await this.reviewAttempt({
       id: taskId,
       directory: live.record.worktree?.repo ?? live.record.directory,
       checks,
@@ -844,9 +844,8 @@ export class Fleet {
     })
     const first = results[0]!
     const pick = (status: Verdict["status"]) => first.verdicts.filter((v) => v.status === status).map((v) => ({ n: v.criterion, text: v.text, note: v.note }))
-    const same = worker && first.model === worker ? " (reviewed by the model that did the work)" : ""
     return {
-      model: `${first.model}${same}`,
+      model: first.model,
       cost: results.reduce((n, x) => n + x.cost, 0),
       total: first.verdicts.length,
       met: first.verdicts.filter((v) => v.status === "met").length,
