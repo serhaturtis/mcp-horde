@@ -282,9 +282,9 @@ export function registerHorde(tool: Tool, opts: HordeOptions) {
           `${a.model ? `switched it to ${a.model} and ` : ""}${SETTLED.has(s.state) && s.state !== "needs_input" ? "it works again; its checks run again when it finishes" : "steered it"}`,
         )
       } else if (a.scope || a.done) {
-        // A rules change alone must re-judge the failed turn under the new rules, or the task
+        // A rules change alone must re-judge the finished turn under the new rules, or the task
         // stays stuck: horde_wait would report nothing new.
-        if (s.gate?.state === "fail") {
+        if (s.gate?.state === "fail" || (a.done && s.gate?.state === "pass")) {
           await fleet.regate(a.id)
           told.push(`re-checking the finished work under the new ${a.done ? "done-criteria" : "scope"}`)
         } else if (a.done && !SETTLED.has(s.state)) {
