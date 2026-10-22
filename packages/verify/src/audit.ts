@@ -176,6 +176,22 @@ function secretIn(text: string): string | undefined {
 const LOCKFILES =
   /(^|\/)(package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?|Cargo\.lock|poetry\.lock|uv\.lock|Pipfile\.lock|go\.sum|composer\.lock|Gemfile\.lock)$/
 
+/** True when the file's first 8000 bytes hold a NUL: the same test git uses for "binary". */
+async function isBinary(root: string, file: string): Promise<boolean> {
+  try {
+    const fh = await fs.open(path.join(root, file), "r")
+    try {
+      const buf = Buffer.alloc(8000)
+      const { bytesRead } = await fh.read(buf, 0, 8000, 0)
+      return buf.subarray(0, bytesRead).includes(0)
+    } finally {
+      await fh.close()
+    }
+  } catch {
+    return false // the file is gone (e.g. a rename target outside the worktree)
+  }
+}
+
 async function changes(root: string, base: string): Promise<Change[]> {
   const byPath = new Map<string, Change>()
   const nameStatus = splitZ(await gitRaw(root, [...Q, "diff", "--no-ext-diff", "-M", "--name-status", "-z", base]))
@@ -190,19 +206,9 @@ async function changes(root: string, base: string): Promise<Change[]> {
       byPath.set(p, { path: p, status: status[0]!, added: [], removed: [], binary: false })
     }
   }
-  // numstat -z: "added<TAB>deleted<TAB>path<NUL>", or for renames "added<TAB>deleted<TAB><NUL>from<NUL>to<NUL>"; "-" counts mean binary.
-  const numstat = splitZ(await gitRaw(root, [...Q, "diff", "--no-ext-diff", "-M", "--numstat", "-z", base]))
-  for (let i = 0; i < numstat.length; i++) {
-    const m = numstat[i]!.match(/^(-|\d+)\t(-|\d+)\t(.*)$/)
-    if (!m) continue
-    let p = m[3]!
-    if (!p) {
-      i += 2
-      p = numstat[i] ?? ""
-    }
-    const c = byPath.get(p)
-    if (c && m[1] === "-") c.binary = true
-  }
+  // numstat used to mark files binary when git reported "-" counts, but a `-diff`
+  // attribute makes a text file (package-lock.json) report "-" too. Binary-ness is
+  // decided from content below instead, so numstat is gone.
   // Added and removed lines, from a zero-context diff that does not depend on user config.
   // Fixed a/ b/ prefixes whatever diff.noprefix or diff.mnemonicPrefix say.
   const diff = await gitRaw(root, [
@@ -212,6 +218,7 @@ async function changes(root: string, base: string): Promise<Change[]> {
     "diff",
     "--no-ext-diff",
     "--no-textconv",
+    "--text",
     "--src-prefix=a/",
     "--dst-prefix=b/",
     "-M",
@@ -270,6 +277,18 @@ async function changes(root: string, base: string): Promise<Change[]> {
     }
     byPath.set(p, c)
   }
+  // Binary-ness comes from content, not git's `-diff` attribute: a NUL byte in the
+  // new blob's head marks a real binary, while a `-diff` text file is not. The `--text`
+  // diff above already gave binary files their raw bytes; drop them so they are not
+  // scanned for secrets or suppressions.
+  for (const c of byPath.values()) {
+    if (c.status === "D" || c.status === "?" || c.binary) continue
+    if (await isBinary(root, c.path)) {
+      c.binary = true
+      c.added = []
+      c.removed = []
+    }
+  }
   return [...byPath.values()]
 }
 
@@ -293,6 +312,7 @@ async function secretHistory(root: string, base: string): Promise<HistoricalSecr
     "-m",
     "--no-ext-diff",
     "--no-textconv",
+    "--text",
     "--src-prefix=a/",
     "--dst-prefix=b/",
     `${base}..HEAD`,
@@ -505,6 +525,13 @@ export async function audit(directory: string, opts: AuditOptions): Promise<Audi
     if ((test || rust) && c.status !== "D") {
       const removed = testDefs(c.removed) - testDefs(c.added.map((a) => a.text))
       if (removed > 0) add("tests", { file: c.path, text: `removes ${removed} test${removed === 1 ? "" : "s"}` })
+    }
+    // A test file that exits its process at the top level stops the runner early, possibly
+    // before it prints a count. Anchored at the line start, so a string in a fixture does not match.
+    if (test || isRunnableTest(c.path)) {
+      for (const a of c.added) {
+        if (/^\s*(?:process\.exit|os\._exit|sys\.exit)\(/.test(a.text)) add("tests", { file: c.path, line: a.line, text: "exits the test process early" })
+      }
     }
     if (test) {
       const lost = assertions(c.removed) - assertions(c.added.map((a) => a.text))

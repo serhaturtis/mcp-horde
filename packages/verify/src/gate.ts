@@ -412,6 +412,8 @@ function summary(c: CheckResult): string {
   if (c.stopped === "timeout") return "timed out"
   if (c.stopped === "cancelled") return "cancelled"
   const n = c.extracted.counts
+  // Exit 0 with failures: a pipe or wrapper hid the runner's exit code.
+  if (c.code === 0 && n?.failed) return `exited 0 although ${n.failed} test${n.failed === 1 ? "" : "s"} failed`
   // A failing run with no failed tests failed outside them (a crash, a threshold, a load error).
   if (n?.failed) return [`${n.failed} failed`, n.passed !== undefined && `${n.passed} passed`, n.skipped && `${n.skipped} skipped`].filter(Boolean).join(", ")
   return [c.code === null ? "failed to run" : `exit ${c.code}`, n?.passed !== undefined && `${n.passed} passed`].filter(Boolean).join(", ")
@@ -493,5 +495,5 @@ export function render(v: Omit<Verdict, "cached" | "text">, budget: number, cach
 
 function summaryPass(c: CheckResult) {
   const n = c.extracted.counts
-  return n?.passed !== undefined ? `${n.passed} passed${n.skipped ? `, ${n.skipped} skipped` : ""}` : "ok"
+  return n?.passed !== undefined ? `${n.passed} passed${n.failed ? `, ${n.failed} failed` : ""}${n.skipped ? `, ${n.skipped} skipped` : ""}` : "ok"
 }

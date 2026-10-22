@@ -83,7 +83,11 @@ export async function runChecks(checks: Check[], opts: RunChecksOptions): Promis
         progressMs: 10_000,
       }),
     ).catch((err: Error) => ({ code: null, stopped: undefined, output: `could not start: ${err.message}`, truncated: 0, durationMs: 0 }))
-    const pass = r.code === 0 && !r.stopped
+    const extracted: Extracted = extract(r.output, check.command, check.cwd)
+    // Exit 0 is not enough: `… | tail`, a wrapper without `set -e`, or `…; echo done`
+    // can hide the runner's exit code while its output still reports failures.
+    // The counts the runner printed are the truth, not the pipeline's last exit code.
+    const pass = r.code === 0 && !r.stopped && (extracted.counts?.failed ?? 0) === 0
     let logFile: string | undefined
     if (opts.logDir) {
       logFile = logFileFor(opts.logDir, check.name)
@@ -91,7 +95,6 @@ export async function runChecks(checks: Check[], opts: RunChecksOptions): Promis
         mode: 0o600,
       })
     }
-    const extracted: Extracted = pass ? { runner: "generic", failures: [] } : extract(r.output, check.command, check.cwd)
     // A failing check must say why, even when its runner reported no failures
     // (coverage thresholds, crashed reporters, timeouts): show the end of the output.
     if (!pass && !extracted.failures.length) {
@@ -102,11 +105,6 @@ export async function runChecks(checks: Check[], opts: RunChecksOptions): Promis
         .join("\n")
       const why = r.stopped === "timeout" ? `timed out after ${Math.round(opts.timeoutMs / 1000)}s` : r.stopped === "cancelled" ? "cancelled" : `exit ${r.code}`
       extracted.failures.push({ message: tail ? `${why}; last output:\n${tail}` : `${why} with no output` })
-    }
-    if (pass) {
-      // Passing runs still report their counts when the runner printed them.
-      const counts = extract(r.output, check.command, check.cwd).counts
-      if (counts) extracted.counts = counts
     }
     results.push({
       name: check.name,

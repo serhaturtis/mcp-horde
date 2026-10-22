@@ -22,6 +22,7 @@ import {
   logFileFor,
   narrowCommand,
   planRelated,
+  render,
   runChecks,
 } from "../src/lib.js"
 
@@ -226,11 +227,59 @@ describe("audit", () => {
     write(root, { "dist/app.js": 'var a=2;var k="AKIAABCDEFGHIJKLMNOP"\n', "assets/logo.bin": Buffer.from([0, 1, 2, 3, 0, 255]) })
     const opts = { base, block: ["scope", "tests", "secrets", "binaries"] as AuditCategory[], warn: [] as AuditCategory[] }
     const lines = async (o: Partial<AuditOptions>) => (await audit(root, { ...opts, ...o })).findings.map((f) => `${f.category} ${f.file}`)
-    assert.ok((await lines({})).includes("binaries dist/app.js"), "without the setting the bundle reads as a binary")
+    // A -diff text file is audited as text, so the key inside it is a secret, not a binary.
+    const plain = await lines({})
+    assert.ok(plain.includes("secrets dist/app.js"), plain.join("\n"))
+    assert.ok(!plain.includes("binaries dist/app.js"), "a -diff text file is not a binary")
     const found = await lines({ generated: ["dist/**"] })
     assert.ok(!found.some((l) => l.endsWith(" dist/app.js")), found.join("\n"))
     assert.ok(found.includes("binaries assets/logo.bin"), found.join("\n"))
     assert.ok((await lines({ generated: ["dist/**"], allowed: ["src/**"] })).includes("scope dist/app.js"))
+  })
+
+  test("a top-level process.exit in a test file blocks; a string in a fixture does not", async () => {
+    const calls = ["process.exit(0)", "os._exit(0)", "sys.exit(0)", "  sys.exit(1)"]
+    const fine = ['const src = "process.exit(0)"', 'const o = "os._exit(0)"', 'x = "sys.exit(0)"']
+    const { root, base } = repo({ "test/a.test.js": "\n" })
+    write(root, { "test/a.test.js": `${[...fine, ...calls].join("\n")}\n` })
+    const findings = (await audit(root, { base, block: ["tests"], warn: [] })).findings
+    const hit = new Set(findings.filter((f) => f.category === "tests" && f.text === "exits the test process early").map((f) => f.line))
+    for (const [i, call] of calls.entries()) assert.ok(hit.has(fine.length + i + 1), `line ${fine.length + i + 1}: ${call}`)
+    assert.equal(
+      findings.filter((f) => f.category === "tests").length,
+      calls.length,
+      `only the top-level exit calls match:\n${findings.map((f) => `${f.line}: ${f.text}`).join("\n")}`,
+    )
+  })
+
+  test("-diff text files are audited as text, and real binaries still block", async () => {
+    // Built at run time so this file holds no literal secret the gate would flag.
+    const key = "AKIA" + "ABCDEFGHIJKLMNOP"
+    const { root, base } = repo({
+      ".gitattributes": "package-lock.json -diff\nsrc/config.js -diff\n",
+      "package-lock.json": '{"name":"x","version":"1"}\n',
+      "src/config.js": "export const host = 'a'\n",
+    })
+    write(root, {
+      "package-lock.json": '{"name":"x","version":"2"}\n',
+      "src/config.js": `export const host = "b"\nexport const key = "${key}"\n`,
+      "assets/logo.bin": Buffer.from([0, 1, 2, 3, 0, 255]),
+    })
+    const r = await audit(root, { base, block: ["binaries", "secrets"], warn: ["dependencies"] })
+    const lines = r.findings.map((f) => `${f.severity} ${f.category} ${f.file ?? ""}${f.line ? `:${f.line}` : ""} ${f.text}`)
+    assert.ok(
+      lines.some((l) => /^block secrets src\/config\.js:2 adds what looks like an AWS access key$/.test(l)),
+      lines.join("\n"),
+    )
+    assert.ok(
+      lines.some((l) => /^warn dependencies package-lock\.json updates a lockfile$/.test(l)),
+      lines.join("\n"),
+    )
+    assert.ok(
+      lines.some((l) => /^block binaries assets\/logo\.bin adds or changes a binary file$/.test(l)),
+      lines.join("\n"),
+    )
+    assert.ok(!lines.some((l) => l.includes("binaries") && (l.includes("package-lock") || l.includes("config.js"))), lines.join("\n"))
   })
 
   test("merge commits are flagged; categories can be switched off", async () => {
@@ -291,6 +340,46 @@ describe("gate", () => {
     const logs = fs.readdirSync(path.join(stateDir, "logs"))
     assert.equal(logs.length, 1, "one log directory for this project")
     assert.match(fs.readFileSync(path.join(stateDir, "logs", logs[0]!, "test.log"), "utf8"), /^\$ node --test test\/math\.test\.mjs/)
+  })
+
+  test("a runner whose failures a wrapper hides still fails the gate", async () => {
+    const { root, base } = repo({
+      "horde.json": JSON.stringify({ verify: { checks: { test: "node run.mjs" } } }),
+      // The wrapper runs node --test but exits 0, the way `… | tail` or `…; echo done` would.
+      "run.mjs":
+        'import { spawnSync } from "node:child_process"\nspawnSync(process.execPath, ["--test", "test/math.test.mjs"], { stdio: "inherit" })\nprocess.exit(0)\n',
+      "test/math.test.mjs": failing,
+      "src/math.mjs": "export const add = (a, b) => a + b\n",
+    })
+    const v = await gate(root, { base, stateDir: tmp() })
+    assert.equal(v.pass, false, v.text)
+    assert.match(v.text, /✗ test · exited 0 although 1 test failed/)
+    assert.deepEqual(v.blockers, ["test: exited 0 although 1 test failed"])
+  })
+
+  test("a passing summary line shows a reported failed count, and omits zero", () => {
+    const verdict = (failed: number) => ({
+      pass: true,
+      directory: "/x",
+      checks: [
+        {
+          name: "test",
+          command: "node --test",
+          kind: "test" as const,
+          pass: true,
+          code: 0,
+          durationMs: 1,
+          extracted: { runner: "generic" as const, failures: [], counts: { failed, passed: 3, skipped: 1 } },
+        },
+      ],
+      blockers: [],
+      warnings: [],
+      durationMs: 1,
+    })
+    assert.match(render(verdict(1), 1000), /✓ test · 3 passed, 1 failed, 1 skipped/)
+    const plain = render(verdict(0), 1000)
+    assert.match(plain, /✓ test · 3 passed, 1 skipped/)
+    assert.doesNotMatch(plain, /0 failed/)
   })
 
   test("blocking audit findings fail a gate whose checks pass; scope comes from the call", async () => {
