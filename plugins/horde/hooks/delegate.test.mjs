@@ -28,6 +28,12 @@ function session(scratchpad_dir) {
     context("PostToolUse", { session_id: "session-1", scratchpad_dir, prompt_id, tool_name, tool_input, cwd })
 }
 
+function commit(dir, message) {
+  const git = (...args) => execFileSync("git", args, { cwd: dir, stdio: "ignore" })
+  git("add", ".")
+  git("commit", "-m", message)
+}
+
 /** A temporary git repository with one committed file, removed when the test ends. */
 function repo(t) {
   const dir = fs.realpathSync(scratch(t))
@@ -37,8 +43,7 @@ function repo(t) {
   git("config", "user.name", "t")
   git("config", "commit.gpgsign", "false")
   fs.writeFileSync(path.join(dir, "committed.txt"), "start")
-  git("add", ".")
-  git("commit", "-m", "initial")
+  commit(dir, "initial")
   return dir
 }
 
@@ -74,9 +79,13 @@ describe("PostToolUse", () => {
     const files = ["/repo/src/a.ts", "/repo/src/b.ts", "/repo/src/c.ts", "/repo/src/d.ts"]
     for (const file of files.slice(0, 3)) assert.equal(hook(...edit(file)), undefined, file)
     const note = hook(...edit(files[3]))
-    assert.match(note, /edited 4 files by hand/)
-    for (const file of files) assert.ok(note.includes(path.basename(file)), file)
-    assert.equal(hook(...edit("/repo/src/e.ts")), undefined, "the note is printed once per prompt")
+    assert.equal(
+      note,
+      "This prompt has edited 4 files by hand so far (a.ts, b.ts, c.ts, d.ts), so it is bigger than a quick change. " +
+        "horde_do can take each piece not started yet, when it is separate and describable (a goal, done-criteria, the files it may change), " +
+        "to a worker that runs in parallel with the piece in hand, with checks and a review before it lands.",
+    )
+    assert.equal(hook(...edit("/repo/src/e.ts")), undefined, "the note is printed once per piece")
   })
 
   test("editing the same file twice counts once", (t) => {
@@ -118,6 +127,68 @@ describe("PostToolUse", () => {
     for (const file of files) assert.ok(note.includes(file), file)
     write(dir, "e.ts")
     assert.equal(hook(...bash(dir)), undefined, "the note is printed once per prompt")
+  })
+
+  test("a commit starts the next piece: four new Bash files produce the note again", (t) => {
+    const dir = repo(t)
+    const hook = session(scratch(t))
+    assert.equal(hook(...bash(dir)), undefined, "the baseline starts clean")
+    const first = ["a.ts", "b.ts", "c.ts", "d.ts"]
+    for (const file of first.slice(0, 3)) {
+      write(dir, file)
+      assert.equal(hook(...bash(dir)), undefined, file)
+    }
+    write(dir, first[3])
+    assert.match(hook(...bash(dir)), /edited 4 files by hand/)
+    commit(dir, "piece one")
+    assert.equal(hook(...bash(dir)), undefined, "the commit resets the count and the baseline")
+    const next = ["w.ts", "x.ts", "y.ts", "z.ts"]
+    for (const file of next.slice(0, 3)) {
+      write(dir, file)
+      assert.equal(hook(...bash(dir)), undefined, file)
+    }
+    write(dir, next[3])
+    const note = hook(...bash(dir))
+    assert.match(note, /edited 4 files by hand/)
+    for (const file of next) assert.ok(note.includes(file), file)
+    assert.ok(!note.includes("a.ts"), "the previous piece's files are not named")
+  })
+
+  test("a horde_do call before the commit keeps the next piece's note silent", (t) => {
+    const dir = repo(t)
+    const hook = session(scratch(t))
+    assert.equal(hook(...bash(dir)), undefined, "the baseline starts clean")
+    const first = ["a.ts", "b.ts", "c.ts", "d.ts"]
+    for (const file of first.slice(0, 3)) {
+      write(dir, file)
+      assert.equal(hook(...bash(dir)), undefined, file)
+    }
+    write(dir, first[3])
+    assert.match(hook(...bash(dir)), /edited 4 files by hand/)
+    assert.equal(hook("mcp__plugin_horde_opencode__horde_do", { goal: "delegate it" }), undefined)
+    commit(dir, "piece one")
+    assert.equal(hook(...bash(dir)), undefined, "the commit resets the count")
+    for (const file of ["w.ts", "x.ts", "y.ts", "z.ts"]) {
+      write(dir, file)
+      assert.equal(hook(...bash(dir)), undefined, file)
+    }
+  })
+
+  test("without a commit the note stays once per prompt", (t) => {
+    const dir = repo(t)
+    const hook = session(scratch(t))
+    assert.equal(hook(...bash(dir)), undefined, "the baseline starts clean")
+    const files = ["a.ts", "b.ts", "c.ts", "d.ts", "e.ts", "f.ts"]
+    for (const file of files.slice(0, 3)) {
+      write(dir, file)
+      assert.equal(hook(...bash(dir)), undefined, file)
+    }
+    write(dir, files[3])
+    assert.match(hook(...bash(dir)), /edited 4 files by hand/)
+    for (const file of files.slice(4)) {
+      write(dir, file)
+      assert.equal(hook(...bash(dir)), undefined, file)
+    }
   })
 
   test("a file already dirty before the prompt's first observation never counts", (t) => {
