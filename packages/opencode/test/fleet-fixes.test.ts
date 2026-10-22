@@ -7,7 +7,7 @@ import { after, before, describe, test } from "node:test"
 import { Board } from "@mcp-horde/board"
 import type { Backend } from "../src/backend.js"
 import type { Config } from "../src/config.js"
-import { Fleet, type Hooks, type Snapshot, scopeGlobs } from "../src/fleet.js"
+import { Fleet, GATE_REVIEW_TIMEOUT_MS, type Hooks, type Snapshot, scopeGlobs } from "../src/fleet.js"
 import { type AgentRecord, OWNER_STALE_MS, ownerAlive, SELF, Store } from "../src/state.js"
 import { connect, git, type Harness, isolatedEnv, type Mock, makeRepo, until } from "./harness.js"
 import { startMockLlm } from "./mock-llm.js"
@@ -199,6 +199,99 @@ describe("fleet fixes: gates, tasks and worktrees (real opencode, mock LLM)", { 
     const next = await h.call("opencode_message", { id: "ds", message: "re-check", wait: true, timeout_seconds: 120 })
     assert.match(next, /gate: ✓ PASS \(round 1\/2\)/, next)
     await h.call("opencode_dispose", { id: "ds", worktree: "discard" })
+  })
+
+  test("gate reviews get ten minutes per answer", () => {
+    assert.equal(GATE_REVIEW_TIMEOUT_MS, 600_000)
+  })
+
+  test("a steer absorbed into a finished turn does not discard its verdict or run the gate again", async () => {
+    const { repo: r } = makeRepo(mock.url, { permission: { bash: "allow" } })
+    fs.writeFileSync(path.join(r, "horde.json"), JSON.stringify({ verify: { checks: { ok: "true" } }, tiers: ["mock/mock"] }))
+    git(r, "add", ".")
+    git(r, "commit", "-qm", "checks")
+    const started = await h.call("horde_do", {
+      directory: r,
+      goal: "Write the greeting.\nRUN: echo hello > hello.txt && git add hello.txt && git commit -qm hello\nRUN: sleep 12",
+      done: ["hello.txt says hello"],
+      scope: ["hello.txt"],
+    })
+    const id = idOf(started)
+    // Wait until the worker has committed and is busy with the slow second step, then steer it
+    // into the same turn: the steer's seq is newer than the turn's start.
+    await until(
+      async () => {
+        for (const line of git(r, "worktree", "list", "--porcelain").split("\n"))
+          if (line.startsWith("worktree ") && fs.existsSync(path.join(line.slice(9), "hello.txt"))) return true
+        return false
+      },
+      60_000,
+      100,
+    )
+    await h.call("horde_tell", { id, message: "carry on" })
+    const out = await h.call("horde_wait", { ids: [id], timeout_seconds: 120 })
+    assert.match(out, new RegExp(`^${id} READY`), out)
+    assert.match(out, /review: 1 of 1 criteria met/, out)
+    // A second gate would spawn another reviewer: wait past a tick and count them.
+    await new Promise((resolve) => setTimeout(resolve, 3000))
+    const reviews = mock.requests.filter((b) => {
+      const msgs = (b as { messages?: { role: string; content: unknown }[] }).messages ?? []
+      return msgs.some(
+        (m) => m.role === "user" && typeof m.content === "string" && m.content.includes("# Acceptance criteria") && m.content.includes("hello.txt says hello"),
+      )
+    })
+    assert.equal(reviews.length, 1, `the gate reviewed the turn once, got ${reviews.length}`)
+    await h.call("opencode_dispose", { id, worktree: "discard" })
+  })
+
+  test("a gate review with no answer from the first reviewer retries on another model", async () => {
+    const { repo: r } = makeRepo(mock.url, { permission: { bash: "allow" } })
+    fs.writeFileSync(path.join(r, "horde.json"), JSON.stringify({ verify: { checks: { ok: "true" } }, tiers: ["mock/mock", "broken/model", "mock/other"] }))
+    git(r, "add", ".")
+    git(r, "commit", "-qm", "checks")
+    const started = await h.call("horde_do", {
+      directory: r,
+      goal: "Write the greeting.\nRUN: echo hello > greeting.txt && git add greeting.txt && git commit -qm greeting",
+      done: ["greeting.txt says hello"],
+      scope: ["greeting.txt"],
+    })
+    const id = idOf(started)
+    const out = await h.call("horde_wait", { ids: [id], timeout_seconds: 180 })
+    assert.match(out, new RegExp(`^${id} READY`), out)
+    assert.match(out, /review: 1 of 1 criteria met/, out)
+    const reviews = mock.requests.filter((b) => {
+      const msgs = (b as { messages?: { role: string; content: unknown }[] }).messages ?? []
+      return msgs.some(
+        (m) =>
+          m.role === "user" && typeof m.content === "string" && m.content.includes("# Acceptance criteria") && m.content.includes("greeting.txt says hello"),
+      )
+    })
+    assert.equal(reviews.length, 1)
+    assert.equal((reviews[0] as { model?: string }).model, "other", "the retry used the next tier model")
+    await h.call("opencode_dispose", { id, worktree: "discard" })
+  })
+
+  test("a gate whose reviewers both give no answer fails closed", async () => {
+    const { repo: r } = makeRepo(mock.url, { permission: { bash: "allow" } })
+    // A second unrunnable model, so first reviewer and retry both fail to start.
+    const config = JSON.parse(fs.readFileSync(path.join(r, "opencode.json"), "utf8"))
+    config.provider.broken.models.other = { name: "Broken other", tool_call: true }
+    fs.writeFileSync(path.join(r, "opencode.json"), JSON.stringify(config))
+    fs.writeFileSync(path.join(r, "horde.json"), JSON.stringify({ verify: { checks: { ok: "true" } }, tiers: ["mock/mock", "broken/model", "broken/other"] }))
+    git(r, "add", ".")
+    git(r, "commit", "-qm", "checks")
+    const started = await h.call("horde_do", {
+      directory: r,
+      goal: "Write the greeting.\nRUN: echo hello > hi.txt && git add hi.txt && git commit -qm hi",
+      done: ["hi.txt says hello"],
+      scope: ["hi.txt"],
+    })
+    const id = idOf(started)
+    const out = await h.call("horde_wait", { ids: [id], timeout_seconds: 180 })
+    assert.match(out, new RegExp(`^${id} FAILED`), out)
+    assert.match(out, /review could not run/, out)
+    assert.match(out, /Cannot initialize broken\/other/, out)
+    await h.call("opencode_dispose", { id, worktree: "discard" })
   })
 
   test("a refused message leaves no leftover commit; the next plain land is refused as leftovers", async () => {

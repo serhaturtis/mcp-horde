@@ -78,6 +78,8 @@ const CHILD_SCAN_MS = 30_000
 const CHILD_COOL_MS = 60_000
 /** Any single OpenCode request a refresh, a tick or a wait makes gets this long. */
 const REQUEST_MS = 30_000
+/** A gate review of a large diff against many criteria gets this long per answer (the ask default is 5 min). */
+export const GATE_REVIEW_TIMEOUT_MS = 600_000
 /** A whole background tick (all due refreshes) gets this long before the next may start. */
 const TICK_MS = 120_000
 /** How often the owner's heartbeat is written into its records. */
@@ -804,27 +806,47 @@ export class Fleet {
 
   /** The gate's review: the change judged against the task's criteria, seeing the checks that just passed. Never throws. */
   private async reviewForGate(live: Live, taskId: string, checks: GateCheck[], signal: AbortSignal): Promise<ReviewSummary> {
+    const repo = live.record.worktree?.repo ?? live.record.directory
+    let worker: string | undefined
+    let first: string | undefined
+    let next: string | undefined
     try {
-      return await this.reviewGate(live, taskId, checks, signal)
-    } catch {
+      worker = current((await Board.open(repo)).task(taskId))?.model
+      const tiers = loadTiers(repo)
+      const at = tiers.findIndex((t) => t.model !== worker)
+      first = at < 0 ? undefined : tiers[at]!.model
+      next = at < 0 ? undefined : tiers.slice(at + 1).find((t) => t.model !== first)?.model
+      return await this.reviewGate(live, taskId, checks, signal, first)
+    } catch (err) {
       // A transient provider failure (a rate limit, a timeout) is not a verdict: pause and retry once.
       // Long enough for a rate limit or a refused slot to clear, short enough not to stall the gate.
       await sleep(5000)
       if (signal.aborted) return { model: "", cost: 0, total: 0, met: 0, notMet: [], unclear: [], error: "cancelled" }
+      // Retry one tier up, so a slow or throttled model is not asked again; when no tier is above
+      // it, a reviewer that gave no answer at all falls back to the worker's own model.
+      const retry = next ?? (/no answer within/.test((err as Error)?.message ?? "") ? worker : undefined)
       try {
-        return await this.reviewGate(live, taskId, checks, signal)
+        return await this.reviewGate(live, taskId, checks, signal, retry)
       } catch (retryErr) {
         return { model: "", cost: 0, total: 0, met: 0, notMet: [], unclear: [], error: (retryErr as Error).message }
       }
     }
   }
 
-  private async reviewGate(live: Live, taskId: string, checks: GateCheck[], signal: AbortSignal): Promise<ReviewSummary> {
-    const { results } = await this.reviewAttempt({ id: taskId, directory: live.record.worktree?.repo ?? live.record.directory, checks, signal })
+  private async reviewGate(live: Live, taskId: string, checks: GateCheck[], signal: AbortSignal, model?: string): Promise<ReviewSummary> {
+    const { results, worker } = await this.reviewAttempt({
+      id: taskId,
+      directory: live.record.worktree?.repo ?? live.record.directory,
+      checks,
+      signal,
+      ...(model ? { models: [model] } : {}),
+      timeoutMs: GATE_REVIEW_TIMEOUT_MS,
+    })
     const first = results[0]!
     const pick = (status: Verdict["status"]) => first.verdicts.filter((v) => v.status === status).map((v) => ({ n: v.criterion, text: v.text, note: v.note }))
+    const same = worker && first.model === worker ? " (reviewed by the model that did the work)" : ""
     return {
-      model: first.model,
+      model: `${first.model}${same}`,
       cost: results.reduce((n, x) => n + x.cost, 0),
       total: first.verdicts.length,
       met: first.verdicts.filter((v) => v.status === "met").length,
@@ -1997,6 +2019,9 @@ export class Fleet {
     const id = live.record.id
     const cfg = live.record.gate!
     const round = (live.record.gateState?.round ?? 0) + 1
+    // A steer absorbed into the turn being judged is part of it, not a new instruction: only a
+    // prompt that arrives after this run starts supersedes its verdict.
+    const promptBefore = live.track.lastPromptedSeq
     let wt = live.record.worktree
     if (wt) wt = await this.followRebase(live, wt)
     const start = wt ? workStart(wt) : undefined
@@ -2052,7 +2077,7 @@ export class Fleet {
     }
     // A new instruction (or dispose, or shutdown) superseded this run: its verdict is about an old task.
     if (this.closed || abort.signal.aborted || this.live.get(id) !== live) return
-    if (live.sent || live.sending || live.track.lastPromptedSeq > turn || currentTurn(live.track)?.startSeq !== turn) return
+    if (live.sent || live.sending || live.track.lastPromptedSeq > promptBefore || currentTurn(live.track)?.startSeq !== turn) return
     const final = pass || round >= cfg.maxRounds || text.startsWith("the gate could not run") || !!review?.error
     this.updateRecord(id, { gateState: { round, verdict: { turn, pass, final, text, at: Date.now(), checks, review } } })
     if (!final) {
