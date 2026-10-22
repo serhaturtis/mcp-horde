@@ -16,7 +16,8 @@ const ABOUT = [
   "the project's checks and a reviewer judge the work before horde_wait returns it, and horde_land applies it to the branch.",
   "A worker costs a fraction of this session's tokens and runs while the session does other things.",
   "It suits any change that can be written down that way: a fix, a feature, tests, docs, a refactor, or several independent pieces in parallel.",
-  "One- or two-line edits, questions, work that is still being investigated, and results needed right away are quicker done directly.",
+  "horde_investigate does the same for work that changes nothing: an audit, a code review, a bug hunt, a question about how the code works; the worker answers with findings citing file:line, and the citations are checked before horde_wait returns them.",
+  "One- or two-line edits, quick questions, changes still being worked out, and results needed right away are quicker done directly.",
 ].join(" ")
 const FOR_SUBAGENTS =
   "Subagents have the same tools: a worker is a cheaper model, not another Claude agent, so one piece of an assignment can go to a worker while the rest goes on here."
