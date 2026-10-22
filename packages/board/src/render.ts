@@ -46,7 +46,13 @@ export function renderBrief(board: Board, t: Task, a: Attempt, budgetTokens = 60
       // The brief must still go out when horde.json cannot be read.
     }
   }
-  const houseRules: Section[] = briefFiles.map((f) => {
+  const maxChars = budgetTokens * 4
+  // House rules share about a quarter of the budget, so a long rules file cannot crowd out the goal.
+  const houseBudget = Math.floor(maxChars / 4)
+  const houseRules: Section[] = []
+  let houseUsed = 0
+  briefFiles.forEach((f, i) => {
+    const allowance = Math.floor((houseBudget - houseUsed) / (briefFiles.length - i))
     let text: string
     try {
       const lines = fs
@@ -58,7 +64,12 @@ export function renderBrief(board: Board, t: Task, a: Attempt, budgetTokens = 60
     } catch {
       text = `## House rules (${f})\n${f} is listed in horde.json workers.brief but does not exist`
     }
-    return { text, required: true }
+    if (text.length > allowance) {
+      const note = `\n… ${f} was shortened to fit the brief; read the rest of ${f} before changing code.`
+      text = allowance > note.length + 40 ? `${truncate(text, allowance - note.length)}${note}` : truncate(text, allowance)
+    }
+    houseUsed += text.length
+    houseRules.push({ text, required: true })
   })
   // The goal is the only required part that can be long: cut it to what the other required
   // parts leave, so the reporting commands are never the thing that is cut.
@@ -90,7 +101,6 @@ export function renderBrief(board: Board, t: Task, a: Attempt, budgetTokens = 60
       required: true,
     },
   ]
-  const maxChars = budgetTokens * 4
   const fixedChars = fixed.reduce((n, f) => n + f.text.length + 2, 0)
   const head = `# Task ${id}: ${t.title}\n\n`
   const goal = `${head}${truncate(t.goal, Math.max(400, maxChars - fixedChars - head.length - 200))}`

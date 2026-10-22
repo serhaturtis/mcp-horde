@@ -362,6 +362,25 @@ describe("board", () => {
     assert.doesNotMatch(broken, /## House rules/)
   })
 
+  test("house rules are cut to their share before the goal", async () => {
+    const root = repo()
+    // Around 36 KB on 120 lines: long, but under the 300-line cap.
+    fs.writeFileSync(path.join(root, "CONTRIBUTING.md"), `${Array.from({ length: 120 }, (_, i) => `rule ${i + 1}: ${"x".repeat(290)}`).join("\n")}\n`)
+    fs.writeFileSync(path.join(root, "short.md"), "Use pnpm.\n")
+    fs.writeFileSync(path.join(root, "horde.json"), JSON.stringify({ workers: { brief: ["CONTRIBUTING.md", "short.md", "missing.md"] } }))
+    const end = "FINAL-REQUIREMENT: also log every refusal."
+    const goal = `${"g".repeat(1612 - end.length)}${end}`
+    const board = new Board(tmp())
+    const t = (await board.plan([{ title: "Change a thing", goal }])).tasks[0]!
+    const { attempt } = await board.assign(t.id)
+    const brief = renderBrief(board, board.task(t.id), attempt, 6000, root)
+    assert.match(brief, /FINAL-REQUIREMENT: also log every refusal\./)
+    assert.ok(brief.length <= 6000 * 4 + 200, `${brief.length}`)
+    assert.match(brief, /shortened to fit the brief; read the rest of CONTRIBUTING\.md before changing code/)
+    assert.match(brief, /## House rules \(short\.md\)\nUse pnpm\./)
+    assert.match(brief, /missing\.md is listed in horde\.json workers\.brief but does not exist/)
+  })
+
   test("a report is checked against the attempt's diff", async () => {
     const root = repo()
     const base = git(root, "rev-parse", "HEAD")
