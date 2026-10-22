@@ -192,39 +192,44 @@ async function isBinary(root: string, file: string): Promise<boolean> {
   }
 }
 
-async function changes(root: string, base: string): Promise<Change[]> {
-  const byPath = new Map<string, Change>()
-  const nameStatus = splitZ(await gitRaw(root, [...Q, "diff", "--no-ext-diff", "-M", "--name-status", "-z", base]))
-  for (let i = 0; i < nameStatus.length; ) {
-    const status = nameStatus[i++]!
-    if (/^[RC]/.test(status)) {
-      const from = nameStatus[i++]!
-      const to = nameStatus[i++]!
-      byPath.set(to, { path: to, status: status[0]!, from, added: [], removed: [], binary: false })
-    } else {
-      const p = nameStatus[i++]!
-      byPath.set(p, { path: p, status: status[0]!, added: [], removed: [], binary: false })
+/** Changed paths git reports with "-" numstat counts: it treats them as binary (real bytes or the -diff attribute). */
+async function gitBinaryPaths(root: string, range: string): Promise<string[]> {
+  const numstat = splitZ(await gitRaw(root, [...Q, "diff", "--no-ext-diff", "-M", "--numstat", "-z", range]))
+  const out: string[] = []
+  for (let i = 0; i < numstat.length; i++) {
+    const m = numstat[i]!.match(/^(-|\d+)\t(-|\d+)\t(.*)$/)
+    if (!m) continue
+    let p = m[3]!
+    if (!p) {
+      i += 2
+      p = numstat[i] ?? ""
     }
+    if (m[1] === "-") out.push(p)
   }
-  // numstat used to mark files binary when git reported "-" counts, but a `-diff`
-  // attribute makes a text file (package-lock.json) report "-" too. Binary-ness is
-  // decided from content below instead, so numstat is gone.
-  // Added and removed lines, from a zero-context diff that does not depend on user config.
-  // Fixed a/ b/ prefixes whatever diff.noprefix or diff.mnemonicPrefix say.
-  const diff = await gitRaw(root, [
-    ...Q,
-    "-c",
-    "color.ui=never",
-    "diff",
-    "--no-ext-diff",
-    "--no-textconv",
-    "--text",
-    "--src-prefix=a/",
-    "--dst-prefix=b/",
-    "-M",
-    "-U0",
-    base,
-  ])
+  return out
+}
+
+/** Whether `file` is a regular file in the working tree (not deleted). */
+async function isFile(root: string, file: string): Promise<boolean> {
+  try {
+    return (await fs.stat(path.join(root, file))).isFile()
+  } catch {
+    return false
+  }
+}
+
+/** The git-binary changed paths whose content is text: these need a --text diff. */
+async function textDiffPaths(root: string, range: string): Promise<string[]> {
+  const out: string[] = []
+  for (const p of await gitBinaryPaths(root, range)) {
+    if (!(await isFile(root, p))) continue
+    if (!(await isBinary(root, p))) out.push(p)
+  }
+  return out
+}
+
+/** Parse a `git diff -U0` (optionally --text) into each path's added/removed lines. */
+function parseDiff(diff: string, byPath: Map<string, Change>) {
   const headerPath = (l: string, prefix: string) => {
     const p = unquoteC(l.slice(4).replace(/\t$/, ""))
     return p.startsWith(prefix) ? p.slice(prefix.length) : p
@@ -261,6 +266,60 @@ async function changes(root: string, base: string): Promise<Change[]> {
     if (l.startsWith("+")) current.added.push({ line: lineNo++, text: l.slice(1) })
     else if (l.startsWith("-")) current.removed.push(l.slice(1))
   }
+}
+
+async function changes(root: string, base: string): Promise<Change[]> {
+  const byPath = new Map<string, Change>()
+  const nameStatus = splitZ(await gitRaw(root, [...Q, "diff", "--no-ext-diff", "-M", "--name-status", "-z", base]))
+  for (let i = 0; i < nameStatus.length; ) {
+    const status = nameStatus[i++]!
+    if (/^[RC]/.test(status)) {
+      const from = nameStatus[i++]!
+      const to = nameStatus[i++]!
+      byPath.set(to, { path: to, status: status[0]!, from, added: [], removed: [], binary: false })
+    } else {
+      const p = nameStatus[i++]!
+      byPath.set(p, { path: p, status: status[0]!, added: [], removed: [], binary: false })
+    }
+  }
+  // Git calls a file binary for a real binary or a -diff attribute. Tell them apart by
+  // content: a NUL byte means a real binary, everything else is text that still needs its lines.
+  const textPaths: string[] = []
+  for (const p of await gitBinaryPaths(root, base)) {
+    const c = byPath.get(p)
+    if (!c || c.status === "D") continue
+    if (await isBinary(root, p)) c.binary = true
+    else textPaths.push(p)
+  }
+  // Added and removed lines, from a zero-context diff that does not depend on user config.
+  // Fixed a/ b/ prefixes whatever diff.noprefix or diff.mnemonicPrefix say. Binary and -diff
+  // files print one "Binary files differ" line here; the -diff text files get a --text pass below.
+  parseDiff(
+    await gitRaw(root, [...Q, "-c", "color.ui=never", "diff", "--no-ext-diff", "--no-textconv", "--src-prefix=a/", "--dst-prefix=b/", "-M", "-U0", base]),
+    byPath,
+  )
+  if (textPaths.length) {
+    // The -diff text files' lines, limited to just those paths so a real binary stays one line.
+    parseDiff(
+      await gitRaw(root, [
+        ...Q,
+        "-c",
+        "color.ui=never",
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--text",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+        "-M",
+        "-U0",
+        base,
+        "--",
+        ...textPaths,
+      ]),
+      byPath,
+    )
+  }
   // Untracked files are additions too (a worker that never ran `git add`).
   for (const p of splitZ(await gitRaw(root, [...Q, "ls-files", "--others", "--exclude-standard", "-z"]))) {
     const c: Change = { path: p, status: "?", added: [], removed: [], binary: false }
@@ -277,18 +336,6 @@ async function changes(root: string, base: string): Promise<Change[]> {
     }
     byPath.set(p, c)
   }
-  // Binary-ness comes from content, not git's `-diff` attribute: a NUL byte in the
-  // new blob's head marks a real binary, while a `-diff` text file is not. The `--text`
-  // diff above already gave binary files their raw bytes; drop them so they are not
-  // scanned for secrets or suppressions.
-  for (const c of byPath.values()) {
-    if (c.status === "D" || c.status === "?" || c.binary) continue
-    if (await isBinary(root, c.path)) {
-      c.binary = true
-      c.added = []
-      c.removed = []
-    }
-  }
   return [...byPath.values()]
 }
 
@@ -301,7 +348,7 @@ interface HistoricalSecret {
 
 /** Secret-looking lines added in any commit since base, even when a later commit removed them. */
 async function secretHistory(root: string, base: string): Promise<HistoricalSecret[]> {
-  const raw = await gitRaw(root, [
+  const args = [
     ...Q,
     "-c",
     "color.ui=never",
@@ -312,11 +359,14 @@ async function secretHistory(root: string, base: string): Promise<HistoricalSecr
     "-m",
     "--no-ext-diff",
     "--no-textconv",
-    "--text",
     "--src-prefix=a/",
     "--dst-prefix=b/",
-    `${base}..HEAD`,
-  ])
+  ]
+  let raw = await gitRaw(root, [...args, `${base}..HEAD`])
+  // -diff text files are hidden from the log above ("Binary files differ"); scan those
+  // too, with --text limited to just them so real binaries never dump their bytes.
+  const textPaths = await textDiffPaths(root, `${base}..HEAD`)
+  if (textPaths.length) raw += await gitRaw(root, [...args, "--text", `${base}..HEAD`, "--", ...textPaths])
   const out: HistoricalSecret[] = []
   const seen = new Set<string>()
   let sha = ""

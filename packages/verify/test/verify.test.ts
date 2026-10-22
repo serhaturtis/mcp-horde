@@ -282,6 +282,25 @@ describe("audit", () => {
     assert.ok(!lines.some((l) => l.includes("binaries") && (l.includes("package-lock") || l.includes("config.js"))), lines.join("\n"))
   })
 
+  test("a real binary stays binary and its bytes are never scanned", async () => {
+    // Built at run time so this file holds no literal secret the gate would flag.
+    const key = "AKIA" + "ABCDEFGHIJKLMNOP"
+    const { root, base } = repo({ "README.md": "x\n" })
+    // 1 MiB of NULs with a secret-looking prefix: a real binary, so its bytes are not
+    // dumped into the patch nor scanned for the key.
+    const bytes = Buffer.alloc(1024 * 1024)
+    bytes.write(key)
+    write(root, { "model.bin": bytes })
+    git(root, "add", "-A")
+    const r = await audit(root, { base, block: ["binaries", "secrets"], warn: [] })
+    const lines = r.findings.map((f) => `${f.category} ${f.file ?? ""} ${f.text}`)
+    assert.ok(
+      lines.some((l) => /^binaries model\.bin adds or changes a binary file$/.test(l)),
+      lines.join("\n"),
+    )
+    assert.ok(!lines.some((l) => l.includes("secrets")), lines.join("\n"))
+  })
+
   test("merge commits are flagged; categories can be switched off", async () => {
     const { root, base } = repo({ "a.txt": "a\n" })
     git(root, "checkout", "-qb", "side")
