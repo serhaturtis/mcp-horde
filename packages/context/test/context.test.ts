@@ -188,14 +188,11 @@ for (const [mode, definitions] of [
 describe("imports and tests", () => {
   test("specifiers and resolution: TS ESM .js → .ts, directory index, Python relative, Go module, Rust mod, Java packages", () => {
     assert.deepEqual(importSpecs(FILES["src/index.ts"]!, "ts"), ["./users/service.js", "./util"])
-    assert.deepEqual(
-      importSpecs(FILES["py/app/api.py"]!, "py"),
-      [".models", ".models", "os"].filter((v, i, a) => a.indexOf(v) === i),
-    )
+    assert.deepEqual(importSpecs(FILES["py/app/api.py"]!, "py"), [".models", ".", "os"])
     const g = importGraph(project())
     assert.deepEqual(g.out.get("src/index.ts"), ["src/users/service.ts", "src/util/index.ts"])
     assert.deepEqual(g.out.get("src/users/service.ts"), ["src/util/index.ts", "src/users/types.ts"])
-    assert.deepEqual(g.out.get("py/app/api.py"), ["py/app/models.py"])
+    assert.deepEqual(g.out.get("py/app/api.py"), ["py/app/models.py", "py/app/__init__.py"])
     assert.deepEqual(g.out.get("cmd/demo/main.go"), ["internal/calc/calc.go"])
     assert.deepEqual(g.out.get("rs/src/lib.rs"), ["rs/src/parser.rs"])
     assert.deepEqual(g.out.get("java/src/main/java/com/acme/Billing.java"), ["java/src/main/java/com/acme/util/Money.java"])
@@ -653,7 +650,7 @@ describe("import resolution details", () => {
     })
     const g = importGraph(openProject(dir))
     assert.deepEqual(g.out.get("app.py")?.sort(), ["pkg/__init__.py", "pkg/mod.py", "pkg/other.py", "pkg/third.py"])
-    assert.deepEqual(importSpecs("from . import (\n    a,\n    b,\n)\n", "py"), [".a", ".b"])
+    assert.deepEqual(importSpecs("from . import (\n    a,\n    b,\n)\n", "py"), [".", ".a", ".b"])
     assert.deepEqual(g.out.get("src/com/a/App.java")?.sort(), ["src/com/a/Calc.java", "src/com/a/util/Money.java", "src/com/a/util/Rate.java"])
     assert.deepEqual(g.out.get("rs/src/a/b.rs"), ["rs/src/a/c.rs", "rs/src/a/b/d.rs"])
   })
@@ -714,8 +711,8 @@ describe("import resolution details", () => {
     })
     const p = openProject(dir)
     const g = importGraph(p)
-    assert.deepEqual(g.out.get("svc/tests/test_core.py"), ["svc/app/core.py"])
-    assert.deepEqual(g.out.get("svc/tests/test_smoke.py"), ["svc/app/core.py"])
+    assert.deepEqual(g.out.get("svc/tests/test_core.py"), ["svc/app/core.py", "svc/app/__init__.py"])
+    assert.deepEqual(g.out.get("svc/tests/test_smoke.py"), ["svc/app/core.py", "svc/app/__init__.py"])
     assert.deepEqual(g.out.get("svc/tests/test_scripts.py"), ["svc/scripts/x.py"], "the project root's scripts/ wins")
     assert.deepEqual(g.out.get("libsvc/tests/test_smoke.py"), ["libsvc/src/app/core.py"])
     assert.deepEqual(g.out.get("nest/inner/tests/test_inner.py"), ["nest/inner/app/inner.py"], "the nearest project root wins")
@@ -801,6 +798,73 @@ describe("import resolution details", () => {
       "src/main.ts": "import { x } from '@a/x'\n",
     })
     assert.deepEqual(importGraph(openProject(cyclic)).out.get("src/main.ts"), ["a/x.ts"])
+  })
+
+  test("Python: __init__.py is linked by relative and absolute package imports", () => {
+    const dir = fixture({
+      "pkg/__init__.py": "SCALE = 2\n\ndef helper():\n    return SCALE\n",
+      "pkg/mod.py": "from . import helper\n",
+      "pkg/sub/__init__.py": "",
+      "pkg/sub/deep.py": "X = 1\n",
+      "app.py": "import pkg.sub.deep\n",
+      "tests/test_mod.py": "import pkg.mod\n",
+    })
+    const p = openProject(dir)
+    // `from . import helper` links pkg/mod.py to pkg/__init__.py (where helper lives).
+    assert.deepEqual(importGraph(p).out.get("pkg/mod.py"), ["pkg/__init__.py"])
+    // An absolute dotted import runs each parent package's __init__.py first.
+    assert.deepEqual(importGraph(p).out.get("app.py")!.sort(), ["pkg/__init__.py", "pkg/sub/__init__.py", "pkg/sub/deep.py"])
+    // The transitive test walk reaches the package through its module.
+    assert.deepEqual(
+      testsFor(p, ["pkg/__init__.py"], { transitive: true })
+        .get("pkg/__init__.py")!
+        .map((t) => `${t.test} (${t.why})`),
+      ["tests/test_mod.py (imports it)"],
+    )
+  })
+
+  test("Vue and Svelte components: their script imports link tests transitively", () => {
+    const dir = fixture({
+      "src/utils/format.ts": "export function format(n: number) {\n  return String(n)\n}\n",
+      "src/components/Price.vue": '<script setup lang="ts">\nimport { format } from "../utils/format"\n</script>\n',
+      "src/components/Price.test.ts": "import Price from './Price.vue'\n",
+      "src/components/Label.svelte": '<script lang="ts">\nimport { format } from "../utils/format"\n</script>\n',
+      "src/components/Label.test.ts": "import Label from './Label.svelte'\n",
+    })
+    assert.deepEqual(
+      testsFor(openProject(dir), ["src/utils/format.ts"], { transitive: true })
+        .get("src/utils/format.ts")!
+        .map((t) => `${t.test} (${t.why})`)
+        .sort(),
+      ["src/components/Label.test.ts (imports it via src/components/Label.svelte)", "src/components/Price.test.ts (imports it via src/components/Price.vue)"],
+    )
+  })
+
+  test("a flat test name mirrors only an unambiguous same-named source", () => {
+    const two = fixture({
+      "billing/models.py": "class Billing:\n    pass\n",
+      "shipping/models.py": "class Shipping:\n    pass\n",
+      "tests/test_models.py": "import billing.models\n",
+    })
+    const r = testsFor(openProject(two), ["billing/models.py", "shipping/models.py"])
+    assert.deepEqual(
+      r.get("billing/models.py")!.map((t) => `${t.test} (${t.why})`),
+      ["tests/test_models.py (imports it)"],
+      "the test imports billing.models, not shipping.models",
+    )
+    assert.deepEqual(r.get("shipping/models.py"), [], "a same-named sibling is not credited")
+
+    const one = fixture({
+      "shipping/models.py": "class Shipping:\n    pass\n",
+      "tests/test_models.py": "def test_something():\n    pass\n",
+    })
+    assert.deepEqual(
+      testsFor(openProject(one), ["shipping/models.py"])
+        .get("shipping/models.py")!
+        .map((t) => `${t.test} (${t.why})`),
+      ["tests/test_models.py (mirror)"],
+      "with a single same-named source the mirror still applies",
+    )
   })
 
   test("C# tests mirror the project they test", () => {

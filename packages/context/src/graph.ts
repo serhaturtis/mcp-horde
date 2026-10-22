@@ -37,8 +37,16 @@ export function fileInfo(project: Project, rel: string): FileInfo | undefined {
   // Computed before the grammars finished loading: compute again.
   const generation = syntaxGeneration()
   if (hit && hit.text === text && hit.generation === generation) return hit.info
-  const parsed = parse(text, lang, rel)
-  const info = { lang, defs: parsed?.defs ?? patternDefinitions(text, lang), specs: importSpecs(text, lang, { submodules: true }), spans: parsed?.spans }
+  // Components mix <template> markup with <script>: read their imports but no definitions,
+  // which the line/grammar rules would otherwise scatter across the markup.
+  const component = /\.(vue|svelte|astro)$/.test(rel)
+  const parsed = component ? undefined : parse(text, lang, rel)
+  const info = {
+    lang,
+    defs: component ? [] : (parsed?.defs ?? patternDefinitions(text, lang)),
+    specs: importSpecs(text, lang, { submodules: true }),
+    spans: parsed?.spans,
+  }
   infos.set(key, { text, generation, info })
   return info
 }
@@ -310,8 +318,16 @@ function resolve(r: Resolver, from: string, spec: string, lang: Lang): string[] 
       const root = r.pyRoot(dir)
       const bases = ["", "src/", "lib/", `${dir}/`]
       if (root && root !== ".") bases.unshift(`${root}/`, `${root}/src/`)
-      const hit = first(bases.flatMap((p) => [`${p}${tail}.py`, `${p}${tail}/__init__.py`]))
-      if (hit.length) return hit
+      for (const base of bases) {
+        const hit = first([`${base}${tail}.py`, `${base}${tail}/__init__.py`])
+        if (!hit.length) continue
+        // Python runs each parent package's __init__.py before the module, so link those too.
+        const inits = parts
+          .slice(0, -1)
+          .map((_, i) => path.posix.normalize(`${base}${parts.slice(0, i + 1).join("/")}/__init__.py`))
+          .filter((p) => files.has(p))
+        return [hit[0]!, ...inits]
+      }
       // A top-level package owned by another project in a workspace (uv members): <pkg>.sub.
       const top = parts[0]
       for (const pkgDir of r.pyPackages().get(top ?? "") ?? []) {
@@ -485,6 +501,13 @@ const isRunnableTest = (p: string) =>
 export function testsFor(project: Project, files: string[], opts: { transitive?: boolean } = {}): Map<string, TestLink[]> {
   const tests = project.files.filter((f) => isTestPath(f) && langOf(f))
   const graph = importGraph(project)
+  // Non-test source files by stem, so a flat test name mirrors only an unambiguous file.
+  const stemCount = new Map<string, number>()
+  for (const f of project.files) {
+    if (isTestPath(f) || !langOf(f)) continue
+    const s = stemOf(f)
+    stemCount.set(s, (stemCount.get(s) ?? 0) + 1)
+  }
   const result = new Map<string, TestLink[]>()
   for (const file of files) {
     const links = new Map<string, string>()
@@ -501,7 +524,8 @@ export function testsFor(project: Project, files: string[], opts: { transitive?:
       if (t === file) continue
       const tdir = path.posix.dirname(t)
       if (stemOf(t) === stem && (tdir === dir || tdir === `${dir}/__tests__` || tdir === `${dir}/tests` || tdir === `${dir}/test`)) add(t, "naming")
-      else if (stemOf(t) === stem && !GENERIC.has(stem) && (mirrors(t, inner) || (lang === "cs" && csMirrors(t, file)))) add(t, "mirror")
+      else if (stemOf(t) === stem && !GENERIC.has(stem) && (mirrors(t, inner, stemCount.get(stem) ?? 0, file) || (lang === "cs" && csMirrors(t, file))))
+        add(t, "mirror")
     }
     // Importers, and importers of re-exporting barrels (index.ts, lib.ts, __init__.py, mod.rs).
     // Breadth first, so each test is credited to its shortest import path.
@@ -544,7 +568,7 @@ export function testsFor(project: Project, files: string[], opts: { transitive?:
 }
 
 /** Does test path `t` mirror `inner` (a/b) under a test directory, ignoring test naming? */
-function mirrors(t: string, inner: string): boolean {
+function mirrors(t: string, inner: string, stemCount: number, file: string): boolean {
   const m = /(?:^|\/)(?:__tests__|tests?|spec)\/(.*)$/.exec(t)
   if (!m) return false
   const rel = m[1]!.replace(/\.[^.]+$/, "").replace(/\.(test|spec)$/, "")
@@ -554,8 +578,19 @@ function mirrors(t: string, inner: string): boolean {
       .replace(/_test$/, "")
       .replace(/([^/])Tests?$/, "$1")
   const a = name(rel)
-  // Same relative path, or the same file name when the test tree is flat.
-  return a === inner || a === path.posix.basename(inner) || inner.endsWith(`/${a}`)
+  // Same relative path always mirrors.
+  if (a === inner) return true
+  // The same file name when the test tree is flat: a bare name mirrors only an unambiguous
+  // source — one file with that stem, or the test and source sharing their top-level directory.
+  const flat = !a.includes("/")
+  if (a === path.posix.basename(inner) || inner.endsWith(`/${a}`)) return !flat || stemCount === 1 || topDir(t) === topDir(file)
+  return false
+}
+
+/** The first path segment ("a/b.ts" → "a"). */
+const topDir = (p: string) => {
+  const i = p.indexOf("/")
+  return i < 0 ? p : p.slice(0, i)
 }
 
 /**

@@ -22,6 +22,10 @@ const EXT: Record<string, Lang> = {
   kt: "kt",
   kts: "kt",
   cs: "cs",
+  // Components hold their imports in a <script> block the TS regexes already read.
+  vue: "ts",
+  svelte: "ts",
+  astro: "ts",
 }
 
 export const LANG_NAMES: Record<Lang, string> = {
@@ -405,8 +409,10 @@ export function importSpecs(text: string, lang: Lang, opts: { submodules?: boole
           .map((n) => n.trim().split(/\s+/)[0]!)
           .filter((n) => /^\w+$/.test(n))
         // `from . import a, b` names modules; `from .x import a` names x (and a, when x.a is a submodule).
-        if (/^\.+$/.test(mod)) for (const n of names) add(`${mod}${n}`)
-        else {
+        if (/^\.+$/.test(mod)) {
+          add(mod) // the package itself: its __init__.py runs before any module it defines
+          for (const n of names) add(`${mod}${n}`)
+        } else {
           add(mod)
           if (opts.submodules) for (const n of names) add(`${mod}.${n}`)
         }
