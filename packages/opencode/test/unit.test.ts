@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import { execFileSync } from "node:child_process"
+import { execFileSync, spawn } from "node:child_process"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
@@ -27,6 +27,7 @@ import {
   type Worktree,
   workStart,
 } from "../src/worktree.js"
+import { pkg } from "./harness.js"
 // Fixes from the support-module audit (hooks, tracker, worktree, backend, supervisor, ask, config).
 import "./support-fixes.test.js"
 
@@ -750,5 +751,121 @@ describe("createWorktree runs the setup at the worktree's repository root", () =
     assert.equal(worktree.path, path.join(worktree.root, "packages", "app"))
     assert.ok(fs.existsSync(path.join(worktree.root, "root-setup.txt")), "the setup ran at the worktree root")
     assert.ok(!fs.existsSync(path.join(worktree.path, "root-setup.txt")), "not in the session's subdirectory")
+  })
+})
+
+describe("the private supervisor outlives a kill of its parent's process group", () => {
+  const posixOnly = { skip: process.platform === "win32" ? "POSIX process groups" : false }
+  const supervisorJs = path.join(pkg, "dist", "supervisor.js")
+  const supervisorTs = path.join(pkg, "src", "supervisor.ts")
+
+  // A parent like spawnPrivate: supervisor in its own group, stdin as a lifeline,
+  // and an exit handler that stops it. The fake server is a node script that sleeps.
+  const fixture = (dir: string) => {
+    const pidFile = path.join(dir, "fake.pid")
+    const fake = path.join(dir, "fake-server.mjs")
+    fs.writeFileSync(fake, `import fs from "node:fs"\nfs.writeFileSync(process.env.FAKE_PID_FILE, String(process.pid))\nsetInterval(() => {}, 1000)\n`)
+    const parent = path.join(dir, "parent.mjs")
+    fs.writeFileSync(
+      parent,
+      `import { spawn } from "node:child_process"
+import fs from "node:fs"
+import path from "node:path"
+
+const [supervisorJs, supervisorTs, fake, pidFile, mode] = process.argv.slice(2)
+const supervisor = fs.existsSync(supervisorJs) ? [supervisorJs] : [...process.execArgv, supervisorTs]
+const proc = spawn(process.execPath, [...supervisor, String(process.pid), process.execPath, fake], {
+  cwd: path.dirname(supervisorTs),
+  env: { ...process.env, FAKE_PID_FILE: pidFile },
+  stdio: ["pipe", "pipe", "pipe"],
+  windowsHide: true,
+  detached: process.platform !== "win32",
+})
+const killChild = () => {
+  if (proc.exitCode !== null) return
+  try {
+    process.kill(proc.pid, "SIGTERM")
+  } catch {
+    // already gone
+  }
+}
+process.once("exit", killChild)
+process.on("SIGTERM", () => process.exit(0))
+const watch = setInterval(() => {
+  if (!fs.existsSync(pidFile)) return
+  clearInterval(watch)
+  if (mode === "normal") process.exit(0)
+}, 50)
+setInterval(() => {}, 1000)
+`,
+    )
+    return { pidFile, parent, fake }
+  }
+
+  const start = async (dir: string, mode: "group-kill" | "normal") => {
+    const f = fixture(dir)
+    const parent = spawn(process.execPath, ["--import", "tsx", f.parent, supervisorJs, supervisorTs, f.fake, f.pidFile, mode], {
+      cwd: pkg,
+      detached: true,
+      stdio: ["ignore", "ignore", "inherit"],
+    })
+    const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) =>
+      parent.once("exit", (code, signal) => resolve({ code, signal })),
+    )
+    const deadline = Date.now() + 20_000
+    while (!fs.existsSync(f.pidFile)) {
+      if (Date.now() > deadline) throw new Error("the fake server never started")
+      await new Promise((r) => setTimeout(r, 50))
+    }
+    return { parent, exited, fakePid: Number(fs.readFileSync(f.pidFile, "utf8")) }
+  }
+
+  const gone = async (pid: number, ms: number) => {
+    const deadline = Date.now() + ms
+    while (Date.now() < deadline) {
+      try {
+        process.kill(pid, 0)
+      } catch {
+        return true
+      }
+      await new Promise((r) => setTimeout(r, 100))
+    }
+    return false
+  }
+
+  const cleanup = (parent: ReturnType<typeof spawn>, fakePid: number) => {
+    try {
+      if (parent.pid) process.kill(-parent.pid, "SIGKILL")
+    } catch {
+      // already gone
+    }
+    try {
+      process.kill(fakePid, "SIGKILL")
+    } catch {
+      // already gone
+    }
+  }
+
+  test("SIGKILL of the parent's group leaves it to stop the server", posixOnly, async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "horde-supervisor-kill-"))
+    const { parent, exited, fakePid } = await start(dir, "group-kill")
+    try {
+      process.kill(-parent.pid!, "SIGKILL")
+      await exited
+      assert.equal(await gone(fakePid, 5_000), true, "the fake server was stopped")
+    } finally {
+      cleanup(parent, fakePid)
+    }
+  })
+
+  test("a normal parent exit stops the server without hanging", posixOnly, async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "horde-supervisor-exit-"))
+    const { parent, exited, fakePid } = await start(dir, "normal")
+    try {
+      assert.equal((await exited).code, 0, "the parent exited normally")
+      assert.equal(await gone(fakePid, 5_000), true, "the fake server was stopped")
+    } finally {
+      cleanup(parent, fakePid)
+    }
   })
 })

@@ -492,6 +492,8 @@ async function spawnPrivate(config: Config, password: string) {
     // stdin stays open as a lifeline: the supervisor stops OpenCode when it closes.
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
+    // Its own group, so a kill of our group misses it and it can stop OpenCode after we die.
+    detached: !isWindows,
   })
   const killChild = () => {
     if (proc.exitCode === null) killTree(proc.pid!, false)
