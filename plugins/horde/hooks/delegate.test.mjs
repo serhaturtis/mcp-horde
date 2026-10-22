@@ -24,11 +24,29 @@ const context = (event, input) => run(event, input)?.hookSpecificOutput.addition
 
 /** One agent session in one fresh scratchpad, with the inputs found on every PostToolUse call. */
 function session(scratchpad_dir) {
-  return (tool_name, tool_input, prompt_id = "prompt-1") =>
-    context("PostToolUse", { session_id: "session-1", scratchpad_dir, prompt_id, tool_name, tool_input })
+  return (tool_name, tool_input, prompt_id = "prompt-1", cwd) =>
+    context("PostToolUse", { session_id: "session-1", scratchpad_dir, prompt_id, tool_name, tool_input, cwd })
+}
+
+/** A temporary git repository with one committed file, removed when the test ends. */
+function repo(t) {
+  const dir = fs.realpathSync(scratch(t))
+  const git = (...args) => execFileSync("git", args, { cwd: dir, stdio: "ignore" })
+  git("init")
+  git("config", "user.email", "t@t")
+  git("config", "user.name", "t")
+  git("config", "commit.gpgsign", "false")
+  fs.writeFileSync(path.join(dir, "committed.txt"), "start")
+  git("add", ".")
+  git("commit", "-m", "initial")
+  return dir
 }
 
 const edit = (file) => ["Edit", { file_path: file }]
+
+const bash = (cwd) => ["Bash", { command: "true" }, "prompt-1", cwd]
+
+const write = (dir, file) => fs.writeFileSync(path.join(dir, file), file)
 
 describe("SessionStart", () => {
   test("tells the session about horde_do", () => {
@@ -83,5 +101,67 @@ describe("PostToolUse", () => {
     const hook = session(scratch(t))
     assert.equal(hook("mcp__plugin_horde_opencode__horde_do", { goal: "delegate it" }), undefined)
     for (const file of ["a.ts", "b.ts", "c.ts", "d.ts", "e.ts"]) assert.equal(hook(...edit(`/repo/${file}`)), undefined, file)
+  })
+
+  test("files created through Bash produce the note on the fourth distinct file", (t) => {
+    const dir = repo(t)
+    const hook = session(scratch(t))
+    assert.equal(hook(...bash(dir)), undefined, "the baseline starts clean")
+    const files = ["a.ts", "b.ts", "c.ts", "d.ts"]
+    for (const file of files.slice(0, 3)) {
+      write(dir, file)
+      assert.equal(hook(...bash(dir)), undefined, file)
+    }
+    write(dir, files[3])
+    const note = hook(...bash(dir))
+    assert.match(note, /edited 4 files by hand/)
+    for (const file of files) assert.ok(note.includes(file), file)
+    write(dir, "e.ts")
+    assert.equal(hook(...bash(dir)), undefined, "the note is printed once per prompt")
+  })
+
+  test("a file already dirty before the prompt's first observation never counts", (t) => {
+    const dir = repo(t)
+    const hook = session(scratch(t))
+    write(dir, "already.txt")
+    assert.equal(hook(...bash(dir)), undefined, "the first observation sets the baseline")
+    const files = ["a.ts", "b.ts", "c.ts", "d.ts"]
+    for (const file of files.slice(0, 3)) {
+      write(dir, file)
+      assert.equal(hook(...bash(dir)), undefined, file)
+    }
+    write(dir, files[3])
+    const note = hook(...bash(dir))
+    assert.match(note, /edited 4 files by hand/)
+    for (const file of files) assert.ok(note.includes(file), file)
+    assert.ok(!note.includes("already.txt"))
+  })
+
+  test("a Bash call outside any git repository counts nothing", (t) => {
+    const dir = scratch(t)
+    const hook = session(scratch(t))
+    for (const file of ["a.ts", "b.ts", "c.ts", "d.ts", "e.ts"]) {
+      write(dir, file)
+      assert.equal(hook(...bash(dir)), undefined, file)
+    }
+    assert.equal(hook(...bash(undefined)), undefined, "no cwd counts nothing")
+  })
+
+  test("a file edited through Edit and then changed through Bash counts once", (t) => {
+    const dir = repo(t)
+    const hook = session(scratch(t))
+    assert.equal(hook(...bash(dir)), undefined, "the baseline starts clean")
+    const file = path.join(dir, "a.ts")
+    assert.equal(hook(...edit(file), "prompt-1", dir), undefined)
+    write(dir, "a.ts")
+    assert.equal(hook(...bash(dir)), undefined, "Bash does not count the file again")
+    for (const name of ["b.ts", "c.ts"]) {
+      write(dir, name)
+      assert.equal(hook(...bash(dir)), undefined, name)
+    }
+    write(dir, "d.ts")
+    const note = hook(...bash(dir))
+    assert.match(note, /edited 4 files by hand/)
+    assert.equal(note.match(/a\.ts/g)?.length, 1, "a.ts is named once")
   })
 })
