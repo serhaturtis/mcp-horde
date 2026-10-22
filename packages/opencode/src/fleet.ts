@@ -40,6 +40,7 @@ import {
   createWorktree,
   followRebase,
   hasUncommitted,
+  judgeCommits,
   landSync,
   mergeWorktree,
   removeWorktree,
@@ -1481,8 +1482,10 @@ export class Fleet {
         const tip = await git(wt.repo, "rev-parse", "HEAD")
         // 1. Onto your branch's tip, inside the worktree, leaving the carried-over baseline out. A
         // conflict leaves both as they were; anything else failing is reported by its own cause.
+        let leftover = false
         try {
           const synced = await landSync(wt, name)
+          leftover = synced.leftover ?? false
           if (synced.worktree) {
             wt = synced.worktree
             // The verdict stands for landing again; a new turn is gated as usual.
@@ -1504,7 +1507,7 @@ export class Fleet {
         }
         // 1b. With a message: the task's own commits become one, which the hook just judged.
         if (message) {
-          const squashed = await squashWorktree(wt, message)
+          const squashed = await squashWorktree(wt, message, leftover)
           if (squashed.refused !== undefined) return { landed: false, target, why: "message", text: squashed.refused, hook }
         }
         // 2. workers.land, after the rebase and the optional squash: run it, commit its changes on
@@ -1527,6 +1530,16 @@ export class Fleet {
           judged = await git(wt.root, "rev-parse", "HEAD")
         }
         const commits = (await git(wt.repo, "rev-list", "--count", `${tip}..${judged}`).catch(() => "0")).trim()
+        // A husky v9 hook lives in a core.hooksPath directory git ignores, so it is absent from the
+        // worktree and the worker's `git commit` there never ran it. Judge every commit that will
+        // land (the task's own, from workStart); a workers.land commit is judged by commitLandStep.
+        if (hook && !message) {
+          const refused = await judgeCommits(wt, hook, workStart(wt), land ? beforeLand! : judged)
+          if (refused !== undefined) {
+            if (beforeLand) await restoreWorktree(wt, beforeLand).catch(() => undefined)
+            return { landed: false, target, why: "message", text: refused, hook }
+          }
+        }
         const v = await runGate(wt.root, {
           audit: false,
           related: false,

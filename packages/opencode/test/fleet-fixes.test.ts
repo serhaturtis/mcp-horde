@@ -99,6 +99,16 @@ describe("fleet fixes: gates, tasks and worktrees (real opencode, mock LLM)", { 
     mock?.close()
   })
 
+  const idOf = (text: string) => text.match(/\bt-[0-9a-f]+\b/)![0]
+  /** The next outcome other than a permission request (this repo's config asks before shell). */
+  async function settle(id: string): Promise<string> {
+    for (;;) {
+      const out = await h.call("horde_wait", { ids: [id], timeout_seconds: 120 })
+      if (!/ NEEDS YOU /.test(out)) return out
+      await h.call("horde_tell", { id, approve: true })
+    }
+  }
+
   test("a text attachment over the inline limit is refused before anything starts", async () => {
     fs.writeFileSync(path.join(repo, "big.txt"), "x".repeat(300 * 1024))
     await assert.rejects(
@@ -186,5 +196,78 @@ describe("fleet fixes: gates, tasks and worktrees (real opencode, mock LLM)", { 
     const next = await h.call("opencode_message", { id: "ds", message: "re-check", wait: true, timeout_seconds: 120 })
     assert.match(next, /gate: ✓ PASS \(round 1\/2\)/, next)
     await h.call("opencode_dispose", { id: "ds", worktree: "discard" })
+  })
+
+  test("a refused message leaves no leftover commit; the next plain land is refused as leftovers", async () => {
+    const { tmp: at, repo: hooked } = makeRepo(mock.url)
+    fs.writeFileSync(path.join(hooked, "horde.json"), JSON.stringify({ verify: { checks: { test: "true" } }, tiers: ["mock/mock", "mock/pricey"] }))
+    git(hooked, "add", ".")
+    git(hooked, "commit", "-qm", "checks")
+    const hooks = path.join(at, "hooks")
+    fs.mkdirSync(hooks)
+    const hook = path.join(hooks, "commit-msg")
+    fs.writeFileSync(hook, '#!/bin/sh\ngrep -q "^feat:" "$1" || { echo "message must start with feat:" >&2; exit 1; }\n')
+    if (process.platform !== "win32") fs.chmodSync(hook, 0o755)
+    git(hooked, "config", "core.hooksPath", hooks)
+
+    const started = await h.call("horde_do", {
+      directory: hooked,
+      goal: 'Write the file.\nRUN: echo ok > done.txt && git add done.txt && git commit -qm "feat: add done"',
+      done: ["done.txt says ok"],
+      scope: ["done.txt", "loose.txt"],
+    })
+    const id = idOf(started)
+    const branch = started.match(/worktree (horde\/[\w-]+)/)![1]!
+    const ready = await settle(id)
+    assert.match(ready, /READY/)
+    const worktree = ready.match(/diff: git -C (\S+) diff/)![1]!
+    const head = git(hooked, "rev-parse", "HEAD")
+    const workerHead = git(hooked, "rev-parse", branch)
+
+    fs.writeFileSync(path.join(worktree, "loose.txt"), "loose\n")
+    const refused = await h.call("horde_land", { id, message: "bad" })
+    assert.match(refused, /did not pass the repository's commit-msg hook/, refused)
+    assert.match(refused, /message must start with feat:/, refused)
+    assert.equal(git(hooked, "rev-parse", "HEAD"), head, "master did not move")
+    assert.equal(git(hooked, "rev-parse", branch), workerHead, "no leftover commit was left on the branch")
+    assert.match(git(worktree, "status", "--porcelain"), /\?\? loose\.txt/, "the leftovers are uncommitted again")
+    assert.equal(fs.readFileSync(path.join(worktree, "loose.txt"), "utf8"), "loose\n")
+
+    const again = await h.call("horde_land", { id })
+    assert.match(again, /still has uncommitted changes/, again)
+  })
+
+  test("a git-ignored core.hooksPath (husky) is judged when landing without a message", async () => {
+    const { repo: hooked } = makeRepo(mock.url)
+    fs.writeFileSync(path.join(hooked, "horde.json"), JSON.stringify({ verify: { checks: { test: "true" } }, tiers: ["mock/mock", "mock/pricey"] }))
+    git(hooked, "add", ".")
+    git(hooked, "commit", "-qm", "checks")
+    // husky v9: core.hooksPath points at a directory git ignores, so it is absent from the worktree
+    // and the worker's `git commit` there runs no hook.
+    const husky = path.join(hooked, ".husky", "_")
+    fs.mkdirSync(husky, { recursive: true })
+    fs.writeFileSync(path.join(husky, "commit-msg"), '#!/bin/sh\ngrep -q "^feat:" "$1" || { echo "message must start with feat:" >&2; exit 1; }\n')
+    if (process.platform !== "win32") fs.chmodSync(path.join(husky, "commit-msg"), 0o755)
+    fs.appendFileSync(path.join(hooked, ".gitignore"), ".husky/_\n")
+    git(hooked, "add", ".gitignore")
+    git(hooked, "commit", "-qm", "ignore husky internals")
+    git(hooked, "config", "core.hooksPath", ".husky/_")
+
+    const started = await h.call("horde_do", {
+      directory: hooked,
+      goal: "Write the file.\nRUN: echo ok > file.txt && git add file.txt && git commit -qm whatever",
+      done: ["file.txt says ok"],
+      scope: ["file.txt"],
+    })
+    const id = idOf(started)
+    assert.match(await settle(id), /READY/)
+
+    const refused = await h.call("horde_land", { id })
+    assert.match(refused, /did not pass the repository's commit-msg hook/, refused)
+    assert.match(refused, /message must start with feat:/, refused)
+    assert.match(refused, /commit [0-9a-f]{10} \(whatever\)/, refused)
+
+    const landed = await h.call("horde_land", { id, message: "feat: x" })
+    assert.match(landed, /^landed t-\w+ on master: 1 commit\(s\)/, landed)
   })
 })

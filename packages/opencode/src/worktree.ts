@@ -496,7 +496,7 @@ export async function commitMsgHook(repo: string): Promise<string | undefined> {
 }
 
 /** Run a commit-msg hook on `file` in `cwd`; its output when it refused the message, else undefined. */
-function runCommitMsgHook(hook: string, cwd: string, file: string): Promise<string | undefined> {
+export function runCommitMsgHook(hook: string, cwd: string, file: string): Promise<string | undefined> {
   return new Promise((resolve) => {
     const child = spawn(isWindows ? "sh" : hook, isWindows ? [hook, file] : [file], {
       cwd,
@@ -513,17 +513,47 @@ function runCommitMsgHook(hook: string, cwd: string, file: string): Promise<stri
 }
 
 /**
+ * Run the repository's commit-msg hook on the message of every commit in `start..stop`, the
+ * commits that will land. Returns the first refusal with the commit named, or undefined when
+ * every message passes. A husky v9 hook lives in a core.hooksPath directory git ignores, so it
+ * is absent from the worktree and the worker's `git commit` never ran it; landing judges it here.
+ */
+export async function judgeCommits(wt: Worktree, hook: string, start: string, stop: string): Promise<string | undefined> {
+  const commits = (await git(wt.repo, "rev-list", "--reverse", `${start}..${stop}`)).split("\n").filter(Boolean)
+  if (!commits.length) return undefined
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "horde-message-"))
+  const file = path.join(dir, "COMMIT_EDITMSG")
+  try {
+    for (const commit of commits) {
+      const message = await git(wt.repo, "log", "-1", "--format=%B", commit)
+      await fs.writeFile(file, message.endsWith("\n") ? message : `${message}\n`)
+      const refused = await runCommitMsgHook(hook, wt.root, file)
+      if (refused !== undefined) {
+        const subject = await git(wt.repo, "log", "-1", "--format=%s", commit)
+        return `commit ${commit.slice(0, 10)} (${subject}):\n${refused}`
+      }
+    }
+    return undefined
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true })
+  }
+}
+
+/**
  * Squash the agent's own commits (everything after workStart) into one commit with `message`,
  * after the repository's commit-msg hook has judged it with the changes staged. A refusal puts
  * the branch back where it was and changes nothing else; the hook's output is returned.
+ *
+ * `leftover` is set when landSync committed uncommitted work first (--no-verify): the squashed
+ * commit is then that leftover commit, so a refusal must not leave it behind. Reset its files
+ * back to uncommitted (mixed, to the commit before it) instead of only moving the ref back.
  */
-export async function squashWorktree(wt: Worktree, message: string): Promise<{ refused?: string }> {
+export async function squashWorktree(wt: Worktree, message: string, leftover = false): Promise<{ refused?: string }> {
   const before = await git(wt.root, "rev-parse", "HEAD")
   const hook = await commitMsgHook(wt.repo)
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "horde-message-"))
   const file = path.join(dir, "COMMIT_EDITMSG")
-  // Only the ref moves on a refusal, so putting it back leaves the files and index as they were.
-  const restore = () => git(wt.root, "reset", "--soft", before)
+  const restore = () => git(wt.root, "reset", leftover ? "--mixed" : "--soft", leftover ? `${before}^` : before)
   try {
     await fs.writeFile(file, message.endsWith("\n") ? message : `${message}\n`)
     await git(wt.root, "reset", "--soft", workStart(wt))
@@ -763,7 +793,7 @@ export async function syncWorktree(wt: Worktree, name: string): Promise<{ text: 
  * checks judge exactly the tree that will land. The user's carried-over changes stay
  * uncommitted in their checkout. On a conflict the worktree is unchanged.
  */
-export async function landSync(wt: Worktree, name: string): Promise<{ text: string; worktree?: Worktree }> {
+export async function landSync(wt: Worktree, name: string): Promise<{ text: string; worktree?: Worktree; leftover?: boolean }> {
   const notes: string[] = []
   const committed = await commitAll(wt, `horde: work from ${name}`)
   if (committed) notes.push(committed)
@@ -773,12 +803,13 @@ export async function landSync(wt: Worktree, name: string): Promise<{ text: stri
   const busy = await operationInProgress(wt.root)
   if (busy) throw new Error(`the worktree has ${busy} in progress; finish or abort it first`)
   const start = workStart(wt)
-  if (start === tip) return { text: [...notes, `${wt.branch} is already on ${target} (${tip.slice(0, 10)}); nothing to rebase`].join("\n") }
+  if (start === tip)
+    return { text: [...notes, `${wt.branch} is already on ${target} (${tip.slice(0, 10)}); nothing to rebase`].join("\n"), leftover: !!committed }
   const replayed = await rebaseOntoTip(wt, target, tip, start)
   notes.push(
     `rebased ${replayed.length} commit(s) of ${wt.branch} onto ${target} (${tip.slice(0, 10)})${wt.baseline ? "; the carried-over changes stay in your checkout" : ""}`,
   )
-  return { text: notes.join("\n"), worktree: { ...wt, base: tip, baseline: undefined, merged: undefined } }
+  return { text: notes.join("\n"), worktree: { ...wt, base: tip, baseline: undefined, merged: undefined }, leftover: !!committed }
 }
 
 /**
