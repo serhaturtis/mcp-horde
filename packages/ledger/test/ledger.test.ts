@@ -59,6 +59,32 @@ describe("ledger", () => {
     assert.match(renderStats(stats(outcomesOf(drifting), "model"), "model", "x"), /⚠ last 10: \d+%/)
   })
 
+  test("failed attempts that never started do not count against the model", async () => {
+    const board = new Board(tmp())
+    for (const title of ["Refactor a", "Refactor b"]) {
+      const t = (await board.plan([{ title, goal: title, scope: ["src/core/**"] }])).tasks[0]!
+      await board.assign(t.id)
+      await board.fail(t.id, { reason: "the agent could not start: worktree creation failed", retry: false })
+    }
+    const outcomes = outcomesOf(board, "repo")
+    assert.deepEqual(outcomes, [], "a setup failure is not an outcome")
+    assert.match(renderStats(stats(outcomes, "model"), "model", "repo"), /No closed attempts/)
+    assert.equal(suggest({ title: "Refactor c", scope: ["src/core/**"] }, outcomes, tiers, "repo"), undefined)
+  })
+
+  test("a failed attempt that ran still counts", async () => {
+    const board = new Board(tmp())
+    await history(board, "Refactor the scheduler", ["src/core/sched/**"], "cheap/flash", false)
+    await history(board, "Refactor the queue", ["src/core/queue.ts"], "cheap/flash", false)
+    const outcomes = outcomesOf(board, "repo")
+    assert.equal(outcomes.length, 2)
+    assert.deepEqual(
+      stats(outcomes, "model").map((r) => [r.key, r.accepted, r.attempts]),
+      [["cheap/flash", 0, 2]],
+    )
+    assert.equal(suggest({ title: "Refactor the locks", scope: ["src/core/locks/**"] }, outcomes, tiers, "repo")?.tier, 1)
+  })
+
   test("the starting tier skips what similar work proved to fail, and only that", async () => {
     const board = new Board(tmp())
     await history(board, "Refactor the scheduler", ["src/core/sched/**"], "cheap/flash", false)

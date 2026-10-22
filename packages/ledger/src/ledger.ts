@@ -67,6 +67,9 @@ const roundsOf = (a: Attempt) => {
   return m ? Number(m[1]) : undefined
 }
 
+/** A failed attempt with no model and no sign its agent did anything never ran: it says nothing about the model. */
+const neverRan = (a: Attempt) => a.outcome === "failed" && !a.model && !a.seenAt && !a.workspace && !a.activity
+
 /** Closed attempts of one board. */
 export function outcomesOf(board: Board, repo = path.basename(board.dir)): Outcome[] {
   const out: Outcome[] = []
@@ -74,7 +77,7 @@ export function outcomesOf(board: Board, repo = path.basename(board.dir)): Outco
     const kind = kindOf(t.title, t.goal)
     const areas = areasOf(t.scope)
     for (const a of t.attempts) {
-      if (!a.endedAt || (a.outcome !== "accepted" && a.outcome !== "failed")) continue
+      if (!a.endedAt || (a.outcome !== "accepted" && a.outcome !== "failed") || neverRan(a)) continue
       out.push({
         repo,
         task: t.id,
