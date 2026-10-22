@@ -95,7 +95,7 @@
     },
     {
       "name": "horde_tell",
-      "description": "Reply to a worker: answer its question (message), allow or refuse what it asks permission for (approve true or false, with an optional message; a message alone refuses it and says what to do instead), or ask for changes to finished or failed work (message: it works again and is checked again, with fresh rounds). While it is working, a message steers it. model switches it to another model first, e.g. the stronger tier a FAILED outcome names. scope replaces the files it may change (approving a request never widens it). After a failed horde_land, tell it what to fix, then land again.",
+      "description": "Reply to a worker: answer its question (message), allow or refuse what it asks permission for (approve true or false, with an optional message; a message alone refuses it and says what to do instead), or ask for changes to finished or failed work (message: it works again and is checked again, with fresh rounds). While it is working, a message steers it. model switches it to another model first, e.g. the stronger tier a FAILED outcome names. scope replaces the files it may change (approving a request never widens it); done replaces the task's done-criteria, which the reviewer judges each round. After a failed horde_land, tell it what to fix, then land again.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -115,6 +115,13 @@
           },
           "scope": {
             "description": "The files or globs it may change from now on (replaces the current scope).",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "done": {
+            "description": "The task's done-criteria from now on: what the reviewer judges each round (replaces the current criteria).",
             "type": "array",
             "items": {
               "type": "string"
