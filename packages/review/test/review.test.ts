@@ -23,6 +23,7 @@ async function fixture() {
   fs.mkdirSync(path.join(repo, "src"))
   fs.writeFileSync(path.join(repo, "src", "login.ts"), "export function login(user: string) {\n  return check(user)\n}\n")
   fs.writeFileSync(path.join(repo, "src", "db.ts"), "export const db = 1\n")
+  fs.writeFileSync(path.join(repo, "src", "a.ts"), `${Array.from({ length: 20 }, (_, i) => `export const foo${i + 1} = ${i + 1}`).join("\n")}\n`)
   fs.writeFileSync(path.join(repo, "src", "config.ts"), `${Array.from({ length: 12 }, (_, i) => `export const v${i + 1} = ${i + 1}`).join("\n")}\n`)
   git(repo, "add", "-A")
   git(repo, "commit", "-qm", "init")
@@ -321,6 +322,33 @@ describe("review", () => {
         ["not_met", []],
       ],
     )
+  })
+
+  test("a deletion can be cited by the context line next to it, but not by other context lines", async () => {
+    const { repo, board, id } = await fixture()
+    const a = path.join(repo, "src", "a.ts")
+    const lines = fs.readFileSync(a, "utf8").trimEnd().split("\n")
+    fs.writeFileSync(a, `${lines.filter((_, i) => i < 9 || i > 11).join("\n")}\n`)
+    const r = await collectReview(board, id)
+    assert.equal(r.changed.get("src/a.ts"), undefined, "nothing was added")
+    assert.deepEqual(
+      [...r.removedAt.get("src/a.ts")!].sort((x, y) => x - y),
+      [9, 10],
+    )
+    const ctx = { ...r, criteria: ["the unused export foo is removed"] }
+    const [before] = checkVerdicts(ctx, {
+      verdicts: [{ criterion: 1, status: "met", evidence: [{ file: "src/a.ts", line: 9 }], note: "removed" }],
+    })
+    assert.equal(before!.status, "met")
+    assert.deepEqual(before!.evidence, [{ file: "src/a.ts", line: 9 }])
+    const [after] = checkVerdicts(ctx, {
+      verdicts: [{ criterion: 1, status: "met", evidence: [{ file: "src/a.ts", line: 10 }], note: "removed" }],
+    })
+    assert.equal(after!.status, "met")
+    const [far] = checkVerdicts(ctx, {
+      verdicts: [{ criterion: 1, status: "met", evidence: [{ file: "src/a.ts", line: 8 }], note: "context" }],
+    })
+    assert.equal(far!.status, "unclear")
   })
 
   test("an untracked file too large to show is listed as not shown", async () => {

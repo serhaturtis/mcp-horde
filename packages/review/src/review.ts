@@ -17,10 +17,12 @@ export interface ReviewInput {
   criteria: string[]
   /** The diff, rendered with new-file line numbers ("L42 +code"). */
   diff: string
-  /** Lines of the new files the diff shows (added or context), by file. */
+  /** Lines of the new files the diff shows (added or context), by file; citations are checked against changed and removedAt instead. */
   shown: Map<string, Set<number>>
   /** Lines the change adds, by file, for every file including ones the budget omitted. */
   changed: Map<string, Set<number>>
+  /** Context lines next to a removed run, by file, so a deletion can be cited without accepting context lines in general. */
+  removedAt: Map<string, Set<number>>
   /** Every file the diff mentions, including deleted files and files the budget omitted. */
   diffFiles: Set<string>
   /** New-file line ranges of each file's hunks, context lines included. */
@@ -119,7 +121,7 @@ export async function collectReview(
     const lines = text.replace(/\n$/, "").split("\n")
     extra += `diff --git a/${f} b/${f}\nnew file\n--- /dev/null\n+++ b/${f}\n@@ -0,0 +1,${lines.length} @@\n${lines.map((l) => `+${l}`).join("\n")}\n`
   }
-  const { diff, shown, omitted, changed, diffFiles, hunks, deleted } = renderDiff(raw + extra, opts.maxDiffChars ?? 60_000)
+  const { diff, shown, omitted, changed, removedAt, diffFiles, hunks, deleted } = renderDiff(raw + extra, opts.maxDiffChars ?? 60_000)
   const touched: string[] = []
   for (const [file, lines] of changed) {
     const lang = langOf(file)
@@ -135,6 +137,7 @@ export async function collectReview(
     diff,
     shown,
     changed,
+    removedAt,
     diffFiles,
     hunks,
     deleted,
@@ -148,6 +151,7 @@ export async function collectReview(
 export function renderDiff(raw: string, maxChars: number) {
   const shown = new Map<string, Set<number>>()
   const changed = new Map<string, Set<number>>()
+  const removedAt = new Map<string, Set<number>>()
   const diffFiles = new Set<string>()
   const hunks = new Map<string, [number, number][]>()
   const deleted = new Set<string>()
@@ -226,7 +230,15 @@ export function renderDiff(raw: string, maxChars: number) {
       }
       out.push(`L${newLine} ${mark === "+" ? "+" : " "}${body}`)
       newLine++
-    } else if (mark === "-") out.push(`     -${body}`)
+    } else if (mark === "-") {
+      if (file) {
+        if (!removedAt.has(file)) removedAt.set(file, new Set())
+        const at = removedAt.get(file)!
+        if (newLine > 1) at.add(newLine - 1)
+        if (newLine >= 1) at.add(newLine)
+      }
+      out.push(`     -${body}`)
+    }
   }
   flush()
   // Smaller files first, so the budget shows as many whole files as it can.
@@ -242,7 +254,7 @@ export function renderDiff(raw: string, maxChars: number) {
     kept.push(f.text)
     used += f.text.length
   }
-  return { diff: kept.join("\n\n"), shown, omitted, changed, diffFiles, hunks, deleted }
+  return { diff: kept.join("\n\n"), shown, omitted, changed, removedAt, diffFiles, hunks, deleted }
 }
 
 export function reviewPrompt(r: ReviewInput, checks?: GateCheck[]): string {
@@ -313,7 +325,7 @@ export function checkVerdicts(r: ReviewInput, json: unknown, checks: GateCheck[]
     const real = (v.evidence ?? [])
       .filter((e): e is { file: string; line: number } => !isCheck(e) && !isUntouched(e))
       .map((e) => ({ file: norm(e.file), line: e.line }))
-      .filter((e) => r.changed.get(e.file)?.has(e.line))
+      .filter((e) => r.changed.get(e.file)?.has(e.line) || r.removedAt.get(e.file)?.has(e.line))
     const kept = (v.evidence ?? [])
       .filter(isCheck)
       .map((e) => e.check)
