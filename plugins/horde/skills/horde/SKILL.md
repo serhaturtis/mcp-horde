@@ -1,6 +1,6 @@
 ---
 name: horde
-description: Delegate coding work to cheap, fast OpenCode workers (DeepSeek, Kimi, GLM, Qwen, local models) and stay the reviewer. Use it for any change you can state as a goal, done-criteria and files (a fix, a feature, tests, docs, a refactor, several independent pieces), read-only investigations (an audit, a code review, a bug hunt, how some code works) through horde_investigate, and when the user asks to parallelize work, use cheaper models, run a "horde", or split a feature into tasks. Not for one- or two-line edits, quick questions, changes you are still working out, or results you need right away. Three calls per task (horde_do, horde_wait, horde_land): workers run in their own worktrees, their work is checked and reviewed before you see it, and landing never breaks your branch.
+description: Delegate coding work to cheap, fast OpenCode workers (DeepSeek, Kimi, GLM, Qwen, local models) and stay the reviewer. Use it for any change you can state as a goal, done-criteria and files (a fix, a feature, tests, docs, a refactor, several independent pieces), read-only investigations (an audit, a code review, a bug hunt, how some code works) through horde_investigate, and when the user asks to parallelize work, use cheaper models, run a "horde", or split a feature into tasks. Not for one- or two-line edits, quick questions, changes you are still working out, or work you would only sit waiting for. Three calls per task (horde_do, horde_wait, horde_land): workers run in their own worktrees, their work is checked and reviewed before you see it, and landing never breaks your branch.
 ---
 
 # Running the horde
@@ -28,6 +28,7 @@ The project's checks judge every task, so `horde_do` refuses in a repository whe
 - **done**: observable criteria a reviewer can check against the diff ("returns 429 after 5 failed attempts", "a test covers the window expiring"). Passing checks is the gate's job; you need not list it.
 - **scope**: the paths it may change. Tasks running at the same time must not overlap.
 - **Small**: one concern, a few files. Split bigger work into tasks that land one by one; start a dependent task after its dependency has landed.
+- **Core first**: when a change needs a design decision, make it and build the piece that checks it (a validator, a contract, a test) here; then hand off what that makes checkable: the tests, the docs, an investigation of the paths it touches.
 
 ## When to step in
 
