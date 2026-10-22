@@ -478,6 +478,8 @@ export class Fleet {
   private monitor?: NodeJS.Timeout
   private monitoring = false
   private closed = false
+  /** A landing waits for the previous landing of its repository; a failure does not block the next. */
+  private readonly landing = new Map<string, Promise<unknown>>()
 
   constructor(
     private readonly backend: Backend,
@@ -1467,136 +1469,160 @@ export class Fleet {
       )
     }
     return this.withoutGate(live, async () => {
-      for (let attempt = 0; attempt < 3; attempt++) {
-        let wt = live.record.worktree!
-        const target = await git(wt.repo, "symbolic-ref", "-q", "--short", "HEAD").catch(() => "")
-        if (!target) throw new Error(`your checkout ${wt.repo} is on a detached HEAD; switch to a branch first`)
-        // After a landing conflict the worker rebased its branch onto the target: the recorded base
-        // must follow it or the next gate and landing count the target's commits as the worker's.
-        wt = await this.followRebase(live, wt)
-        // A repository with a commit-msg hook judges every commit: our own --no-verify commit
-        // would bypass it, so leftover work is refused until the worker commits it or a message
-        // squashes everything into one commit the hook checks.
-        const hook = await commitMsgHook(wt.repo)
-        if (hook && !message && (await hasUncommitted(wt))) return { landed: false, target, why: "leftovers", text: hook }
-        const tip = await git(wt.repo, "rev-parse", "HEAD")
-        // 1. Onto your branch's tip, inside the worktree, leaving the carried-over baseline out. A
-        // conflict leaves both as they were; anything else failing is reported by its own cause.
-        let leftover = false
-        try {
-          const synced = await landSync(wt, name)
-          leftover = synced.leftover ?? false
-          if (synced.worktree) {
-            wt = synced.worktree
-            // The verdict stands for landing again; a new turn is gated as usual.
-            const gs = live.record.gateState ?? { round: 0 }
-            this.updateRecord(id, { worktree: wt, gateState: { ...gs, superseded: currentTurn(live.track)?.startSeq } })
-            await this.rebindTaskBase(live, wt)
-          }
-        } catch (err) {
-          if (!(err as { conflicts?: boolean }).conflicts) throw err
-          return {
-            landed: false,
-            target,
-            why: "conflict",
-            text: (err as Error).message
-              .split("\n")
-              .filter((l) => !/^Tell the agent/.test(l))
-              .join("\n"),
-          }
+      const repo = live.record.worktree!.repo
+      const previous = this.landing.get(repo) ?? Promise.resolve()
+      const run = previous.then(() => this.landLoop(live, id, name, task, signal, message))
+      const tail = run.catch(() => undefined)
+      this.landing.set(repo, tail)
+      void tail.then(() => {
+        if (this.landing.get(repo) === tail) this.landing.delete(repo)
+      })
+      return run
+    })
+  }
+
+  /**
+   * One landing, retried up to 3 times when the branch tip moves under it from outside this
+   * process (the user committing, another session). Parallel lands of one repository queue here,
+   * so a land waits for the previous one before its first attempt instead of redoing its checks.
+   */
+  private async landLoop(
+    live: Live,
+    id: string,
+    name: string,
+    task: { id: string; title: string; attempt: number },
+    signal: AbortSignal | undefined,
+    message: string | undefined,
+  ): Promise<LandResult> {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      let wt = live.record.worktree!
+      const target = await git(wt.repo, "symbolic-ref", "-q", "--short", "HEAD").catch(() => "")
+      if (!target) throw new Error(`your checkout ${wt.repo} is on a detached HEAD; switch to a branch first`)
+      // After a landing conflict the worker rebased its branch onto the target: the recorded base
+      // must follow it or the next gate and landing count the target's commits as the worker's.
+      wt = await this.followRebase(live, wt)
+      // A repository with a commit-msg hook judges every commit: our own --no-verify commit
+      // would bypass it, so leftover work is refused until the worker commits it or a message
+      // squashes everything into one commit the hook checks.
+      const hook = await commitMsgHook(wt.repo)
+      if (hook && !message && (await hasUncommitted(wt))) return { landed: false, target, why: "leftovers", text: hook }
+      const tip = await git(wt.repo, "rev-parse", "HEAD")
+      // 1. Onto your branch's tip, inside the worktree, leaving the carried-over baseline out. A
+      // conflict leaves both as they were; anything else failing is reported by its own cause.
+      let leftover = false
+      try {
+        const synced = await landSync(wt, name)
+        leftover = synced.leftover ?? false
+        if (synced.worktree) {
+          wt = synced.worktree
+          // The verdict stands for landing again; a new turn is gated as usual.
+          const gs = live.record.gateState ?? { round: 0 }
+          this.updateRecord(id, { worktree: wt, gateState: { ...gs, superseded: currentTurn(live.track)?.startSeq } })
+          await this.rebindTaskBase(live, wt)
         }
-        // 1b. With a message: the task's own commits become one, which the hook just judged.
-        if (message) {
-          const squashed = await squashWorktree(wt, message, leftover)
-          if (squashed.refused !== undefined) return { landed: false, target, why: "message", text: squashed.refused, hook }
-        }
-        // 2. workers.land, after the rebase and the optional squash: run it, commit its changes on
-        // top (judged by the repository's hooks), keeping the branch's pre-step commit to restore if
-        // this attempt does not fast-forward, so the worker's branch never keeps the land step's
-        // commit or files.
-        const land = loadWorkers(wt.repo).land
-        let judged = ""
-        let beforeLand: string | undefined
-        if (land) {
-          const before = await git(wt.root, "rev-parse", "HEAD")
-          beforeLand = before
-          try {
-            judged = await runLandStep(wt, task.id, target, land)
-          } catch (err) {
-            await restoreWorktree(wt, before).catch(() => undefined)
-            return { landed: false, target, why: "land", text: (err as Error).message }
-          }
-        } else {
-          judged = await git(wt.root, "rev-parse", "HEAD")
-        }
-        const commits = (await git(wt.repo, "rev-list", "--count", `${tip}..${judged}`).catch(() => "0")).trim()
-        // A husky v9 hook lives in a core.hooksPath directory git ignores, so it is absent from the
-        // worktree and the worker's `git commit` there never ran it. Judge every commit that will
-        // land (the task's own, from workStart); a workers.land commit is judged by commitLandStep.
-        if (hook && !message) {
-          const refused = await judgeCommits(wt, hook, workStart(wt), land ? beforeLand! : judged)
-          if (refused !== undefined) {
-            if (beforeLand) await restoreWorktree(wt, beforeLand).catch(() => undefined)
-            return { landed: false, target, why: "message", text: refused, hook }
-          }
-        }
-        const v = await runGate(wt.root, {
-          audit: false,
-          related: false,
-          stage: "land",
-          env: { HORDE_TASK: task.id, HORDE_WORKTREE: wt.root },
-          baseline: this.baselineFor(wt.repo, tip, `${target}'s tip`),
-          signal,
-          stateDir: verifyStateDir(),
-        })
-        if (!v.pass) {
-          if (beforeLand) await restoreWorktree(wt, beforeLand).catch(() => undefined)
-          return { landed: false, target, why: "checks", text: v.text, checks: v.checks.map(gateCheck) }
-        }
-        // 3. Under a per-repository lock, fast-forward your branch only if it is still at the tip the
-        // checks saw; otherwise go round again (rebase onto the new tip, check again).
-        const lockDir = await lockDirFor(wt.repo, verifyStateDir())
-        await fs.mkdir(lockDir, { recursive: true }).catch(() => undefined)
-        let advanced = false
-        try {
-          advanced = await withLock(lockDir, "land", async () => {
-            if ((await git(wt.repo, "rev-parse", "HEAD")) !== tip) return false
-            await git(wt.repo, "merge", "--ff-only", judged)
-            return true
-          })
-        } catch (err) {
-          if (beforeLand) await restoreWorktree(wt, beforeLand).catch(() => undefined)
-          // The tip was still where the checks saw it, so only the user's uncommitted changes can
-          // refuse the fast-forward; the refusal names them.
-          const changed = await git(wt.repo, "status", "--porcelain").catch(() => "")
-          const detail = err instanceof Error ? err.message : String(err)
-          return {
-            landed: false,
-            target,
-            why: "uncommitted",
-            text: `${detail}${changed ? `\nuncommitted changes:\n${changed}` : ""}`,
-          }
-        }
-        if (!advanced) {
-          if (beforeLand) await restoreWorktree(wt, beforeLand).catch(() => undefined)
-          continue
-        }
-        const board = await Board.open(wt.repo)
-        await board.accept(task.id, { note: `landed on ${target}` }).catch(() => undefined)
-        // The branch goes only once every one of its commits is on your branch (they all are, after a fast-forward).
-        const unmerged = (await git(wt.repo, "cherry", target, wt.branch, tip).catch(() => "+")).split("\n").filter((l) => l.startsWith("+"))
-        await this.dispose(id, { worktree: "discard" })
-        if (!unmerged.length) await git(wt.repo, "branch", "-D", wt.branch).catch(() => undefined)
+      } catch (err) {
+        if (!(err as { conflicts?: boolean }).conflicts) throw err
         return {
-          landed: true,
+          landed: false,
           target,
-          commits: Number(commits) || 0,
-          checks: v.checks.map(gateCheck),
-          branchKept: unmerged.length ? wt.branch : undefined,
+          why: "conflict",
+          text: (err as Error).message
+            .split("\n")
+            .filter((l) => !/^Tell the agent/.test(l))
+            .join("\n"),
         }
       }
-      throw new Error(`your branch kept moving while ${name} was being landed; call horde_land again`)
-    })
+      // 1b. With a message: the task's own commits become one, which the hook just judged.
+      if (message) {
+        const squashed = await squashWorktree(wt, message, leftover)
+        if (squashed.refused !== undefined) return { landed: false, target, why: "message", text: squashed.refused, hook }
+      }
+      // 2. workers.land, after the rebase and the optional squash: run it, commit its changes on
+      // top (judged by the repository's hooks), keeping the branch's pre-step commit to restore if
+      // this attempt does not fast-forward, so the worker's branch never keeps the land step's
+      // commit or files.
+      const land = loadWorkers(wt.repo).land
+      let judged = ""
+      let beforeLand: string | undefined
+      if (land) {
+        const before = await git(wt.root, "rev-parse", "HEAD")
+        beforeLand = before
+        try {
+          judged = await runLandStep(wt, task.id, target, land)
+        } catch (err) {
+          await restoreWorktree(wt, before).catch(() => undefined)
+          return { landed: false, target, why: "land", text: (err as Error).message }
+        }
+      } else {
+        judged = await git(wt.root, "rev-parse", "HEAD")
+      }
+      const commits = (await git(wt.repo, "rev-list", "--count", `${tip}..${judged}`).catch(() => "0")).trim()
+      // A husky v9 hook lives in a core.hooksPath directory git ignores, so it is absent from the
+      // worktree and the worker's `git commit` there never ran it. Judge every commit that will
+      // land (the task's own, from workStart); a workers.land commit is judged by commitLandStep.
+      if (hook && !message) {
+        const refused = await judgeCommits(wt, hook, workStart(wt), land ? beforeLand! : judged)
+        if (refused !== undefined) {
+          if (beforeLand) await restoreWorktree(wt, beforeLand).catch(() => undefined)
+          return { landed: false, target, why: "message", text: refused, hook }
+        }
+      }
+      const v = await runGate(wt.root, {
+        audit: false,
+        related: false,
+        stage: "land",
+        env: { HORDE_TASK: task.id, HORDE_WORKTREE: wt.root },
+        baseline: this.baselineFor(wt.repo, tip, `${target}'s tip`),
+        signal,
+        stateDir: verifyStateDir(),
+      })
+      if (!v.pass) {
+        if (beforeLand) await restoreWorktree(wt, beforeLand).catch(() => undefined)
+        return { landed: false, target, why: "checks", text: v.text, checks: v.checks.map(gateCheck) }
+      }
+      // 3. Under a per-repository lock, fast-forward your branch only if it is still at the tip the
+      // checks saw; otherwise go round again (rebase onto the new tip, check again).
+      const lockDir = await lockDirFor(wt.repo, verifyStateDir())
+      await fs.mkdir(lockDir, { recursive: true }).catch(() => undefined)
+      let advanced = false
+      try {
+        advanced = await withLock(lockDir, "land", async () => {
+          if ((await git(wt.repo, "rev-parse", "HEAD")) !== tip) return false
+          await git(wt.repo, "merge", "--ff-only", judged)
+          return true
+        })
+      } catch (err) {
+        if (beforeLand) await restoreWorktree(wt, beforeLand).catch(() => undefined)
+        // The tip was still where the checks saw it, so only the user's uncommitted changes can
+        // refuse the fast-forward; the refusal names them.
+        const changed = await git(wt.repo, "status", "--porcelain").catch(() => "")
+        const detail = err instanceof Error ? err.message : String(err)
+        return {
+          landed: false,
+          target,
+          why: "uncommitted",
+          text: `${detail}${changed ? `\nuncommitted changes:\n${changed}` : ""}`,
+        }
+      }
+      if (!advanced) {
+        if (beforeLand) await restoreWorktree(wt, beforeLand).catch(() => undefined)
+        continue
+      }
+      const board = await Board.open(wt.repo)
+      await board.accept(task.id, { note: `landed on ${target}` }).catch(() => undefined)
+      // The branch goes only once every one of its commits is on your branch (they all are, after a fast-forward).
+      const unmerged = (await git(wt.repo, "cherry", target, wt.branch, tip).catch(() => "+")).split("\n").filter((l) => l.startsWith("+"))
+      await this.dispose(id, { worktree: "discard" })
+      if (!unmerged.length) await git(wt.repo, "branch", "-D", wt.branch).catch(() => undefined)
+      return {
+        landed: true,
+        target,
+        commits: Number(commits) || 0,
+        checks: v.checks.map(gateCheck),
+        branchKept: unmerged.length ? wt.branch : undefined,
+      }
+    }
+    throw new Error(`your branch kept moving while ${name} was being landed; call horde_land again`)
   }
 
   /** The agent finished and its gate passed (also when a landing synced it since). */
@@ -2489,7 +2515,7 @@ export class Fleet {
     untracked: SessionInfo[]
   }> {
     this.syncStore()
-    const active = await this.activeSet()
+    const active = await this.activeSet().catch(() => undefined)
     const ids = [...this.live.keys()]
     const results = await Promise.allSettled(ids.map((id) => this.snapshot(id, active)))
     const snapshots: Snapshot[] = []
@@ -2590,7 +2616,9 @@ export class Fleet {
       // One round of reads, given up at the deadline or on abort even if a request hangs.
       const round = await this.untilDeadline(
         (async () => {
-          const active = await this.activeSet()
+          // A blip of the OpenCode server leaves the active set unknown for this round; each id is
+          // then counted unreadable, so the UNREADABLE_MS window absorbs it instead of throwing.
+          const active = await this.activeSet().catch(() => undefined)
           return Promise.allSettled(ids.map((id) => this.snapshot(id, active)))
         })(),
         deadline,

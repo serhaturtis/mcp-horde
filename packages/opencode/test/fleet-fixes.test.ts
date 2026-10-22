@@ -1,10 +1,13 @@
 import assert from "node:assert/strict"
+import { EventEmitter } from "node:events"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { after, before, describe, test } from "node:test"
 import { Board } from "@mcp-horde/board"
-import { scopeGlobs } from "../src/fleet.js"
+import type { Backend } from "../src/backend.js"
+import type { Config } from "../src/config.js"
+import { Fleet, type Hooks, type Snapshot, scopeGlobs } from "../src/fleet.js"
 import { type AgentRecord, OWNER_STALE_MS, ownerAlive, SELF, Store } from "../src/state.js"
 import { connect, git, type Harness, isolatedEnv, type Mock, makeRepo, until } from "./harness.js"
 import { startMockLlm } from "./mock-llm.js"
@@ -269,5 +272,150 @@ describe("fleet fixes: gates, tasks and worktrees (real opencode, mock LLM)", { 
 
     const landed = await h.call("horde_land", { id, message: "feat: x" })
     assert.match(landed, /^landed t-\w+ on master: 1 commit\(s\)/, landed)
+  })
+
+  test("two concurrent lands on one repository both succeed: the second waits for the first", async () => {
+    const { repo: r } = makeRepo(mock.url)
+    // A slow check makes the two lands overlap without the queue, so they would redo each other's
+    // checks; with the per-repository queue the second waits and both land on the first attempt.
+    fs.writeFileSync(
+      path.join(r, "horde.json"),
+      JSON.stringify({ verify: { checks: { slow: `node -e "setTimeout(() => process.exit(0), 2000)"` } }, tiers: ["mock/mock"] }),
+    )
+    git(r, "add", ".")
+    git(r, "commit", "-qm", "checks")
+    const a = await h.call("horde_do", {
+      directory: r,
+      goal: "Write the file.\nRUN: echo a > a.txt && git add a.txt && git commit -qm a",
+      done: ["a.txt says a"],
+      scope: ["a.txt"],
+    })
+    const b = await h.call("horde_do", {
+      directory: r,
+      goal: "Write the file.\nRUN: echo b > b.txt && git add b.txt && git commit -qm b",
+      done: ["b.txt says b"],
+      scope: ["b.txt"],
+    })
+    assert.match(await settle(idOf(a)), /READY/)
+    assert.match(await settle(idOf(b)), /READY/)
+    const [la, lb] = await Promise.all([h.call("horde_land", { id: idOf(a) }), h.call("horde_land", { id: idOf(b) })])
+    assert.match(la, /^landed /, la)
+    assert.match(lb, /^landed /, lb)
+  })
+
+  test("a failed land does not block the next queued land of the same repository", async () => {
+    const { repo: r } = makeRepo(mock.url)
+    // workers.land runs only at landing and fails in a worktree that holds a.txt (task A's file),
+    // so A's landing fails while B's succeeds; the queue must let B land anyway.
+    fs.writeFileSync(
+      path.join(r, "horde.json"),
+      JSON.stringify({
+        verify: { checks: { ok: "true" } },
+        workers: { land: `node -e "process.exit(require('fs').existsSync('a.txt') ? 1 : 0)"` },
+        tiers: ["mock/mock"],
+      }),
+    )
+    git(r, "add", ".")
+    git(r, "commit", "-qm", "checks")
+    const a = await h.call("horde_do", {
+      directory: r,
+      goal: "Write the file.\nRUN: echo a > a.txt && git add a.txt && git commit -qm a",
+      done: ["a.txt says a"],
+      scope: ["a.txt"],
+    })
+    const b = await h.call("horde_do", {
+      directory: r,
+      goal: "Write the file.\nRUN: echo b > b.txt && git add b.txt && git commit -qm b",
+      done: ["b.txt says b"],
+      scope: ["b.txt"],
+    })
+    assert.match(await settle(idOf(a)), /READY/)
+    assert.match(await settle(idOf(b)), /READY/)
+    const [la, lb] = await Promise.all([h.call("horde_land", { id: idOf(a) }), h.call("horde_land", { id: idOf(b) })])
+    assert.match(la, /not landed/, la)
+    assert.match(lb, /^landed /, lb)
+  })
+})
+
+describe("fleet fixes: a brief OpenCode stall is absorbed by the wait", () => {
+  test("a wait round whose activeSet() rejects once returns the outcome instead of throwing", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "horde-wait-"))
+    const store = new Store(tmp)
+    store.put({
+      id: "ses_wait",
+      server: "local",
+      directory: tmp,
+      policy: "ask",
+      questions: "ask",
+      limits: {},
+      createdAt: 0,
+      reportedSeq: 0,
+      owner: SELF,
+      ownerSeen: Date.now(),
+    })
+    const backend = {
+      client: {},
+      info: { key: "local" },
+      events: new EventEmitter(),
+      streaming: false,
+      dead: true,
+    } as unknown as Backend
+    const config: Config = {
+      username: "opencode",
+      allowInsecure: false,
+      serverMode: "shared",
+      bin: "opencode",
+      directory: tmp,
+      defaultPermissions: "ask",
+      maxRunning: 0,
+      maxRunningFrom: "test",
+      stateDir: path.join(tmp, "state"),
+      worktreeDir: path.join(tmp, "worktrees"),
+      channel: false,
+      elicitTimeoutMs: 600_000,
+    }
+    const hooks: Hooks = {
+      canElicit: () => false,
+      askPermission: async () => undefined,
+      askQuestion: async () => undefined,
+      settled: () => {},
+    }
+    const fleet = new Fleet(backend, config, store, hooks)
+    try {
+      let activeCalls = 0
+      const fleetAny = fleet as unknown as {
+        activeSet: () => Promise<Set<string>>
+        snapshot: (ref: string, active?: Set<string>) => Promise<Snapshot>
+      }
+      fleetAny.activeSet = async () => {
+        if (++activeCalls === 1) throw new Error("listing active sessions failed: aborted due to timeout")
+        return new Set(["ses_wait"])
+      }
+      fleetAny.snapshot = async (ref, active) => {
+        if (!active) throw new Error("listing active sessions failed: aborted due to timeout")
+        return {
+          id: ref,
+          title: "",
+          state: "idle",
+          directory: tmp,
+          policy: "ask",
+          questionPolicy: "ask",
+          limits: {},
+          pending: { permissions: [], questions: [] },
+          unreported: [],
+          steps: 0,
+          cost: 0,
+          tokens: { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
+          children: [],
+        }
+      }
+      const result = await fleet.waitFor(["ses_wait"], "all", 5_000)
+      assert.equal(activeCalls, 2, "the first activeSet() rejected and the next one answered")
+      assert.equal(result.timedOut, false)
+      assert.ok(result.snapshots.some((s) => s.id === "ses_wait"))
+      assert.deepEqual([...result.errors], [])
+    } finally {
+      fleet.close()
+    }
   })
 })
