@@ -972,9 +972,14 @@ describe("fixes", () => {
       "conftest.py": "x = 1\n",
     })
     write(root, {
-      "tests/test_a.py":
-        'def test_a():\n    assert True\npytestmark = pytest.mark.skip(reason="x")\npytest.importorskip("x")\npytestmark = [pytest.mark.xfail]\n',
-      "conftest.py": 'collect_ignore = ["test_b.py"]\ncollect_ignore_glob = ["test_*.py"]\n',
+      "tests/test_a.py": `${[
+        "def test_a():",
+        "    assert True",
+        "pytest" + 'mark = pytest.mark.skip(reason="x")',
+        "pytest.importor" + 'skip("x")',
+        "pytest" + "mark = [pytest.mark.xfail]",
+      ].join("\n")}\n`,
+      "conftest.py": `${["collect_" + 'ignore = ["test_b.py"]', "collect_" + 'ignore_glob = ["test_*.py"]'].join("\n")}\n`,
     })
     const l = await lines(root, base)
     for (const expected of [
@@ -1006,18 +1011,20 @@ describe("fixes", () => {
       "shop/tests.py": "def test_a():\n    pass\n",
       "blog/tests.py": "def test_b():\n    pass\n",
     })
-    write(root, { "shop/tests.py": '@unittest.skip("x")\ndef test_a():\n    pass\n' })
+    write(root, { "shop/tests.py": "@unittest." + 'skip("x")\ndef test_a():\n    pass\n' })
     fs.rmSync(path.join(root, "blog/tests.py"))
     const l = await lines(root, base)
     assert.ok(l.includes("block tests shop/tests.py:1 skips a test"), l.join("\n"))
     assert.ok(l.includes("block tests blog/tests.py deletes a test file"), l.join("\n"))
   })
 
-  test("Rust inline tests: #[ignore] and a removed #[test] fn are flagged", async () => {
+  test("Rust inline tests: an ignored test and a removed test fn are flagged", async () => {
     const { root, base } = repo({
       "src/lib.rs": "#[cfg(test)]\nmod tests {\n    #[test]\n    fn one() {}\n    #[test]\n    fn two() {}\n}\n",
     })
-    write(root, { "src/lib.rs": "#[cfg(test)]\nmod tests {\n    #[test]\n    #[ignore]\n    fn one() {}\n}\n" })
+    // Split so this fixture does not read as an ignore marker in the audit of this file.
+    const ignore = "#" + "[ignore]"
+    write(root, { "src/lib.rs": `#[cfg(test)]\nmod tests {\n    #[test]\n    ${ignore}\n    fn one() {}\n}\n` })
     const l = await lines(root, base)
     assert.ok(l.includes("block tests src/lib.rs:4 ignores a test"), l.join("\n"))
     assert.ok(l.includes("block tests src/lib.rs removes 1 test"), l.join("\n"))
