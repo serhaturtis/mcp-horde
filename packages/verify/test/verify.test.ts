@@ -972,6 +972,21 @@ describe("fixes", () => {
     assert.ok(!l.some((x) => x.includes("other/tsconfig.json")), "a config outside the checks' cwd is not a rule")
   })
 
+  test("vite.config is a rule only when the base has no vitest config in its directory", async () => {
+    const withVitest = repo({
+      "vite.config.ts": "export default {}\n",
+      "vitest.config.ts": "export default {}\n",
+    })
+    write(withVitest.root, { "vite.config.ts": "export default { plugins: [] }\n" })
+    const a = await lines(withVitest.root, withVitest.base, { ruleScripts: ["test"] })
+    assert.ok(!a.some((x) => /changes the rules/.test(x) && x.includes("vite.config.ts")), a.join("\n"))
+
+    const withoutVitest = repo({ "vite.config.ts": "export default {}\n" })
+    write(withoutVitest.root, { "vite.config.ts": "export default { plugins: [] }\n" })
+    const b = await lines(withoutVitest.root, withoutVitest.base, { ruleScripts: ["test"] })
+    assert.ok(b.includes("block tests vite.config.ts changes the rules the gate checks with: vite.config.ts"), b.join("\n"))
+  })
+
   test("ruff, mypy and coverage sections of pyproject.toml are rules; a dependency-only change is not", async () => {
     const { root, base } = repo({
       "pyproject.toml":

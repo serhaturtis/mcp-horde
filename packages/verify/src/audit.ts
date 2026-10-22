@@ -548,6 +548,13 @@ async function ruleChanges(root: string, base: string, all: Change[], scripts: s
     const changed = groups.filter(([re]) => sections(a, re) !== sections(b, re)).map(([, name]) => name)
     return changed.length ? `${file} ${changed.join(", ")}` : undefined
   }
+  // Vitest ignores vite.config only when it has its own config in the same directory.
+  const vitestAt = async (dir: string) => {
+    const tree = dir === "." ? base : `${base}:${dir}`
+    const names = (await gitRaw(root, ["ls-tree", "--name-only", tree]).catch(() => "")).split("\n")
+    return names.some((n) => /^vitest\.(config|workspace)\.[\w.]+$/.test(n))
+  }
+  const viteSuppressed = async (p: string) => /^vite\.config\..+$/.test(path.posix.basename(p)) && (await vitestAt(path.posix.dirname(p)))
   const local = new Set([...dirs].map((d) => path.relative(root, d).split(path.sep).join("/") || "."))
   for (const c of all) {
     const file = c.path
@@ -569,8 +576,12 @@ async function ruleChanges(root: string, base: string, all: Change[], scripts: s
     } else if (/(^|\/)conftest\.py$/.test(file) || (c.from && /(^|\/)conftest\.py$/.test(c.from))) {
       out.push({ file, what: "conftest.py" })
     } else if (CHECK_CONFIG.test(path.posix.basename(file)) || (c.from && CHECK_CONFIG.test(path.posix.basename(c.from)))) {
-      const at = (p: string) => local.has(path.posix.dirname(p))
-      if (at(file) || (c.from && at(c.from))) out.push({ file, what: path.posix.basename(file) })
+      const watched = (p: string) => local.has(path.posix.dirname(p))
+      for (const p of [file, ...(c.from ? [c.from] : [])].filter(watched)) {
+        if (await viteSuppressed(p)) continue
+        out.push({ file, what: path.posix.basename(file) })
+        break
+      }
     } else if (/(^|\/)pyproject\.toml$/.test(file)) {
       const what = sectionRule("pyproject.toml", PYPROJECT_RULES, await before(old), await after(file))
       if (what) out.push({ file, what })
