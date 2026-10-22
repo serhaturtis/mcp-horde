@@ -757,6 +757,63 @@ console.log("1..0")
     assert.ok(!fs.existsSync(path.join(worktree, "generated.txt")), "the command's file was not kept in the worktree")
     await h.call("horde_drop", { id })
   })
+
+  test("a scope change alone re-checks a task the audit failed for an out-of-scope file", async () => {
+    const { repo: r } = makeRepo(mock.url)
+    fs.writeFileSync(path.join(r, "horde.json"), JSON.stringify({ verify: { checks: { test: "true" } }, tiers: ["mock/mock", "mock/pricey"] }))
+    git(r, "add", "horde.json")
+    git(r, "commit", "-qm", "checks")
+    const started = await h.call("horde_do", {
+      directory: r,
+      goal: "Write b.txt.\nRUN: echo ok > b.txt && git add b.txt && git commit -qm b",
+      done: ["b.txt says ok"],
+      scope: ["a.txt"],
+    })
+    const id = idOf(started)
+    const failed = await settle(id)
+    assert.match(failed, new RegExp(`^${id} FAILED`), failed)
+    assert.match(failed, /outside the allowed scope/, failed)
+    // The FAILED outcome suggests a scope change, naming the out-of-scope file.
+    assert.match(failed, /scope: \[\.\.\.\]\} to allow b\.txt/, failed)
+    // Telling it the new scope with no message re-runs the gate under it: a fresh outcome, then READY.
+    assert.match(await h.call("horde_tell", { id, scope: ["a.txt", "b.txt"] }), /re-checking the finished work under the new scope/)
+    const ready = await settle(id)
+    assert.match(ready, new RegExp(`^${id} READY`), ready)
+    assert.match(await h.call("horde_land", { id }), /^landed t-\w+ on master: 1 commit\(s\)/)
+    assert.equal(fs.readFileSync(path.join(r, "b.txt"), "utf8").trim(), "ok")
+  })
+
+  test("an uncommitted horde.json is not carried over; the gate runs HEAD's and the notes say so", async () => {
+    const { repo: r } = makeRepo(mock.url)
+    const committed = "echo committed > marker.txt"
+    fs.writeFileSync(path.join(r, "horde.json"), JSON.stringify({ verify: { checks: { test: committed } }, tiers: ["mock/mock", "mock/pricey"] }))
+    git(r, "add", "horde.json")
+    git(r, "commit", "-qm", "checks")
+    // The user edits horde.json locally and leaves another, unrelated change uncommitted.
+    fs.writeFileSync(
+      path.join(r, "horde.json"),
+      JSON.stringify({ verify: { checks: { test: "echo uncommitted > marker.txt" } }, tiers: ["mock/mock", "mock/pricey"] }),
+    )
+    fs.writeFileSync(path.join(r, "carried.txt"), "carried\n")
+
+    const started = await h.call("horde_do", {
+      directory: r,
+      goal: "Write hello.txt.\nRUN: echo ok > hello.txt && git add hello.txt && git commit -qm hello",
+      done: ["hello.txt says ok"],
+      scope: ["hello.txt"],
+    })
+    assert.match(started, /echo committed/, started) // the announced checks are HEAD's, not the edit
+    assert.doesNotMatch(started, /echo uncommitted/, started)
+    assert.match(started, /horde\.json's uncommitted changes stay in your checkout; tasks use HEAD's/, started)
+    const id = idOf(started)
+    const ready = await settle(id)
+    assert.match(ready, new RegExp(`^${id} READY`), ready)
+    const worktree = ready.match(/diff: git -C (\S+) diff/)![1]!
+    assert.equal(fs.readFileSync(path.join(worktree, "marker.txt"), "utf8").trim(), "committed", "the gate ran HEAD's horde.json")
+    assert.ok(fs.existsSync(path.join(worktree, "carried.txt")), "other uncommitted changes are still carried over")
+    assert.match(fs.readFileSync(path.join(r, "horde.json"), "utf8"), /echo uncommitted/, "the edit stays in the checkout")
+    await h.call("horde_drop", { id })
+  })
 })
 
 describe("the gate review runs outside the worker limit and its failure fails the task", { timeout: 600_000 }, () => {

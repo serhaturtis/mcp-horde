@@ -20,7 +20,7 @@ Every task runs in its own worktree, a fresh checkout of HEAD, and the project's
 4. **House rules.** Short, rule-like files workers should read in full go in `workers.brief` (each capped at 300 lines). `CLAUDE.md`, `AGENTS.md` and `CONTRIBUTING.md` are included anyway.
 5. **Models.** Add `tiers` only when the user names models for this repository. Their defaults for every repository live in `~/.config/mcp-horde/horde.json`.
 6. **Prove it.** `verify_gate` with `fresh: true` on the clean tree. A check that fails here is flagged on every task and costs each one a second run to tell its failures apart: fix the command, or tell the user which check is broken on their branch. Never drop or loosen a check to get a pass without saying so.
-7. **Commit it.** Workers start from HEAD and their gates read HEAD's `horde.json`, so an uncommitted one changes nothing. Show the user the file and commit it once they agree.
+7. **Commit it.** Workers start from HEAD and their gates read HEAD's `horde.json`, so an uncommitted one changes nothing: a task never carries `horde.json` over from your checkout (it does carry your other uncommitted changes). Show the user the file and commit it once they agree.
 8. **Offer the opt-in line.** If the user wants delegation by default here, offer to add this to the repository's `CLAUDE.md`: "Hand changes that touch several files, or several independent pieces, to the horde (`horde_do`), and review what comes back." It is their instruction to give, so ask.
 
 ## horde.json

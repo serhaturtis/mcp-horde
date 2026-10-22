@@ -1621,6 +1621,30 @@ export class Fleet {
     if (task) await (await Board.open(live.record.worktree?.repo ?? live.record.directory)).edit(task.id, { scope: paths })
   }
 
+  /**
+   * Re-judge a finished, failed turn under the agent's (possibly changed) rules, as the next
+   * gate round. A scope change that lets the audit pass then produces a fresh verdict, instead
+   * of leaving the task stuck with no new outcome. Runs in the background like a normal gate.
+   */
+  async regate(ref: string): Promise<void> {
+    const live = await this.get(ref)
+    await this.refresh(live)
+    const id = live.record.id
+    const turn = currentTurn(live.track)
+    const gs = live.record.gateState
+    if (!live.record.gate) throw new Error(`${live.record.name ?? id} has no gate to re-run`)
+    if (!turn || !gs?.verdict?.final) throw new Error(`${live.record.name ?? id} has no finished, judged turn to re-check; horde_tell it a message instead`)
+    // The same turn is judged again and reported again once the new verdict lands.
+    this.updateRecord(id, { gateState: { round: gs.round }, reportedSeq: turn.startSeq - 1 })
+    const abort = new AbortController()
+    live.gating = { turn: turn.startSeq, abort }
+    void this.runGateFor(live, turn.startSeq, abort).finally(() => {
+      if (live.gating?.abort === abort) live.gating = undefined
+      this.wake()
+      if (!this.closed && this.live.get(id) === live) void this.refresh(live).catch(() => undefined)
+    })
+  }
+
   /** What an outcome reports beyond the snapshot: the record (worktree, task, gate verdict) and edits refused outside the scope. */
   async inspect(ref: string): Promise<{ snapshot: Snapshot; record: AgentRecord; refused: string[] }> {
     const live = await this.get(ref)

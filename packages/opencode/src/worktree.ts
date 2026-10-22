@@ -240,9 +240,9 @@ export async function createWorktree(directory: string, name: string, opts: Work
 }
 
 /** Stream `git diff HEAD` into `git apply` in the worktree (no size limit). Settles once both processes have closed. */
-function pipePatch(repo: string, root: string): Promise<boolean> {
+function pipePatch(repo: string, root: string, exclude: string[] = []): Promise<boolean> {
   return new Promise((resolve, reject) => {
-    const diff = spawn("git", [...DIFF, "--binary", "--src-prefix=a/", "--dst-prefix=b/", "HEAD"], {
+    const diff = spawn("git", [...DIFF, "--binary", "--src-prefix=a/", "--dst-prefix=b/", "HEAD", "--", ...exclude.map((p) => `:(exclude)${p}`)], {
       cwd: repo,
       env: GIT_ENV,
       stdio: ["ignore", "pipe", "pipe"],
@@ -316,13 +316,24 @@ function secretLooking(rel: string): boolean {
   )
 }
 
+/** Whether the root horde.json has uncommitted changes (a tracked edit or an untracked file). */
+async function hasHordeJsonChanges(repo: string): Promise<boolean> {
+  const tracked = await git(repo, "diff", "--name-only", "HEAD", "--", "horde.json").catch(() => "")
+  if (tracked) return true
+  const untracked = await git(repo, "ls-files", "--others", "--exclude-standard", "--", "horde.json").catch(() => "")
+  return untracked !== ""
+}
+
 async function carryUncommitted(repo: string, root: string, notes: string[], links: string[] = []): Promise<string | undefined> {
   const parts: string[] = []
   // git apply ignores gitlink (submodule pointer) changes; say so instead of dropping them silently.
   const raw = await git(repo, "diff", "--no-ext-diff", "--raw", "HEAD").catch(() => "")
   const gitlinks = raw.split("\n").filter((l) => /^:(\d{6}) (\d{6})/.exec(l)?.slice(1).includes("160000"))
   if (gitlinks.length) notes.push(`${gitlinks.length} submodule pointer change(s) were not carried over`)
-  if (await pipePatch(repo, root)) parts.push("uncommitted changes")
+  // horde.json's uncommitted changes are never carried over: a task's gates read HEAD's horde.json,
+  // so editing it locally must not silently change the task's checks.
+  if (await hasHordeJsonChanges(repo)) notes.push("horde.json's uncommitted changes stay in your checkout; tasks use HEAD's")
+  if (await pipePatch(repo, root, ["horde.json"])) parts.push("uncommitted changes")
 
   const entries = (await gitRaw(repo, ["ls-files", "--others", "--exclude-standard", "-z"])).split("\0").filter(Boolean)
   let files = 0
@@ -334,6 +345,8 @@ async function carryUncommitted(repo: string, root: string, notes: string[], lin
   const linked = (rel: string) => links.some((l) => rel === l || rel === `${l}/` || rel.startsWith(`${l}/`))
   for (const rel of entries) {
     if (linked(rel)) continue
+    // horde.json is never carried over: the task's gates read HEAD's, so a local edit changes nothing.
+    if (rel === "horde.json") continue
     // A nested repository shows up as "dir/": copying it would embed its .git.
     if (rel.endsWith("/")) {
       skippedRepos++

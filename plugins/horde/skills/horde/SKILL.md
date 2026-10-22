@@ -19,7 +19,7 @@ You plan and judge; workers do the typing. Your context is the scarce resource: 
 
 ## Setting up a repository
 
-The project's checks judge every task, so `horde_do` refuses in a repository where none are found, or where they are not committed. The setup skill (`/horde:setup`) writes `horde.json` for a repository: the checks CI runs, what a new worktree needs, the resources checks share (database, ports, test slots). Run `verify_gate` once before the first task: a check that fails on a clean tree is flagged on every task and costs each one a second run.
+The project's checks judge every task, so `horde_do` refuses in a repository where none are found, or where they are not committed (an uncommitted `horde.json` is never carried into a task's worktree; its gates read HEAD's). The setup skill (`/horde:setup`) writes `horde.json` for a repository: the checks CI runs, what a new worktree needs, the resources checks share (database, ports, test slots). Run `verify_gate` once before the first task: a check that fails on a clean tree is flagged on every task and costs each one a second run.
 
 ## Writing a task: where cheap models waste money
 

@@ -271,7 +271,14 @@ export function registerHorde(tool: Tool, opts: HordeOptions) {
         done.push(
           `${a.model ? `switched it to ${a.model} and ` : ""}${SETTLED.has(s.state) && s.state !== "needs_input" ? "it works again; its checks run again when it finishes" : "steered it"}`,
         )
-      } else if (!a.scope) {
+      } else if (a.scope) {
+        // A scope change alone must re-judge the failed turn under the new scope, or the task
+        // stays stuck: horde_wait would report nothing new.
+        if (s.gate?.state === "fail") {
+          await fleet.regate(a.id)
+          done.push("re-checking the finished work under the new scope")
+        }
+      } else {
         throw new Error("nothing to tell: pass message, approve, model or scope")
       }
       return `${a.id}: ${done.join("; ")}.\n→ horde_wait {ids: ["${a.id}"]}`
@@ -473,6 +480,7 @@ export async function outcome(fleet: Fleet, ref: string): Promise<string> {
   if (workerSaid) lines.push(`  worker: ${truncate(workerSaid, 240)}`)
   lines.push(`  ${footer}`)
   const stronger = nextTier(repo, task?.tier)
+  const scopeBlamed = scopeFiles(verdict?.text)
   lines.push(
     next(
       ...(reviewError
@@ -480,6 +488,7 @@ export async function outcome(fleet: Fleet, ref: string): Promise<string> {
         : [`horde_tell {id: "${id}", message: "<a precise hint>"} (its checks run again)`]),
       ...(stronger ? [`horde_tell {id: "${id}", message, model: "${stronger}"}`] : []),
       ...(refused.length ? [`horde_tell {id: "${id}", scope: [...]} to let it edit more`] : []),
+      ...(scopeBlamed.length ? [`horde_tell {id: "${id}", scope: [...]} to allow ${scopeBlamed.join(", ")}`] : []),
       `horde_drop {id: "${id}"}`,
     ),
   )
@@ -533,6 +542,17 @@ function checksLine(checks: { name: string; pass: boolean; summary?: string }[])
   const all = checks.every((c) => c.pass)
   const named = checks.map((c) => `${all ? "" : c.pass ? "✓ " : "✗ "}${c.name}${c.summary && c.summary !== "ok" ? ` (${c.summary})` : ""}`)
   return `checks ${all ? "✓ " : ""}${named.join(", ")}`
+}
+
+/** Files an audit 'scope' finding blamed, from the rendered verdict ("✗ scope: b.txt adds …"). */
+function scopeFiles(text?: string): string[] {
+  if (!text) return []
+  const files: string[] = []
+  for (const line of text.split("\n")) {
+    const m = /scope:\s+(\S+)\s+(adds|changes|deletes|moves)\b/.exec(line)
+    if (m) files.push(m[1]!)
+  }
+  return [...new Set(files)]
 }
 
 function reviewLine(r: ReviewSummary): string {
