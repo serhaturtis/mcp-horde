@@ -412,7 +412,7 @@ export function importGraph(project: Project): Graph {
 
 export interface TestLink {
   test: string
-  /** "is a test", "naming", "mirror", "imports it", "imports it via <barrel>", "same package" or "inline tests". */
+  /** "is a test", "naming", "mirror", "imports it", "imports it via <importer>", "same package", "conftest.py fixtures" or "inline tests". */
   why: string
 }
 
@@ -430,11 +430,21 @@ const stemOf = (f: string) =>
     .replace(/_test$/, "")
     .replace(/Tests?$/, "")
 
+/** A test a runner executes directly (not a helper or fixture); mirrors verify's isRunnableTest. */
+const isRunnableTest = (p: string) =>
+  /\.(test|spec)\.[cm]?[jt]sx?$/.test(p) ||
+  /(^|\/)__tests__\/.+\.[cm]?[jt]sx?$/.test(p) ||
+  /(^|\/)test_[^/]+\.py$/.test(p) ||
+  /[^/]_test\.(py|go)$/.test(p) ||
+  /(^|\/)tests\/[^/]+\.rs$/.test(p) ||
+  /[^/]Tests?\.(java|kt|cs)$/.test(p)
+
 /**
  * The test files that cover each file: the file itself when it is a test; tests named
  * after it next to it or in a mirrored test directory; tests that import it (directly or
  * through re-exporting index/lib files, or, with `transitive`, through any chain of
- * imports); for Go, the package's tests; for Rust, the file's own `#[cfg(test)]` module.
+ * imports including test helpers); the tests pytest loads a conftest.py for; for Go, the
+ * package's tests; for Rust, the file's own `#[cfg(test)]` module.
  */
 export function testsFor(project: Project, files: string[], opts: { transitive?: boolean } = {}): Map<string, TestLink[]> {
   const tests = project.files.filter((f) => isTestPath(f) && langOf(f))
@@ -464,16 +474,30 @@ export function testsFor(project: Project, files: string[], opts: { transitive?:
     for (let depth = 0; frontier.length && depth < (opts.transitive ? 50 : 3); depth++) {
       const next: { f: string; via?: string }[] = []
       for (const { f, via } of frontier) {
+        // A Go package's tests live next to it and never import their package: cover every
+        // non-test Go file the walk visits, the changed file and each importer it walks through.
+        if (langOf(f) === "go" && !isTestPath(f))
+          for (const t of tests) if (t.endsWith("_test.go") && path.posix.dirname(t) === path.posix.dirname(f)) add(t, "same package")
         for (const importer of graph.in.get(f) ?? []) {
           if (seen.has(importer)) continue
           seen.add(importer)
-          if (isTestPath(importer)) add(importer, via ? `imports it via ${via}` : "imports it")
-          else if (opts.transitive || BARREL.test(importer)) next.push({ f: importer, via: via ?? importer })
+          if (path.posix.basename(importer) === "conftest.py") {
+            // pytest loads a conftest.py for every test under its directory, so a fixture it
+            // defines covers tests that never import it.
+            add(importer, via ? `imports it via ${via}` : "imports it")
+            const cdir = path.posix.dirname(importer)
+            for (const t of tests) if (t !== importer && (cdir === "." || t.startsWith(`${cdir}/`))) add(t, "conftest.py fixtures")
+          } else if (isTestPath(importer)) {
+            add(importer, via ? `imports it via ${via}` : "imports it")
+            // Walk through a helper (test/helpers.ts), not a runnable test, to the tests importing it.
+            if (opts.transitive && !isRunnableTest(importer)) next.push({ f: importer, via: via ?? importer })
+          } else if (opts.transitive || BARREL.test(importer)) {
+            next.push({ f: importer, via: via ?? importer })
+          }
         }
       }
       frontier = next
     }
-    if (lang === "go") for (const t of tests) if (t.endsWith("_test.go") && path.posix.dirname(t) === dir) add(t, "same package")
     if (lang === "rs" && /#\[cfg\(test\)\]/.test(readText(project, file) ?? "")) add(file, "inline tests")
     result.set(
       file,

@@ -245,6 +245,55 @@ describe("imports and tests", () => {
       ["packages/a/test/a.test.ts (imports it via packages/a/src/index.ts)"],
     )
   })
+
+  test("transitive tests walk through test helpers to the tests importing them", () => {
+    const dir = fixture({
+      "src/db.ts": "export const db = 1\n",
+      "test/helpers.ts": "import { db } from '../src/db'\nexport const helper = db\n",
+      "test/a.test.ts": "import { helper } from './helpers'\n",
+      "test/db.test.ts": "import { db } from '../src/db'\n",
+    })
+    assert.deepEqual(
+      testsFor(openProject(dir), ["src/db.ts"], { transitive: true })
+        .get("src/db.ts")!
+        .map((t) => `${t.test} (${t.why})`)
+        .sort(),
+      ["test/a.test.ts (imports it via test/helpers.ts)", "test/db.test.ts (mirror)", "test/helpers.ts (imports it)"],
+    )
+  })
+
+  test("a conftest.py covers every test under its directory", () => {
+    const dir = fixture({
+      "app/db.py": "def connect():\n    return 1\n",
+      "tests/conftest.py": "from app.db import connect\n",
+      "tests/test_api.py": "def test_api():\n    pass\n",
+      "tests/test_db.py": "import app.db\n",
+    })
+    assert.deepEqual(
+      testsFor(openProject(dir), ["app/db.py"], { transitive: true })
+        .get("app/db.py")!
+        .map((t) => `${t.test} (${t.why})`)
+        .sort(),
+      ["tests/conftest.py (imports it)", "tests/test_api.py (conftest.py fixtures)", "tests/test_db.py (mirror)"],
+    )
+  })
+
+  test("Go same-package tests cover importers of a changed package", () => {
+    const dir = fixture({
+      "go.mod": "module example.com/m\n\ngo 1.22\n",
+      "c/c.go": "package c\n\nfunc C() int { return 1 }\n",
+      "c/c_test.go": 'package c\n\nimport "testing"\n\nfunc TestC(t *testing.T) {}\n',
+      "b/b.go": 'package b\n\nimport "example.com/m/c"\n\nfunc B() int { return c.C() }\n',
+      "b/b_test.go": 'package b\n\nimport "testing"\n\nfunc TestB(t *testing.T) {}\n',
+    })
+    assert.deepEqual(
+      testsFor(openProject(dir), ["c/c.go"], { transitive: true })
+        .get("c/c.go")!
+        .map((t) => `${t.test} (${t.why})`)
+        .sort(),
+      ["b/b_test.go (same package)", "c/c_test.go (naming)"],
+    )
+  })
 })
 
 describe("syntax trees: what line patterns get wrong", () => {
