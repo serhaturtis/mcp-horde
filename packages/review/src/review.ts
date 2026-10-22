@@ -17,7 +17,7 @@ export interface ReviewInput {
   criteria: string[]
   /** The diff, rendered with new-file line numbers ("L42 +code"). */
   diff: string
-  /** Lines of the new files the diff shows (added or context), by file: what may be cited. */
+  /** Lines of the new files the diff shows (added or context), by file. */
   shown: Map<string, Set<number>>
   /** Lines the change adds, by file, for every file including ones the budget omitted. */
   changed: Map<string, Set<number>>
@@ -276,6 +276,15 @@ export function reviewPrompt(r: ReviewInput, checks?: GateCheck[]): string {
     .join("\n")
 }
 
+/** Whether a criterion is about a check or test passing, or about something staying unchanged. */
+function checksOrUnchanged(text: string): boolean {
+  return (
+    /\b(tests?|testing|checks?|checked|lint|typecheck|type-check|pass(es|ing|ed)?|unchanged|untouched|keep|keeps|kept|still|remains?|preserve[ds]?)\b/i.test(
+      text,
+    ) || /\b(not|never|no|without|isn't|aren't|doesn't|don't)\s+(change[ds]?|changing|modif(y|ied|ies)|touch(ed|es)?)\b/i.test(text)
+  )
+}
+
 /** The model's answer, with every citation checked against the diff and the gate's passed checks, and a verdict for every criterion. */
 export function checkVerdicts(r: ReviewInput, json: unknown, checks: GateCheck[] = []): Verdict[] {
   const passed = new Set(checks.filter((c) => c.pass).map((c) => c.name))
@@ -304,7 +313,7 @@ export function checkVerdicts(r: ReviewInput, json: unknown, checks: GateCheck[]
     const real = (v.evidence ?? [])
       .filter((e): e is { file: string; line: number } => !isCheck(e) && !isUntouched(e))
       .map((e) => ({ file: norm(e.file), line: e.line }))
-      .filter((e) => r.shown.get(e.file)?.has(e.line))
+      .filter((e) => r.changed.get(e.file)?.has(e.line))
     const kept = (v.evidence ?? [])
       .filter(isCheck)
       .map((e) => e.check)
@@ -315,16 +324,22 @@ export function checkVerdicts(r: ReviewInput, json: unknown, checks: GateCheck[]
         const m = /^(.*):(\d+)$/.exec(e.untouched)
         return { file: norm(m ? m[1]! : e.untouched), line: m ? Number(m[2]) : undefined }
       })
-      .filter((u) =>
-        u.line === undefined
-          ? !r.diffFiles.has(u.file)
-          : !r.deleted.has(u.file) && !r.hunks.get(u.file)?.some(([start, end]) => u.line! >= start && u.line! <= end),
-      )
+      .filter((u) => {
+        if (u.file.includes("\0")) return false
+        const abs = path.join(r.workspace.path, u.file)
+        if (!fs.statSync(abs, { throwIfNoEntry: false })?.isFile() || r.deleted.has(u.file)) return false
+        if (u.line === undefined) return !r.diffFiles.has(u.file)
+        if (r.hunks.get(u.file)?.some(([start, end]) => u.line! >= start && u.line! <= end)) return false
+        const body = fs.readFileSync(abs, "utf8")
+        const lines = body ? body.replace(/\n$/, "").split("\n").length : 0
+        return u.line <= lines
+      })
       .map((u) => (u.line === undefined ? u.file : `${u.file}:${u.line}`))
     const dropped = (v.evidence ?? []).length - real.length - kept.length - untouched.length
     let status = v.status
     let note = truncate(v.note ?? "", 300)
-    if (status === "met" && !real.length && !kept.length && !untouched.length) {
+    const supported = real.length > 0 || ((kept.length > 0 || untouched.length > 0) && checksOrUnchanged(text))
+    if (status === "met" && !supported) {
       status = "unclear"
       note = `${note} (said met, but cited no line of the change)`.trim()
     }
