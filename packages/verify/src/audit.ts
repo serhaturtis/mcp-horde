@@ -60,6 +60,7 @@ export const isRunnableTest = (p: string) =>
   /\.(test|spec)\.[cm]?[jt]sx?$/.test(p) ||
   /(^|\/)__tests__\/.+\.[cm]?[jt]sx?$/.test(p) ||
   /(^|\/)test_[^/]+\.py$/.test(p) ||
+  /(^|\/)tests\.py$/.test(p) ||
   /[^/]_test\.(py|go)$/.test(p) ||
   /(^|\/)tests\/[^/]+\.rs$/.test(p) ||
   /[^/]Tests?\.(java|kt|cs)$/.test(p)
@@ -98,6 +99,17 @@ export function unquoteC(p: string): string {
 const ASSERTION = /\b(assert\w*|expect|should|assertEquals|assertThat|require\.\w+|t\.(Error|Fatal)\w*)\s*[.(!]/g
 const assertions = (lines: string[]) => lines.reduce((n, l) => n + (l.match(ASSERTION)?.length ?? 0), 0)
 
+/** Test definitions per runner; a rename removes one and adds one, so only the net count matters. */
+const TEST_DEF = [
+  /(?<![.\w$])(?:it|test)(?:\.\w+)*\s*\(/,
+  /^\s*(?:async\s+)?def\s+test_/,
+  /^\s*func\s+Test/,
+  /^\s*#\[test\b/,
+  /^\s*@Test\b/,
+  /^\s*\[(?:Test|Fact)\b/,
+]
+const testDefs = (lines: string[]) => lines.reduce((n, l) => n + (TEST_DEF.some((re) => re.test(l)) ? 1 : 0), 0)
+
 /** Test-runner calls, never ordinary words: `(?<![.\w$])` keeps `model.fit(` or `outfit(` from matching. */
 const SKIP_MARKERS: [RegExp, string][] = [
   [/\b(describe|it|test|context|suite)\.only(\.each)?\s*[(`]|(?<![.\w$])f(it|describe)\s*\(/, "focuses tests with .only (all others stop running)"],
@@ -105,6 +117,8 @@ const SKIP_MARKERS: [RegExp, string][] = [
   // node:test options and context, mocha's this.skip()
   [/[{,]\s*(skip|todo)\s*:\s*(true\b|["'`])|\bt\.(skip|todo)\s*\(|\bthis\.skip\s*\(/, "skips a test"],
   [/@pytest\.mark\.(skip|skipif|xfail)\b|\bpytest\.(skip|xfail)\s*\(|@unittest\.(skip\w*|expectedFailure)\b|\.skipTest\s*\(/, "skips a test"],
+  // Module-level pytest skips, including a list on the same line.
+  [/\bpytestmark\s*=\s*\[?[^\n]*pytest\.mark\.(skip|skipif|xfail)\b|\bpytest\.importorskip\s*\(|\bcollect_ignore(_glob)?\s*=/, "skips a test"],
   [/\bt\.Skip(Now|f)?\(/, "skips a test"],
   [/#\[ignore\b/, "ignores a test"],
   [/@(Disabled|Ignore)\b/, "disables a test"],
@@ -475,15 +489,24 @@ export async function audit(directory: string, opts: AuditOptions): Promise<Audi
   for (const c of all) {
     if (opts.generated?.length && generated(c.path)) continue
     const test = isTestPath(c.path)
+    // Rust unit tests live inline in src/*.rs, so every changed .rs file is scanned.
+    const rust = /\.rs$/.test(c.path)
     if (c.status === "D" && (test || isRunnableTest(c.path))) add("tests", { file: c.path, text: "deletes a test file" })
     // x.test.ts → x.test.ts.bak stays in a test directory but no runner picks it up any more.
     if (c.from && ((isTestPath(c.from) && !test) || (isRunnableTest(c.from) && !isRunnableTest(c.path))))
       add("tests", { file: c.from, text: `moves a test file out of the test suite (to ${c.path})` })
-    if (test) {
+    // A root conftest.py is not under tests/, but its pytest hooks still skip tests.
+    if (test || rust || /(^|\/)conftest\.py$/.test(c.path)) {
       for (const a of c.added) {
         const hit = SKIP_MARKERS.find(([re]) => re.test(a.text))
         if (hit) add("tests", { file: c.path, line: a.line, text: hit[1] })
       }
+    }
+    if ((test || rust) && c.status !== "D") {
+      const removed = testDefs(c.removed) - testDefs(c.added.map((a) => a.text))
+      if (removed > 0) add("tests", { file: c.path, text: `removes ${removed} test${removed === 1 ? "" : "s"}` })
+    }
+    if (test) {
       const lost = assertions(c.removed) - assertions(c.added.map((a) => a.text))
       if (lost > 0 && c.status !== "D") add("tests", { file: c.path, text: `removes ${lost} assertion${lost === 1 ? "" : "s"}` }, true)
       if (/\.snap$|__snapshots__\//.test(c.path) && c.removed.length > 20)

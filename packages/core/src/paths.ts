@@ -3,6 +3,7 @@ export const isTestPath = (p: string) =>
   /(^|\/)(__tests__|tests?|spec)\//.test(p) ||
   /\.(test|spec)\.[cm]?[jt]sx?$/.test(p) ||
   /(^|\/)test_[^/]+\.py$/.test(p) ||
+  /(^|\/)tests\.py$/.test(p) ||
   /_test\.(go|py)$/.test(p) ||
   /(^|\/)tests\/[^/]+\.rs$/.test(p) ||
   /[^/]Tests?\.(java|kt|cs)$/.test(p) ||

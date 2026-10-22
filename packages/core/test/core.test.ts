@@ -8,6 +8,7 @@ import {
   fitSections,
   formatDuration,
   globMatcher,
+  isTestPath,
   loadHordeFile,
   loadTiers,
   loadWorkers,
@@ -388,5 +389,12 @@ describe("globMatcher", () => {
     for (const p of ["src/auth/a.js", "src/api/v1/x.js", "src/api/v2/y/z.js", "a.ts", "deep/b.tsx", "doc3.md", "xb.txt"]) assert.ok(m(p), p)
     for (const p of ["src/api/v3/x.js", "src/other/a.js", "a.js", "docx.md", "xa.txt", "x/.txt"]) assert.ok(!m(p), p)
     assert.ok(globMatcher(["{a}.md"])("{a}.md"), "a brace without alternatives is literal")
+  })
+})
+
+describe("isTestPath", () => {
+  test("Django's per-app tests.py is a test file", () => {
+    for (const p of ["shop/tests.py", "tests.py", "blog/apps/shop/tests.py"]) assert.ok(isTestPath(p), p)
+    for (const p of ["shop/test.py", "shop/testing.py"]) assert.ok(!isTestPath(p), p)
   })
 })

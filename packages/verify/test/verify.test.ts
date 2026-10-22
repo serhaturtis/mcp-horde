@@ -966,6 +966,63 @@ describe("fixes", () => {
     for (const [i, o] of ordinary.entries()) assert.ok(!hit.has(marked.length + i + 1), `not a marker: ${o}`)
   })
 
+  test("module-level pytest skips and collect_ignore are flagged", async () => {
+    const { root, base } = repo({
+      "tests/test_a.py": "def test_a():\n    assert True\n",
+      "conftest.py": "x = 1\n",
+    })
+    write(root, {
+      "tests/test_a.py":
+        'def test_a():\n    assert True\npytestmark = pytest.mark.skip(reason="x")\npytest.importorskip("x")\npytestmark = [pytest.mark.xfail]\n',
+      "conftest.py": 'collect_ignore = ["test_b.py"]\ncollect_ignore_glob = ["test_*.py"]\n',
+    })
+    const l = await lines(root, base)
+    for (const expected of [
+      "block tests tests/test_a.py:3 skips a test",
+      "block tests tests/test_a.py:4 skips a test",
+      "block tests tests/test_a.py:5 skips a test",
+      "block tests conftest.py:1 skips a test",
+      "block tests conftest.py:2 skips a test",
+    ])
+      assert.ok(l.includes(expected), l.join("\n"))
+  })
+
+  test("removing a test case blocks, renaming one does not", async () => {
+    const { root, base } = repo({
+      "test/a.test.js": "it('one', () => {})\nit('two', () => {})\n",
+      "test/rename.test.js": "it('old', () => {})\n",
+    })
+    write(root, {
+      "test/a.test.js": "it('one', () => {})\n",
+      "test/rename.test.js": "it('new', () => {})\n",
+    })
+    const l = await lines(root, base)
+    assert.ok(l.includes("block tests test/a.test.js removes 1 test"), l.join("\n"))
+    assert.ok(!l.some((x) => /^block tests test\/rename\.test\.js removes/.test(x)), l.join("\n"))
+  })
+
+  test("Django tests.py is a test file: skips and deletions are flagged", async () => {
+    const { root, base } = repo({
+      "shop/tests.py": "def test_a():\n    pass\n",
+      "blog/tests.py": "def test_b():\n    pass\n",
+    })
+    write(root, { "shop/tests.py": '@unittest.skip("x")\ndef test_a():\n    pass\n' })
+    fs.rmSync(path.join(root, "blog/tests.py"))
+    const l = await lines(root, base)
+    assert.ok(l.includes("block tests shop/tests.py:1 skips a test"), l.join("\n"))
+    assert.ok(l.includes("block tests blog/tests.py deletes a test file"), l.join("\n"))
+  })
+
+  test("Rust inline tests: #[ignore] and a removed #[test] fn are flagged", async () => {
+    const { root, base } = repo({
+      "src/lib.rs": "#[cfg(test)]\nmod tests {\n    #[test]\n    fn one() {}\n    #[test]\n    fn two() {}\n}\n",
+    })
+    write(root, { "src/lib.rs": "#[cfg(test)]\nmod tests {\n    #[test]\n    #[ignore]\n    fn one() {}\n}\n" })
+    const l = await lines(root, base)
+    assert.ok(l.includes("block tests src/lib.rs:4 ignores a test"), l.join("\n"))
+    assert.ok(l.includes("block tests src/lib.rs removes 1 test"), l.join("\n"))
+  })
+
   test("secrets: placeholders and words are not credentials, sk- needs a key-like body", async () => {
     const { root, base } = repo({ "a.txt": "\n" })
     const bad = ['password = "q7Ldf9Xk2Pz0vBn4Rt8w"', 'key = "sk-AbCdEfGhIjKlMnOpQrStUv12"', 'k = "sk-ant-api03-AbCdEfGh_IjKlMnOp-QrStUv12"']
