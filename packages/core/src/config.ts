@@ -2,10 +2,80 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 
+/** The keys every horde.json section knows; anything else is a typo, not a setting. */
+const KNOWN = {
+  top: ["context", "opencode", "tiers", "verify", "workers"],
+  verify: ["checks", "audit", "timeoutSeconds"],
+  check: ["command", "kind", "cwd", "env", "when", "slots", "exclusive"],
+  audit: ["block", "warn", "off", "allowed", "generated"],
+  workers: ["link", "setup", "brief", "land"],
+  land: ["command", "message"],
+  opencode: ["maxRunning"],
+  context: ["ignore", "entrypoints"],
+  tier: ["model", "variant"],
+} as const
+
+const isObject = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v)
+
+function editDistance(a: string, b: string): number {
+  let prev = Array.from({ length: b.length + 1 }, (_, i) => i)
+  for (let i = 1; i <= a.length; i++) {
+    const next = [i]
+    for (let j = 1; j <= b.length; j++) next[j] = Math.min(prev[j]! + 1, next[j - 1]! + 1, prev[j - 1]! + (a[i - 1] === b[j - 1] ? 0 : 1))
+    prev = next
+  }
+  return prev[b.length]!
+}
+
+/** Reject keys a level does not know, naming the path and the closest known key. */
+function rejectUnknown(value: unknown, known: readonly string[], at: string, file?: string): void {
+  if (!isObject(value)) return
+  for (const key of Object.keys(value)) {
+    if (known.includes(key)) continue
+    let closest: string | undefined
+    let distance = 3
+    for (const k of known) {
+      const d = editDistance(key, k)
+      if (d < distance) {
+        distance = d
+        closest = k
+      }
+    }
+    const hint = closest ? ` (did you mean "${closest}"?)` : ""
+    throw new Error(`${file ? `${file}: ` : ""}unknown key "${at ? `${at}.` : ""}${key}"${hint}`)
+  }
+}
+
+/**
+ * Reject keys horde.json does not read, at every level. horde.json is usually
+ * written by an LLM, so a misspelled key must fail loudly instead of quietly
+ * falling back to defaults.
+ */
+export function validateHordeFile(data: Record<string, unknown>, file?: string): void {
+  rejectUnknown(data, KNOWN.top, "", file)
+  if (isObject(data.verify)) {
+    rejectUnknown(data.verify, KNOWN.verify, "verify", file)
+    if (isObject(data.verify.checks))
+      for (const [name, spec] of Object.entries(data.verify.checks)) rejectUnknown(spec, KNOWN.check, `verify.checks.${name}`, file)
+    rejectUnknown(data.verify.audit, KNOWN.audit, "verify.audit", file)
+  }
+  if (isObject(data.workers)) {
+    rejectUnknown(data.workers, KNOWN.workers, "workers", file)
+    rejectUnknown(data.workers.land, KNOWN.land, "workers.land", file)
+  }
+  rejectUnknown(data.opencode, KNOWN.opencode, "opencode", file)
+  rejectUnknown(data.context, KNOWN.context, "context", file)
+  if (Array.isArray(data.tiers))
+    data.tiers.forEach((tier, i) => {
+      rejectUnknown(tier, KNOWN.tier, `tiers[${i}]`, file)
+    })
+}
+
 /**
  * `horde.json` at a repository root holds project behaviour shared by every
  * horde server (checks, audit rules, tiers, …). Each package reads and
- * validates its own section; this only finds and parses the file.
+ * validates its own section; this finds and parses the file and rejects keys
+ * none of them reads.
  */
 export interface HordeFile {
   /** Directory containing horde.json, or the search start when there is none. */
@@ -45,6 +115,7 @@ export function loadHordeFile(directory: string): HordeFile {
       throw new Error(`${file} is not valid JSON: ${(err as Error).message}`)
     }
     if (!data || typeof data !== "object" || Array.isArray(data)) throw new Error(`${file} must contain a JSON object`)
+    validateHordeFile(data as Record<string, unknown>, file)
     return { root: dir, file, data: data as Record<string, unknown> }
   }
   return { root: start, data: {} }
@@ -82,6 +153,7 @@ export function loadUserHordeFile(env: NodeJS.ProcessEnv = process.env): { file:
     throw new Error(`${file} is not valid JSON: ${(err as Error).message}`)
   }
   if (!data || typeof data !== "object" || Array.isArray(data)) throw new Error(`${file} must contain a JSON object`)
+  validateHordeFile(data as Record<string, unknown>, file)
   return { file, data: data as Record<string, unknown> }
 }
 

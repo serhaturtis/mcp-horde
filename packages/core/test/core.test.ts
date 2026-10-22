@@ -267,14 +267,14 @@ describe("text", () => {
 describe("horde.json", () => {
   test("found from a subdirectory, not above the repository root, malformed files throw", () => {
     const outer = tmp()
-    fs.writeFileSync(path.join(outer, "horde.json"), JSON.stringify({ project: "outer" }))
+    fs.writeFileSync(path.join(outer, "horde.json"), JSON.stringify({ tiers: ["outer/model"] }))
     const repo = path.join(outer, "repo")
     fs.mkdirSync(path.join(repo, ".git"), { recursive: true })
     fs.mkdirSync(path.join(repo, "src", "deep"), { recursive: true })
     assert.deepEqual(loadHordeFile(path.join(repo, "src", "deep")).data, {}, "does not escape the repository")
-    fs.writeFileSync(path.join(repo, "horde.json"), JSON.stringify({ project: "inner" }))
+    fs.writeFileSync(path.join(repo, "horde.json"), JSON.stringify({ tiers: ["inner/model"] }))
     const found = loadHordeFile(path.join(repo, "src", "deep"))
-    assert.equal(found.data.project, "inner")
+    assert.deepEqual(found.data, { tiers: ["inner/model"] })
     assert.equal(found.root, repo)
     fs.writeFileSync(path.join(repo, "horde.json"), "{ nope")
     assert.throws(() => loadHordeFile(repo), /not valid JSON/)
@@ -380,6 +380,42 @@ describe("horde.json", () => {
     assert.throws(() => loadWorkers(repo), /horde\.json: "workers"\.land must be a command string or \{ "command": "…", "message"\?: "…" \}/)
     fs.writeFileSync(path.join(repo, "horde.json"), JSON.stringify({ workers: { land: { command: "npm run generate", message: 3 } } }))
     assert.throws(() => loadWorkers(repo), /horde\.json: "workers"\.land\.message must be a string/)
+  })
+
+  test("unknown keys are rejected at every level, with a hint", () => {
+    const repo = tmp()
+    fs.mkdirSync(path.join(repo, ".git"))
+    const load = (data: unknown) => {
+      fs.writeFileSync(path.join(repo, "horde.json"), JSON.stringify(data))
+      return loadHordeFile(repo)
+    }
+    assert.throws(() => load({ verfy: {} }), /unknown key "verfy".*did you mean "verify"/)
+    assert.throws(() => load({ workers: { setpu: "npm ci" } }), /unknown key "workers\.setpu".*did you mean "setup"/)
+    assert.throws(() => load({ workers: { land: { command: "x", mesage: "y" } } }), /unknown key "workers\.land\.mesage".*did you mean "message"/)
+    assert.throws(() => load({ opencode: { maxRunnin: 3 } }), /unknown key "opencode\.maxRunnin".*did you mean "maxRunning"/)
+    assert.throws(() => load({ context: { entryponts: [] } }), /unknown key "context\.entryponts".*did you mean "entrypoints"/)
+    assert.throws(() => load({ tiers: [{ model: "a/b", varaint: "high" }] }), /unknown key "tiers\[0\]\.varaint".*did you mean "variant"/)
+    assert.doesNotThrow(() => load({ context: { ignore: ["dist"] }, opencode: { maxRunning: 2 }, tiers: [{ model: "a/b", variant: "high" }] }))
+  })
+
+  test("the user-level horde.json rejects unknown keys too", () => {
+    const repo = tmp()
+    fs.mkdirSync(path.join(repo, ".git"))
+    const config = tmp()
+    const userFile = path.join(config, "mcp-horde", "horde.json")
+    fs.mkdirSync(path.dirname(userFile), { recursive: true })
+    fs.writeFileSync(userFile, JSON.stringify({ tier: ["deepseek/deepseek-flash"] }))
+    const xdg = process.env.XDG_CONFIG_HOME
+    process.env.XDG_CONFIG_HOME = config
+    try {
+      assert.throws(
+        () => loadTiers(repo),
+        (err: Error) => err.message.includes(userFile) && /unknown key "tier".*did you mean "tiers"/.test(err.message),
+      )
+    } finally {
+      if (xdg === undefined) delete process.env.XDG_CONFIG_HOME
+      else process.env.XDG_CONFIG_HOME = xdg
+    }
   })
 })
 

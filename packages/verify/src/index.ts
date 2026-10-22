@@ -82,7 +82,16 @@ tool(
     const settings = loadSettings(d)
     const checks = await detectChecks(d, settings)
     const lines = checks.length
-      ? checks.map((c) => `${c.name} (${c.kind}): ${c.command}${c.cwd !== d ? `  [in ${path.relative(d, c.cwd) || "."}]` : ""}  ← ${c.source}`)
+      ? checks.map((c) => {
+          const inCwd = c.cwd !== d ? `  [in ${path.relative(d, c.cwd) || "."}]` : ""
+          const options = [
+            c.when ? `when=${c.when}` : "",
+            c.slots ? `slots=${c.slots}` : "",
+            c.exclusive ? `exclusive=${c.exclusive}` : "",
+            c.env && Object.keys(c.env).length ? `env=${Object.keys(c.env).join(",")}` : "",
+          ].filter(Boolean)
+          return `${c.name} (${c.kind}): ${c.command}${inCwd}${options.length ? `  [${options.join(", ")}]` : ""}  ← ${c.source}`
+        })
       : ["no checks found: add verify.checks to horde.json"]
     lines.push(
       `audit blocks on: ${settings.audit.block.join(", ") || "nothing"}; warns on: ${settings.audit.warn.join(", ") || "nothing"}${settings.audit.allowed.length ? `; allowed: ${settings.audit.allowed.join(", ")}` : ""}`,

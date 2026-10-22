@@ -1442,3 +1442,125 @@ describe("MCP server", () => {
     }
   })
 })
+
+describe("horde.json settings", () => {
+  const settings = (data: unknown) => {
+    const root = tmp()
+    fs.writeFileSync(path.join(root, "horde.json"), JSON.stringify(data))
+    return loadSettings(root)
+  }
+
+  test("unknown keys are rejected at every level, with a hint", () => {
+    assert.throws(
+      () => settings({ verify: { check: { test: "npm test" } } }),
+      (err: Error) => /unknown key "verify\.check"/.test(err.message) && /did you mean "checks"/.test(err.message),
+    )
+    assert.throws(
+      () => settings({ verify: { checks: { pg: { command: "pytest", wehn: "land", slot: 2 } } } }),
+      (err: Error) => /unknown key "verify\.checks\.pg\.wehn"/.test(err.message) && /did you mean "when"/.test(err.message),
+    )
+    assert.throws(
+      () => settings({ workers: { setpu: "npm ci" } }),
+      (err: Error) => /unknown key "workers\.setpu"/.test(err.message) && /did you mean "setup"/.test(err.message),
+    )
+    assert.throws(() => settings({ verify: { audit: { blcok: ["scope"] } } }), /unknown key "verify\.audit\.blcok".*"block"/)
+    assert.throws(() => settings({ verify: { timeoutSecond: 60 } }), /unknown key "verify\.timeoutSecond".*"timeoutSeconds"/)
+    assert.throws(() => settings({ verfy: {} }), /unknown key "verfy".*"verify"/)
+  })
+
+  test("env variable names are arbitrary, not unknown keys", () => {
+    const loaded = settings({
+      verify: { checks: { test: { command: "npm test", env: { AUTH_PROVIDER: "local", ANY_OTHER_NAME: "x" } } } },
+    })
+    assert.deepEqual(loaded.checks?.[0]?.env, { AUTH_PROVIDER: "local", ANY_OTHER_NAME: "x" })
+  })
+
+  test("the base commit's horde.json is validated too", async () => {
+    const { root, base } = repo({ "horde.json": JSON.stringify({ verify: { check: { test: "npm test" } } }) })
+    await assert.rejects(
+      loadSettingsAt(root, base),
+      (err: Error) => /unknown key "verify\.check"/.test(err.message) && /did you mean "checks"/.test(err.message),
+    )
+  })
+
+  test("this repository's horde.json and the documented examples load", () => {
+    assert.doesNotThrow(() => loadSettings(path.resolve(import.meta.dirname, "../../..")))
+    // plugins/horde/skills/setup/SKILL.md
+    assert.doesNotThrow(() =>
+      settings({
+        tiers: ["deepseek/deepseek-flash", "deepseek/deepseek-v4-pro"],
+        workers: { setup: "buf generate && npm ci --prefix web", brief: ["docs/lane_brief.md"] },
+        verify: {
+          checks: {
+            go: { command: "go test -race ./...", cwd: "api", env: { AUTH_PROVIDER: "local" }, slots: 2 },
+            web: { command: "npm test", cwd: "web" },
+            pg: { command: "uv run pytest -n 8 tests/pg", when: "land", exclusive: "dev-stack" },
+          },
+        },
+      }),
+    )
+    // docs/DESIGN.md §5
+    assert.doesNotThrow(() =>
+      settings({
+        opencode: { maxRunning: 8 },
+        tiers: [{ model: "deepseek/deepseek-v4-flash", variant: "high" }, "moonshot/kimi-k3"],
+        verify: {
+          checks: {
+            test: "npm test",
+            lint: "npm run lint",
+            pg: { command: "uv run pytest tests/pg", cwd: "api", env: { AUTH_PROVIDER: "local" }, when: "land", slots: 2, exclusive: "dev-stack" },
+          },
+          timeoutSeconds: 600,
+          audit: { block: ["scope", "tests", "secrets", "binaries"], warn: ["suppressions", "dependencies"] },
+        },
+        context: { ignore: ["fixtures/**"], entrypoints: ["src/index.ts"] },
+        workers: { setup: "uv sync --frozen", brief: ["docs/lane_brief.md"] },
+      }),
+    )
+  })
+
+  test("verify_detect shows when, slots, exclusive and env names (never values)", async () => {
+    const root = tmp()
+    fs.writeFileSync(
+      path.join(root, "horde.json"),
+      JSON.stringify({
+        verify: {
+          checks: {
+            pg: {
+              command: "pytest tests/pg",
+              kind: "test",
+              when: "land",
+              slots: 2,
+              exclusive: "dev-stack",
+              env: { AUTH_PROVIDER: "local", DB_PASSWORD: "s3cret" },
+            },
+            plain: "echo hi",
+          },
+        },
+      }),
+    )
+    const client = new Client({ name: "test", version: "0" })
+    await client.connect(
+      new StdioClientTransport({
+        command: process.execPath,
+        args: ["--conditions=source", "--import", "tsx", path.join(pkg, "src/index.ts")],
+        cwd: pkg,
+        env: { ...(process.env as Record<string, string>), HORDE_VERIFY_DIRECTORY: root, HORDE_VERIFY_STATE_DIR: tmp() },
+        stderr: "inherit",
+      }),
+    )
+    try {
+      const res = (await client.callTool({ name: "verify_detect", arguments: {} }, { timeout: 120_000 })) as {
+        content: { text: string }[]
+        isError?: boolean
+      }
+      const text = res.content.map((c) => c.text).join("\n")
+      assert.ok(!res.isError, text)
+      assert.match(text, /pg \(test\): pytest tests\/pg {2}\[when=land, slots=2, exclusive=dev-stack, env=AUTH_PROVIDER,DB_PASSWORD\] {2}← horde\.json/)
+      assert.match(text, /plain \(other\): echo hi {2}← horde\.json/, "no options bracket when none are set")
+      assert.doesNotMatch(text, /s3cret/, "env values are never printed")
+    } finally {
+      await client.close()
+    }
+  })
+})

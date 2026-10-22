@@ -1,6 +1,6 @@
 import fs from "node:fs"
 import path from "node:path"
-import { git, gitRaw, type HordeFile, loadHordeFile } from "@mcp-horde/core"
+import { git, gitRaw, type HordeFile, loadHordeFile, validateHordeFile } from "@mcp-horde/core"
 
 export type CheckKind = "test" | "typecheck" | "lint" | "build" | "other"
 
@@ -83,6 +83,7 @@ export async function loadSettingsAt(directory: string, base: string): Promise<V
         throw new Error(`${file} at ${base} is not valid JSON: ${(err as Error).message}`)
       }
       if (!data || typeof data !== "object" || Array.isArray(data)) throw new Error(`${file} at ${base} must contain a JSON object`)
+      validateHordeFile(data as Record<string, unknown>, `${file} at ${base}`)
       return parseSettings({ root: dir, file: path.join(dir, "horde.json"), data: data as Record<string, unknown> })
     }
     if (!rel) break

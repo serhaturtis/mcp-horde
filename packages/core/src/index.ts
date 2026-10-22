@@ -8,6 +8,7 @@ export {
   type Tier,
   tierLabel,
   tierModel,
+  validateHordeFile,
   type Workers,
 } from "./config.js"
 export { pidAlive, readJson, SELF, sleepSync, withLock, writeAtomic, writeJson } from "./files.js"
