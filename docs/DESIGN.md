@@ -177,7 +177,7 @@ Mechanical judgement with a compact verdict. Library + MCP server; both orchestr
 
 ### 4.4 `@mcp-horde/board`
 
-The shared task graph. One server, two modes: orchestrator (default) and `--worker` (reduced, worker-safe tool set). State in `~/.local/state/mcp-horde/<projectKey>/board/`: `tasks/<id>.json`, `findings.jsonl`, `memory.jsonl`, `locks/<slug>.json`, `events.jsonl`. Multiple processes (one orchestrator, N worker-side instances started by OpenCode) share it through `core`'s store and locks.
+The shared task graph. One server, two modes: orchestrator (default) and `--worker` (reduced, worker-safe tool set). State in `~/.local/state/mcp-horde/board/<repo>-<hash>/`: `tasks/<id>.json`, `findings.jsonl`, `memory.jsonl`, `locks/<slug>.json`, `events.jsonl`. Multiple processes (one orchestrator, N worker-side instances started by OpenCode) share it through `core`'s store and locks.
 
 **Task record**
 ```ts
@@ -208,7 +208,7 @@ The shared task graph. One server, two modes: orchestrator (default) and `--work
 - `board_accept { id, verdict, cost? }` / `board_fail { id, reason, escalate?: boolean }` / `board_block { id, on }` / `board_update { id, patch }`.
 - `board_summary { }` → ≤ 1500 chars: counts by status, running tasks with their agents, blocked tasks and why, unanswered worker questions, cost so far, next ready tasks.
 - `board_task { id, detail?: "brief" | "full" }` → one task; `full` includes reports and attempts.
-- `board_findings { since?, tags?, paths? }`, `board_remember { text, tags, confidence? }`, `board_recall { query, limit? }`, `board_forget { id }`.
+- `board_findings { paths?, tags? }`, `board_remember { text, tags?, paths?, confidence? }`, `board_recall { query?, tags?, paths? }`, `board_forget { id }`.
 - `board_locks { }`, `board_unlock { path }` (orchestrator can break a lease).
 - `board_archive { }` moves done/failed tasks out of the active set.
 
@@ -222,7 +222,7 @@ The shared task graph. One server, two modes: orchestrator (default) and `--work
 
 Worker questions go through OpenCode's own question tool (they already surface as `needs_input` on the parent agent in `opencode`), so the board has no `ask`.
 
-**Memory.** Entries `{ id, text, tags, confidence, source: {task, attempt}, createdAt, verifiedAt? }`. `board_recall` ranks by tag and path overlap, then recency; stale entries (older than 90 days, never re-verified) are marked `(stale)` in output. The brief includes memory under a "Project notes" heading with the caveat that notes may be outdated.
+**Memory.** Entries `{ id, text, tags, confidence, source: {task, attempt}, createdAt, verifiedAt? }`. `board_recall` ranks by tag and path overlap, then recency. The brief includes memory under a "Project notes" heading with the caveat that notes may be outdated.
 
 **Events.** Every mutation appends to `events.jsonl`. `board_summary` prints the summary for the orchestrator; `horde status` and `horde watch` (live) show the board to people (§10.13).
 
@@ -310,7 +310,6 @@ At the repository root (optional; everything auto-detects without it):
 
 ```json
 {
-  "project": "myapp",
   "opencode": { "maxRunning": 8 },
   "tiers": [
     { "model": "deepseek/deepseek-v4-flash", "variant": "high" },
@@ -326,8 +325,7 @@ At the repository root (optional; everything auto-detects without it):
     "audit": { "block": ["scope", "tests", "secrets", "binaries"], "warn": ["suppressions", "dependencies"] }
   },
   "context": { "ignore": ["fixtures/**"], "entrypoints": ["src/index.ts"] },
-  "workers": { "setup": "uv sync --frozen", "brief": ["docs/lane_brief.md"] },
-  "board": { "leaseMinutes": 30, "memoryStaleDays": 90 }
+  "workers": { "setup": "uv sync --frozen", "brief": ["docs/lane_brief.md"] }
 }
 ```
 
