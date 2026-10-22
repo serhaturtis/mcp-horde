@@ -423,6 +423,29 @@ const RULE_SCRIPTS = ["test", "typecheck", "type-check", "check-types", "tsc", "
 /** Test-runner configuration files: changing one changes which tests run and how. */
 const RUNNER_CONFIG =
   /(^|\/)(jest\.config\.[\w.]+|vitest\.(config|workspace)\.[\w.]+|pytest\.ini|tox\.ini|\.mocharc(\.[\w]+)?|karma\.conf(\.[\w]+)?|\.c8rc(\.json)?|\.nycrc(\.[\w]+)?)$/
+/** Tool config files a check reads. Watched at the repository root and at each check's cwd. */
+const CHECK_CONFIG =
+  /^(tsconfig[^/]*\.json|jsconfig[^/]*\.json|biome\.jsonc?|\.eslintrc.*|eslint\.config\..+|ruff\.toml|\.ruff\.toml|mypy\.ini|playwright\.config\..+|vite\.config\..+)$/
+/** pyproject.toml and setup.cfg sections that set what a check enforces. */
+const PYPROJECT_RULES: [RegExp, string][] = [
+  [/^\[tool\.pytest/, "[tool.pytest]"],
+  [/^\[tool\.ruff/, "[tool.ruff]"],
+  [/^\[tool\.mypy/, "[tool.mypy]"],
+  [/^\[tool\.coverage/, "[tool.coverage]"],
+  [/^\[tool\.pyright/, "[tool.pyright]"],
+  [/^\[flake8/, "[flake8]"],
+  [/^\[mypy/, "[mypy]"],
+]
+const SETUP_CFG_RULES: [RegExp, string][] = [
+  [/^\[tool:pytest/, "[tool:pytest]"],
+  [/^\[tool\.ruff/, "[tool.ruff]"],
+  [/^\[tool\.mypy/, "[tool.mypy]"],
+  [/^\[tool\.coverage/, "[tool.coverage]"],
+  [/^\[tool\.pyright/, "[tool.pyright]"],
+  [/^\[flake8/, "[flake8]"],
+  [/^\[mypy/, "[mypy]"],
+  [/^\[coverage:/, "[coverage:*]"],
+]
 
 /** Text of the INI/TOML sections whose header matches `header`, without trailing whitespace or blank lines. */
 function sections(text: string, header: RegExp): string {
@@ -463,11 +486,36 @@ function dependencyLines(text: string): Set<number> {
 }
 
 /**
- * Changes to what the gate itself checks with: horde.json's verify section, the package.json
- * scripts the checks run (and jest's config there), test-runner configs, pytest's sections of
- * pyproject.toml and setup.cfg. A worker that edits these can make a failing suite pass.
+ * Directories whose tool configs a check reads: the directory under audit and its ancestors (where
+ * detection finds the project), plus horde.json's explicit check cwds, read at base.
  */
-async function ruleChanges(root: string, base: string, all: Change[], scripts: string[]): Promise<{ file: string; what: string }[]> {
+async function checkDirs(root: string, base: string, directory: string): Promise<Set<string>> {
+  const dirs = new Set<string>()
+  for (let d = path.resolve(directory); ; d = path.dirname(d)) {
+    dirs.add(d)
+    const rel = path.relative(root, d).split(path.sep).join("/")
+    if (!rel.startsWith("..")) {
+      const text = await gitRaw(root, ["show", `${base}:${rel ? `${rel}/` : ""}horde.json`]).catch(() => "")
+      try {
+        const checks = ((JSON.parse(text || "{}") as { verify?: { checks?: Record<string, unknown> } }).verify?.checks ?? {}) as Record<string, unknown>
+        for (const spec of Object.values(checks))
+          if (spec && typeof spec === "object" && typeof (spec as { cwd?: unknown }).cwd === "string") dirs.add(path.resolve(d, (spec as { cwd: string }).cwd))
+      } catch {
+        // A broken base horde.json is not this audit's problem.
+      }
+    }
+    if (d === root || path.dirname(d) === d) break
+  }
+  return dirs
+}
+
+/**
+ * Changes to what the gate itself checks with: horde.json's verify section, the package.json
+ * scripts the checks run (and the scripts they reach, with their pre/post hooks), test-runner
+ * and tool configs, pytest/ruff/mypy/coverage sections of pyproject.toml and setup.cfg. A worker
+ * that edits these can make a failing suite pass.
+ */
+async function ruleChanges(root: string, base: string, all: Change[], scripts: string[], dirs: Set<string>): Promise<{ file: string; what: string }[]> {
   const out: { file: string; what: string }[] = []
   const before = (f: string) => gitRaw(root, ["show", `${base}:${f}`]).catch(() => "")
   const after = (f: string) => fs.readFile(path.join(root, f), "utf8").catch(() => "")
@@ -479,7 +527,28 @@ async function ruleChanges(root: string, base: string, all: Change[], scripts: s
     }
   }
   const differs = (a: unknown, b: unknown) => JSON.stringify(a ?? null) !== JSON.stringify(b ?? null)
-  const names = new Set([...RULE_SCRIPTS, ...scripts])
+  const roots = new Set([...RULE_SCRIPTS, ...scripts])
+  const refs = (cmd: unknown) => (typeof cmd === "string" ? [...cmd.matchAll(/\b(?:npm|pnpm|yarn|bun)\s+run\s+([\w:.-]+)/g)].map((m) => m[1]!) : [])
+  // Follow `npm run X` from a checked script, and the pre/post hooks npm runs around each script.
+  const chain = (sa: Record<string, unknown>) => {
+    const seen = new Set<string>()
+    const hooks = new Set([...roots, ...Object.keys(sa)])
+    const queue = [...roots]
+    while (queue.length) {
+      const n = queue.shift()!
+      if (seen.has(n)) continue
+      seen.add(n)
+      // Only a script that exists at base (or a checked name) can have hooks of its own.
+      if (hooks.has(n)) queue.push(`pre${n}`, `post${n}`)
+      queue.push(...refs(sa[n]))
+    }
+    return seen
+  }
+  const sectionRule = (file: string, groups: [RegExp, string][], a: string, b: string) => {
+    const changed = groups.filter(([re]) => sections(a, re) !== sections(b, re)).map(([, name]) => name)
+    return changed.length ? `${file} ${changed.join(", ")}` : undefined
+  }
+  const local = new Set([...dirs].map((d) => path.relative(root, d).split(path.sep).join("/") || "."))
   for (const c of all) {
     const file = c.path
     const old = c.from ?? c.path
@@ -489,19 +558,25 @@ async function ruleChanges(root: string, base: string, all: Change[], scripts: s
       const [a, b] = [json(await before(old)), json(await after(file))]
       const sa = (a.scripts ?? {}) as Record<string, unknown>
       const sb = (b.scripts ?? {}) as Record<string, unknown>
+      const runnable = chain(sa)
       const changed = [...new Set([...Object.keys(sa), ...Object.keys(sb)])].filter(
-        (n) => (names.has(n) || /^(test|lint|typecheck|check)[:-]/.test(n)) && differs(sa[n], sb[n]),
+        (n) => (runnable.has(n) || /^(test|lint|typecheck|check)[:-]/.test(n)) && differs(sa[n], sb[n]),
       )
       if (changed.length) out.push({ file, what: `package.json scripts ${changed.join(", ")}` })
       if (differs(a.jest, b.jest)) out.push({ file, what: "package.json jest" })
     } else if (RUNNER_CONFIG.test(file) || (c.from && RUNNER_CONFIG.test(c.from))) {
       out.push({ file, what: path.posix.basename(RUNNER_CONFIG.test(file) ? file : c.from!) })
+    } else if (/(^|\/)conftest\.py$/.test(file) || (c.from && /(^|\/)conftest\.py$/.test(c.from))) {
+      out.push({ file, what: "conftest.py" })
+    } else if (CHECK_CONFIG.test(path.posix.basename(file)) || (c.from && CHECK_CONFIG.test(path.posix.basename(c.from)))) {
+      const at = (p: string) => local.has(path.posix.dirname(p))
+      if (at(file) || (c.from && at(c.from))) out.push({ file, what: path.posix.basename(file) })
     } else if (/(^|\/)pyproject\.toml$/.test(file)) {
-      const re = /^\[tool\.pytest/
-      if (sections(await before(old), re) !== sections(await after(file), re)) out.push({ file, what: "pyproject.toml [tool.pytest]" })
+      const what = sectionRule("pyproject.toml", PYPROJECT_RULES, await before(old), await after(file))
+      if (what) out.push({ file, what })
     } else if (/(^|\/)setup\.cfg$/.test(file)) {
-      const re = /^\[tool:pytest\]/
-      if (sections(await before(old), re) !== sections(await after(file), re)) out.push({ file, what: "setup.cfg [tool:pytest]" })
+      const what = sectionRule("setup.cfg", SETUP_CFG_RULES, await before(old), await after(file))
+      if (what) out.push({ file, what })
     }
   }
   return out
@@ -631,7 +706,7 @@ export async function audit(directory: string, opts: AuditOptions): Promise<Audi
     } else if (LOCKFILES.test(c.path)) add("dependencies", { file: c.path, text: "updates a lockfile" }, true)
   }
 
-  for (const f of await ruleChanges(root, base, all, opts.ruleScripts ?? []))
+  for (const f of await ruleChanges(root, base, all, opts.ruleScripts ?? [], await checkDirs(root, base, directory)))
     add("tests", { file: f.file, text: `changes the rules the gate checks with: ${f.what}` })
 
   // A secret committed and then deleted still leaked: scan the commits, not only the net diff.

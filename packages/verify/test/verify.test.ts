@@ -934,6 +934,104 @@ describe("fixes", () => {
     assert.ok(!v.blockers.some((b) => /pyproject.*\[project\]/.test(b)), "other pyproject sections are not rules")
   })
 
+  test("tool configs at the root and at a check's cwd are rules", async () => {
+    const { root, base } = repo({
+      "README.md": "# x\n",
+      "horde.json": JSON.stringify({ verify: { checks: { test: { command: "node --test", cwd: "svc" } } } }),
+    })
+    write(root, {
+      "tsconfig.json": '{"compilerOptions":{"strict":false}}\n',
+      "tsconfig.build.json": '{"extends":"./tsconfig.json"}\n',
+      "biome.json": '{"linter":{"enabled":false}}\n',
+      "eslint.config.js": "export default []\n",
+      "vite.config.ts": "export default {}\n",
+      "playwright.config.ts": "export default {}\n",
+      "ruff.toml": "line-length = 120\n",
+      "mypy.ini": "[mypy]\nstrict = False\n",
+      "conftest.py": "# hooks\n",
+      "svc/tsconfig.json": '{"compilerOptions":{"strict":false}}\n',
+      "other/tsconfig.json": '{"compilerOptions":{"strict":false}}\n',
+    })
+    const l = await lines(root, base, { ruleScripts: ["test", "typecheck", "lint"] })
+    for (const f of [
+      "tsconfig.json",
+      "tsconfig.build.json",
+      "biome.json",
+      "eslint.config.js",
+      "vite.config.ts",
+      "playwright.config.ts",
+      "ruff.toml",
+      "mypy.ini",
+      "conftest.py",
+      "svc/tsconfig.json",
+    ])
+      assert.ok(
+        l.some((x) => x.startsWith(`block tests ${f} `) && x.includes("changes the rules the gate checks with")),
+        `${f} in ${l.join("\n")}`,
+      )
+    assert.ok(!l.some((x) => x.includes("other/tsconfig.json")), "a config outside the checks' cwd is not a rule")
+  })
+
+  test("ruff, mypy and coverage sections of pyproject.toml are rules; a dependency-only change is not", async () => {
+    const { root, base } = repo({
+      "pyproject.toml":
+        "[project]\nname = 'x'\ndependencies = [\n  'a',\n]\n\n[tool.ruff]\nline-length = 100\n\n[tool.mypy]\nstrict = true\n\n[tool.coverage.run]\nbranch = true\n",
+    })
+    write(root, {
+      "pyproject.toml":
+        "[project]\nname = 'x'\ndependencies = [\n  'a',\n  'b',\n]\n\n[tool.ruff]\nline-length = 120\n\n[tool.mypy]\nstrict = false\n\n[tool.coverage.run]\nbranch = false\n",
+    })
+    const l = await lines(root, base)
+    assert.ok(
+      l.includes("block tests pyproject.toml changes the rules the gate checks with: pyproject.toml [tool.ruff], [tool.mypy], [tool.coverage]"),
+      l.join("\n"),
+    )
+    assert.ok(
+      l.some((x) => /dependencies pyproject\.toml adds or changes 'b'/.test(x)),
+      l.join("\n"),
+    )
+
+    const onlyDeps = repo({
+      "pyproject.toml": "[project]\nname = 'x'\ndependencies = [\n  'a',\n]\n\n[tool.ruff]\nline-length = 100\n",
+    })
+    write(onlyDeps.root, {
+      "pyproject.toml": "[project]\nname = 'x'\ndependencies = [\n  'a',\n  'b',\n]\n\n[tool.ruff]\nline-length = 100\n",
+    })
+    const d = await lines(onlyDeps.root, onlyDeps.base)
+    assert.ok(!d.some((x) => /changes the rules/.test(x)), d.join("\n"))
+    assert.ok(
+      d.some((x) => /adds or changes 'b'/.test(x)),
+      d.join("\n"),
+    )
+  })
+
+  test("scripts reachable from a checked script, and their pre/post hooks, are rules", async () => {
+    const { root, base } = repo({
+      "package.json": JSON.stringify({ scripts: { test: "npm run unit", unit: "node --test", other: "tsc" } }),
+    })
+    write(root, {
+      "package.json": JSON.stringify({
+        scripts: { test: "npm run unit", pretest: "echo pre", preunit: "echo preunit", unit: "node --test --test-only", other: "true" },
+      }),
+    })
+    const l = await lines(root, base, { ruleScripts: ["test"] })
+    const line = l.find((x) => /package\.json changes the rules/.test(x))
+    assert.ok(line, l.join("\n"))
+    const changed = line!.split("scripts ")[1]!.split(", ")
+    assert.deepEqual(new Set(changed), new Set(["unit", "pretest", "preunit"]))
+  })
+
+  test("an unrelated package.json script is not a rule change", async () => {
+    const { root, base } = repo({
+      "package.json": JSON.stringify({ scripts: { test: "npm run unit", unit: "node --test", other: "tsc" } }),
+    })
+    write(root, {
+      "package.json": JSON.stringify({ scripts: { test: "npm run unit", unit: "node --test", other: "tsc --watch" } }),
+    })
+    const l = await lines(root, base, { ruleScripts: ["test"] })
+    assert.ok(!l.some((x) => /changes the rules/.test(x)), l.join("\n"))
+  })
+
   test("an ordinary pyproject.toml or Cargo.toml edit is not a rule or dependency change", async () => {
     const { root, base } = repo({
       "pyproject.toml": "[project]\nname = 'x'\nversion = '0.1.0'\n\n[tool.pytest.ini_options]\naddopts = '-q'\n",
