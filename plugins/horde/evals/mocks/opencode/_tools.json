@@ -66,12 +66,12 @@
     },
     {
       "name": "horde_wait",
-      "description": "Wait for delegated tasks. Returns every outcome that is ready, each once; if none is, it blocks until the first one (up to timeout_seconds). READY: checks passed and the work was reviewed (what changed, cost) → horde_land. NEEDS YOU: the worker asks a question or for permission → horde_tell. FAILED: why, what the worker changed, and any edits refused outside its scope → horde_tell with a hint, or horde_drop. With no ids it waits for any task you started; on a timeout it says what each worker is doing (they keep working). In a subagent the call blocks the whole time (Claude Code moves only main-conversation calls to the background), so start the subagent's other work before waiting.",
+      "description": "Wait for delegated tasks. Returns every outcome that is ready, each once; if none is, it blocks until the first one (up to timeout_seconds). READY: checks passed and the work was reviewed (what changed, cost) → horde_land. REPORT: an investigation's findings, ordered by severity with each citation checked, and the path of the full report JSON → nothing to land. NEEDS YOU: the worker asks a question or for permission → horde_tell. FAILED: why, what the worker changed, and any edits refused outside its scope → horde_tell with a hint, or horde_drop. With no ids it waits for any task you started (changes and investigations); on a timeout it says what each worker is doing (they keep working). In a subagent the call blocks the whole time (Claude Code moves only main-conversation calls to the background), so start the subagent's other work before waiting.",
       "inputSchema": {
         "type": "object",
         "properties": {
           "ids": {
-            "description": "Task ids (t-…) from horde_do. Default: every task you started.",
+            "description": "Task ids (t-…) from horde_do or horde_investigate. Default: every task you started.",
             "type": "array",
             "items": {
               "type": "string"
