@@ -1,0 +1,16 @@
+schema_version: "1.1"
+name: design-and-trace
+description: One coupled change to design here, with a read-only trace needed alongside. The trace should go to horde_investigate while the core is designed.
+tags: [delegate, investigate]
+context:
+  scaffold_script: scaffold.sh
+execution:
+  max_turns: 10
+  allowed_tools: [Read, Glob, Grep, Skill]
+  prompt: |
+    The verdict a gate returns already records, per check, whether it ran only the tests related to the change or the whole suite (the `related` plan on each check in packages/verify/src/gate.ts, which render prints as "related tests only (N files)" or as the full run), but that stops in verify: the opencode server's outcome line for a task (`checksLine` in packages/opencode/src/horde.ts) names the checks and their summaries only, and the board's attempt activity keeps just a gate state string. I want a READY or FAILED outcome to say which checks ran narrowed and which ran in full and why, and the board's attempt record to keep the same per-check narrowing with the gate state it already records, with tests in verify, opencode and board, and docs/DESIGN.md §4.3 and §4.9 updated. Before the outcome lines change I also need a trace of every path from a worker finishing to the outcome text the session reads, through packages/opencode/src/fleet.ts and horde.ts: each place that builds or stores outcome text, and whether any of them parses or pattern-matches the verdict's text instead of reading the verdict as data, with file and line for each.
+graders:
+  - name: delegated-trace
+    type: tool_used
+    tool: mcp__plugin_horde_opencode__horde_investigate
+    min: 1

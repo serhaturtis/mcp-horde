@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Saves the real definitions of the horde's five main tools for the plugin's eval suite. The
+// Saves the real definitions of the horde's six main tools for the plugin's eval suite. The
 // mocked tools there carry whatever this file says, and their descriptions are part of what the
 // suite measures, so it has to match the bundled server.
 //
@@ -14,7 +14,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/client/stdio"
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..")
 const file = path.join(root, "plugins", "horde", "evals", "mocks", "opencode", "_tools.json")
-const names = ["horde_do", "horde_wait", "horde_tell", "horde_land", "horde_drop"]
+const names = ["horde_do", "horde_investigate", "horde_wait", "horde_tell", "horde_land", "horde_drop"]
 
 // A throwaway state directory: listing tools must not write to the real one.
 const state = fs.mkdtempSync(path.join(os.tmpdir(), "horde-eval-tools-"))

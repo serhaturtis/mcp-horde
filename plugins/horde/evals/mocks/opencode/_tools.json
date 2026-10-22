@@ -65,6 +65,70 @@
       }
     },
     {
+      "name": "horde_investigate",
+      "description": "Hand a read-only investigation to a cheaper worker model and get it back as a checked report. Use it for audits, code reviews, bug hunts and \"how does X work\" questions that produce no change: the worker reads, builds and runs code in its own git worktree (never committing), then answers with a JSON report of findings, each citing file:line and the command that produced it. The citations are checked mechanically (a file that does not exist, or a line past its end, is marked), and an answer that is not valid JSON is asked for again once before it fails. Returns at once with the task id; call horde_wait for the REPORT, or pass wait: true to block until it is done.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "question": {
+            "type": "string",
+            "minLength": 1,
+            "description": "What to find out and why, with the context you have. The worker sees only this and the repository; it does not see this conversation. It reads, builds and runs code to answer, so describe what you need to know and why it matters."
+          },
+          "want": {
+            "description": "What the answer must contain, e.g. [\"which code paths call X\", \"whether the race is real\"].",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "focus": {
+            "description": "Paths or globs to start reading from; the worker is not limited to them.",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "title": {
+            "description": "Short name (default: the question's first sentence).",
+            "type": "string"
+          },
+          "model": {
+            "description": "\"provider/model\" for the worker. Default: the cheapest tier of the repository's horde.json \"tiers\", else of the user-level ~/.config/mcp-horde/horde.json, else OpenCode's default model.",
+            "type": "string"
+          },
+          "variant": {
+            "description": "Effort level the model offers, e.g. \"low\", \"high\", \"max\".",
+            "type": "string"
+          },
+          "directory": {
+            "description": "The repository (default: the server's directory).",
+            "type": "string"
+          },
+          "wait": {
+            "description": "Block until the outcome. Default false.",
+            "type": "boolean"
+          },
+          "timeout_seconds": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 86400,
+            "description": "How long to block (default 25 min in Claude Code, 50 s elsewhere); on a timeout the workers keep going."
+          }
+        },
+        "required": [
+          "question"
+        ],
+        "$schema": "https://json-schema.org/draft/2020-12/schema"
+      },
+      "annotations": {
+        "openWorldHint": false
+      },
+      "_meta": {
+        "anthropic/alwaysLoad": true
+      }
+    },
+    {
       "name": "horde_wait",
       "description": "Wait for delegated tasks. Returns every outcome that is ready, each once; if none is, it blocks until the first one (up to timeout_seconds). READY: checks passed and the work was reviewed (what changed, cost) → horde_land. REPORT: an investigation's findings, ordered by severity with each citation checked, and the path of the full report JSON → nothing to land. NEEDS YOU: the worker asks a question or for permission → horde_tell. FAILED: why, what the worker changed, and any edits refused outside its scope → horde_tell with a hint, or horde_drop. With no ids it waits for any task you started (changes and investigations); on a timeout it says what each worker is doing (they keep working). In a subagent the call blocks the whole time (Claude Code moves only main-conversation calls to the background), so start the subagent's other work before waiting.",
       "inputSchema": {

@@ -1,6 +1,6 @@
 # Delegation evals
 
-Does an agent hand work to the horde when that is the better path, and keep it when it is not? Each case is a request a user might type, without any mention of the horde, run in a clone of this repository at a fixed commit (7caae37). Each case has one grader, whether `horde_do` was called; `no-checks` adds a judge on the final reply.
+Does an agent hand work to the horde when that is the better path, and keep it when it is not? Each case is a request a user might type, without any mention of the horde, run in a clone of this repository at a fixed commit (7caae37). Each case has one grader, whether `horde_do` was called, except `design-and-trace`, which grades whether `horde_investigate` was called; `no-checks` adds a judge on the final reply.
 
 | Case | Request | Expected |
 | --- | --- | --- |
@@ -11,6 +11,7 @@ Does an agent hand work to the horde when that is the better path, and keep it w
 | `one-line` | Change `watch`'s default interval from one second to two | do directly |
 | `question` | How the verify server finds the tests that cover a change | do directly |
 | `ledger-duration` | Median attempt duration in `ledger_stats`, its README and tests, asked casually (borderline) | delegate |
+| `design-and-trace` | A per-check narrowing record carried from the verdict to the outcome and the board, plus a trace of every path to the outcome text | delegate the trace (horde_investigate) while designing the core |
 | `two-file-fix` | A rounding bug in `formatDuration`, described precisely, plus its test (borderline: well described but small) | do directly |
 | `vague-speedup` | "The watch view is sluggish, make it faster" (borderline: sounds like work, but cannot be described yet) | do directly |
 | `no-checks` | The user asks for the horde in a small repository with no checks, where `horde_do` refuses (its own scaffold and mock). It names the horde on purpose: it measures handling of the refusal, not the decision | take the refusal: no retries, no claim the work was delegated or checked |
@@ -34,7 +35,7 @@ claude plugin eval plugins/horde --runs 1 --ablation none --model claude-opus-5-
 
 ## The mocks
 
-`mocks/opencode/` answers the five horde tools with fixed text in the shape of the real answers. No worker runs. A task starts, and `horde_wait` says it is still working, as a real wait does when it times out. The first version returned READY and then "landed". Agents went looking for work that never appeared, which cost turns and told nothing. `_tools.json` carries the real tool definitions, because the descriptions are part of what is being measured.
+`mocks/opencode/` answers the six horde tools with fixed text in the shape of the real answers. No worker runs. A task starts, and `horde_wait` says it is still working, as a real wait does when it times out. The first version returned READY and then "landed". Agents went looking for work that never appeared, which cost turns and told nothing. `_tools.json` carries the real tool definitions, because the descriptions are part of what is being measured.
 
 `node scripts/eval-tools.mjs` regenerates it from the bundled server; run it after changing a description. `ci.sh` fails while it is out of date.
 
