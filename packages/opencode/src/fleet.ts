@@ -1923,7 +1923,6 @@ export class Fleet {
           within(this.api.session.interrupt({ sessionID: sid }, timed()), REQUEST_MS + REQUEST_GRACE_MS, "interrupting the session").catch(() => undefined),
         ),
       )
-      if (live.run !== token || this.closed) return
     }
     if (live.run !== token || this.closed) return
     live.lastRefresh = Date.now()
