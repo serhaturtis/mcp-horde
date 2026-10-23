@@ -106,6 +106,35 @@ describe("PostToolUse", () => {
     assert.match(hook(...edit("/repo/z.ts"), "prompt-2"), /edited 4 files by hand/)
   })
 
+  test("edits outside the repository do not count toward the note", (t) => {
+    const dir = repo(t)
+    const outside = scratch(t)
+    const hook = session(scratch(t))
+    const stray = ["a.md", "b.md", "c.md"]
+    for (const name of stray) assert.equal(hook(...edit(path.join(outside, name)), "prompt-1", dir), undefined, name)
+    assert.equal(hook(...edit(path.join(dir, "only.ts")), "prompt-1", dir), undefined, "one edit inside is not four")
+    const files = ["only.ts", "a.ts", "b.ts", "c.ts"]
+    for (const file of files.slice(1, 3)) assert.equal(hook(...edit(path.join(dir, file)), "prompt-1", dir), undefined, file)
+    const note = hook(...edit(path.join(dir, files[3])), "prompt-1", dir)
+    assert.match(note, /edited 4 files by hand/)
+    for (const file of files) assert.ok(note.includes(file), file)
+    for (const name of stray) assert.ok(!note.includes(name), name)
+  })
+
+  test("a path through a symlink into the repository still counts", (t) => {
+    const dir = repo(t)
+    const link = path.join(scratch(t), "link")
+    fs.symlinkSync(dir, link)
+    const hook = session(scratch(t))
+    const files = ["a.ts", "b.ts", "c.ts", "d.ts"]
+    for (const file of files.slice(0, 3)) {
+      write(dir, file)
+      assert.equal(hook(...edit(path.join(link, file)), "prompt-1", dir), undefined, file)
+    }
+    write(dir, files[3])
+    assert.match(hook(...edit(path.join(link, files[3])), "prompt-1", dir), /edited 4 files by hand/)
+  })
+
   test("a horde_do call earlier in the prompt stops the note", (t) => {
     const hook = session(scratch(t))
     assert.equal(hook("mcp__plugin_horde_opencode__horde_do", { goal: "delegate it" }), undefined)

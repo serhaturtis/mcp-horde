@@ -2,8 +2,9 @@
 //   SessionStart / SubagentStart: what the horde does and what it suits, as facts; the docs warn
 //     that hook text framed as commands can trip prompt-injection defenses.
 //   PostToolUse: once per piece — a commit starts the next — when an agent has edited EDITS_BEFORE_NOTE
-//     files by hand without delegating (Edit/Write paths, or files git reports changed after a Bash
-//     call), a note next to that edit: the work has turned out bigger than a quick change.
+//     files by hand without delegating (Edit/Write paths inside the repository, or files git reports
+//     changed after a Bash call), a note next to that edit: the work has turned out bigger than a
+//     quick change.
 import { execFileSync } from "node:child_process"
 import fs from "node:fs"
 import os from "node:os"
@@ -43,8 +44,9 @@ function subagentStart(input) {
 }
 
 /**
- * The repository HEAD in cwd and a function returning the absolute paths git reports changed there.
- * Undefined when cwd is missing; a git call that fails leaves HEAD undefined, so it never resets a piece.
+ * The repository HEAD in cwd, its worktree root, and a function returning the absolute paths git
+ * reports changed there. Undefined when cwd is missing; a git call that fails leaves HEAD undefined,
+ * so it never resets a piece.
  */
 function gitState(cwd) {
   if (!cwd) return undefined
@@ -60,18 +62,29 @@ function gitState(cwd) {
   try {
     head = git("rev-parse", "HEAD").trim()
   } catch {}
+  let top
+  function root() {
+    if (top === undefined) {
+      try {
+        top = git("rev-parse", "--show-toplevel").trim()
+      } catch {
+        top = cwd
+      }
+    }
+    return top
+  }
   let changed
   function files() {
     if (changed) return changed
     try {
-      const root = git("rev-parse", "--show-toplevel").trim()
+      const dir = root()
       const entries = git("status", "--porcelain", "-z", "--untracked-files=all").split("\0")
       changed = []
       // A rename or copy is followed by its previous path, which is not a changed file.
       for (let i = 0; i < entries.length; i++) {
         const entry = entries[i]
         if (!entry) continue
-        changed.push(path.resolve(root, entry.slice(3)))
+        changed.push(path.resolve(dir, entry.slice(3)))
         if (entry.startsWith("R") || entry.startsWith("C")) i++
       }
     } catch {
@@ -79,7 +92,23 @@ function gitState(cwd) {
     }
     return changed
   }
-  return { head, files }
+  return { head, root, files }
+}
+
+/** The resolved path, through symlinks when the file exists. */
+function realPath(file) {
+  try {
+    return fs.realpathSync(file)
+  } catch {
+    return path.resolve(file)
+  }
+}
+
+/** Whether a path lies in the git worktree that contains cwd; every path counts when cwd is absent. */
+function inRepository(file, git) {
+  if (!git) return true
+  const rel = path.relative(realPath(git.root()), realPath(file))
+  return rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel)
 }
 
 /** Counts the files edited since the current piece began; a horde_do call means the agent is delegating already. */
@@ -113,7 +142,7 @@ function postToolUse(input) {
   const changed = isBash && git ? git.files() : []
   const candidates = isBash
     ? changed.filter((f) => !state.baseline.includes(f))
-    : [input.tool_input?.file_path ?? input.tool_input?.notebook_path].filter(Boolean)
+    : [input.tool_input?.file_path ?? input.tool_input?.notebook_path].filter((f) => f && inRepository(f, git))
   let note
   if (/horde_do$/.test(input.tool_name ?? "")) state.delegated = true
   else {
