@@ -78,10 +78,16 @@ const CHILD_SCAN_MS = 30_000
 const CHILD_COOL_MS = 60_000
 /** Any single OpenCode request a refresh, a tick or a wait makes gets this long. */
 const REQUEST_MS = 30_000
+/** A request's own abort gets this much grace before we give up on it locally. */
+const REQUEST_GRACE_MS = 5_000
+/** Directory-scoped calls (create, location, prompt) may need this long in a directory OpenCode has not opened yet. */
+const LONG_REQUEST_MS = 120_000
 /** A gate review of a large diff against many criteria gets this long per answer (the ask default is 5 min). */
 export const GATE_REVIEW_TIMEOUT_MS = 600_000
 /** A whole background tick (all due refreshes) gets this long before the next may start. */
 const TICK_MS = 120_000
+/** A single agent refresh gets this long; an abandoned run must not publish over a newer one. */
+const REFRESH_MS = 120_000
 /** How often the owner's heartbeat is written into its records. */
 const HEARTBEAT_MS = 30_000
 
@@ -258,6 +264,8 @@ interface Live {
   settledAt: number
   /** Bumped on every prompt we send; refreshes started before it do not publish state. */
   gen: number
+  /** Bumped on every refresh run; an abandoned run must not publish over a newer one. */
+  run: number
   /**
    * A prompt we sent (its message id) that the conversation does not show yet. Until it
    * does, the previous (settled) turn would look current.
@@ -293,11 +301,13 @@ interface Live {
   activity?: { key: string; write: Promise<void> }
 }
 
-/** The answer of a request, or an error that names what failed. */
-async function req<T>(what: string, p: Promise<T>): Promise<T> {
+/** The answer of a request, or an error that names what failed. Settles within a local deadline whatever the SDK does. */
+async function req<T>(what: string, p: Promise<T>, ms = REQUEST_MS + REQUEST_GRACE_MS): Promise<T> {
   try {
-    return await p
+    return await within(p, ms, what)
   } catch (err) {
+    // A local deadline already names the request; anything else is named once here.
+    if ((err as Error).message === `${what} did not finish within ${Math.round(ms / 1000)}s`) throw err
     throw new Error(`${what} failed: ${(err as Error).message || String(err)}`, { cause: err })
   }
 }
@@ -615,8 +625,8 @@ export class Fleet {
   /** Rules saved by "always" answers for the project containing `directory`. */
   async savedPermissions(directory?: string): Promise<{ project: string; rules: PermissionSavedInfo[] }> {
     const dir = this.resolveDir(directory)
-    const loc = await req("locating the project", this.api.location.get({ location: { directory: dir } }))
-    const rules = await req("listing saved permissions", this.api.permission.saved.list({ projectID: loc.project.id }))
+    const loc = await req("locating the project", this.api.location.get({ location: { directory: dir } }, timed(LONG_REQUEST_MS)), LONG_REQUEST_MS)
+    const rules = await req("listing saved permissions", this.api.permission.saved.list({ projectID: loc.project.id }, timed()))
     return { project: loc.project.directory, rules }
   }
 
@@ -624,7 +634,7 @@ export class Fleet {
     const { rules } = await this.savedPermissions(directory)
     const rule = rules.find((r) => r.id === id)
     if (!rule) throw new Error(`no saved permission ${id} for this project${rules.length ? `; saved: ${rules.map((r) => r.id).join(", ")}` : ""}`)
-    await req("removing the saved permission", this.api.permission.saved.remove({ id }))
+    await req("removing the saved permission", this.api.permission.saved.remove({ id }, timed()))
     return rule
   }
 
@@ -632,7 +642,7 @@ export class Fleet {
     const dir = this.resolveDir(directory)
     let agents: AgentInfo[] = []
     for (let i = 0; i < 20; i++) {
-      agents = (await req("listing agents", this.api.agent.list({ location: { directory: dir } }))).data
+      agents = (await req("listing agents", this.api.agent.list({ location: { directory: dir } }, timed()))).data
       if (agents.length) break
       await sleep(250)
     }
@@ -1084,13 +1094,17 @@ export class Fleet {
       const profile = input.scope ? withScope(input.profile ?? {}, input.scope) : input.profile
       const session = await req(
         "creating session",
-        this.api.session.create({
-          location: { directory },
-          title: `horde: ${name}`,
-          ...(model ? { model } : {}),
-          ...(input.agent ? { agent: input.agent } : {}),
-          ...(profile ? { permissions: profileRules(profile) } : {}),
-        }),
+        this.api.session.create(
+          {
+            location: { directory },
+            title: `horde: ${name}`,
+            ...(model ? { model } : {}),
+            ...(input.agent ? { agent: input.agent } : {}),
+            ...(profile ? { permissions: profileRules(profile) } : {}),
+          },
+          timed(LONG_REQUEST_MS),
+        ),
+        LONG_REQUEST_MS,
       )
       sessionId = session.id
       const steps = [input.limits?.maxSteps, profile?.steps].filter((n): n is number => !!n)
@@ -1137,7 +1151,7 @@ export class Fleet {
       if (!prompted) {
         if (sessionId) {
           this.forget(sessionId)
-          await this.api.session.remove({ sessionID: sessionId }).catch(() => undefined)
+          await within(this.api.session.remove({ sessionID: sessionId }), REQUEST_MS + REQUEST_GRACE_MS, "removing the session").catch(() => undefined)
         }
         if (worktree) await removeWorktree(worktree, name, true).catch(() => undefined)
       }
@@ -1193,11 +1207,11 @@ export class Fleet {
             : undefined
         if (!model) throw new Error("variant requires model: the agent's model is not known yet; pass model too")
         await this.validateModel(model, directory)
-        await req("switching model", this.api.session.switchModel({ sessionID: id, model }))
+        await req("switching model", this.api.session.switchModel({ sessionID: id, model }, timed()))
       }
       if (opts.agent) {
         await this.validateAgent(opts.agent, directory)
-        await req("switching agent", this.api.session.switchAgent({ sessionID: id, agent: opts.agent }))
+        await req("switching agent", this.api.session.switchAgent({ sessionID: id, agent: opts.agent }, timed()))
       }
       const patch: Partial<AgentRecord> = {}
       if (opts.permissions) {
@@ -1228,12 +1242,16 @@ export class Fleet {
     try {
       sent = await req(
         "sending prompt",
-        this.api.session.prompt({
-          sessionID: live.record.id,
-          text: body,
-          ...(prepared.files.length ? { files: prepared.files } : {}),
-          delivery: delivery ?? "steer",
-        }),
+        this.api.session.prompt(
+          {
+            sessionID: live.record.id,
+            text: body,
+            ...(prepared.files.length ? { files: prepared.files } : {}),
+            delivery: delivery ?? "steer",
+          },
+          timed(LONG_REQUEST_MS),
+        ),
+        LONG_REQUEST_MS,
       )
     } finally {
       live.sending--
@@ -1277,7 +1295,11 @@ export class Fleet {
 
   private async interruptNow(live: Live, reason: string) {
     const tree = [live.record.id, ...live.children]
-    await Promise.all(tree.map((sid) => this.api.session.interrupt({ sessionID: sid }, timed()).catch(() => undefined)))
+    await Promise.all(
+      tree.map((sid) =>
+        within(this.api.session.interrupt({ sessionID: sid }, timed()), REQUEST_MS + REQUEST_GRACE_MS, "interrupting the session").catch(() => undefined),
+      ),
+    )
     this.updateRecord(live.record.id, { interruptedSeq: live.track.seq, pauseAfterStep: undefined, stopReason: reason })
     // A prompt we sent that history does not show yet escaped this interrupt: stop its turn when it shows up.
     if (live.sent) live.stopSent = { gen: live.gen, at: Date.now() }
@@ -1323,11 +1345,14 @@ export class Fleet {
   }
 
   private async replyPermission(p: PermissionRequest, decision: "once" | "always" | "reject", message?: string) {
-    await req("replying to permission", this.api.permission.reply({ sessionID: p.sessionID, requestID: p.id, decision, ...(message ? { message } : {}) }))
+    await req(
+      "replying to permission",
+      this.api.permission.reply({ sessionID: p.sessionID, requestID: p.id, decision, ...(message ? { message } : {}) }, timed()),
+    )
   }
 
   private async answerQuestion(q: FormInfo, answer: FormAnswer) {
-    await req("answering question", this.api.session.form.reply({ sessionID: q.sessionID, formID: q.id, answer }))
+    await req("answering question", this.api.session.form.reply({ sessionID: q.sessionID, formID: q.id, answer }, timed()))
   }
 
   /** Cancelling a question halts the agent in OpenCode, so "dismiss" answers it instead. */
@@ -1336,7 +1361,7 @@ export class Fleet {
   }
 
   private async rejectQuestion(q: FormInfo) {
-    await req("rejecting question", this.api.session.form.cancel({ sessionID: q.sessionID, formID: q.id }))
+    await req("rejecting question", this.api.session.form.cancel({ sessionID: q.sessionID, formID: q.id }, timed()))
   }
 
   async dispose(ref: string, opts: { worktree?: "keep" | "remove" | "discard"; deleteSession?: boolean }): Promise<string> {
@@ -1373,7 +1398,7 @@ export class Fleet {
     if (opts.deleteSession) {
       // First, while its directory still exists: OpenCode opens the session's
       // directory to serve the request. Deleting removes the session and its children.
-      const err = await this.api.session.remove({ sessionID: id }).then(
+      const err = await within(this.api.session.remove({ sessionID: id }), REQUEST_MS + REQUEST_GRACE_MS, "removing the session").then(
         () => undefined,
         (e: Error) => e,
       )
@@ -1390,7 +1415,10 @@ export class Fleet {
         // Stop tracking first: our own refreshes would make OpenCode reopen the directory.
         this.forget(id)
         // Let OpenCode release the directory (again before each retry) before it disappears.
-        const release = () => this.api.debug.location.evict({ location: { directory: wt.path } }).catch(() => undefined)
+        const release = () =>
+          within(this.api.debug.location.evict({ location: { directory: wt.path } }), REQUEST_MS + REQUEST_GRACE_MS, "evicting the location").catch(
+            () => undefined,
+          )
         notes.push(await removeWorktree(wt, name, mode === "discard", release))
         // Its check logs go too: nothing reads them once the worktree is gone.
         for (const dir of new Set([wt.path, wt.root])) await fs.rm(logDirFor(path.join(verifyStateDir(), "logs"), dir), { recursive: true, force: true })
@@ -1668,7 +1696,7 @@ export class Fleet {
     const scope: Scope = { paths, outside: live.record.scope?.outside ?? "deny" }
     const session = await this.session(id)
     const kept = (session.permissions ?? []).filter((r) => r.action !== "edit")
-    await req("updating the agent's rules", this.api.session.update({ sessionID: id, permissions: [...kept, ...profileRules(withScope({}, scope))] }))
+    await req("updating the agent's rules", this.api.session.update({ sessionID: id, permissions: [...kept, ...profileRules(withScope({}, scope))] }, timed()))
     this.updateRecord(id, { scope, ...(live.record.gate ? { gate: { ...live.record.gate, allowed: scopeGlobs(paths) } } : {}) })
     const task = live.record.task
     if (task) await (await Board.open(live.record.worktree?.repo ?? live.record.directory)).edit(task.id, { scope: paths })
@@ -1751,7 +1779,7 @@ export class Fleet {
   // --------------------------------------------------------------- reading
 
   async session(id: string): Promise<SessionInfo> {
-    return req(`loading session ${id}`, this.api.session.get({ sessionID: id }))
+    return req(`loading session ${id}`, this.api.session.get({ sessionID: id }, timed()))
   }
 
   /** Wait for the agent's loop to wind down. False when it is still active at the deadline. */
@@ -1790,7 +1818,8 @@ export class Fleet {
   }
 
   private runRefresh(live: Live, active?: Set<string>): Promise<void> {
-    const run = this.doRefresh(live, active).finally(() => {
+    live.run++
+    const run = within(this.doRefresh(live, active), REFRESH_MS, "refreshing the agent").finally(() => {
       if (live.running === run) live.running = undefined
     })
     live.running = run
@@ -1800,23 +1829,29 @@ export class Fleet {
   private async doRefresh(live: Live, activeIn?: Set<string>) {
     const id = live.record.id
     const gen = live.gen
+    const token = live.run
     const before = live.state
+    let session: SessionInfo
     try {
-      live.session = await this.api.session.get({ sessionID: id }, timed())
+      session = await req(`loading session ${id}`, this.api.session.get({ sessionID: id }, timed()))
     } catch (err) {
-      if (!isNotFound(err)) throw new Error(`loading session ${id} failed: ${(err as Error).message}`, { cause: err })
+      if (!isNotFound((err as Error).cause)) throw err
       this.forget(id)
       const wt = live.record.worktree
       throw new Error(
         `session ${id} no longer exists on the OpenCode server (deleted?); stopped tracking it${wt ? `. Its worktree is left as it was: ${wt.path} (branch ${wt.branch} in ${wt.repo}); merge or remove it with git` : ""}`,
       )
     }
+    if (live.run !== token || this.closed) return
+    live.session = session
 
     // The conversation since its last settled turn.
     const replaying = !live.loaded
     const turnsBefore = live.track.turns.length ? currentTurn(live.track)!.startSeq : -1
     const seqBefore = live.track.seq
-    live.track = await this.readHistory(id, live.track, live.session.location.directory)
+    const track = await this.readHistory(id, live.track, live.session.location.directory)
+    if (live.run !== token || this.closed) return
+    live.track = track
     // Grace windows run on local receive times, so a skewed server clock cannot shorten or stretch them.
     const seenAt = Date.now()
     if (live.track.seq !== seqBefore || replaying) live.lastNewEventAt = seenAt
@@ -1831,25 +1866,30 @@ export class Fleet {
     if (live.record.directory !== live.session.location.directory) this.updateRecord(id, { directory: live.session.location.directory })
 
     const active = activeIn ?? (await this.activeSet())
+    if (live.run !== token || this.closed) return
     const now = Date.now()
     for (const c of live.children) if (active.has(c)) live.hotChildren.set(c, now)
     if (now - live.lastChildScan > CHILD_SCAN_MS && this.working(live)) await this.scanChildren(live).catch(() => undefined)
+    if (live.run !== token || this.closed) return
     for (const [c, at] of live.hotChildren) if (now - at > CHILD_COOL_MS && !active.has(c)) live.hotChildren.delete(c)
     // Child histories (for cost limits) and requests, only for children with recent activity.
     const hot = [...live.hotChildren.keys()]
     for (const c of hot) {
       const t = live.childTracks.get(c) ?? emptyTrack()
-      live.childTracks.set(c, await this.readHistory(c, t, live.session.location.directory).catch(() => t))
+      const childTrack = await this.readHistory(c, t, live.session.location.directory).catch(() => t)
+      if (live.run !== token || this.closed) return
+      live.childTracks.set(c, childTrack)
     }
     const tree = [id, ...hot]
     const [perms, questions] = await Promise.all([
       Promise.all(tree.map((sid) => req("listing permissions", this.api.permission.list({ sessionID: sid }, timed())))),
       Promise.all(tree.map((sid) => req("listing questions", this.api.session.form.list({ sessionID: sid }, timed())))),
     ])
-    if (this.closed) return
+    if (live.run !== token || this.closed) return
     live.pending = { permissions: perms.flat(), questions: questions.flat() }
     this.pruneRequestSets(live)
     await this.approveTrusted(live)
+    if (live.run !== token || this.closed) return
 
     // A prompt that escaped an interrupt (sent, not yet in history) has shown up: its turn is stopped too.
     const stop = live.stopSent
@@ -1871,14 +1911,21 @@ export class Fleet {
     else if (live.record.pauseAfterStep && !live.track.stepOpen && !live.track.openTools.size && live.gen === gen) {
       // Between steps (seen by polling, without the event stream): this is the pause point.
       await this.interruptNow(live, live.record.stopReason ?? "paused after step")
+      if (live.run !== token || this.closed) return
     }
     // Interrupting before the loop picked up the prompt is a no-op in OpenCode, so
     // the turn may start afterwards: stop it again once it does.
     const marker = live.record.interruptedSeq
     const cur = currentTurn(live.track)
     if (marker !== undefined && cur && live.track.inLoop && cur.startSeq > marker && cur.admittedSeq <= marker && live.gen === gen) {
-      await Promise.all([id, ...live.hotChildren.keys()].map((sid) => this.api.session.interrupt({ sessionID: sid }, timed()).catch(() => undefined)))
+      await Promise.all(
+        [id, ...live.hotChildren.keys()].map((sid) =>
+          within(this.api.session.interrupt({ sessionID: sid }, timed()), REQUEST_MS + REQUEST_GRACE_MS, "interrupting the session").catch(() => undefined),
+        ),
+      )
+      if (live.run !== token || this.closed) return
     }
+    if (live.run !== token || this.closed) return
     live.lastRefresh = Date.now()
     // A prompt was sent while we were reading: our view predates it.
     if (live.gen !== gen || this.closed) return
@@ -1887,7 +1934,9 @@ export class Fleet {
     live.state = state
     live.error = error
     await this.applyPolicies(live)
+    if (live.run !== token || this.closed) return
     if (live.state === "running" && live.gen === gen) await this.enforceLimits(live)
+    if (live.run !== token || this.closed) return
 
     if (SETTLED.has(live.state) && before !== undefined && !SETTLED.has(before)) {
       live.liveText = ""
@@ -2461,7 +2510,7 @@ export class Fleet {
     if (live.state === "running" || live.state === "needs_input")
       throw new Error(`${live.record.name ?? live.record.id} is ${live.state}; compact it once it is idle (opencode_wait, or opencode_interrupt first)`)
     return this.withoutGate(live, async () => {
-      const queued = await req("compacting the session", this.api.session.compact({ sessionID: live.record.id }))
+      const queued = await req("compacting the session", this.api.session.compact({ sessionID: live.record.id }, timed()))
       // The summary is written by the model; wait for it to land (its message keeps the request's id).
       const deadline = Date.now() + 120_000
       while (Date.now() < deadline) {
@@ -2533,8 +2582,8 @@ export class Fleet {
       await sleep(250)
       messages = await conversation()
     }
-    const staged = await req("staging the revert", this.api.session.revert.stage({ sessionID, messageID: from, files: true }))
-    await req("committing the revert", this.api.session.revert.commit({ sessionID }))
+    const staged = await req("staging the revert", this.api.session.revert.stage({ sessionID, messageID: from, files: true }, timed()))
+    await req("committing the revert", this.api.session.revert.commit({ sessionID }, timed()))
     await this.refresh(live)
     // The gate judged work that no longer exists, and what is left was judged before: the
     // current turn is not gated again; the agent's next turn is.
@@ -2572,7 +2621,9 @@ export class Fleet {
       const dir = this.resolveDir(opts.directory)
       const real = await fs.realpath(dir).catch(() => dir)
       const lists = await Promise.all(
-        [...new Set([dir, real])].map((directory) => req("listing sessions", this.api.session.list({ directory, limit: opts.limit ?? 20, order: "desc" }))),
+        [...new Set([dir, real])].map((directory) =>
+          req("listing sessions", this.api.session.list({ directory, limit: opts.limit ?? 20, order: "desc" }, timed())),
+        ),
       )
       const owned = new Set(this.store.agents(this.serverKey).map((r) => r.id))
       const seen = new Set<string>()
@@ -2600,7 +2651,7 @@ export class Fleet {
     let cursor: string | undefined
     for (let page = 0; page < 200; page++) {
       // The cursor already encodes the order.
-      const res = await req("loading messages", this.api.message.list({ sessionID: id, limit: 100, ...(cursor ? { cursor } : { order: "desc" }) }))
+      const res = await req("loading messages", this.api.message.list({ sessionID: id, limit: 100, ...(cursor ? { cursor } : { order: "desc" }) }, timed()))
       let done = false
       for (const m of res.data) {
         if (since !== undefined && m.time.created < since) {
@@ -2876,6 +2927,7 @@ export class Fleet {
       handedToCaller: new Set(),
       settledAt: 0,
       gen: 0,
+      run: 0,
       turnSeen: new Map(),
       sending: 0,
       holdGate: 0,
@@ -2994,7 +3046,7 @@ export class Fleet {
     const root = this.childToRoot.get(ref)
     if (root && this.live.has(root)) return this.live.get(root)!
     if (this.gone.has(ref)) throw new Error(`session ${ref} was disposed or deleted; it is no longer tracked`)
-    const session = await this.api.session.get({ sessionID: ref }).catch((err: unknown) => {
+    const session = await within(this.api.session.get({ sessionID: ref }), REQUEST_MS + REQUEST_GRACE_MS, `loading session ${ref}`).catch((err: unknown) => {
       throw new Error(isNotFound(err) ? `session ${ref} does not exist on this OpenCode server` : `loading session ${ref} failed: ${(err as Error).message}`)
     })
     // A subagent's session belongs to its root agent.

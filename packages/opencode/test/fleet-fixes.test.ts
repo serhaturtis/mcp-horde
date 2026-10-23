@@ -3,14 +3,14 @@ import { EventEmitter } from "node:events"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { after, before, describe, test } from "node:test"
+import { after, before, describe, mock as mockTimers, test } from "node:test"
 import { Board } from "@mcp-horde/board"
 import type { Backend } from "../src/backend.js"
 import type { Config } from "../src/config.js"
 import { Fleet, GATE_REVIEW_TIMEOUT_MS, type Hooks, type Snapshot, scopeGlobs } from "../src/fleet.js"
 import { outcome } from "../src/horde.js"
 import { type AgentRecord, OWNER_STALE_MS, ownerAlive, SELF, Store } from "../src/state.js"
-import { emptyTrack } from "../src/tracker.js"
+import { emptyTrack, type Track } from "../src/tracker.js"
 import { connect, git, type Harness, isolatedEnv, type Mock, makeRepo, until } from "./harness.js"
 import { startMockLlm } from "./mock-llm.js"
 
@@ -600,6 +600,176 @@ describe("fleet fixes: outcomes after a wait", () => {
       else process.env.HORDE_BOARD_STATE_DIR = boardState
       fleet.close()
       fs.rmSync(tmp, { recursive: true, force: true })
+    }
+  })
+})
+
+describe("fleet fixes: request and refresh deadlines", () => {
+  // Drains the microtask queue (setImmediate is not mocked, so it runs after pending microtasks).
+  const flush = () => new Promise<void>((resolve) => setImmediate(resolve))
+
+  const configFor = (tmp: string): Config => ({
+    username: "opencode",
+    allowInsecure: false,
+    serverMode: "shared",
+    bin: "opencode",
+    directory: tmp,
+    defaultPermissions: "ask",
+    maxRunning: 0,
+    maxRunningFrom: "test",
+    stateDir: path.join(tmp, "state"),
+    worktreeDir: path.join(tmp, "worktrees"),
+    channel: false,
+    elicitTimeoutMs: 600_000,
+  })
+
+  const hooksFor = (): Hooks => ({
+    canElicit: () => false,
+    askPermission: async () => undefined,
+    askQuestion: async () => undefined,
+    settled: () => {},
+  })
+
+  const backendFor = (client: unknown): Backend =>
+    ({
+      client,
+      info: { key: "local" },
+      events: new EventEmitter(),
+      streaming: false,
+      dead: true,
+    }) as unknown as Backend
+
+  test("a request whose promise never settles rejects at the bound, naming it once", async (t) => {
+    mockTimers.timers.enable({ apis: ["setTimeout"] })
+    t.after(() => mockTimers.timers.reset())
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "horde-req-"))
+    const store = new Store(tmp)
+    const backend = backendFor({ session: { get: () => new Promise(() => {}) } })
+    const fleet = new Fleet(backend, configFor(tmp), store, hooksFor())
+    try {
+      const p = fleet.session("ses_x")
+      mockTimers.timers.tick(35_000)
+      await assert.rejects(p, { message: "loading session ses_x did not finish within 35s" })
+    } finally {
+      fleet.close()
+    }
+  })
+
+  test("a refresh that never settles rejects at REFRESH_MS and the next one starts a new run", async (t) => {
+    mockTimers.timers.enable({ apis: ["setTimeout"] })
+    t.after(() => mockTimers.timers.reset())
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "horde-refresh-"))
+    const store = new Store(tmp)
+    store.put({
+      id: "ses_x",
+      server: "local",
+      directory: tmp,
+      policy: "ask",
+      questions: "ask",
+      limits: {},
+      createdAt: 0,
+      reportedSeq: 0,
+      owner: SELF,
+      ownerSeen: Date.now(),
+    })
+    const fleet = new Fleet(backendFor({}), configFor(tmp), store, hooksFor())
+    try {
+      let calls = 0
+      const fleetAny = fleet as unknown as {
+        doRefresh: () => Promise<void>
+        live: Map<string, { running?: Promise<void> }>
+      }
+      fleetAny.doRefresh = () => {
+        calls++
+        return calls === 1 ? new Promise(() => {}) : Promise.resolve()
+      }
+      const first = fleet.snapshot("ses_x")
+      await flush()
+      assert.equal(calls, 1)
+      mockTimers.timers.tick(120_000)
+      await assert.rejects(first, { message: "refreshing the agent did not finish within 120s" })
+      assert.equal(fleetAny.live.get("ses_x")?.running, undefined)
+      const second = fleet.snapshot("ses_x")
+      await flush()
+      assert.equal(calls, 2)
+      await second
+    } finally {
+      fleet.close()
+    }
+  })
+
+  test("an abandoned refresh publishes nothing when its hung readHistory later resolves", async (t) => {
+    mockTimers.timers.enable({ apis: ["setTimeout"] })
+    t.after(() => mockTimers.timers.reset())
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "horde-abandon-"))
+    const store = new Store(tmp)
+    store.put({
+      id: "ses_x",
+      server: "local",
+      directory: tmp,
+      policy: "ask",
+      questions: "ask",
+      limits: {},
+      createdAt: 0,
+      reportedSeq: 0,
+      owner: SELF,
+      ownerSeen: Date.now(),
+    })
+    const fleet = new Fleet(
+      backendFor({
+        session: {
+          get: async () => ({ id: "ses_x", location: { directory: tmp }, title: "" }),
+          active: async () => ({}),
+          list: async () => ({ data: [] }),
+          form: { list: async () => [] },
+        },
+        permission: { list: async () => [] },
+      }),
+      configFor(tmp),
+      store,
+      hooksFor(),
+    )
+    try {
+      let calls = 0
+      let resolveFirst!: (track: Track) => void
+      const first = new Promise<Track>((resolve) => {
+        resolveFirst = resolve
+      })
+      const fleetAny = fleet as unknown as {
+        readHistory: (id: string, track: Track, dir: string) => Promise<Track>
+        live: Map<string, { track: Track; state?: string; lastRefresh: number }>
+      }
+      fleetAny.readHistory = (_id, _track) => {
+        calls++
+        return calls === 1 ? first : Promise.resolve(emptyTrack())
+      }
+
+      const firstSnap = fleet.snapshot("ses_x")
+      await flush()
+      assert.equal(calls, 1)
+      mockTimers.timers.tick(120_000)
+      await assert.rejects(firstSnap, { message: "refreshing the agent did not finish within 120s" })
+
+      // A later refresh completes and becomes the current run.
+      const secondSnap = fleet.snapshot("ses_x")
+      await secondSnap
+      assert.equal(calls, 2)
+      const live = fleetAny.live.get("ses_x")!
+      const trackAfter = live.track
+      const stateAfter = live.state
+      const lastRefreshAfter = live.lastRefresh
+      assert.equal(stateAfter, "idle")
+      assert.ok(lastRefreshAfter > 0)
+
+      // The abandoned run's hung readHistory finally resolves: it must not publish over the later refresh.
+      resolveFirst(emptyTrack())
+      await flush()
+
+      assert.equal(live.track, trackAfter)
+      assert.equal(live.state, stateAfter)
+      assert.equal(live.lastRefresh, lastRefreshAfter)
+    } finally {
+      fleet.close()
     }
   })
 })
