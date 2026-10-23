@@ -8,7 +8,9 @@ import { Board } from "@mcp-horde/board"
 import type { Backend } from "../src/backend.js"
 import type { Config } from "../src/config.js"
 import { Fleet, GATE_REVIEW_TIMEOUT_MS, type Hooks, type Snapshot, scopeGlobs } from "../src/fleet.js"
+import { outcome } from "../src/horde.js"
 import { type AgentRecord, OWNER_STALE_MS, ownerAlive, SELF, Store } from "../src/state.js"
+import { emptyTrack } from "../src/tracker.js"
 import { connect, git, type Harness, isolatedEnv, type Mock, makeRepo, until } from "./harness.js"
 import { startMockLlm } from "./mock-llm.js"
 
@@ -509,6 +511,95 @@ describe("fleet fixes: a brief OpenCode stall is absorbed by the wait", () => {
       assert.deepEqual([...result.errors], [])
     } finally {
       fleet.close()
+    }
+  })
+})
+
+describe("fleet fixes: outcomes after a wait", () => {
+  test("outcome renders the wait's in-memory state without refreshing or re-reading the agent", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "horde-outcome-"))
+    const store = new Store(tmp)
+    const backend = {
+      client: {},
+      info: { key: "local" },
+      events: new EventEmitter(),
+      streaming: false,
+      dead: true,
+    } as unknown as Backend
+    const config: Config = {
+      username: "opencode",
+      allowInsecure: false,
+      serverMode: "shared",
+      bin: "opencode",
+      directory: tmp,
+      defaultPermissions: "ask",
+      maxRunning: 0,
+      maxRunningFrom: "test",
+      stateDir: path.join(tmp, "state"),
+      worktreeDir: path.join(tmp, "worktrees"),
+      channel: false,
+      elicitTimeoutMs: 600_000,
+    }
+    const hooks: Hooks = {
+      canElicit: () => false,
+      askPermission: async () => undefined,
+      askQuestion: async () => undefined,
+      settled: () => {},
+    }
+    const fleet = new Fleet(backend, config, store, hooks)
+    const boardState = process.env.HORDE_BOARD_STATE_DIR
+    process.env.HORDE_BOARD_STATE_DIR = path.join(tmp, "board-state")
+    try {
+      const live = {
+        record: {
+          id: "ses_live",
+          server: "local",
+          directory: tmp,
+          policy: "ask",
+          questions: "ask",
+          limits: {},
+          createdAt: Date.now(),
+          reportedSeq: 0,
+          owner: SELF,
+          ownerSeen: Date.now(),
+        },
+        track: emptyTrack(),
+        loaded: true,
+        state: "running",
+        pending: { permissions: [], questions: [] },
+        children: new Set<string>(),
+        childTracks: new Map(),
+        hotChildren: new Map(),
+        liveText: "",
+        handled: new Set<string>(),
+        dialogs: new Map(),
+      }
+      let refreshes = 0
+      let snapshots = 0
+      const fleetAny = fleet as unknown as {
+        get: (ref: string) => Promise<unknown>
+        refresh: (live: unknown) => Promise<never>
+        snapshot: (ref: string) => Promise<never>
+      }
+      fleetAny.get = async () => live
+      fleetAny.refresh = async () => {
+        refreshes++
+        throw new Error("outcome must not refresh")
+      }
+      fleetAny.snapshot = async () => {
+        snapshots++
+        throw new Error("outcome must not re-read the agent")
+      }
+
+      const text = await outcome(fleet, "ses_live", { live: true })
+      assert.match(text, /^ses_live working · .* · starting$/)
+      assert.equal(refreshes, 0)
+      assert.equal(snapshots, 0)
+    } finally {
+      if (boardState === undefined) delete process.env.HORDE_BOARD_STATE_DIR
+      else process.env.HORDE_BOARD_STATE_DIR = boardState
+      fleet.close()
+      fs.rmSync(tmp, { recursive: true, force: true })
     }
   })
 })

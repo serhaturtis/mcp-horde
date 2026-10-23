@@ -290,6 +290,7 @@ export function registerTools(server: McpServer, ctx: Context) {
   registerHorde((name, description, shape, run) => tool(name, description, shape, run, {}, { alwaysLoad: true }), {
     waitSeconds: () => defaultWait(ctx),
     progress: (extra) => progress(extra as Extra),
+    progressMessage: (extra) => progressMessage(extra as Extra),
   })
 
   tool(

@@ -1708,9 +1708,10 @@ export class Fleet {
   }
 
   /** What an outcome reports beyond the snapshot: the record (worktree, task, gate verdict) and edits refused outside the scope. */
-  async inspect(ref: string): Promise<{ snapshot: Snapshot; record: AgentRecord; refused: string[] }> {
+  async inspect(ref: string, opts: { live?: boolean } = {}): Promise<{ snapshot: Snapshot; record: AgentRecord; refused: string[] }> {
     const live = await this.get(ref)
-    const snapshot = await this.snapshot(live.record.id)
+    // A wait has just read its agents: use that state, so a slow re-read cannot hold its outcome back.
+    const snapshot = opts.live ? this.build(live) : await this.snapshot(live.record.id)
     const refused = new Set<string>()
     for (const m of live.track.messages) {
       if (m.type !== "assistant") continue

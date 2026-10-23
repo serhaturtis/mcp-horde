@@ -24,6 +24,8 @@ export interface HordeOptions {
   waitSeconds: () => number
   /** Progress notifications while a wait blocks, when the client asked for them. */
   progress: (extra: unknown) => ((snaps: Snapshot[], elapsedMs: number) => void) | undefined
+  /** Progress notifications for long single operations, when the client asked for them. */
+  progressMessage: (extra: unknown) => ((message: string) => void) | undefined
 }
 
 // Instructions explain the tools, without superiority claims or "reach for it first", which make
@@ -88,7 +90,7 @@ const INVESTIGATE_RETRY_MS = 300_000
 export function registerHorde(tool: Tool, opts: HordeOptions) {
   tool(
     "horde_do",
-    "Hand a coding task to a cheaper worker model and get it back checked. Use it for any change you can state as a goal, done-criteria and the files it may change: a fix, a feature, tests, docs, a refactor, or several independent pieces at once (one call each; they run in parallel). Do it directly instead when it is a one- or two-line edit, a question, work you are still investigating, or something you would only sit waiting for. The worker does not see this conversation, so describe the task the way you would to a new colleague: goal (what and why), done (how you will know it is finished), scope (the files it may change). It gets its own git worktree with the project's dependencies, and code context from the repository; when it finishes, the project's tests, typecheck and lint run, a reviewer model checks each done-criterion against the diff, and failures go back to the worker to fix (2 rounds). Returns at once with the task id; call horde_wait for the outcome, or pass wait: true to block until it is done (like a subagent).",
+    "Hand a coding task to a cheaper worker model and get it back checked. Use it for any change you can state as a goal, done-criteria and the files it may change: a fix, a feature, tests, docs, a refactor, or several independent pieces at once (one call each; they run in parallel). Do it directly instead when it is a one- or two-line edit, a question, work you are still investigating, or something you would only sit waiting for. The worker does not see this conversation, so describe the task the way you would to a new colleague: goal (what and why), done (how you will know it is finished), scope (the files it may change). It gets its own git worktree with the project's dependencies, and code context from the repository; when it finishes, the project's tests, typecheck and lint run, a reviewer model checks each done-criterion against the diff, and failures go back to the worker to fix (2 rounds). Returns with the task id once the worker has started (a new worktree's setup, installing the project's dependencies, can take a minute or two first and reports progress); call horde_wait for the outcome, or pass wait: true to block until it is done (like a subagent).",
     {
       goal: z
         .string()
@@ -140,6 +142,7 @@ export function registerHorde(tool: Tool, opts: HordeOptions) {
           questions: "ask",
           gate: { review: true, ...(task.scope.length ? { allowed: task.scope } : {}) },
           signal: extra.mcpReq.signal,
+          onProgress: opts.progressMessage(extra),
         })
         .catch(async (err: Error) => {
           // Nothing started: the plan entry must not linger as an open task.
@@ -163,7 +166,7 @@ export function registerHorde(tool: Tool, opts: HordeOptions) {
 
   tool(
     "horde_investigate",
-    'Hand a read-only investigation to a cheaper worker model and get it back as a checked report. Use it for audits, code reviews, bug hunts and "how does X work" questions that produce no change: the worker reads, builds and runs code in its own git worktree (never committing), then answers with a JSON report of findings, each citing file:line and the command that produced it. The citations are checked mechanically (a file that does not exist, or a line past its end, is marked), and an answer that is not valid JSON is asked for again once before it fails. Returns at once with the task id; call horde_wait for the REPORT, or pass wait: true to block until it is done.',
+    "Hand a read-only investigation to a cheaper worker model and get it back as a checked report. Use it for audits, code reviews, bug hunts and \"how does X work\" questions that produce no change: the worker reads, builds and runs code in its own git worktree (never committing), then answers with a JSON report of findings, each citing file:line and the command that produced it. The citations are checked mechanically (a file that does not exist, or a line past its end, is marked), and an answer that is not valid JSON is asked for again once before it fails. Returns with the task id once the worker has started (a new worktree's setup, installing the project's dependencies, can take a minute or two first and reports progress); call horde_wait for the REPORT, or pass wait: true to block until it is done.",
     {
       question: z
         .string()
@@ -202,6 +205,7 @@ export function registerHorde(tool: Tool, opts: HordeOptions) {
           gate: false,
           investigate: true,
           signal: extra.mcpReq.signal,
+          onProgress: opts.progressMessage(extra),
         })
         .catch(async (err: Error) => {
           // Nothing started: the plan entry must not linger as an open task.
@@ -382,8 +386,9 @@ async function collect(fleet: Fleet, ids: string[], mode: "any" | "all", seconds
   const news = r.snapshots.filter((s) => r.news.has(s.id))
   const working = r.snapshots.filter((s) => !r.news.has(s.id) && !SETTLED.has(s.state))
   const parts: string[] = []
-  for (const s of news) parts.push(await outcome(fleet, s.id).catch((err: Error) => `${s.name ?? s.id}: could not read its outcome: ${err.message}`))
-  for (const s of working) parts.push(await outcome(fleet, s.id).catch(() => `${s.name ?? s.id} working`))
+  for (const s of news)
+    parts.push(await outcome(fleet, s.id, { live: true }).catch((err: Error) => `${s.name ?? s.id}: could not read its outcome: ${err.message}`))
+  for (const s of working) parts.push(await outcome(fleet, s.id, { live: true }).catch(() => `${s.name ?? s.id} working`))
   if (r.timedOut && !news.length) parts.unshift(`Nothing finished within ${seconds}s; the workers keep going (horde_wait again):`)
   else if (!news.length && r.nothingToWaitFor && !r.errors.length) parts.unshift("Nothing new: every outcome was already reported.")
   if (r.errors.length) parts.push(`Could not read: ${r.errors.join("; ")}`)
@@ -391,8 +396,8 @@ async function collect(fleet: Fleet, ids: string[], mode: "any" | "all", seconds
 }
 
 /** A task's outcome as a compact block that ends with the calls that make sense next. */
-export async function outcome(fleet: Fleet, ref: string): Promise<string> {
-  const { snapshot: s, record, refused } = await fleet.inspect(ref)
+export async function outcome(fleet: Fleet, ref: string, opts: { live?: boolean } = {}): Promise<string> {
+  const { snapshot: s, record, refused } = await fleet.inspect(ref, opts)
   const wt = record.worktree
   const repo = wt?.repo ?? record.directory
   const board = await Board.open(repo).catch(() => undefined)
