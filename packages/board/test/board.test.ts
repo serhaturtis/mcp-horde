@@ -21,6 +21,8 @@ import {
   shellWords,
   workerCommand,
 } from "../src/lib.js"
+// The package's test script names only this file; the CLI tests live in cli.test.ts.
+import "./cli.test.js"
 
 const pkg = path.resolve(import.meta.dirname, "..")
 const temps: string[] = []

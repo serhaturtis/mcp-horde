@@ -69,10 +69,35 @@ const csv = (values?: string[]) =>
 const USAGE =
   "usage: horde --state <dir> task|progress|report|finding|findings|recall|lock|unlock …\n       horde status [task id] | watch [--interval <seconds>]  [--repo <dir> | --state <dir>]\n       horde remove [--repo <dir>] [--yes]"
 
+/** Refuse a --state directory that is not there: a typo would otherwise create an empty board at it. */
+function knownState(state: string) {
+  if (fs.existsSync(state)) return
+  const root = path.dirname(state)
+  const name = path.basename(state)
+  const dash = name.lastIndexOf("-")
+  const prefix = dash > 0 ? name.slice(0, dash + 1) : name
+  const siblings = fs.existsSync(root)
+    ? fs
+        .readdirSync(root, { withFileTypes: true })
+        .filter((d) => d.isDirectory() && d.name.startsWith(prefix))
+        .map((d) => d.name)
+        .sort()
+    : []
+  throw new Error(
+    [
+      `no board exists at ${state}`,
+      ...(siblings.length ? [`boards in ${root}: ${siblings.join(", ")}`] : []),
+      "copy the --state path from your brief exactly",
+    ].join("\n"),
+  )
+}
+
 /** The board a person asked for: --state, else the one of --repo or the current directory's repository. */
 async function humanBoard(flags: Flags) {
   const repo = path.resolve(flags.repo?.[0] ?? process.cwd())
-  return { board: flags.state?.[0] ? new Board(flags.state[0]) : await Board.open(repo), tiers: loadTiers(repo), repo }
+  const state = flags.state?.[0]
+  if (state) knownState(state)
+  return { board: state ? new Board(state) : await Board.open(repo), tiers: loadTiers(repo), repo }
 }
 
 /** The board at a glance, or one task in full: what a human checks while the horde works. */
@@ -218,6 +243,7 @@ async function main(argv: string[]): Promise<string> {
   }
   const state = flags.state?.[0]
   if (!state) throw new Error(`missing --state <dir>\n${USAGE}`)
+  knownState(state)
   const board = new Board(state)
   const [command, ...args] = positional
   const need = (n: number, what: string) => {
