@@ -274,6 +274,7 @@ export function reviewPrompt(r: ReviewInput, checks?: GateCheck[]): string {
     '- "met" needs evidence: the lines of the change that do it, as {file, line} using the L<number> shown before each line. Cite the lines that matter most (at most 5).',
     '- A criterion saying something must not change may cite {"untouched": "<path>"} or {"untouched": "<path>:<line>"} instead.',
     '- "not_met" when the change does not do it or does it wrongly; say what is missing in the note and cite the closest lines if any.',
+    "- A test that no longer asserts the behaviour it is named for, or that was emptied, skipped or made trivially true, does not meet the criterion it was written to prove; say so under that criterion.",
     '- "unclear" when the change alone cannot tell (it depends on code not shown, or a test that was not run).',
     gate
       ? '- Do not assume work that is not in the change. A criterion about checks passing (tests, typecheck, lint) may cite a passed check as evidence: {"check": "<name>"}.'

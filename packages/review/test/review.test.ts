@@ -64,6 +64,10 @@ describe("review", () => {
     const prompt = reviewPrompt(r)
     assert.match(prompt, /# Acceptance criteria\n1\. 429 after 5 failures per minute\n2\. the limit is configurable\n3\. failures are logged/)
     assert.match(prompt, /"met" needs evidence/)
+    assert.match(
+      prompt,
+      /- "not_met"[^\n]*\n- A test that no longer asserts the behaviour it is named for, or that was emptied, skipped or made trivially true, does not meet the criterion it was written to prove; say so under that criterion\.\n- "unclear"/,
+    )
   })
 
   test("citations are checked: an unfounded met is unclear, a missing verdict too", async () => {
