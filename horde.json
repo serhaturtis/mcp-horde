@@ -4,6 +4,12 @@
     "setup": "npm ci --prefer-offline --no-audit --no-fund && npm run build"
   },
   "verify": {
+    "timeoutSeconds": 1800,
+    "checks": {
+      "typecheck": { "command": "npm run typecheck", "kind": "typecheck" },
+      "lint": { "command": "npm run lint", "kind": "lint" },
+      "test": { "command": "npm test", "kind": "test", "slots": 1 }
+    },
     "audit": {
       "generated": ["plugins/horde/servers/**"]
     }
