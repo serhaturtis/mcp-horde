@@ -1025,15 +1025,15 @@ console.log("1..0")
     fs.writeFileSync(path.join(r, "horde.json"), JSON.stringify({ verify: { checks: { test: "true" } }, tiers: ["mock/mock", "mock/pricey"] }))
     git(r, "add", ".")
     git(r, "commit", "-qm", "checks")
-    // The orchestrator's untracked export, carried over as the worktree's baseline.
-    fs.writeFileSync(path.join(r, "carried.txt"), "carried\n")
+    // The orchestrator's untracked export (a binary), carried over as the worktree's baseline.
+    fs.writeFileSync(path.join(r, "carried.png"), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01, 0x02, 0x03]))
     const seen = mock.requests.length
     const id = idOf(
       await h.call("horde_do", {
         directory: r,
-        goal: "Delete the carried file and update the tracked one.\nRUN: rm carried.txt && echo ok > tracked.txt && git add -A && git commit -qm change",
+        goal: "Delete the carried file and update the tracked one.\nRUN: rm carried.png && echo ok > tracked.txt && git add -A && git commit -qm change",
         done: ["tracked.txt says ok"],
-        scope: ["tracked.txt", "carried.txt"],
+        scope: ["tracked.txt", "carried.png"],
       }),
     )
     // The worker's first prompt names the carried-over file and forbids touching it.
@@ -1043,7 +1043,7 @@ console.log("1..0")
       .join("\n")
     assert.ok(
       prompts.includes(
-        "holds 1 file(s) that are uncommitted in the main checkout, not the project's committed state: carried.txt. Do not delete, move or rewrite them",
+        "holds 1 file(s) that are uncommitted in the main checkout, not the project's committed state: carried.png. Do not delete, move or rewrite them",
       ),
       prompts,
     )
@@ -1053,7 +1053,7 @@ console.log("1..0")
     const landed = await h.call("horde_land", { id })
     assert.match(landed, new RegExp(`^landed ${id} on master: 1 commit\\(s\\)`), landed)
     assert.equal(git(r, "show", "--name-only", "--format=", "HEAD"), "tracked.txt", "only the tracked change landed")
-    assert.equal(git(r, "status", "--porcelain"), "?? carried.txt", "the untracked file stays untracked in the checkout")
+    assert.equal(git(r, "status", "--porcelain"), "?? carried.png", "the untracked file stays untracked in the checkout")
   })
 
   test("a conflict confined to generated files is resolved by the land step, which regenerates them", async () => {

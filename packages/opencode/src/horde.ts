@@ -672,12 +672,13 @@ async function changeSummary(root: string, start: string, base?: string): Promis
   const names = files.slice(0, 6).map((f) => `${f.file}${f.isNew ? " (new)" : ""}`)
   // Deletions of files the checkout only has uncommitted (the carried-over baseline): they are
   // not real deletions, since landing drops them as nothing, so the changed-files line says so.
+  // Named by --diff-filter=D rather than the numstat counts, which read "-" for binary files.
   let carried = 0
   if (base) {
-    for (const f of files) {
-      if (f.isNew || f.add || !f.del) continue
+    const deleted = (await git(root, "diff", "--name-only", "--diff-filter=D", start).catch(() => "")).split("\n").filter(Boolean)
+    for (const file of deleted) {
       if (
-        !(await git(root, "cat-file", "-e", `${base}:${f.file}`).then(
+        !(await git(root, "cat-file", "-e", `${base}:${file}`).then(
           () => true,
           () => false,
         ))
