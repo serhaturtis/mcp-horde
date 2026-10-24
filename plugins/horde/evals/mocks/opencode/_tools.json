@@ -206,7 +206,7 @@
     },
     {
       "name": "horde_land",
-      "description": "Land a READY task. Its commits are brought onto your current branch's tip inside its worktree and the project's checks run there; only if they pass is your branch updated, with exactly those commits (fast-forwarded, keeping their hashes, when they sit directly on your tip). Your uncommitted changes stay as they are. A horde.json \"workers.land\" command, if set, runs in the worktree after the rebase, and any files it changes are committed and landed with the task. Then the task is marked done and its worktree and branch are removed. If the commits conflict with your branch or the checks fail, your branch is not touched: the answer shows why, and the worker, now on top of your branch, can fix it (horde_tell, then horde_land again). Pass message to land the task's commits as one commit with that message, judged first by the repository's commit-msg hook. In a repository with a commit-msg hook, work the worker left uncommitted is refused: horde_tell it to commit with git commit, or pass message.",
+      "description": "Land a READY task. Its commits are brought onto your current branch's tip inside its worktree and the project's checks run there; only if they pass is your branch updated, with exactly those commits (fast-forwarded, keeping their hashes, when they sit directly on your tip). Your uncommitted changes stay as they are. A horde.json \"workers.land\" command, if set, runs in the worktree after the rebase, and any files it changes are committed and landed with the task. Then the task is marked done and its worktree and branch are removed. If the checks fail or the commits conflict with your branch, your branch is not touched and the answer shows why. After failing checks the worker is now on top of your branch and can fix it (horde_tell, then horde_land again); after a conflict nothing moved, and you may resolve it in its worktree yourself (git -C <root> rebase <target>, fix the files, git -C <root> rebase --continue) or horde_tell the worker to rebase. If you already landed the task's commits yourself, horde_land recognises them by patch-id and closes the task without landing anything. Pass message to land the task's commits as one commit with that message, judged first by the repository's commit-msg hook. In a repository with a commit-msg hook, work the worker left uncommitted is refused: horde_tell it to commit with git commit, or pass message.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -233,7 +233,7 @@
     },
     {
       "name": "horde_drop",
-      "description": "Give up on a task: stop its worker, record the attempt as failed (tier suggestions learn from it), and remove its worktree and branch (the answer names the last commit, in case you want it back). To try again differently, horde_do again with a clearer goal, or horde_tell {model} for a stronger model on the same work.",
+      "description": "Give up on a task: stop its worker, record the attempt as failed (tier suggestions learn from it), and remove its worktree and branch (the answer names the last commit, in case you want it back). Pass landed: true when you landed the work yourself by hand (e.g. cherry-picked or merged it), to record the attempt as accepted instead of failed. To try again differently, horde_do again with a clearer goal, or horde_tell {model} for a stronger model on the same work.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -243,6 +243,10 @@
           },
           "reason": {
             "type": "string"
+          },
+          "landed": {
+            "description": "Set true when you landed the work yourself by hand: the attempt is recorded as accepted (with this as the note) instead of failed.",
+            "type": "boolean"
           }
         },
         "required": [
