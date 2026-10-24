@@ -742,6 +742,129 @@ console.log("1..0")
     assert.equal(git(r, "status", "--porcelain"), "?? carried.txt", "the carried-over change stays uncommitted in the checkout")
   })
 
+  test("a by-hand rebase in the worktree lands a conflict's commit with no new gate round", async () => {
+    const { repo: r } = makeRepo(mock.url)
+    fs.writeFileSync(path.join(r, "conflict.txt"), "base\n")
+    fs.writeFileSync(path.join(r, "horde.json"), JSON.stringify({ verify: { checks: { test: "true" } }, tiers: ["mock/mock", "mock/pricey"] }))
+    git(r, "add", ".")
+    git(r, "commit", "-qm", "checks")
+    const id = idOf(
+      await h.call("horde_do", {
+        directory: r,
+        goal: "Change conflict.txt to worker.\nRUN: echo worker > conflict.txt && git add -A && git commit -qm worker",
+        done: ["conflict.txt says worker"],
+        scope: ["conflict.txt"],
+      }),
+    )
+    await settle(id)
+    fs.writeFileSync(path.join(r, "conflict.txt"), "master\n")
+    git(r, "add", "conflict.txt")
+    git(r, "commit", "-qm", "master change")
+    const tip = git(r, "rev-parse", "HEAD")
+    const refused = await h.call("horde_land", { id })
+    assert.match(refused, /conflict with master in conflict\.txt/, refused)
+    // The answer names the worktree root and the exact by-hand commands, beside horde_tell and horde_drop.
+    const root = refused.match(/git -C (\S+) rebase master/)![1]!
+    assert.match(refused, /resolve it yourself: git -C \S+ rebase master, fix conflict\.txt, git -C \S+ rebase --continue/, refused)
+    assert.match(refused, /horde_tell .*a fresh gate round, then horde_land again/, refused)
+    assert.match(refused, /horde_drop/, refused)
+    // The orchestrator resolves it by hand in the worker's worktree: the rebase stops on the
+    // conflict (git exits non-zero), so catch it and resolve.
+    try {
+      git(root, "-c", "core.editor=true", "rebase", "master")
+    } catch {
+      // expected: the rebase stopped on the conflict
+    }
+    fs.writeFileSync(path.join(root, "conflict.txt"), "worker\n")
+    git(root, "add", "conflict.txt")
+    git(root, "-c", "core.editor=true", "rebase", "--continue")
+    // No new gate round: the landing re-checks the result and fast-forwards the one commit.
+    const landed = await h.call("horde_land", { id })
+    assert.match(landed, new RegExp(`^landed ${id} on master: 1 commit\\(s\\)`), landed)
+    assert.equal(git(r, "rev-list", "--count", `${tip}..HEAD`), "1", "only the worker's commit landed, no empty duplicates of master's")
+    assert.equal(git(r, "show", "--name-only", "--format=", "HEAD"), "conflict.txt", "and it only touches the worker's file")
+  })
+
+  test("work already cherry-picked onto master is recognised and closed without an empty commit", async () => {
+    const { repo: r } = makeRepo(mock.url)
+    fs.writeFileSync(path.join(r, "horde.json"), JSON.stringify({ verify: { checks: { test: "true" } }, tiers: ["mock/mock", "mock/pricey"] }))
+    git(r, "add", "horde.json")
+    git(r, "commit", "-qm", "checks")
+    const started = await h.call("horde_do", {
+      directory: r,
+      goal: "Write cherry.txt.\nRUN: echo ok > cherry.txt && git add cherry.txt && git commit -qm cherry",
+      done: ["cherry.txt says ok"],
+      scope: ["cherry.txt"],
+    })
+    const id = idOf(started)
+    const branch = started.match(/worktree (horde\/[\w-]+)/)![1]!
+    await settle(id)
+    const before = git(r, "rev-parse", "HEAD")
+    // The orchestrator lands the worker's commit by hand: cherry-pick it onto master.
+    git(r, "cherry-pick", git(r, "rev-parse", branch))
+    assert.equal(git(r, "rev-list", "--count", `${before}..HEAD`), "1", "master now has the worker's change")
+    const landed = await h.call("horde_land", { id })
+    assert.match(
+      landed,
+      new RegExp(`^${id}'s 1 commit\\(s\\) are already on master \\(patch-identical\\): nothing to land · task done, worktree and branch removed`),
+      landed,
+    )
+    assert.equal(git(r, "rev-list", "--count", `${before}..HEAD`), "1", "no empty commit was added on top of the cherry-pick")
+    assert.equal(git(r, "branch", "--list", "horde/*"), "", "the branch is gone")
+    assert.equal((await Board.open(r, boardState())).task(id).status, "done")
+  })
+
+  test("only some commits already on master are refused before rebasing, naming both sets", async () => {
+    const { repo: r } = makeRepo(mock.url)
+    fs.writeFileSync(path.join(r, "horde.json"), JSON.stringify({ verify: { checks: { test: "true" } }, tiers: ["mock/mock", "mock/pricey"] }))
+    git(r, "add", "horde.json")
+    git(r, "commit", "-qm", "checks")
+    const before = git(r, "rev-parse", "HEAD")
+    const started = await h.call("horde_do", {
+      directory: r,
+      goal: "Write two files.\nRUN: echo one > one.txt && git add one.txt && git commit -qm one\nRUN: echo two > two.txt && git add two.txt && git commit -qm two",
+      done: ["one.txt and two.txt say ok"],
+      scope: ["one.txt", "two.txt"],
+    })
+    const id = idOf(started)
+    const branch = started.match(/worktree (horde\/[\w-]+)/)![1]!
+    await settle(id)
+    const [first] = git(r, "rev-list", "--reverse", `${before}..${branch}`).split("\n")
+    // The orchestrator cherry-picks only the first of the worker's two commits.
+    git(r, "cherry-pick", first!)
+    assert.equal(git(r, "rev-list", "--count", `${before}..HEAD`), "1", "master now has the first commit")
+    const refused = await h.call("horde_land", { id })
+    assert.match(
+      refused,
+      new RegExp(`^not landed: 1 of 2 commits of ${id} are already on master; landing the rest would replay those 1 as empty commits\\.`),
+      refused,
+    )
+    assert.match(refused, /already on master: \w+ one/, refused)
+    assert.match(refused, /not on master: \w+ two/, refused)
+    assert.match(refused, new RegExp(`horde_drop \\{id: "${id}", landed: true\\}`), refused)
+    assert.equal(git(r, "rev-list", "--count", `${before}..HEAD`), "1", "master did not move further")
+    assert.equal(git(r, "rev-list", "--count", `${before}..${branch}`), "2", "the worker's branch was not rebased")
+    await h.call("horde_drop", { id })
+  })
+
+  test("horde_drop {landed: true} records the attempt as accepted, not failed", async () => {
+    const id = idOf(
+      await h.call("horde_do", {
+        goal: "Write the dropped file.\nRUN: echo ok > dropped.txt && git add dropped.txt && git commit -qm dropped",
+        done: ["dropped.txt says ok"],
+        scope: ["dropped.txt"],
+      }),
+    )
+    await settle(id)
+    const dropped = await h.call("horde_drop", { id, reason: "cherry-picked it myself", landed: true })
+    assert.match(dropped, new RegExp(`^${id} landed by hand: the attempt is recorded as accepted, its worktree and branch are removed`), dropped)
+    const task = (await Board.open(repo, boardState())).task(id)
+    assert.equal(task.status, "done")
+    const attempt = task.attempts.at(-1)!
+    assert.equal(attempt.outcome, "accepted")
+    assert.equal(attempt.note, "landed by hand: cherry-picked it myself")
+  })
+
   test("a workers.land command's file is committed on top and landed, judged by the checks", async () => {
     const { tmp: at, repo: r } = makeRepo(mock.url)
     const marker = path.join(at, "land-check.ran")

@@ -1562,6 +1562,35 @@ export class Fleet {
       const hook = await commitMsgHook(wt.repo)
       if (hook && !message && (await hasUncommitted(wt))) return { landed: false, target, why: "leftovers", text: hook }
       const tip = await git(wt.repo, "rev-parse", "HEAD")
+      // 0. Work already on the branch (cherry-picked or merged by hand) would be replayed as empty
+      // commits by the rebase below, checked for minutes, then fast-forwarded as empty commits. By
+      // patch-id: every one already there means nothing to land; only some means landing the rest
+      // would replay those some as empty commits, so refuse before anything moves.
+      const start = workStart(wt)
+      const own = (await git(wt.root, "rev-list", "--reverse", `${start}..HEAD`)).split("\n").filter(Boolean)
+      if (own.length) {
+        const cherry = (await git(wt.root, "cherry", "-v", tip, "HEAD", start).catch(() => "")).split("\n").filter(Boolean)
+        const name = (l: string) => l.replace(/^[-+]\s*/, "").replace(/^(\S{10})\S*/, "$1")
+        const on = cherry.filter((l) => l.startsWith("-")).map(name)
+        const off = cherry.filter((l) => l.startsWith("+")).map(name)
+        if (on.length && on.length === cherry.length) {
+          const board = await Board.open(wt.repo)
+          await board.accept(task.id, { note: `already on ${target}` }).catch(() => undefined)
+          await this.dispose(id, { worktree: "discard" })
+          await git(wt.repo, "branch", "-D", wt.branch).catch(() => undefined)
+          return { landed: true, target, commits: own.length, checks: [], already: true }
+        }
+        if (on.length) {
+          return {
+            landed: false,
+            target,
+            why: "already",
+            text: [`already on ${target}: ${on.join(", ")}`, `not on ${target}: ${off.join(", ")}`].join("\n"),
+            root: wt.root,
+            alreadyOn: { on: on.length, total: own.length },
+          }
+        }
+      }
       // 1. Onto your branch's tip, inside the worktree, leaving the carried-over baseline out. A
       // conflict leaves both as they were; anything else failing is reported by its own cause.
       let leftover = false
@@ -1581,6 +1610,7 @@ export class Fleet {
           landed: false,
           target,
           why: "conflict",
+          root: wt.root,
           text: (err as Error).message
             .split("\n")
             .filter((l) => !/^Tell the agent/.test(l))
@@ -3063,20 +3093,26 @@ export class Fleet {
 }
 
 export type LandResult =
-  | { landed: true; target: string; commits: number; checks: GateCheckSummary[]; branchKept?: string }
+  | { landed: true; target: string; commits: number; checks: GateCheckSummary[]; branchKept?: string; already?: true }
   | {
       landed: false
       target: string
       /**
        * message: the repository's commit-msg hook refused the message; leftovers: the worktree
        * still has uncommitted changes in a repository whose hook would judge the commit; land:
-       * horde.json "workers.land" failed or its commit was refused by the repository's hooks.
+       * horde.json "workers.land" failed or its commit was refused by the repository's hooks;
+       * already: some of the task's commits are already on the target, so landing would replay
+       * them as empty commits.
        */
-      why: "conflict" | "checks" | "uncommitted" | "message" | "leftovers" | "land"
+      why: "conflict" | "checks" | "uncommitted" | "message" | "leftovers" | "land" | "already"
       text: string
       checks?: GateCheckSummary[]
       /** why "message": the hook that refused it. */
       hook?: string
+      /** why "conflict" or "already": the worker's worktree root, for the by-hand fix the answer suggests. */
+      root?: string
+      /** why "already": the task's own commits already on the target (patch-identical), of its total. */
+      alreadyOn?: { on: number; total: number }
     }
 
 interface Prepared {

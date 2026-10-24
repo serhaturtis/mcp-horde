@@ -304,7 +304,7 @@ export function registerHorde(tool: Tool, opts: HordeOptions) {
 
   tool(
     "horde_land",
-    "Land a READY task. Its commits are brought onto your current branch's tip inside its worktree and the project's checks run there; only if they pass is your branch updated, with exactly those commits (fast-forwarded, keeping their hashes, when they sit directly on your tip). Your uncommitted changes stay as they are. A horde.json \"workers.land\" command, if set, runs in the worktree after the rebase, and any files it changes are committed and landed with the task. Then the task is marked done and its worktree and branch are removed. If the commits conflict with your branch or the checks fail, your branch is not touched: the answer shows why, and the worker, now on top of your branch, can fix it (horde_tell, then horde_land again). Pass message to land the task's commits as one commit with that message, judged first by the repository's commit-msg hook. In a repository with a commit-msg hook, work the worker left uncommitted is refused: horde_tell it to commit with git commit, or pass message.",
+    "Land a READY task. Its commits are brought onto your current branch's tip inside its worktree and the project's checks run there; only if they pass is your branch updated, with exactly those commits (fast-forwarded, keeping their hashes, when they sit directly on your tip). Your uncommitted changes stay as they are. A horde.json \"workers.land\" command, if set, runs in the worktree after the rebase, and any files it changes are committed and landed with the task. Then the task is marked done and its worktree and branch are removed. If the checks fail or the commits conflict with your branch, your branch is not touched and the answer shows why. After failing checks the worker is now on top of your branch and can fix it (horde_tell, then horde_land again); after a conflict nothing moved, and you may resolve it in its worktree yourself (git -C <root> rebase <target>, fix the files, git -C <root> rebase --continue) or horde_tell the worker to rebase. If you already landed the task's commits yourself, horde_land recognises them by patch-id and closes the task without landing anything. Pass message to land the task's commits as one commit with that message, judged first by the repository's commit-msg hook. In a repository with a commit-msg hook, work the worker left uncommitted is refused: horde_tell it to commit with git commit, or pass message.",
     {
       id: z.string().describe("Task id (t-…)."),
       message: z
@@ -327,8 +327,15 @@ export function registerHorde(tool: Tool, opts: HordeOptions) {
 
   tool(
     "horde_drop",
-    "Give up on a task: stop its worker, record the attempt as failed (tier suggestions learn from it), and remove its worktree and branch (the answer names the last commit, in case you want it back). To try again differently, horde_do again with a clearer goal, or horde_tell {model} for a stronger model on the same work.",
-    { id: z.string().describe("Task id (t-…)."), reason: z.string().optional() },
+    "Give up on a task: stop its worker, record the attempt as failed (tier suggestions learn from it), and remove its worktree and branch (the answer names the last commit, in case you want it back). Pass landed: true when you landed the work yourself by hand (e.g. cherry-picked or merged it), to record the attempt as accepted instead of failed. To try again differently, horde_do again with a clearer goal, or horde_tell {model} for a stronger model on the same work.",
+    {
+      id: z.string().describe("Task id (t-…)."),
+      reason: z.string().optional(),
+      landed: z
+        .boolean()
+        .optional()
+        .describe("Set true when you landed the work yourself by hand: the attempt is recorded as accepted (with this as the note) instead of failed."),
+    },
     async (a, fleet) => {
       const found = await fleet.inspect(a.id).catch(async (err: Error) => {
         // A task whose worker never started (a stale claim) has no agent to stop: close it on the board.
@@ -344,7 +351,8 @@ export function registerHorde(tool: Tool, opts: HordeOptions) {
       const wt = record.worktree
       if (task) {
         const board = await Board.open(wt?.repo ?? record.directory)
-        await board.fail(task.id, { reason: a.reason ?? "dropped by the orchestrator", retry: false }).catch(() => undefined)
+        if (a.landed) await board.accept(task.id, { note: `landed by hand${a.reason ? `: ${a.reason}` : ""}` }).catch(() => undefined)
+        else await board.fail(task.id, { reason: a.reason ?? "dropped by the orchestrator", retry: false }).catch(() => undefined)
       }
       await fleet.dispose(a.id, { worktree: "remove" })
       let kept = ""
@@ -359,6 +367,7 @@ export function registerHorde(tool: Tool, opts: HordeOptions) {
         )
           kept = ` (its last commit was ${tip.slice(0, 10)}: \`git branch ${wt.branch} ${tip.slice(0, 10)}\` brings it back)`
       }
+      if (a.landed) return `${task?.id ?? a.id} landed by hand: the attempt is recorded as accepted, its worktree and branch are removed${kept}.`
       return `dropped ${task?.id ?? a.id}: the worker stopped, the attempt is recorded as failed, and its worktree and branch are removed${kept}.`
     },
   )
@@ -517,6 +526,8 @@ export async function outcome(fleet: Fleet, ref: string, opts: { live?: boolean 
 
 function renderLanding(id: string, r: LandResult): string {
   if (r.landed) {
+    if (r.already)
+      return `${id}'s ${r.commits} commit(s) are already on ${r.target} (patch-identical): nothing to land · task done, worktree and branch removed`
     const kept = r.branchKept ? ` (branch ${r.branchKept} kept: not all of its commits are on ${r.target})` : ""
     const lines = [
       `landed ${id} on ${r.target}: ${r.commits} commit(s) · ${checksLine(r.checks)} on ${r.target}'s tip before updating it · task done, worktree${r.branchKept ? "" : " and branch"} removed${kept}`,
@@ -548,11 +559,21 @@ function renderLanding(id: string, r: LandResult): string {
       `${r.target} is unchanged; the worker is now on top of it.`,
       `→ horde_tell {id: "${id}", message: "<what to fix>"} (it is checked again; then horde_land again) · horde_drop {id: "${id}"}`,
     ].join("\n")
+  if (r.why === "already") {
+    const { on, total } = r.alreadyOn ?? { on: 0, total: 0 }
+    return [
+      `not landed: ${on} of ${total} commits of ${id} are already on ${r.target}; landing the rest would replay those ${on} as empty commits.`,
+      indent(r.text, "  "),
+      `If you landed its work yourself, horde_drop {id: "${id}", landed: true}; otherwise merge the rest by hand (git -C ${r.root} …)`,
+    ].join("\n")
+  }
   if (r.why === "conflict") {
     const files = r.text.split("\n").filter((l) => l && !/:$/.test(l) && !/^(syncing|conflicting)/.test(l))
     return [
       `not landed: ${id}'s commits conflict with ${r.target}${files.length ? ` in ${files.join(", ")}` : ""}. ${r.target} is unchanged.`,
-      `→ horde_tell {id: "${id}", message: "Rebase your branch onto ${r.target} and resolve the conflict${files.length ? ` in ${files.join(", ")}` : ""}"} · horde_drop {id: "${id}"}`,
+      `→ horde_tell {id: "${id}", message: "Rebase your branch onto ${r.target} and resolve the conflict${files.length ? ` in ${files.join(", ")}` : ""}"} (a fresh gate round, then horde_land again)`,
+      `→ resolve it yourself: git -C ${r.root} rebase ${r.target}, fix${files.length ? ` ${files.join(", ")}` : " the named files"}, git -C ${r.root} rebase --continue, then horde_land {id: "${id}"} again (the land's checks run on the result)`,
+      `→ horde_drop {id: "${id}"}`,
     ].join("\n")
   }
   return `not landed: ${id}'s commits collide with your uncommitted changes:\n${indent(truncate(r.text, 800), "  ")}\nCommit or stash them, then horde_land {id: "${id}"} again.`
