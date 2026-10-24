@@ -474,6 +474,14 @@ export function defined<T extends object>(o: T): Partial<T> {
   return Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined)) as Partial<T>
 }
 
+/** The running-agent limit refused a start: nothing started, so nothing failed. */
+export class CapacityError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = "CapacityError"
+  }
+}
+
 /** Orchestrates OpenCode sessions ("agents") through the OpenCode 2 API. */
 export class Fleet {
   private readonly live = new Map<string, Live>()
@@ -695,7 +703,7 @@ export class Fleet {
     if (this.config.maxRunning > 0) {
       const busy = [...this.live.values()].filter((l) => this.working(l)).map((l) => l.record.name ?? l.record.id)
       if (busy.length + this.reserved >= this.config.maxRunning) {
-        throw new Error(
+        throw new CapacityError(
           `${busy.length + this.reserved} agents are already working or starting (limit ${this.config.maxRunning}, from ${this.config.maxRunningFrom})${busy.length ? `: ${busy.join(", ")}` : ""}. Wait for one with opencode_wait, or stop one.`,
         )
       }
@@ -1611,6 +1619,7 @@ export class Fleet {
           target,
           why: "conflict",
           root: wt.root,
+          baseline: !!wt.baseline,
           text: (err as Error).message
             .split("\n")
             .filter((l) => !/^Tell the agent/.test(l))
@@ -3111,6 +3120,8 @@ export type LandResult =
       hook?: string
       /** why "conflict" or "already": the worker's worktree root, for the by-hand fix the answer suggests. */
       root?: string
+      /** why "conflict": the worktree carries a baseline commit, which the rebase replays first. */
+      baseline?: boolean
       /** why "already": the task's own commits already on the target (patch-identical), of its total. */
       alreadyOn?: { on: number; total: number }
     }

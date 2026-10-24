@@ -730,6 +730,12 @@ console.log("1..0")
     git(r, "commit", "-qm", "master changes")
     const refused = await h.call("horde_land", { id })
     assert.match(refused, /conflict with master/, refused)
+    assert.ok(
+      refused.includes(
+        'The first commit, "horde: uncommitted changes carried over from the main checkout", is the carried-over baseline; leave it as it is, it never lands.',
+      ),
+      refused,
+    )
     await h.call("horde_tell", {
       id,
       message: "TOOL: git rebase master; echo worker > conflict.txt; git add conflict.txt; GIT_EDITOR=true git rebase --continue",
@@ -738,6 +744,50 @@ console.log("1..0")
     assert.match(ready, new RegExp(`^${id} READY`), ready)
     const landed = await h.call("horde_land", { id })
     assert.match(landed, new RegExp(`^landed ${id} on master: 1 commit\\(s\\)`), landed)
+    assert.equal(git(r, "show", "--name-only", "--format=", "HEAD"), "conflict.txt", "the carried-over baseline never landed")
+    assert.equal(git(r, "status", "--porcelain"), "?? carried.txt", "the carried-over change stays uncommitted in the checkout")
+  })
+
+  test("a by-hand rebase with a carried-over baseline replays it first and lands only the worker's commit", async () => {
+    const { repo: r } = makeRepo(mock.url)
+    fs.writeFileSync(path.join(r, "conflict.txt"), "base\n")
+    fs.writeFileSync(path.join(r, "horde.json"), JSON.stringify({ verify: { checks: { test: "true" } }, tiers: ["mock/mock", "mock/pricey"] }))
+    git(r, "add", ".")
+    git(r, "commit", "-qm", "checks")
+    // Carried over as the worktree's baseline.
+    fs.writeFileSync(path.join(r, "carried.txt"), "carried\n")
+    const id = idOf(
+      await h.call("horde_do", {
+        directory: r,
+        goal: "Change conflict.txt to worker.\nRUN: echo worker > conflict.txt && git add -A && git commit -qm worker",
+        done: ["conflict.txt says worker"],
+        scope: ["conflict.txt"],
+      }),
+    )
+    await settle(id)
+    fs.writeFileSync(path.join(r, "conflict.txt"), "master\n")
+    git(r, "add", "conflict.txt")
+    git(r, "commit", "-qm", "master change")
+    const tip = git(r, "rev-parse", "HEAD")
+    const refused = await h.call("horde_land", { id })
+    assert.match(refused, /conflict with master/, refused)
+    const root = refused.match(/git -C (\S+) rebase master/)![1]!
+    // The by-hand rebase replays the baseline first; the worker's commit conflicts after it.
+    try {
+      git(root, "-c", "core.editor=true", "rebase", "master")
+    } catch {
+      // expected: the rebase stopped on the conflict
+    }
+    fs.writeFileSync(path.join(root, "conflict.txt"), "worker\n")
+    git(root, "add", "conflict.txt")
+    git(root, "-c", "core.editor=true", "rebase", "--continue")
+    assert.deepEqual(git(root, "log", "--reverse", "--format=%s", `${tip}..HEAD`).split("\n"), [
+      "horde: uncommitted changes carried over from the main checkout",
+      "worker",
+    ])
+    const landed = await h.call("horde_land", { id })
+    assert.match(landed, new RegExp(`^landed ${id} on master: 1 commit\\(s\\)`), landed)
+    assert.equal(git(r, "rev-list", "--count", `${tip}..HEAD`), "1", "only the worker's commit landed")
     assert.equal(git(r, "show", "--name-only", "--format=", "HEAD"), "conflict.txt", "the carried-over baseline never landed")
     assert.equal(git(r, "status", "--porcelain"), "?? carried.txt", "the carried-over change stays uncommitted in the checkout")
   })
@@ -768,6 +818,7 @@ console.log("1..0")
     assert.match(refused, /resolve it yourself: git -C \S+ rebase master, fix conflict\.txt, git -C \S+ rebase --continue/, refused)
     assert.match(refused, /horde_tell .*a fresh gate round, then horde_land again/, refused)
     assert.match(refused, /horde_drop/, refused)
+    assert.doesNotMatch(refused, /carried-over baseline/, refused)
     // The orchestrator resolves it by hand in the worker's worktree: the rebase stops on the
     // conflict (git exits non-zero), so catch it and resolve.
     try {
@@ -1203,6 +1254,89 @@ describe("the gate review runs outside the worker limit and its failure fails th
     assert.match(failed, new RegExp(`^${id} FAILED`), failed)
     assert.match(failed, /error: bad request from mock/, failed)
     assert.doesNotMatch(failed, /checks failed after/, failed)
+  })
+})
+
+describe("the running-agent limit refuses a start without leaving a task on the board", { timeout: 600_000 }, () => {
+  let lh: Harness
+  let lmock: Mock
+  let ltmp: string
+  let lrepo: string
+  const lboardState = () => path.join(ltmp, "board-state")
+  const lid = (text: string) => text.match(/\bt-[0-9a-f]+\b/)![0]
+  const lrepoFor = (extra: Record<string, unknown> = {}): string => {
+    const { repo } = makeRepo(lmock.url, { permission: { bash: "allow" } })
+    fs.writeFileSync(path.join(repo, "horde.json"), JSON.stringify({ verify: { checks: { test: "true" } }, tiers: ["mock/mock", "mock/pricey"], ...extra }))
+    git(repo, "add", ".")
+    git(repo, "commit", "-qm", "checks")
+    return repo
+  }
+
+  before(async () => {
+    lmock = await startMockLlm()
+    ;({ tmp: ltmp, repo: lrepo } = makeRepo(lmock.url))
+    lh = await connect({ ...isolatedEnv(ltmp, lrepo), HORDE_OPENCODE_MAX_RUNNING: "1", HORDE_BOARD_STATE_DIR: lboardState() })
+  })
+
+  after(async () => {
+    await lh?.call("opencode_server", { action: "stop" }).catch((e: Error) => process.stderr.write(`could not stop the test server: ${e.message}\n`))
+    await lh?.close()
+    lmock?.close()
+  })
+
+  test("a start that fails for another reason still records a failed task", async () => {
+    const dir = lrepoFor({ workers: { setup: "exit 1" } })
+    await assert.rejects(
+      lh.call("horde_do", {
+        directory: dir,
+        goal: "Write a file.\nRUN: echo ok > setup-failed.txt && git add setup-failed.txt && git commit -qm setup-failed",
+        done: ["setup-failed.txt says ok"],
+        scope: ["setup-failed.txt"],
+      }),
+      (err: Error) => {
+        assert.match(err.message, /worktree setup `exit 1` failed \(exit 1\)/)
+        return true
+      },
+    )
+    const tasks = (await Board.open(dir, lboardState())).tasks()
+    assert.equal(tasks.length, 1, "the failed start keeps its task")
+    assert.equal(tasks[0]!.status, "failed")
+  })
+
+  test("a second start at the running limit is refused and leaves no task behind", async () => {
+    const dir = lrepoFor()
+    const first = await lh.call("horde_do", {
+      directory: dir,
+      goal: "Take your time.\nRUN: sleep 30",
+      done: ["it waited"],
+      scope: ["slow/**"],
+    })
+    const id = lid(first)
+    assert.equal((await Board.open(dir, lboardState())).tasks().length, 1)
+    await assert.rejects(
+      lh.call("horde_do", {
+        directory: dir,
+        goal: "Write a second file.\nRUN: echo ok > second.txt && git add second.txt && git commit -qm second",
+        done: ["second.txt says ok"],
+        scope: ["second.txt"],
+      }),
+      (err: Error) => {
+        assert.match(err.message, /agents are already working or starting \(limit 1, from HORDE_OPENCODE_MAX_RUNNING\)/)
+        assert.match(err.message, /Wait for one with opencode_wait, or stop one\./)
+        return true
+      },
+    )
+    await assert.rejects(lh.call("horde_investigate", { directory: dir, question: "What is in this repository?" }), (err: Error) => {
+      assert.match(err.message, /agents are already working or starting \(limit 1/)
+      return true
+    })
+    const after = (await Board.open(dir, lboardState())).tasks()
+    assert.deepEqual(
+      after.map((t) => t.id),
+      [id],
+      "only the running task remains on the board",
+    )
+    await lh.call("horde_drop", { id })
   })
 })
 

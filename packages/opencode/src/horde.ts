@@ -12,9 +12,9 @@ import { type Check, detectChecks, loadSettingsAt } from "@mcp-horde/verify"
 import type { ServerContext } from "@modelcontextprotocol/server"
 import { z } from "zod"
 import { extractJson, type JsonSchema, retryPrompt, schemaPrompt, validate } from "./ask.js"
-import { type Fleet, formatModel, formText, type LandResult, SETTLED, type Snapshot } from "./fleet.js"
+import { CapacityError, type Fleet, formatModel, formText, type LandResult, SETTLED, type Snapshot } from "./fleet.js"
 import type { AgentRecord, ReviewSummary } from "./state.js"
-import { type Worktree, workStart } from "./worktree.js"
+import { BASELINE_MESSAGE, type Worktree, workStart } from "./worktree.js"
 
 // biome-ignore lint/suspicious/noExplicitAny: the registration helper is generic over each tool's schema
 type Tool = (name: string, description: string, shape: z.ZodRawShape, run: (args: any, fleet: Fleet, extra: ServerContext) => Promise<string>) => void
@@ -87,6 +87,11 @@ type Finding = {
 /** How long the one retry for an invalid answer may block. */
 const INVESTIGATE_RETRY_MS = 300_000
 
+/** A failed cleanup must not hide the original start error; report it on stderr instead. */
+function noteCleanupFailure(err: Error, action: string, id: string): void {
+  process.stderr.write(`[mcp-horde/opencode] could not ${action} ${id}: ${err.message}\n`)
+}
+
 export function registerHorde(tool: Tool, opts: HordeOptions) {
   tool(
     "horde_do",
@@ -145,8 +150,13 @@ export function registerHorde(tool: Tool, opts: HordeOptions) {
           onProgress: opts.progressMessage(extra),
         })
         .catch(async (err: Error) => {
-          // Nothing started: the plan entry must not linger as an open task.
-          await board.fail(task.id, { reason: `could not start: ${err.message}`, retry: false }).catch(() => undefined)
+          // Nothing started: the plan entry must not linger as an open task. A running-limit refusal
+          // started nothing and failed nothing, so it is forgotten rather than recorded as a failure.
+          if (err instanceof CapacityError) await board.unplan(task.id).catch((e: Error) => noteCleanupFailure(e, "unplan", task.id))
+          else
+            await board
+              .fail(task.id, { reason: `could not start: ${err.message}`, retry: false })
+              .catch((e: Error) => noteCleanupFailure(e, "record the failed start of", task.id))
           throw err
         })
       if (a.wait) return (await collect(fleet, [snapshot.id], "all", a.timeout_seconds ?? opts.waitSeconds(), extra, opts)).text
@@ -208,8 +218,13 @@ export function registerHorde(tool: Tool, opts: HordeOptions) {
           onProgress: opts.progressMessage(extra),
         })
         .catch(async (err: Error) => {
-          // Nothing started: the plan entry must not linger as an open task.
-          await board.fail(task.id, { reason: `could not start: ${err.message}`, retry: false }).catch(() => undefined)
+          // Nothing started: the plan entry must not linger as an open task. A running-limit refusal
+          // started nothing and failed nothing, so it is forgotten rather than recorded as a failure.
+          if (err instanceof CapacityError) await board.unplan(task.id).catch((e: Error) => noteCleanupFailure(e, "unplan", task.id))
+          else
+            await board
+              .fail(task.id, { reason: `could not start: ${err.message}`, retry: false })
+              .catch((e: Error) => noteCleanupFailure(e, "record the failed start of", task.id))
           throw err
         })
       if (a.wait) return (await collect(fleet, [snapshot.id], "all", a.timeout_seconds ?? opts.waitSeconds(), extra, opts)).text
@@ -572,7 +587,7 @@ function renderLanding(id: string, r: LandResult): string {
     return [
       `not landed: ${id}'s commits conflict with ${r.target}${files.length ? ` in ${files.join(", ")}` : ""}. ${r.target} is unchanged.`,
       `→ horde_tell {id: "${id}", message: "Rebase your branch onto ${r.target} and resolve the conflict${files.length ? ` in ${files.join(", ")}` : ""}"} (a fresh gate round, then horde_land again)`,
-      `→ resolve it yourself: git -C ${r.root} rebase ${r.target}, fix${files.length ? ` ${files.join(", ")}` : " the named files"}, git -C ${r.root} rebase --continue, then horde_land {id: "${id}"} again (the land's checks run on the result)`,
+      `→ resolve it yourself: git -C ${r.root} rebase ${r.target}, fix${files.length ? ` ${files.join(", ")}` : " the named files"}, git -C ${r.root} rebase --continue, then horde_land {id: "${id}"} again (the land's checks run on the result).${r.baseline ? ` The first commit, "${BASELINE_MESSAGE}", is the carried-over baseline; leave it as it is, it never lands.` : ""}`,
       `→ horde_drop {id: "${id}"}`,
     ].join("\n")
   }

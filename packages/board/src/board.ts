@@ -311,6 +311,17 @@ export class Board {
     })
   }
 
+  /** Remove a planned task that never started; a task with an attempt is history and is refused. */
+  unplan(id: string): Promise<void> {
+    return this.mutate(() => {
+      const t = this.task(id)
+      if (t.attempts.length) throw new Error(`${id} has attempts; a started task is history, so fail or drop it instead`)
+      fs.rmSync(this.taskFile(id), { force: true })
+      this.releaseLocks(id)
+      this.event("unplan", { task: id })
+    })
+  }
+
   private newId(existing: Task[]): string {
     for (;;) {
       const id = `t-${randomBytes(3).toString("hex").slice(0, 4)}`

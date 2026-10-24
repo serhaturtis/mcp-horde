@@ -703,7 +703,7 @@ export async function mergeWorktree(wt: Worktree, name: string, strategy: "merge
   return { text: notes.join("\n"), merged: tip }
 }
 
-const BASELINE_MESSAGE = "horde: uncommitted changes carried over from the main checkout"
+export const BASELINE_MESSAGE = "horde: uncommitted changes carried over from the main checkout"
 
 /**
  * Where the worker's branch really starts now: the merge-base of its HEAD and the checkout's
