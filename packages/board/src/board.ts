@@ -383,7 +383,8 @@ export class Board {
     // outside the diff). A changed file missing from the diff, or a test that does not exist,
     // is still a claim the diff does not support.
     const isFile = (p: string) => fs.existsSync(path.join(root, p)) || fs.existsSync(path.join(ws.path, p))
-    const claimedPath = (p: string) => Boolean(p) && (!/\s/.test(p) || isFile(p))
+    // A bare word such as "none" says nothing about the diff; a path has a slash or an extension.
+    const claimedPath = (p: string) => Boolean(p) && (isFile(p) || (!/\s/.test(p) && /[./]/.test(p)))
     const changed = r.filesChanged.map(norm).filter(claimedPath)
     const testPaths = r.testsAdded.map(norm).filter(claimedPath)
     const tests = testPaths.filter((p) => diff.includes(p) || !isFile(p))

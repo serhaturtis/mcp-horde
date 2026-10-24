@@ -429,6 +429,53 @@ describe("board", () => {
     )
   })
 
+  test("a bare word in the report's changed list is no claim about the diff", async () => {
+    const root = repo()
+    const base = git(root, "rev-parse", "HEAD")
+    const board = new Board(tmp())
+    const t = (await board.plan([{ title: "x", goal: "y" }])).tasks[0]!
+    const { attempt } = await board.assign(t.id, "w")
+    await board.bindWorkspace(t.id, attempt.token, { path: root, base })
+    fs.writeFileSync(path.join(root, "README.md"), "changed\n")
+    fs.writeFileSync(path.join(root, "extra.ts"), "new\n")
+    await board.report(t.id, attempt.token, { summary: "changed nothing this round", filesChanged: ["none"] })
+    const check = (await board.checkReport(t.id))!
+    assert.deepEqual(check.claimedNotChanged, [])
+    assert.deepEqual(check.changedNotReported, ["README.md", "extra.ts"])
+  })
+
+  test("an existing extension-less file in the report still matches the diff", async () => {
+    const root = repo()
+    fs.writeFileSync(path.join(root, "Makefile"), "all:\n")
+    git(root, "add", "-A")
+    git(root, "commit", "-qm", "makefile")
+    const base = git(root, "rev-parse", "HEAD")
+    const board = new Board(tmp())
+    const t = (await board.plan([{ title: "x", goal: "y" }])).tasks[0]!
+    const { attempt } = await board.assign(t.id, "w")
+    await board.bindWorkspace(t.id, attempt.token, { path: root, base })
+    fs.writeFileSync(path.join(root, "Makefile"), "all:\n\t@true\n")
+    await board.report(t.id, attempt.token, { summary: "changed the build", filesChanged: ["Makefile"] })
+    const check = (await board.checkReport(t.id))!
+    assert.deepEqual(check.claimedNotChanged, [])
+    assert.deepEqual(check.changedNotReported, [])
+    assert.deepEqual(check.diff, ["Makefile"])
+  })
+
+  test("a non-existent bare word in the report's tests is no claim", async () => {
+    const root = repo()
+    const base = git(root, "rev-parse", "HEAD")
+    const board = new Board(tmp())
+    const t = (await board.plan([{ title: "x", goal: "y" }])).tasks[0]!
+    const { attempt } = await board.assign(t.id, "w")
+    await board.bindWorkspace(t.id, attempt.token, { path: root, base })
+    fs.writeFileSync(path.join(root, "README.md"), "changed\n")
+    await board.report(t.id, attempt.token, { summary: "ran nothing", filesChanged: ["README.md"], testsAdded: ["nothing"] })
+    const check = (await board.checkReport(t.id))!
+    assert.deepEqual(check.claimedNotChanged, [])
+    assert.deepEqual(check.changedNotReported, [])
+  })
+
   test("a test file that was only run is listed as unchanged and never matches the diff", async () => {
     const root = repo()
     fs.mkdirSync(path.join(root, "test"), { recursive: true })
