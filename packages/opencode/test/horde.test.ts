@@ -1019,6 +1019,144 @@ console.log("1..0")
     await h.call("horde_drop", { id })
   })
 
+  test("a worker told it carried a checkout's untracked file deletes it and lands only its tracked change", async () => {
+    const { repo: r } = makeRepo(mock.url)
+    fs.writeFileSync(path.join(r, "tracked.txt"), "stale\n")
+    fs.writeFileSync(path.join(r, "horde.json"), JSON.stringify({ verify: { checks: { test: "true" } }, tiers: ["mock/mock", "mock/pricey"] }))
+    git(r, "add", ".")
+    git(r, "commit", "-qm", "checks")
+    // The orchestrator's untracked export, carried over as the worktree's baseline.
+    fs.writeFileSync(path.join(r, "carried.txt"), "carried\n")
+    const seen = mock.requests.length
+    const id = idOf(
+      await h.call("horde_do", {
+        directory: r,
+        goal: "Delete the carried file and update the tracked one.\nRUN: rm carried.txt && echo ok > tracked.txt && git add -A && git commit -qm change",
+        done: ["tracked.txt says ok"],
+        scope: ["tracked.txt", "carried.txt"],
+      }),
+    )
+    // The worker's first prompt names the carried-over file and forbids touching it.
+    const prompts = (mock.requests.slice(seen) as { messages?: { role: string; content: unknown }[] }[])
+      .flatMap((q) => q.messages ?? [])
+      .map((m) => (typeof m.content === "string" ? m.content : ((m.content as { text?: string }[] | undefined) ?? []).map((p) => p.text ?? "").join(" ")))
+      .join("\n")
+    assert.ok(
+      prompts.includes(
+        "holds 1 file(s) that are uncommitted in the main checkout, not the project's committed state: carried.txt. Do not delete, move or rewrite them",
+      ),
+      prompts,
+    )
+    const ready = await settle(id)
+    assert.match(ready, new RegExp(`^${id} READY`), ready)
+    assert.match(ready, /1 deleted file\(s\) exist only in your checkout's uncommitted changes and stay as they are when landed/, ready)
+    const landed = await h.call("horde_land", { id })
+    assert.match(landed, new RegExp(`^landed ${id} on master: 1 commit\\(s\\)`), landed)
+    assert.equal(git(r, "show", "--name-only", "--format=", "HEAD"), "tracked.txt", "only the tracked change landed")
+    assert.equal(git(r, "status", "--porcelain"), "?? carried.txt", "the untracked file stays untracked in the checkout")
+  })
+
+  test("a conflict confined to generated files is resolved by the land step, which regenerates them", async () => {
+    const { repo: r } = makeRepo(mock.url)
+    fs.mkdirSync(path.join(r, "src"), { recursive: true })
+    fs.mkdirSync(path.join(r, "dist"), { recursive: true })
+    fs.writeFileSync(path.join(r, "src", "worker.txt"), "base\n")
+    fs.writeFileSync(path.join(r, "src", "master.txt"), "base\n")
+    fs.writeFileSync(path.join(r, "dist", "out.txt"), "base\n")
+    fs.writeFileSync(
+      path.join(r, "horde.json"),
+      JSON.stringify({
+        verify: { checks: { test: "true" }, audit: { generated: ["dist/**"] } },
+        workers: {
+          land: `node -e "require('fs').writeFileSync('dist/out.txt', require('fs').readFileSync('src/worker.txt','utf8').trim() + '-' + require('fs').readFileSync('src/master.txt','utf8').trim())"`,
+        },
+        tiers: ["mock/mock", "mock/pricey"],
+      }),
+    )
+    git(r, "add", ".")
+    git(r, "commit", "-qm", "checks")
+    const id = idOf(
+      await h.call("horde_do", {
+        directory: r,
+        goal: "Change the worker source and its generated output.\nRUN: echo worker > src/worker.txt && echo worker-dist > dist/out.txt && git add -A && git commit -qm worker",
+        done: ["src/worker.txt says worker"],
+        scope: ["src/**", "dist/**"],
+      }),
+    )
+    await settle(id)
+    // Master changes a different source file and regenerates the same output.
+    fs.writeFileSync(path.join(r, "src", "master.txt"), "master\n")
+    fs.writeFileSync(path.join(r, "dist", "out.txt"), "master-dist\n")
+    git(r, "add", "-A")
+    git(r, "commit", "-qm", "master regenerates")
+    const landed = await h.call("horde_land", { id })
+    assert.match(landed, new RegExp(`^landed ${id} on master: 2 commit\\(s\\)`), landed)
+    assert.match(landed, /resolved 1 conflict\(s\) in generated files with master's version; the land step regenerated them/, landed)
+    assert.equal(fs.readFileSync(path.join(r, "dist", "out.txt"), "utf8").trim(), "worker-master", "the land step regenerated the file from both sources")
+    assert.equal(fs.readFileSync(path.join(r, "src", "worker.txt"), "utf8").trim(), "worker")
+    assert.equal(fs.readFileSync(path.join(r, "src", "master.txt"), "utf8").trim(), "master")
+  })
+
+  test("a conflict confined to generated files with no workers.land is refused, naming them", async () => {
+    const { repo: r } = makeRepo(mock.url)
+    fs.mkdirSync(path.join(r, "src"), { recursive: true })
+    fs.mkdirSync(path.join(r, "dist"), { recursive: true })
+    fs.writeFileSync(path.join(r, "src", "worker.txt"), "base\n")
+    fs.writeFileSync(path.join(r, "src", "master.txt"), "base\n")
+    fs.writeFileSync(path.join(r, "dist", "out.txt"), "base\n")
+    fs.writeFileSync(
+      path.join(r, "horde.json"),
+      JSON.stringify({ verify: { checks: { test: "true" }, audit: { generated: ["dist/**"] } }, tiers: ["mock/mock", "mock/pricey"] }),
+    )
+    git(r, "add", ".")
+    git(r, "commit", "-qm", "checks")
+    const id = idOf(
+      await h.call("horde_do", {
+        directory: r,
+        goal: "Change the worker source and its generated output.\nRUN: echo worker > src/worker.txt && echo worker-dist > dist/out.txt && git add -A && git commit -qm worker",
+        done: ["src/worker.txt says worker"],
+        scope: ["src/**", "dist/**"],
+      }),
+    )
+    await settle(id)
+    fs.writeFileSync(path.join(r, "src", "master.txt"), "master\n")
+    fs.writeFileSync(path.join(r, "dist", "out.txt"), "master-dist\n")
+    git(r, "add", "-A")
+    git(r, "commit", "-qm", "master regenerates")
+    const head = git(r, "rev-parse", "HEAD")
+    const refused = await h.call("horde_land", { id })
+    assert.match(refused, /only in generated files \(dist\/out\.txt\); master is unchanged\./, refused)
+    assert.match(refused, /Set horde\.json "workers\.land" to the command that regenerates them/, refused)
+    assert.equal(git(r, "rev-parse", "HEAD"), head, "master did not move")
+    await h.call("horde_drop", { id })
+  })
+
+  test("a conflict in a non-generated file is still refused, even with generated paths set", async () => {
+    const { repo: r } = makeRepo(mock.url)
+    fs.writeFileSync(path.join(r, "conflict.txt"), "base\n")
+    fs.writeFileSync(
+      path.join(r, "horde.json"),
+      JSON.stringify({ verify: { checks: { test: "true" }, audit: { generated: ["dist/**"] } }, tiers: ["mock/mock", "mock/pricey"] }),
+    )
+    git(r, "add", ".")
+    git(r, "commit", "-qm", "checks")
+    const id = idOf(
+      await h.call("horde_do", {
+        directory: r,
+        goal: "Change conflict.txt to worker.\nRUN: echo worker > conflict.txt && git add -A && git commit -qm worker",
+        done: ["conflict.txt says worker"],
+        scope: ["conflict.txt"],
+      }),
+    )
+    await settle(id)
+    fs.writeFileSync(path.join(r, "conflict.txt"), "master\n")
+    git(r, "add", "conflict.txt")
+    git(r, "commit", "-qm", "master change")
+    const refused = await h.call("horde_land", { id })
+    assert.match(refused, /not landed: .*conflict with master in conflict\.txt/, refused)
+    await h.call("horde_drop", { id })
+  })
+
   test("a scope change alone re-checks a task the audit failed for an out-of-scope file", async () => {
     const { repo: r } = makeRepo(mock.url)
     fs.writeFileSync(path.join(r, "horde.json"), JSON.stringify({ verify: { checks: { test: "true" } }, tiers: ["mock/mock", "mock/pricey"] }))

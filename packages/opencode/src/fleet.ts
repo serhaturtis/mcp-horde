@@ -35,6 +35,7 @@ import { type Detail, inputSummary, renderTranscript } from "./render.js"
 import { type AgentRecord, type GateConfig, type Limits, ownerAlive, type ReviewSummary, SELF, type Store } from "./state.js"
 import { buildTrack, type CostEstimator, costSince, currentTurn, emptyTrack, latestTool, stablePrefix, type Track, type Turn, turnsSince } from "./tracker.js"
 import {
+  BASELINE_MESSAGE,
   commitAll,
   commitMsgHook,
   createWorktree,
@@ -1150,6 +1151,15 @@ export class Fleet {
         preamble.push(
           `<workspace>You are working in an isolated git worktree on branch ${worktree.branch}. Commit your changes to this branch with clear messages when the task is done. Do not push, and do not switch branches.${hook ? ` This repository has a commit-msg hook at ${hook}: commit your work with git commit in a message it accepts (read the hook for its rules), never with --no-verify.` : ""}</workspace>`,
         )
+        if (worktree.baseline) {
+          // The first commit is the carried-over baseline: files the main checkout has uncommitted.
+          const carried = (await git(worktree.root, "diff", "--name-only", worktree.base, worktree.baseline)).split("\n").filter(Boolean)
+          const named = carried.slice(0, 8)
+          const more = carried.length - named.length
+          preamble.push(
+            `<carried-over>Your branch's first commit, "${BASELINE_MESSAGE}", holds ${carried.length} file(s) that are uncommitted in the main checkout, not the project's committed state: ${named.join(", ")}${more > 0 ? `, … and ${more} more` : ""}. Do not delete, move or rewrite them; your own work goes on top of them.</carried-over>`,
+          )
+        }
       }
       const text = preamble.length ? `${preamble.join("\n\n")}\n\n${input.prompt}` : input.prompt
       await this.sendPrompt(live, text, prepared)
@@ -1602,9 +1612,11 @@ export class Fleet {
       // 1. Onto your branch's tip, inside the worktree, leaving the carried-over baseline out. A
       // conflict leaves both as they were; anything else failing is reported by its own cause.
       let leftover = false
+      let resolved = 0
       try {
         const synced = await landSync(wt, name)
         leftover = synced.leftover ?? false
+        resolved = synced.resolved ?? 0
         if (synced.worktree) {
           wt = synced.worktree
           // The verdict stands for landing again; a new turn is gated as usual.
@@ -1613,7 +1625,10 @@ export class Fleet {
           await this.rebindTaskBase(live, wt)
         }
       } catch (err) {
-        if (!(err as { conflicts?: boolean }).conflicts) throw err
+        const conflict = err as { conflicts?: boolean; generated?: boolean; files?: string[] }
+        if (!conflict.conflicts) throw err
+        // Every conflict was in generated files but nothing regenerates them: say what to set.
+        if (conflict.generated) return { landed: false, target, why: "generated", root: wt.root, files: conflict.files ?? [] }
         return {
           landed: false,
           target,
@@ -1714,6 +1729,7 @@ export class Fleet {
         commits: Number(commits) || 0,
         checks: v.checks.map(gateCheck),
         branchKept: unmerged.length ? wt.branch : undefined,
+        ...(resolved ? { resolved } : {}),
       }
     }
     throw new Error(`your branch kept moving while ${name} was being landed; call horde_land again`)
@@ -3102,7 +3118,7 @@ export class Fleet {
 }
 
 export type LandResult =
-  | { landed: true; target: string; commits: number; checks: GateCheckSummary[]; branchKept?: string; already?: true }
+  | { landed: true; target: string; commits: number; checks: GateCheckSummary[]; branchKept?: string; already?: true; resolved?: number }
   | {
       landed: false
       target: string
@@ -3125,6 +3141,8 @@ export type LandResult =
       /** why "already": the task's own commits already on the target (patch-identical), of its total. */
       alreadyOn?: { on: number; total: number }
     }
+  /** why "generated": the conflict is confined to generated files but no workers.land command regenerates them. */
+  | { landed: false; target: string; why: "generated"; root?: string; files: string[] }
 
 interface Prepared {
   files: { uri: string; name: string }[]

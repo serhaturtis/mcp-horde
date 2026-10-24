@@ -463,7 +463,7 @@ export async function outcome(fleet: Fleet, ref: string, opts: { live?: boolean 
 
   if (record.investigate) return investigate(fleet, ref, s, record)
 
-  const changes = wt ? await changeSummary(wt.root, workStart(wt)) : undefined
+  const changes = wt ? await changeSummary(wt.root, workStart(wt), wt.base) : undefined
   const workerSaid = oneLine(task?.reports.at(-1)?.summary ?? s.lastTurn?.finalText ?? "")
 
   const passed = s.gate?.state === "pass" || (verdict?.pass && verdict.final)
@@ -548,6 +548,7 @@ function renderLanding(id: string, r: LandResult): string {
       `landed ${id} on ${r.target}: ${r.commits} commit(s) · ${checksLine(r.checks)} on ${r.target}'s tip before updating it · task done, worktree${r.branchKept ? "" : " and branch"} removed${kept}`,
     ]
     for (const c of r.checks) if (c.baseline && !c.baseline.pass) lines.push(`⚠ ${c.name} fails at ${c.baseline.label} too (not caused by this work)`)
+    if (r.resolved) lines.push(`resolved ${r.resolved} conflict(s) in generated files with ${r.target}'s version; the land step regenerated them`)
     return lines.join("\n")
   }
   if (r.why === "leftovers")
@@ -580,6 +581,13 @@ function renderLanding(id: string, r: LandResult): string {
       `not landed: ${on} of ${total} commits of ${id} are already on ${r.target}; landing the rest would replay those ${on} as empty commits.`,
       indent(r.text, "  "),
       `If you landed its work yourself, horde_drop {id: "${id}", landed: true}; otherwise merge the rest by hand (git -C ${r.root} …)`,
+    ].join("\n")
+  }
+  if (r.why === "generated") {
+    return [
+      `not landed: ${id}'s commits conflict with ${r.target} only in generated files (${r.files.join(", ")}); ${r.target} is unchanged.`,
+      `Set horde.json "workers.land" to the command that regenerates them, then horde_land {id: "${id}"} again.`,
+      `→ horde_drop {id: "${id}"}`,
     ].join("\n")
   }
   if (r.why === "conflict") {
@@ -647,7 +655,7 @@ function safeTiers(repo: string) {
 }
 
 /** "changed 3 files (+86 −2): a.ts (new), b.ts, …", and the first changed lines for a failure. */
-async function changeSummary(root: string, start: string): Promise<{ line: string; excerpt: string } | undefined> {
+async function changeSummary(root: string, start: string, base?: string): Promise<{ line: string; excerpt: string } | undefined> {
   const numstat = await git(root, "diff", "--numstat", start).catch(() => "")
   const untracked = (await git(root, "ls-files", "--others", "--exclude-standard").catch(() => "")).split("\n").filter(Boolean)
   const files: { file: string; add: number; del: number; isNew?: boolean }[] = numstat
@@ -662,7 +670,23 @@ async function changeSummary(root: string, start: string): Promise<{ line: strin
   const add = files.reduce((n, f) => n + f.add, 0)
   const del = files.reduce((n, f) => n + f.del, 0)
   const names = files.slice(0, 6).map((f) => `${f.file}${f.isNew ? " (new)" : ""}`)
-  const line = `changed ${files.length} file(s) (+${add} −${del}): ${names.join(", ")}${files.length > 6 ? `, … ${files.length - 6} more` : ""}`
+  // Deletions of files the checkout only has uncommitted (the carried-over baseline): they are
+  // not real deletions, since landing drops them as nothing, so the changed-files line says so.
+  let carried = 0
+  if (base) {
+    for (const f of files) {
+      if (f.isNew || f.add || !f.del) continue
+      if (
+        !(await git(root, "cat-file", "-e", `${base}:${f.file}`).then(
+          () => true,
+          () => false,
+        ))
+      )
+        carried++
+    }
+  }
+  const note = carried ? `; ${carried} deleted file(s) exist only in your checkout's uncommitted changes and stay as they are when landed` : ""
+  const line = `changed ${files.length} file(s) (+${add} −${del}): ${names.join(", ")}${files.length > 6 ? `, … ${files.length - 6} more` : ""}${note}`
   const diff = await git(root, "-c", "core.quotePath=false", "diff", "-U0", "--no-color", start).catch(() => "")
   const excerpt: string[] = []
   for (const l of diff.split("\n")) {

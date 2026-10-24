@@ -3,7 +3,8 @@ import { constants, existsSync } from "node:fs"
 import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
-import { branchSlug, GIT_ENV, git, gitRaw, repoKey, runCommand, splitZ, type Workers } from "@mcp-horde/core"
+import { branchSlug, GIT_ENV, git, gitRaw, globMatcher, loadWorkers, repoKey, runCommand, splitZ, type Workers } from "@mcp-horde/core"
+import { loadSettingsAt } from "@mcp-horde/verify"
 
 const isWindows = process.platform === "win32"
 
@@ -741,34 +742,104 @@ async function baselineReplay(root: string, base: string): Promise<string | unde
  * so the agent continues on top of everything merged since it started and its own merge
  * later applies cleanly. On a conflict the rebase is aborted and the worktree is unchanged.
  */
+interface RebaseOptions {
+  /** Resolve a conflict confined to these globs by taking the target's version; the land command regenerates them. */
+  generated?: string[]
+  /** Whether horde.json names a workers.land command to regenerate the generated files. */
+  land?: boolean
+}
+
 /**
  * Rebase the commits after `start` in the worktree onto the checkout's tip (`tip`). A rebase
  * replays only ordinary commits, so a merge commit is refused; on a conflict the rebase is
- * aborted and the conflicting files are named. Returns the replayed commits, in order.
+ * aborted and the conflicting files are named. With `generated` set (landing), a conflict
+ * confined to those globs is instead resolved in the target's favour and the rebase continues,
+ * because workers.land regenerates the files fresh; a conflict touching anything else, or one
+ * with no land command to regenerate, still aborts. Returns the replayed commits, in order,
+ * and how many generated-file conflicts it resolved.
  */
-async function rebaseOntoTip(wt: Worktree, target: string, tip: string, start: string): Promise<string[]> {
+async function rebaseOntoTip(
+  wt: Worktree,
+  target: string,
+  tip: string,
+  start: string,
+  opts: RebaseOptions = {},
+): Promise<{ commits: string[]; resolved: number }> {
   const merges = (await git(wt.root, "rev-list", "--merges", `${start}..HEAD`)).split("\n").filter(Boolean)
   if (merges.length)
     throw new Error(
       `${wt.branch} contains merge commits (${merges.slice(0, 3).join(", ")}${merges.length > 3 ? ", …" : ""}), which a rebase would replay without their merge-only changes. Merge it by hand instead, e.g. git merge ${target}.`,
     )
   const identity = (await hasIdentity(wt.root)) ? [] : IDENTITY
+  const generated = opts.generated?.length ? globMatcher(opts.generated) : undefined
+  const abortError = (
+    conflicts: string[],
+    detail = conflicts.length ? `conflicting files:\n${conflicts.join("\n")}` : "",
+  ): Error & { conflicts?: boolean; generated?: boolean; files?: string[] } => {
+    const e = new Error(
+      `syncing ${wt.branch} onto ${target} failed and was aborted; the worktree is unchanged.\n${detail}\nTell the agent what changed in ${target} (or merge by hand).`,
+    ) as Error & { conflicts?: boolean; generated?: boolean; files?: string[] }
+    e.conflicts = conflicts.length > 0
+    return e
+  }
+  let resolved = 0
   try {
     // Reapply commits even when the target already has the same patch, and keep the ones that
     // become empty. Every original commit then has a replay, so the baseline is the first one;
     // no commit message or count can be spoofed.
     await git(wt.root, ...NO_SIGN, ...identity, "-c", "core.editor=true", "rebase", "--empty=keep", "--reapply-cherry-picks", "--onto", tip, start, wt.branch)
   } catch (err) {
-    const conflicts = await git(wt.root, "diff", "--name-only", "--diff-filter=U").catch(() => "")
-    await git(wt.root, "rebase", "--abort").catch(() => undefined)
-    const detail = conflicts ? `conflicting files:\n${conflicts}` : err instanceof Error ? err.message : String(err)
-    const e = new Error(
-      `syncing ${wt.branch} onto ${target} failed and was aborted; the worktree is unchanged.\n${detail}\nTell the agent what changed in ${target} (or merge by hand).`,
-    ) as Error & { conflicts?: boolean }
-    e.conflicts = conflicts.length > 0
-    throw e
+    // The rebase stopped on a conflict. Resolve generated-only conflicts in the target's favour,
+    // then carry on; `--continue` stops again at the next conflict, so loop until it finishes.
+    let last = err
+    for (;;) {
+      const conflicts = (await git(wt.root, "diff", "--name-only", "--diff-filter=U").catch(() => "")).split("\n").filter(Boolean)
+      // Without generated resolution, or a failure that left no conflict, abort as today.
+      if (!generated || !conflicts.length) {
+        await git(wt.root, "rebase", "--abort").catch(() => undefined)
+        throw abortError(conflicts, conflicts.length ? undefined : last instanceof Error ? last.message : String(last))
+      }
+      // A conflict touching any non-generated file aborts as today.
+      if (conflicts.some((f) => !generated(f))) {
+        await git(wt.root, "rebase", "--abort").catch(() => undefined)
+        throw abortError(conflicts)
+      }
+      // Every conflict is generated but nothing regenerates them: refuse and say what to set.
+      if (!opts.land) {
+        const e = abortError(
+          conflicts,
+          `the conflict is only in generated files (${conflicts.join(", ")}); set horde.json "workers.land" to the command that regenerates them, then horde_land again`,
+        )
+        e.generated = true
+        e.files = conflicts
+        await git(wt.root, "rebase", "--abort").catch(() => undefined)
+        throw e
+      }
+      // Take the target's version of each generated file and continue; workers.land regenerates them.
+      for (const file of conflicts) {
+        if (
+          await git(wt.root, "cat-file", "-e", `HEAD:${file}`).then(
+            () => true,
+            () => false,
+          )
+        ) {
+          await git(wt.root, "checkout", "--ours", "--", file)
+          await git(wt.root, "add", "--", file)
+        } else {
+          await git(wt.root, "rm", "-f", "--", file)
+        }
+        resolved++
+      }
+      try {
+        if (await git(wt.root, "diff", "--cached", "--name-only")) await git(wt.root, "-c", "core.editor=true", "rebase", "--continue")
+        else await git(wt.root, "rebase", "--skip")
+        break
+      } catch (next) {
+        last = next
+      }
+    }
   }
-  return (await git(wt.root, "rev-list", "--reverse", `${tip}..HEAD`)).split("\n").filter(Boolean)
+  return { commits: (await git(wt.root, "rev-list", "--reverse", `${tip}..HEAD`)).split("\n").filter(Boolean), resolved }
 }
 
 /**
@@ -790,7 +861,7 @@ export async function syncWorktree(wt: Worktree, name: string): Promise<{ text: 
   // is also true after the user reset to an older commit or switched to an older branch, and then
   // the work must move onto that (older) tip.
   if (wt.base === tip) return { text: [...notes, `${wt.branch} already contains ${target} (${tip.slice(0, 10)}); nothing to sync`].join("\n") }
-  const replayed = await rebaseOntoTip(wt, target, tip, wt.base)
+  const { commits: replayed } = await rebaseOntoTip(wt, target, tip, wt.base)
   // Every commit was replayed in order, so the first one is the baseline.
   const baseline = wt.baseline ? replayed[0] : undefined
   const own = replayed.length - (baseline ? 1 : 0)
@@ -806,7 +877,7 @@ export async function syncWorktree(wt: Worktree, name: string): Promise<{ text: 
  * checks judge exactly the tree that will land. The user's carried-over changes stay
  * uncommitted in their checkout. On a conflict the worktree is unchanged.
  */
-export async function landSync(wt: Worktree, name: string): Promise<{ text: string; worktree?: Worktree; leftover?: boolean }> {
+export async function landSync(wt: Worktree, name: string): Promise<{ text: string; worktree?: Worktree; leftover?: boolean; resolved?: number }> {
   const notes: string[] = []
   const committed = await commitAll(wt, `horde: work from ${name}`)
   if (committed) notes.push(committed)
@@ -818,11 +889,15 @@ export async function landSync(wt: Worktree, name: string): Promise<{ text: stri
   const start = workStart(wt)
   if (start === tip)
     return { text: [...notes, `${wt.branch} is already on ${target} (${tip.slice(0, 10)}); nothing to rebase`].join("\n"), leftover: !!committed }
-  const replayed = await rebaseOntoTip(wt, target, tip, start)
+  // A conflict confined to generated paths is resolved in the target's favour: workers.land regenerates them.
+  const settings = await loadSettingsAt(wt.repo, "HEAD")
+  const land = loadWorkers(wt.repo).land
+  const { commits: replayed, resolved } = await rebaseOntoTip(wt, target, tip, start, { generated: settings.audit.generated, land: !!land })
+  if (resolved) notes.push(`resolved ${resolved} conflict(s) in generated files with ${target}'s version; the land step regenerated them`)
   notes.push(
     `rebased ${replayed.length} commit(s) of ${wt.branch} onto ${target} (${tip.slice(0, 10)})${wt.baseline ? "; the carried-over changes stay in your checkout" : ""}`,
   )
-  return { text: notes.join("\n"), worktree: { ...wt, base: tip, baseline: undefined, merged: undefined }, leftover: !!committed }
+  return { text: notes.join("\n"), worktree: { ...wt, base: tip, baseline: undefined, merged: undefined }, leftover: !!committed, resolved }
 }
 
 /**
