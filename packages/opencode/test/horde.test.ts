@@ -1174,12 +1174,38 @@ console.log("1..0")
     assert.match(failed, /outside the allowed scope/, failed)
     // The FAILED outcome suggests a scope change, naming the out-of-scope file.
     assert.match(failed, /scope: \[\.\.\.\]\} to allow b\.txt/, failed)
+    // Other audit categories get no binaries hint.
+    assert.doesNotMatch(failed, /"warn": \["binaries"\]/, failed)
     // Telling it the new scope with no message re-runs the gate under it: a fresh outcome, then READY.
     assert.match(await h.call("horde_tell", { id, scope: ["a.txt", "b.txt"] }), /re-checking the finished work under the new scope/)
     const ready = await settle(id)
     assert.match(ready, new RegExp(`^${id} READY`), ready)
     assert.match(await h.call("horde_land", { id }), /^landed t-\w+ on master: 1 commit\(s\)/)
     assert.equal(fs.readFileSync(path.join(r, "b.txt"), "utf8").trim(), "ok")
+  })
+
+  test("the FAILED outcome says how a binary deliverable stops blocking the audit", async () => {
+    const { repo: r } = makeRepo(mock.url)
+    fs.writeFileSync(path.join(r, "horde.json"), JSON.stringify({ verify: { checks: { test: "true" } }, tiers: ["mock/mock", "mock/pricey"] }))
+    git(r, "add", "horde.json")
+    git(r, "commit", "-qm", "checks")
+    const started = await h.call("horde_do", {
+      directory: r,
+      goal: `Write the icon.\nRUN: mkdir -p docs && node -e "require('fs').writeFileSync('docs/icon.png', Buffer.from([0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a,0x00,0x01,0x02,0x03]))" && git add -A && git commit -qm icon`,
+      done: ["docs/icon.png is the icon"],
+      scope: ["docs/**"],
+    })
+    const id = idOf(started)
+    const failed = await settle(id)
+    assert.match(failed, new RegExp(`^${id} FAILED`), failed)
+    assert.match(failed, /binaries: docs\/icon\.png adds or changes a binary file/, failed)
+    // The audit's binaries category blocks by default; the outcome names the file and the rule that changes it.
+    assert.match(failed, /the audit blocks added or changed binaries and files over 1 MB by default: docs\/icon\.png/, failed)
+    assert.match(failed, /"warn": \["binaries"\]/, failed)
+    assert.match(failed, /"generated": \["<globs>"\]/, failed)
+    assert.match(failed, /"off": \["binaries"\]/, failed)
+    assert.match(failed, new RegExp(`horde_tell \\{id: "${id}", message: "Run your checks again"\\}`), failed)
+    await h.call("horde_drop", { id })
   })
 
   test("an uncommitted horde.json is not carried over; the gate runs HEAD's and the notes say so", async () => {

@@ -523,6 +523,16 @@ export async function outcome(fleet: Fleet, ref: string, opts: { live?: boolean 
   }
   if (workerSaid) lines.push(`  worker: ${truncate(workerSaid, 240)}`)
   lines.push(`  ${footer}`)
+  const binaryBlamed = binaryFiles(verdict?.text)
+  if (binaryBlamed.length) {
+    const named = binaryBlamed.slice(0, 4).join(", ")
+    lines.push(
+      `  the audit blocks added or changed binaries and files over 1 MB by default: ${named}${binaryBlamed.length > 4 ? ` +${binaryBlamed.length - 4} more` : ""}`,
+    )
+    lines.push(
+      `  if these files are the work (images, fonts, fixtures), the repository's committed horde.json decides: {"verify": {"audit": {"warn": ["binaries"]}}} lists them as warnings instead, "generated": ["<globs>"] exempts only those paths, "off": ["binaries"] silences the category; commit the change, then horde_tell {id: "${id}", message: "Run your checks again"} (the gate reads the rules from your branch's tip)`,
+    )
+  }
   const stronger = nextTier(repo, task?.tier)
   const scopeBlamed = scopeFiles(verdict?.text)
   lines.push(
@@ -614,6 +624,17 @@ function scopeFiles(text?: string): string[] {
   const files: string[] = []
   for (const line of text.split("\n")) {
     const m = /scope:\s+(\S+)\s+(adds|changes|deletes|moves)\b/.exec(line)
+    if (m) files.push(m[1]!)
+  }
+  return [...new Set(files)]
+}
+
+/** Files a blocking audit 'binaries' finding blamed, from the rendered verdict ("✗ binaries: a.png adds …"). */
+function binaryFiles(text?: string): string[] {
+  if (!text) return []
+  const files: string[] = []
+  for (const line of text.split("\n")) {
+    const m = /^\s*✗ binaries:\s+(\S+)\s+(?:adds or changes a binary file|file is [\d.]+ MB)/.exec(line)
     if (m) files.push(m[1]!)
   }
   return [...new Set(files)]
