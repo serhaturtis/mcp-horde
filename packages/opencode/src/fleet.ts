@@ -2133,11 +2133,15 @@ export class Fleet {
     let checks: GateCheckSummary[] | undefined
     let review: ReviewSummary | undefined
     try {
+      // A worktree's commits are never on the target branch: its rules are horde.json at that
+      // branch's tip, including a change the orchestrator committed while the task ran.
+      const rulesAt = wt ? await git(wt.repo, "rev-parse", "HEAD").catch(() => undefined) : undefined
       const v = await runGate(live.session?.location.directory ?? live.record.directory, {
         base: start ?? cfg.base,
+        rulesAt,
         audit: cfg.audit,
-        // Only an unaudited shared gate may use the human's working config; an audited one
-        // must judge by the rules that were in force at base.
+        // Only an unaudited shared gate may use the human's working config; a worktree gate
+        // judges by the target branch's rules, which the work itself cannot rewrite.
         settingsFrom: !wt && !cfg.audit ? "working" : "base",
         checks: cfg.checks,
         allowed: cfg.allowed,

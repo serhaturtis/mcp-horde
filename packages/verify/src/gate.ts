@@ -11,6 +11,8 @@ import { type CheckResult, logDirFor, runChecks } from "./run.js"
 export interface GateOptions {
   /** Commit the work started from; the audit covers base → working tree. Without it, only checks run. */
   base?: string
+  /** Commit whose horde.json supplies the rules; default base. */
+  rulesAt?: string
   /** Names of checks to run (default: all detected or configured ones). */
   checks?: string[]
   /**
@@ -21,9 +23,10 @@ export interface GateOptions {
   /** Skip the audit (e.g. outside a worktree, where the human's own edits would be audited too). */
   audit?: boolean
   /**
-   * Where the gate's settings come from when `base` is set. `"base"` (the default) freezes the
-   * rules at the start of the work; `"working"` is for a shared directory, whose horde.json the
-   * human owns and may not have committed yet.
+   * Where the gate's settings come from when `base` is set. `"base"` (the default) reads the
+   * rules at `rulesAt` (base unless the caller names the commit the work will land on);
+   * `"working"` is for a shared directory, whose horde.json the human owns and may not have
+   * committed yet.
    */
   settingsFrom?: "base" | "working"
   /** Character budget for the rendered verdict. */
@@ -278,11 +281,13 @@ async function compareBaseline(
 
 export async function gate(directory: string, opts: GateOptions = {}): Promise<Verdict> {
   const dir = path.resolve(directory)
-  // The diff starts where HEAD meets base; the rules are base's, so the work cannot rewrite them.
+  // The diff starts where HEAD meets base; the rules come from rulesAt (base by default), a
+  // commit on the target branch, so the work cannot rewrite them.
   const base = opts.base ? await diffBase(await git(dir, "rev-parse", "--show-toplevel"), opts.base) : undefined
-  // In a worktree the rules are base's, so the work cannot rewrite them. In a shared directory
-  // the human's working horde.json is the configuration; the caller must say so explicitly.
-  const settings = base && opts.settingsFrom !== "working" ? await loadSettingsAt(dir, base) : loadSettings(dir)
+  // In a worktree the rules are the target branch's, so the work cannot rewrite them; a caller
+  // may name a later commit there to include a rule change made while the work ran. In a shared
+  // directory the human's working horde.json is the configuration; the caller must say so.
+  const settings = base && opts.settingsFrom !== "working" ? await loadSettingsAt(dir, opts.rulesAt ?? base) : loadSettings(dir)
   const all = await detectChecks(dir, settings)
   const selected = opts.checks?.length ? pick(all, opts.checks) : all
   const doAudit = opts.audit !== false && !!base

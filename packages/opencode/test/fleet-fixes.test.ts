@@ -203,6 +203,32 @@ describe("fleet fixes: gates, tasks and worktrees (real opencode, mock LLM)", { 
     await h.call("opencode_dispose", { id: "ds", worktree: "discard" })
   })
 
+  test("a worktree gate reads a rule committed on the main checkout while the task runs", async () => {
+    const { repo: r } = makeRepo(mock.url, { permission: { bash: "allow" } })
+    fs.writeFileSync(path.join(r, "horde.json"), JSON.stringify({ verify: { checks: { ok: `node -e "process.exit(0)"` } } }))
+    git(r, "add", "horde.json")
+    git(r, "commit", "-qm", "checks")
+    const failed = await h.call("opencode_spawn", {
+      prompt: `TOOL: node -e "require('fs').writeFileSync('logo.bin', Buffer.from([0,1,2,3]))"`,
+      name: "rules",
+      directory: r,
+      isolation: "worktree",
+      permissions: "allow",
+      gate: { max_rounds: 1 },
+      wait: true,
+      timeout_seconds: 120,
+    })
+    assert.match(failed, /gate: ✗ FAIL \(round 1\/1\)/, failed)
+    assert.match(failed, /binaries/, failed)
+    // The orchestrator commits the looser rule on the target branch; the worktree does not have it.
+    fs.writeFileSync(path.join(r, "horde.json"), JSON.stringify({ verify: { checks: { ok: `node -e "process.exit(0)"` }, audit: { warn: ["binaries"] } } }))
+    git(r, "add", "horde.json")
+    git(r, "commit", "-qm", "warn binaries")
+    const passed = await h.call("opencode_message", { id: "rules", message: "run the checks again", wait: true, timeout_seconds: 120 })
+    assert.match(passed, /gate: ✓ PASS \(round 1\/1\)/, passed)
+    await h.call("opencode_dispose", { id: "rules", worktree: "discard" })
+  })
+
   test("gate reviews get ten minutes per answer", () => {
     assert.equal(GATE_REVIEW_TIMEOUT_MS, 600_000)
   })

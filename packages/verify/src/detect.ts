@@ -60,13 +60,14 @@ export function loadSettings(directory: string): VerifySettings {
 }
 
 /**
- * Settings as horde.json had them at `base`, so a worker cannot loosen the rules its own
- * gate applies (drop a check, unblock a category) by editing horde.json. The same files
- * loadHordeFile would find are looked up in the base commit; when none existed there, the
- * defaults apply: a working-tree horde.json is the work's own change (the audit flags it),
+ * Settings as horde.json had them at `commit`, so a worker cannot loosen the rules its own
+ * gate applies (drop a check, unblock a category) by editing horde.json. The gate passes the
+ * commit whose rules apply: base by default, or the target branch's tip when it moved on. The
+ * same files loadHordeFile would find are looked up in that commit; when none existed there,
+ * the defaults apply: a working-tree horde.json is the work's own change (the audit flags it),
  * not a rule the gate may run.
  */
-export async function loadSettingsAt(directory: string, base: string): Promise<VerifySettings> {
+export async function loadSettingsAt(directory: string, commit: string): Promise<VerifySettings> {
   const top = await git(directory, "rev-parse", "--show-toplevel").catch(() => undefined)
   if (!top) return loadSettings(directory)
   const realTop = realpath(top)
@@ -74,16 +75,16 @@ export async function loadSettingsAt(directory: string, base: string): Promise<V
     const rel = path.relative(realTop, dir).replace(/\\/g, "/")
     if (rel.startsWith("..") || path.isAbsolute(rel)) break
     const file = rel ? `${rel}/horde.json` : "horde.json"
-    const text = await gitRaw(realTop, ["show", `${base}:${file}`]).catch(() => undefined)
+    const text = await gitRaw(realTop, ["show", `${commit}:${file}`]).catch(() => undefined)
     if (text !== undefined) {
       let data: unknown
       try {
         data = JSON.parse(text)
       } catch (err) {
-        throw new Error(`${file} at ${base} is not valid JSON: ${(err as Error).message}`)
+        throw new Error(`${file} at ${commit} is not valid JSON: ${(err as Error).message}`)
       }
-      if (!data || typeof data !== "object" || Array.isArray(data)) throw new Error(`${file} at ${base} must contain a JSON object`)
-      validateHordeFile(data as Record<string, unknown>, `${file} at ${base}`)
+      if (!data || typeof data !== "object" || Array.isArray(data)) throw new Error(`${file} at ${commit} must contain a JSON object`)
+      validateHordeFile(data as Record<string, unknown>, `${file} at ${commit}`)
       return parseSettings({ root: dir, file: path.join(dir, "horde.json"), data: data as Record<string, unknown> })
     }
     if (!rel) break
@@ -125,8 +126,10 @@ function parseSettings(horde: HordeFile): VerifySettings {
     })
   }
   const audit = (v.audit ?? {}) as Record<string, unknown>
-  const block = categories(audit.block, `${where}.audit.block`) ?? DEFAULT_BLOCK
-  const warn = [...(categories(audit.warn, `${where}.audit.warn`) ?? DEFAULT_WARN)]
+  const warned = categories(audit.warn, `${where}.audit.warn`)
+  // An explicit warn list takes a category out of the default block; an explicit block still wins.
+  const block = categories(audit.block, `${where}.audit.block`) ?? DEFAULT_BLOCK.filter((c) => !warned?.includes(c))
+  const warn = [...(warned ?? DEFAULT_WARN)]
   const off = categories(audit.off, `${where}.audit.off`) ?? []
   // A category named nowhere warns: listing only `block` must not switch the rest off (that is what `off` is for).
   for (const c of AUDIT_CATEGORIES) if (!block.includes(c) && !off.includes(c) && !warn.includes(c)) warn.push(c)

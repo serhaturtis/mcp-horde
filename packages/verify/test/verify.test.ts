@@ -1094,6 +1094,32 @@ describe("fixes", () => {
     assert.equal(v.checks[0]?.name, "ok")
   })
 
+  test("a worktree gate reads the rules from the commit the work will land on", async () => {
+    const { root, base } = repo({ "horde.json": JSON.stringify({ verify: { checks: { ok: 'node -e "process.exit(0)"' } } }) })
+    write(root, {
+      "horde.json": JSON.stringify({ verify: { checks: { ok: 'node -e "process.exit(0)"' }, audit: { warn: ["binaries"] } } }),
+    })
+    git(root, "add", "horde.json")
+    git(root, "commit", "-qm", "warn binaries")
+    const rulesAt = git(root, "rev-parse", "HEAD")
+    // The task started at base and does not have the commit made on the target branch since.
+    const wt = path.join(tmp(), "wt")
+    git(root, "worktree", "add", "-q", "-b", "task", wt, base)
+    write(wt, { "logo.png": Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0x01]) })
+    const blocked = await gate(wt, { base, stateDir: tmp() })
+    assert.equal(blocked.pass, false, blocked.text)
+    assert.ok(
+      blocked.blockers.some((b) => /binaries/.test(b)),
+      blocked.text,
+    )
+    const warned = await gate(wt, { base, rulesAt, stateDir: tmp() })
+    assert.equal(warned.pass, true, warned.text)
+    assert.ok(
+      warned.warnings.some((w) => /binaries/.test(w)),
+      warned.text,
+    )
+  })
+
   test("no checks is not a pass", async () => {
     const { root } = repo({ "README.md": "# x\n" })
     const v = await gate(root, { stateDir: tmp() })
