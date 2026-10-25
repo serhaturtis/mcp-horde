@@ -32,6 +32,7 @@ To have it in every project, run the installer. It checks Node.js and OpenCode, 
 ./install.sh                                          # from a clone; Claude Code reads the plugin in place, so git pull updates it
 ./install.sh --default-model deepseek/deepseek-flash  # also make that the default worker model in every repository
 curl -fsSL https://raw.githubusercontent.com/serhaturtis/mcp-horde/master/install.sh | bash -s -- --github   # without a clone
+claude plugin marketplace update mcp-horde && claude plugin update horde@mcp-horde                               # update an install made without a clone, then restart Claude Code
 ```
 
 Or from inside Claude Code: `/plugin marketplace add serhaturtis/mcp-horde`, then `/plugin install horde@mcp-horde`.

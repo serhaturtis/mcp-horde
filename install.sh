@@ -11,6 +11,7 @@ Installs the horde plugin for Claude Code in every project (user scope).
   (no option)                     from this checkout: Claude Code reads the plugin in place, so a git pull updates it
   --github                        from github.com/serhaturtis/mcp-horde, no checkout needed:
                                   curl -fsSL https://raw.githubusercontent.com/serhaturtis/mcp-horde/master/install.sh | bash -s -- --github
+                                  (later: claude plugin marketplace update mcp-horde && claude plugin update horde@mcp-horde, then restart Claude Code)
   --default-model provider/model  make that model the default worker in every repository, e.g. deepseek/deepseek-flash
                                   (written to $XDG_CONFIG_HOME/mcp-horde/horde.json, only if that file does not exist;
                                   a repository's own horde.json still wins)
