@@ -163,9 +163,10 @@ Mechanical judgement with a compact verdict. Library + MCP server; both orchestr
   - tests: deleted test files, `.skip`/`.only`/`xit`/`@pytest.mark.skip` added, assertions removed (count of `expect(`/`assert` lines lost per test file), snapshot files rewritten wholesale
   - suppressions: `@ts-ignore`, `@ts-expect-error` without a reason, `eslint-disable`, `# type: ignore`, `# noqa`, `as any`, `unknown as`, empty `catch {}`, `.catch(() => {})`
   - dependencies: manifest or lockfile changes, new packages named
-  - hygiene: binaries, files over 1 MB, generated directories, secret-looking strings (common key prefixes, private key headers)
+  - binaries: added or changed files with binary content, and files grown past 1 MB (lockfiles excepted); paths matching `generated` are exempt
+  - secrets: secret-looking strings (common key prefixes, private key headers)
   - git: merge commits on the branch, commits that touch only `.horde`/`.opencode`
-  Each finding has `severity: block | warn`, a file, a line when known, and one line of text. Which categories block is configurable (`horde.json` `verify.audit`); defaults: scope, test deletion/skips, secrets and binaries block; suppressions and dependency changes warn.
+  Each finding has `severity: block | warn`, a file, a line when known, and one line of text. Which categories block, warn or are off is configurable (`horde.json` `verify.audit`); defaults: scope, test deletion/skips, secrets and binaries block; suppressions, dependency changes and merge commits warn.
 - `verify_gate { directory, base, checks?, related?, allowed?, budget_chars? (default 1500) }` (`related` derives the changed files from `base`) → `PASS` or `FAIL` with `blockers` (failing checks, blocking audit findings) and `warnings`, rendered within the budget. This is what `opencode` calls.
 - `verify_logs { directory, check }` → the last run's full output for one check, head-truncated to a requested size. Available, never automatic.
 
@@ -322,7 +323,13 @@ At the repository root (optional; everything auto-detects without it):
       "pg": { "command": "uv run pytest tests/pg", "cwd": "api", "env": { "AUTH_PROVIDER": "local" }, "when": "land", "slots": 2, "exclusive": "dev-stack" }
     },
     "timeoutSeconds": 600,
-    "audit": { "block": ["scope", "tests", "secrets", "binaries"], "warn": ["suppressions", "dependencies"] }
+    "audit": {
+      "block": ["scope", "tests", "secrets", "binaries"],
+      "warn": ["suppressions", "dependencies", "git"],
+      "off": [],
+      "allowed": ["src/**", "test/**"],
+      "generated": ["dist/**"]
+    }
   },
   "context": { "ignore": ["fixtures/**"], "entrypoints": ["src/index.ts"] },
   "workers": { "setup": "uv sync --frozen", "brief": ["docs/lane_brief.md"] }
@@ -330,6 +337,8 @@ At the repository root (optional; everything auto-detects without it):
 ```
 
 `tiers` lists worker models cheapest first, as `"provider/model"` or `{ model, variant }`; a task's tier indexes it, and the tier past the last entry is the orchestrator itself (a task-bound spawn there is refused with that explanation; an explicit `model` always wins). `workers.brief` lists repository-relative files (house rules) that every worker brief includes in full under `## House rules (<path>)`, right after its scope (each capped at 300 lines, with a missing file named in the brief rather than failing it). A check runs in a shell from the root or its `cwd`, with its `env`; `"when": "land"` keeps it out of a task's rounds entirely (its related tests do not run either) and in the gate before landing; `slots` and `exclusive` bound how many runs overlap across every process and worktree of the repository (lock files under verify's state directory, freed when their holder dies). Checks and `workers.setup` see `HORDE_TASK` and `HORDE_WORKTREE` when they run for a task, for per-task databases and ports. `workers.land` runs while a task lands, after the rebase onto your branch and before the checks, and its changes are committed on top through the repository's hooks: what a project regenerates after any rebase (migration chains, digests, docs pinned to commit hashes) is regenerated on the base the work actually lands on; when the landing does not complete, the worker's branch is put back as it was before the step. `horde_do` refuses in a repository where no checks are found, since its gate could never pass, and looks for them in HEAD's `horde.json`, the one its workers' gates read (an uncommitted one is named as the reason); its first answer names the checks that will judge the work. `horde.json` is the one file a task never carries over from the checkout: its uncommitted changes stay in your checkout, the task's gates read HEAD's, and the task's notes say so, so a local edit cannot silently change a task's checks (every other uncommitted change is still carried over). The plugin's setup skill (`/horde:setup`) writes `horde.json` from the project's CI and manifests and proves it on a clean tree. Environment variables remain for machine-level settings (state dirs, the OpenCode binary, server mode, passwords), as `opencode` does today. Project behaviour lives in `horde.json`, so it is versioned with the code and shared by every horde server and both sides.
+
+`verify.audit` decides the diff audit's seven categories, `scope`, `tests`, `suppressions`, `dependencies`, `secrets`, `binaries` and `git`: `block` and `warn` list them, a category named in neither warns (listing only `block` does not switch the rest off), and `off` turns one off entirely. By default `scope`, `tests`, `secrets` and `binaries` block and `suppressions`, `dependencies` and `git` warn. `allowed` lists globs every change must stay within, and `generated` lists committed generated output such as bundles: a change there gets no binary, size, secret or suppression findings, though scope still applies. These rules are read from the committed `horde.json` on the branch the work lands on, at the gate and at land, never from a worktree's copy: a committed change takes effect on a task's next round and at landing, and an uncommitted `horde.json` changes nothing.
 
 A user-level `$XDG_CONFIG_HOME/mcp-horde/horde.json` (or `~/.config/mcp-horde/horde.json` when `XDG_CONFIG_HOME` is unset) sets `tiers` and `opencode` once for every repository; each applies only where the repository's `horde.json` does not set it, and every other key in it is ignored. For example, `{ "tiers": ["deepseek/deepseek-flash"] }` there makes `deepseek/deepseek-flash` the default worker model everywhere.
 
