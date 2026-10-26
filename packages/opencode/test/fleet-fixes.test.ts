@@ -272,6 +272,41 @@ describe("fleet fixes: gates, tasks and worktrees (real opencode, mock LLM)", { 
     await h.call("opencode_dispose", { id, worktree: "discard" })
   })
 
+  for (const [label, tiers] of [
+    ["once", ["mock/pricey"]],
+    ["twice", ["mock/pricey", "mock/pricey"]],
+  ] as const) {
+    test(`tiers naming only the worker's model (${label}) are reviewed by that model, not OpenCode's default`, async () => {
+      const { repo: r } = makeRepo(mock.url, { permission: { bash: "allow" } })
+      fs.writeFileSync(path.join(r, "horde.json"), JSON.stringify({ verify: { checks: { ok: "true" } }, tiers }))
+      git(r, "add", ".")
+      git(r, "commit", "-qm", "checks")
+      const file = `pricey-${label}.txt`
+      const criterion = `${file} says hello`
+      const started = await h.call("horde_do", {
+        directory: r,
+        goal: `Write the greeting.\nRUN: echo hello > ${file} && git add ${file} && git commit -qm pricey`,
+        done: [criterion],
+        scope: [file],
+      })
+      const id = idOf(started)
+      const out = await h.call("horde_wait", { ids: [id], timeout_seconds: 180 })
+      assert.match(out, new RegExp(`^${id} READY`), out)
+      // The harness's OpenCode default is mock/mock, so only a reviewer chosen from the tiers
+      // (the worker's own model here) makes the outcome say mock/pricey.
+      assert.match(out, /review: 1 of 1 criteria met \(by mock\/pricey, the model that did the work\)/, out)
+      const reviews = mock.requests.filter((b) => {
+        const msgs = (b as { messages?: { role: string; content: unknown }[] }).messages ?? []
+        return msgs.some(
+          (m) => m.role === "user" && typeof m.content === "string" && m.content.includes("# Acceptance criteria") && m.content.includes(criterion),
+        )
+      })
+      assert.equal(reviews.length, 1)
+      assert.equal((reviews[0] as { model?: string }).model, "pricey", "the reviewer was the worker's model, not the OpenCode default")
+      await h.call("opencode_dispose", { id, worktree: "discard" })
+    })
+  }
+
   test("a gate review with no answer from the first reviewer retries on another model", async () => {
     const { repo: r } = makeRepo(mock.url, { permission: { bash: "allow" } })
     fs.writeFileSync(path.join(r, "horde.json"), JSON.stringify({ verify: { checks: { ok: "true" } }, tiers: ["mock/mock", "broken/model", "mock/other"] }))

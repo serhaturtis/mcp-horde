@@ -755,7 +755,8 @@ export class Fleet {
    * attempt's worktree diff and must cite its lines; citations are checked against the diff
    * (an unfounded "met" becomes "unclear"). With several models, where they disagree is
    * listed. The first model's outcome is kept on the attempt. By default the reviewer is the
-   * cheapest tier model other than the one that did the work.
+   * cheapest tier model other than the one that did the work, or that model itself when no
+   * tier differs.
    */
   async review(input: {
     id: string
@@ -794,7 +795,11 @@ export class Fleet {
     const override = input.path ? { path: this.resolveDir(input.path), base: input.base ?? "HEAD" } : undefined
     const r = await collectReview(board, input.id, { override, maxDiffChars: input.maxDiffChars })
     const worker = attempt?.model
-    const models = input.models?.length ? input.models : [loadTiers(repo).find((t) => t.model !== worker)?.model]
+    // When every tier is the worker's model, that model reviews the work too. Never fall back to
+    // OpenCode's default here: with tiers it need not be a model the project chose. Without tiers
+    // and a recorded model, there is nothing else to ask.
+    const tier = loadTiers(repo).find((t) => t.model !== worker)?.model
+    const models = input.models?.length ? input.models : [tier ?? worker]
     const results: { model: string; verdicts: Verdict[]; cost: number }[] = []
     for (const model of models) {
       const answer = await this.ask({
@@ -832,8 +837,11 @@ export class Fleet {
     try {
       worker = current((await Board.open(repo)).task(taskId))?.model
       const tiers = loadTiers(repo)
+      // The first tier whose model differs from the worker's; when none does, the worker reviews
+      // its own work. With tiers this is never undefined (unless the attempt recorded no model):
+      // ask() would otherwise use OpenCode's default, which need not be a model the project chose.
       const at = tiers.findIndex((t) => t.model !== worker)
-      first = at < 0 ? undefined : tiers[at]!.model
+      first = at < 0 ? worker : tiers[at]!.model
       next = at < 0 ? undefined : tiers.slice(at + 1).find((t) => t.model !== first)?.model
       return await this.reviewGate(live, taskId, checks, signal, first)
     } catch (err) {
@@ -841,9 +849,10 @@ export class Fleet {
       // Long enough for a rate limit or a refused slot to clear, short enough not to stall the gate.
       await sleep(5000)
       if (signal.aborted) return { model: "", cost: 0, total: 0, met: 0, notMet: [], unclear: [], error: "cancelled" }
-      // Retry one tier up, so a slow or throttled model is not asked again; when no tier is above
-      // it, a reviewer that gave no answer at all falls back to the worker's own model.
-      const retry = next ?? (/no answer within/.test((err as Error)?.message ?? "") ? worker : undefined)
+      // Retry one tier up, so a slow or throttled model is not asked again; when no tier is above,
+      // ask the same model again rather than OpenCode's default. A reviewer that gave no answer at
+      // all is replaced by the worker's own model.
+      const retry = next ?? (/no answer within/.test((err as Error)?.message ?? "") ? worker : first)
       try {
         return await this.reviewGate(live, taskId, checks, signal, retry)
       } catch (retryErr) {

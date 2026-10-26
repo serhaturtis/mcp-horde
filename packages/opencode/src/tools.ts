@@ -615,7 +615,7 @@ export function registerTools(server: McpServer, ctx: Context) {
 
   tool(
     "review_task",
-    'Check a board task\'s latest attempt against its acceptance criteria (horde_do reviews its tasks by itself; use this to review again, or with other models): a model reads the attempt\'s worktree diff and answers each criterion met / not met / unclear, citing the lines that show it; every citation is checked against the diff, so a "met" without real evidence becomes "unclear". The gate proves the code builds and its tests pass; this asks whether it does what the task asked. Default reviewer: the cheapest tier model other than the worker\'s. Two models cross-check each other and list where they disagree. The outcome is kept on the attempt (board_task shows it).',
+    "Check a board task's latest attempt against its acceptance criteria (horde_do reviews its tasks by itself; use this to review again, or with other models): a model reads the attempt's worktree diff and answers each criterion met / not met / unclear, citing the lines that show it; every citation is checked against the diff, so a \"met\" without real evidence becomes \"unclear\". The gate proves the code builds and its tests pass; this asks whether it does what the task asked. Default reviewer: the cheapest tier model other than the worker's, else the worker's own. Two models cross-check each other and list where they disagree. The outcome is kept on the attempt (board_task shows it).",
     {
       id: z.string().describe("Board task id, e.g. t-3fa2 (its latest attempt's worktree is reviewed)."),
       directory: z.string().optional().describe("Repository of the board (default: the server's directory)."),
