@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import { execFileSync } from "node:child_process"
+import { execFileSync, spawn } from "node:child_process"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
@@ -16,11 +16,18 @@ function scratch(t) {
 }
 
 /** A state directory whose news file holds `content`. */
-function state(t, content) {
+function state(t, content, session = SESSION) {
   const dir = scratch(t)
   fs.mkdirSync(path.join(dir, "news"), { recursive: true })
-  fs.writeFileSync(path.join(dir, "news", `${SESSION}.json`), JSON.stringify(content))
+  fs.writeFileSync(path.join(dir, "news", `${session}.json`), JSON.stringify(content))
   return dir
+}
+
+/** A live child of this test process, standing in for the opencode server it spawned. */
+function server(t) {
+  const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { stdio: "ignore" })
+  t.after(() => child.kill())
+  return child
 }
 
 /** The server's per-session news, naming this test process as the live publisher. */
@@ -101,6 +108,32 @@ describe("Stop", () => {
 
   test("never blocks on working alone", (t) => {
     assert.equal(run("Stop", state(t, news({ working: [{ id: "t-77aa", title: "Still busy" }] }))), undefined)
+  })
+})
+
+describe("another session's news after /clear", () => {
+  test("finds the live server news named for the session the server was spawned with", (t) => {
+    const pid = server(t).pid
+    const dir = state(t, news({ waiting: twoWaiting, pid }), "session-before-clear")
+    assert.match(context(run("UserPromptSubmit", dir)), /2 horde outcome\(s\) waiting/)
+  })
+
+  test("uses the newest when several live servers of this process have news", (t) => {
+    const older = server(t)
+    const newer = server(t)
+    const dir = state(t, news({ waiting: [{ id: "t-old", title: "Old", kind: "finished" }], pid: older.pid, at: Date.now() - 60 * 1000 }), "session-old")
+    fs.writeFileSync(
+      path.join(dir, "news", "session-new.json"),
+      JSON.stringify(news({ waiting: [{ id: "t-new", title: "New", kind: "finished" }], pid: newer.pid })),
+    )
+    const text = context(run("UserPromptSubmit", dir))
+    assert.match(text, /t-new/)
+    assert.ok(!text.includes("t-old"))
+  })
+
+  test("ignores another session's news when the server has a different parent", (t) => {
+    const dir = state(t, news({ waiting: twoWaiting }), "session-before-clear")
+    assert.equal(run("UserPromptSubmit", dir), undefined)
   })
 })
 

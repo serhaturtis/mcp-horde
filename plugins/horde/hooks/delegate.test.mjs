@@ -15,12 +15,12 @@ function scratch(t) {
 }
 
 /** Run the hook the way Claude Code does: the event in argv, its input as JSON on stdin. */
-function run(event, input = {}) {
-  const out = execFileSync(process.execPath, [hookPath, event], { input: JSON.stringify(input) }).toString()
+function run(event, input = {}, env = {}) {
+  const out = execFileSync(process.execPath, [hookPath, event], { input: JSON.stringify(input), env: { ...process.env, ...env } }).toString()
   return out ? JSON.parse(out) : undefined
 }
 
-const context = (event, input) => run(event, input)?.hookSpecificOutput.additionalContext
+const context = (event, input, env) => run(event, input, env)?.hookSpecificOutput.additionalContext
 
 /** One agent session in one fresh scratchpad, with the inputs found on every PostToolUse call. */
 function session(scratchpad_dir) {
@@ -235,6 +235,32 @@ describe("PostToolUse", () => {
     assert.match(note, /edited 4 files by hand/)
     for (const file of files) assert.ok(note.includes(file), file)
     assert.ok(!note.includes("already.txt"))
+  })
+
+  test("a repository's core.fsmonitor command never runs", (t) => {
+    const dir = repo(t)
+    const marker = path.join(scratch(t), "fsmonitor-ran")
+    const monitor = path.join(scratch(t), "fsmonitor.sh")
+    fs.writeFileSync(monitor, `#!/bin/sh\ntouch ${JSON.stringify(marker)}\n`, { mode: 0o755 })
+    execFileSync("git", ["config", "core.fsmonitor", monitor], { cwd: dir, stdio: "ignore" })
+    // The hostile config is live: a plain git call in this repository runs the command.
+    execFileSync("git", ["status", "--porcelain"], { cwd: dir, stdio: "ignore" })
+    assert.equal(fs.existsSync(marker), true)
+    fs.rmSync(marker)
+    const hook = session(scratch(t))
+    assert.equal(hook(...bash(dir)), undefined)
+    assert.equal(fs.existsSync(marker), false, "the hook's git calls must disable core.fsmonitor")
+  })
+
+  test("without a scratchpad the state file lives in a 0700 directory under the temp dir", (t) => {
+    const tmp = scratch(t)
+    const hook = (tool_name, tool_input) => context("PostToolUse", { session_id: "session-1", prompt_id: "prompt-1", tool_name, tool_input }, { TMPDIR: tmp })
+    for (const file of ["a.ts", "b.ts", "c.ts", "d.ts"]) hook(...edit(`/repo/${file}`))
+    const dirs = fs.readdirSync(tmp).filter((name) => name.startsWith("horde-hooks-"))
+    assert.equal(dirs.length, 1)
+    const dir = path.join(tmp, dirs[0])
+    assert.equal(fs.statSync(dir).mode & 0o777, 0o700)
+    assert.ok(fs.existsSync(path.join(dir, "horde-edits-session-1.json")))
   })
 
   test("a Bash call outside any git repository counts nothing", (t) => {

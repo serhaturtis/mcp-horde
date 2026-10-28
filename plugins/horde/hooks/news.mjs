@@ -4,7 +4,10 @@
 //   Stop: an agent that tries to stop with outcomes waiting is told to collect them first; a
 //     background horde_wait already running will deliver them itself, so that case stays silent.
 // The server publishes <stateDir>/news/<session_id>.json; a file that is missing, unreadable, stale
-// or left behind by a dead server means there is nothing to say.
+// or left behind by a dead server means there is nothing to say. The server keeps the session id it
+// was spawned with, so after /clear the file is named for the old id: a missing file falls back to
+// the newest live server that is a child of this Claude Code process.
+import { execFileSync } from "node:child_process"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
@@ -36,16 +39,63 @@ function readNews(input) {
   if (typeof session !== "string" || !session) return undefined
   // A session id names a file, so it must not reach outside the news directory.
   if (session !== path.basename(session) || session === "." || session === "..") return undefined
-  let saved
-  try {
-    saved = JSON.parse(fs.readFileSync(path.join(stateDir(), "news", `${session}.json`), "utf8"))
-  } catch {
-    return undefined
-  }
-  if (!saved || typeof saved !== "object") return undefined
+  const saved = readFile(path.join(stateDir(), "news", `${session}.json`)) ?? fallback()
+  if (!saved) return undefined
   if (!Number.isInteger(saved.pid) || saved.pid <= 0 || !alive(saved.pid)) return undefined
   if (typeof saved.at !== "number" || Date.now() - saved.at > STALE_MS) return undefined
   return { waiting: entries(saved.waiting, true), working: entries(saved.working, false) }
+}
+
+function readFile(file) {
+  try {
+    const saved = JSON.parse(fs.readFileSync(file, "utf8"))
+    return saved && typeof saved === "object" ? saved : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * The newest news file from a live server that is a child of this Claude Code process. The opencode
+ * server keeps the CLAUDE_CODE_SESSION_ID it was spawned with, which /clear changes under the hook;
+ * its parent is the Claude Code process the hook also runs under.
+ */
+function fallback() {
+  const dir = path.join(stateDir(), "news")
+  let names
+  try {
+    names = fs.readdirSync(dir)
+  } catch {
+    return undefined
+  }
+  const parent = process.ppid
+  let newest
+  for (const name of names) {
+    if (!name.endsWith(".json")) continue
+    const saved = readFile(path.join(dir, name))
+    if (!saved) continue
+    if (!Number.isInteger(saved.pid) || saved.pid <= 0 || !alive(saved.pid)) continue
+    if (parentPid(saved.pid) !== parent) continue
+    if (typeof saved.at !== "number" || Date.now() - saved.at > STALE_MS) continue
+    if (!newest || saved.at > newest.at) newest = saved
+  }
+  return newest
+}
+
+/** A process's parent pid, or undefined where this platform gives no way to read it. */
+function parentPid(pid) {
+  try {
+    // /proc/<pid>/stat: the command may contain spaces and parentheses, so split after the last ')'.
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8")
+    const ppid = Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[1])
+    if (Number.isInteger(ppid) && ppid > 0) return ppid
+  } catch {}
+  try {
+    const out = execFileSync("ps", ["-o", "ppid=", "-p", String(pid)], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim()
+    const ppid = Number(out)
+    if (out && Number.isInteger(ppid) && ppid > 0) return ppid
+  } catch {}
+  return undefined
 }
 
 /** <stateDir> follows packages/opencode/src/config.ts: the env override, then XDG, then ~/.local/state. */

@@ -43,6 +43,16 @@ function subagentStart(input) {
   return READ_ONLY.has(input.agent_type) ? undefined : `${ABOUT} ${FOR_SUBAGENTS}`
 }
 
+/** A private directory for the state Claude Code's scratchpad does not cover, named per user in the shared temp dir. */
+function privateStateDir() {
+  const dir = path.join(os.tmpdir(), `horde-hooks-${process.getuid?.() ?? "user"}`)
+  try {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+    fs.chmodSync(dir, 0o700)
+  } catch {}
+  return dir
+}
+
 /**
  * The repository HEAD in cwd, its worktree root, and a function returning the absolute paths git
  * reports changed there. Undefined when cwd is missing; a git call that fails leaves HEAD undefined,
@@ -52,8 +62,9 @@ function gitState(cwd) {
   if (!cwd) return undefined
   // All git calls of one hook run share one 3 s budget so a slow repository cannot outlast its 5 s timeout.
   const deadline = Date.now() + 3000
+  // The repository may be hostile: its config must not turn these calls into command execution.
   const git = (...args) =>
-    execFileSync("git", ["-C", cwd, ...args], {
+    execFileSync("git", ["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-C", cwd, ...args], {
       encoding: "utf8",
       timeout: Math.max(1, deadline - Date.now()),
       stdio: ["ignore", "pipe", "ignore"],
@@ -118,7 +129,7 @@ function postToolUse(input) {
     .filter(Boolean)
     .join("-")
     .replace(/[^\w-]/g, "_")
-  const file = path.join(input.scratchpad_dir ?? os.tmpdir(), `horde-edits-${key}.json`)
+  const file = path.join(input.scratchpad_dir ?? privateStateDir(), `horde-edits-${key}.json`)
   let state
   try {
     const saved = JSON.parse(fs.readFileSync(file, "utf8"))
