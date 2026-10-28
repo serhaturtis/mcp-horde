@@ -31,6 +31,7 @@ import type {
 import { ASK_GUARDED_PROFILE, ASK_PREAMBLE, ASK_PROFILE, extractJson, type JsonSchema, retryPrompt, schemaPrompt, validate } from "./ask.js"
 import type { Backend } from "./backend.js"
 import { type Config, inProject, type PermissionPolicy } from "./config.js"
+import { News, type NewsWait, type NewsWork } from "./news.js"
 import { type Detail, inputSummary, renderTranscript } from "./render.js"
 import { type AgentRecord, type GateConfig, type Limits, ownerAlive, type ReviewSummary, SELF, type Store } from "./state.js"
 import { buildTrack, type CostEstimator, costSince, currentTurn, emptyTrack, latestTool, stablePrefix, type Track, type Turn, turnsSince } from "./tracker.js"
@@ -507,6 +508,7 @@ export class Fleet {
     private readonly config: Config,
     private readonly store: Store,
     private readonly hooks: Hooks,
+    private readonly news = new News(config.stateDir),
   ) {
     this.syncStore()
     backend.events.on("event", (e: OpenCodeEvent) => {
@@ -541,6 +543,7 @@ export class Fleet {
     this.live.clear()
     this.childToRoot.clear()
     this.wake()
+    return this.news.remove()
   }
 
   /**
@@ -1024,6 +1027,7 @@ export class Fleet {
       const base = wt ? workStart(wt) : await git(snap.directory, "rev-parse", "HEAD").catch(() => "HEAD")
       await board.bindWorkspace(taskId, attempt.token, { path: snap.directory, base, session: snap.id }).catch(() => undefined)
       this.updateRecord(snap.id, { task: { id: task.id, title: task.title, attempt: attempt.n } })
+      this.publishNews()
       return {
         snapshot: await this.snapshot(snap.id),
         notes: [
@@ -2259,6 +2263,7 @@ export class Fleet {
     const holding = live.state === "idle" && !!gate && gate.state !== "pass" && gate.state !== "fail"
     if (!live.state || !SETTLED.has(live.state) || holding) {
       if (!holding) live.lastPushKey = undefined
+      this.publishNews()
       return
     }
     const ids = [...live.pending.permissions, ...live.pending.questions]
@@ -2271,6 +2276,29 @@ export class Fleet {
     live.lastPushKey = key
     // Agents found already settled at startup are not news.
     if (!first) this.hooks.settled(this.build(live))
+    this.publishNews()
+  }
+
+  /**
+   * Write the file a Claude Code hook reads: task outcomes horde_wait has not returned yet, and
+   * task-bound agents still running or held by an undecided gate.
+   */
+  private publishNews() {
+    if (this.closed) return
+    const waiting: NewsWait[] = []
+    const working: NewsWork[] = []
+    for (const live of this.live.values()) {
+      const task = live.record.task
+      if (!task) continue
+      const s = this.build(live)
+      const entry = { id: task.id, title: task.title }
+      if (this.hasNews(s, live)) waiting.push({ ...entry, kind: s.state === "needs_input" ? "needs you" : "finished" })
+      else if (live.state === undefined || live.state === "running" || gateUndecided(s)) working.push(entry)
+    }
+    const byId = (a: { id: string }, b: { id: string }) => a.id.localeCompare(b.id)
+    waiting.sort(byId)
+    working.sort(byId)
+    this.news.update(waiting, working)
   }
 
   /**
@@ -2750,9 +2778,11 @@ export class Fleet {
     const live = this.live.get(s.id)
     if (!live) return
     for (const r of [...s.pending.permissions, ...s.pending.questions]) live.reportedRequests.add(r.id)
-    if (s.state === "needs_input") return
-    const seq = Math.max(live.record.reportedSeq, ...s.unreported.map((t) => t.startSeq))
-    this.updateRecord(s.id, { reportedSeq: seq, reportedAt: Date.now() })
+    if (s.state !== "needs_input") {
+      const seq = Math.max(live.record.reportedSeq, ...s.unreported.map((t) => t.startSeq))
+      this.updateRecord(s.id, { reportedSeq: seq, reportedAt: Date.now() })
+    }
+    this.publishNews()
   }
 
   /**
@@ -3073,6 +3103,7 @@ export class Fleet {
     for (const d of live.dialogs.values()) d.abort()
     for (const c of live.children) this.childToRoot.delete(c)
     this.live.delete(id)
+    this.publishNews()
   }
 
   /** Stop tracking an agent for good (disposed, failed spawn, or deleted). */

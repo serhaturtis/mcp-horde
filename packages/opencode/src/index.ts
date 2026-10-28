@@ -7,6 +7,7 @@ import { Backend, sharedServerAlive, stopServer } from "./backend.js"
 import { type Config, inProject, loadConfig } from "./config.js"
 import { Fleet } from "./fleet.js"
 import { makeHooks } from "./hooks.js"
+import { News } from "./news.js"
 import { ownerAlive, Store } from "./state.js"
 import { INSTRUCTIONS, registerTools } from "./tools.js"
 import { repoRoot } from "./worktree.js"
@@ -38,6 +39,10 @@ try {
 } catch (err) {
   process.stderr.write(`[mcp-horde/opencode] ${(err as Error).message}\n`)
 }
+
+// A hook reads this session's news file; a server that died without cleaning up left one behind.
+const news = loaded ? new News(loaded.config.stateDir) : undefined
+await news?.clear()
 
 const server = new McpServer(
   { name: "opencode", version: VERSION },
@@ -86,7 +91,10 @@ const getFleet = async (): Promise<Fleet> => {
   const b = await getBackend()
   if (!fleet) {
     const { config, store } = load()
-    fleet = Promise.resolve(new Fleet(b, config, store, makeHooks(server, config)))
+    // If the first load failed, this one may succeed: clear the stale file before any write.
+    const newsFile = news ?? new News(config.stateDir)
+    if (!news) await newsFile.clear()
+    fleet = Promise.resolve(new Fleet(b, config, store, makeHooks(server, config), newsFile))
   }
   return fleet
 }

@@ -1578,3 +1578,127 @@ describe("horde_investigate: read-only workers that answer with a checked report
     assert.doesNotMatch(failed, /REPORT/, failed)
   })
 })
+
+describe("the server's news file for Claude Code hooks (real opencode, mock LLM)", { timeout: 600_000 }, () => {
+  const SESSION = "test-session-news"
+  let h: Harness
+  let mock: Mock
+  let repo: string
+  let tmp: string
+  let newsFile: string
+
+  type News = { pid: number; at: number; waiting: { id: string; title: string; kind: string }[]; working: { id: string; title: string }[] }
+
+  const read = (): News | undefined => {
+    try {
+      return JSON.parse(fs.readFileSync(newsFile, "utf8")) as News
+    } catch {
+      return undefined
+    }
+  }
+  const has = (n: News | undefined, list: "waiting" | "working", id: string) => !!n?.[list].some((x) => x.id === id)
+
+  before(async () => {
+    mock = await startMockLlm()
+    ;({ tmp, repo } = makeRepo(mock.url, { permission: { bash: "allow" } }))
+    fs.writeFileSync(path.join(repo, "horde.json"), JSON.stringify({ verify: { checks: { test: "true" } }, tiers: ["mock/mock"] }))
+    git(repo, "add", ".")
+    git(repo, "commit", "-qm", "checks")
+    h = await connect({ ...isolatedEnv(tmp, repo), CLAUDE_CODE_SESSION_ID: SESSION })
+    newsFile = path.join(tmp, "state", "news", `${SESSION}.json`)
+  })
+
+  after(async () => {
+    await h?.call("opencode_server", { action: "stop" }).catch(() => undefined)
+    await h?.close()
+    mock?.close()
+  })
+
+  test("a finished, unread task is news; a wait reports it and a drop removes it", async () => {
+    const started = await h.call("horde_do", {
+      goal: "Write the news file.\nRUN: echo ok > news.txt && git add news.txt && git commit -qm news",
+      done: ["news.txt says ok"],
+      scope: ["news.txt"],
+    })
+    const id = idOf(started)
+    const title = "Write the news file"
+
+    const waiting = await until(async () => {
+      const n = read()
+      return has(n, "waiting", id) ? n : undefined
+    }, 120_000)
+    assert.ok(Number.isInteger(waiting.pid) && waiting.pid > 0, `server pid: ${waiting.pid}`)
+    assert.ok(waiting.at > 0, "write time")
+    assert.deepEqual(
+      waiting.waiting.find((w) => w.id === id),
+      { id, title, kind: "finished" },
+    )
+    assert.ok(!has(waiting, "working", id), "a finished task is not also working")
+
+    const outcome = await h.call("horde_wait", { ids: [id], timeout_seconds: 120 })
+    assert.match(outcome, new RegExp(`^${id} READY`), outcome)
+    const reported = await until(async () => {
+      const n = read()
+      return n && !has(n, "waiting", id) ? n : undefined
+    })
+    assert.ok(!has(reported, "working", id), "a reported task is not working")
+
+    await h.call("horde_drop", { id })
+    const dropped = await until(async () => {
+      const n = read()
+      return n && !has(n, "waiting", id) && !has(n, "working", id) ? n : undefined
+    })
+    assert.deepEqual(dropped.waiting, [])
+    assert.deepEqual(dropped.working, [])
+  })
+
+  test("a task still running is listed under working", async () => {
+    const started = await h.call("horde_do", {
+      goal: "Take your time.\nRUN: sleep 10",
+      done: ["the slow command ran"],
+    })
+    const id = idOf(started)
+    const working = await until(async () => {
+      const n = read()
+      return has(n, "working", id) ? n : undefined
+    }, 60_000)
+    assert.deepEqual(
+      working.working.find((w) => w.id === id),
+      { id, title: "Take your time" },
+    )
+    await h.call("horde_drop", { id })
+    await until(async () => {
+      const n = read()
+      return n && !has(n, "working", id) ? n : undefined
+    })
+  })
+
+  test("without CLAUDE_CODE_SESSION_ID no file is written", async () => {
+    const { tmp: ntmp, repo: nrepo } = makeRepo(mock.url, { permission: { bash: "allow" } })
+    fs.writeFileSync(path.join(nrepo, "horde.json"), JSON.stringify({ verify: { checks: { test: "true" } }, tiers: ["mock/mock"] }))
+    git(nrepo, "add", ".")
+    git(nrepo, "commit", "-qm", "checks")
+    const saved = process.env.CLAUDE_CODE_SESSION_ID
+    delete process.env.CLAUDE_CODE_SESSION_ID
+    let nh: Harness
+    try {
+      nh = await connect({ ...isolatedEnv(ntmp, nrepo) })
+    } finally {
+      if (saved !== undefined) process.env.CLAUDE_CODE_SESSION_ID = saved
+    }
+    try {
+      const id = idOf(await nh.call("horde_do", { goal: "Write nothing.\nRUN: echo ok > nothing.txt", done: ["nothing.txt says ok"] }))
+      await nh.call("horde_wait", { ids: [id], timeout_seconds: 120 })
+      assert.equal(fs.existsSync(path.join(ntmp, "state", "news")), false, "no news directory without a session id")
+    } finally {
+      await nh.call("opencode_server", { action: "stop" }).catch(() => undefined)
+      await nh.close()
+    }
+  })
+
+  test("the file is removed when the server stops", async () => {
+    assert.ok(fs.existsSync(newsFile), "the file exists while the server runs")
+    await h.call("opencode_server", { action: "stop" })
+    await until(async () => !fs.existsSync(newsFile), 30_000)
+  })
+})
