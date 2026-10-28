@@ -34,8 +34,8 @@ export interface Attempt {
   outcome?: "accepted" | "failed" | "abandoned"
   note?: string
   /**
-   * Why the attempt's gate failed after its last round. The attempt stays open for horde_tell,
-   * but the board shows it as failed (open) instead of in review.
+   * Why the attempt's gate failed after its last round. The task is failed while the attempt
+   * stays open for horde_tell.
    */
   failure?: string
   cost?: number
@@ -443,20 +443,29 @@ export class Board {
       if (activity.state) a.activity = { state: activity.state, gate: activity.gate, at: Date.now() }
       if (activity.model) Object.assign(a, { model: activity.model, variant: activity.variant })
       // Running again or passing means the last round's failure is no longer the attempt's state.
-      if (activity.state === "running" || activity.gate?.startsWith("pass")) a.failure = undefined
+      if (activity.state === "running" || activity.gate?.startsWith("pass")) this.clearFailure(a)
+      // A failed task that is being worked again (horde_tell) reads as working until its next report.
+      if (activity.state === "running" && t.status === "failed" && !a.endedAt) t.status = "working"
       t.cost = totalCost(t)
+      this.scopeLocks(t)
     })
   }
 
   /**
    * The worker's gate failed after its last round. The attempt stays open (horde_tell can send
-   * more work), but no verdict is pending, so board_summary shows it as failed (open).
+   * more work), but the task reads as failed rather than in review: no verdict is pending.
    */
   gateFailed(id: string, attempt: number, reason: string): Promise<Task> {
     return this.update(id, (t) => {
       const a = t.attempts.find((x) => x.n === attempt)
       if (!a || a.endedAt) return
-      a.failure = reason.slice(0, MAX_NOTE)
+      const why = reason.slice(0, MAX_NOTE)
+      a.failure = why
+      // The attempt's note is what board_task shows for an open attempt.
+      a.note = why
+      t.status = "failed"
+      // A failed round is when a task's stray locks are visible: keep only those inside its scope.
+      this.scopeLocks(t)
     })
   }
 
@@ -566,7 +575,10 @@ export class Board {
   private worker(t: Task, token: string): Attempt {
     const a = current(t)
     if (!a || a.token !== token || a.endedAt) throw new Error(`token does not match the current attempt of ${t.id}; this attempt was closed or replaced`)
-    if (!["claimed", "working", "review"].includes(t.status)) throw new Error(`${t.id} is ${t.status}; nothing to do`)
+    // A task whose gate failed after its last round stays failed but open: horde_tell sends more
+    // work to the same attempt, which can report, lock and renew as before.
+    const open = ["claimed", "working", "review"].includes(t.status) || t.status === "failed"
+    if (!open) throw new Error(`${t.id} is ${t.status}; nothing to do`)
     return a
   }
 
@@ -575,7 +587,7 @@ export class Board {
       const a = this.worker(t, token)
       a.seenAt = Date.now()
       if (progress) a.progress = progress.slice(0, MAX_NOTE)
-      if (t.status === "claimed") t.status = "working"
+      if (t.status === "claimed" || t.status === "failed") t.status = "working"
       this.renewLocks(id, a)
       if (progress) this.event("progress", { task: id, attempt: a.n, note: a.progress })
     })
@@ -618,7 +630,7 @@ export class Board {
       }
       t.reports.push(report)
       a.seenAt = report.at
-      a.failure = undefined
+      this.clearFailure(a)
       this.renewLocks(id, a)
       t.status = "review"
       this.event("report", { task: id, attempt: a.n })
@@ -671,10 +683,6 @@ export class Board {
       for (const p of want)
         if (!p || p === "." || /^(\/|[A-Za-z]:)/.test(p) || p.split("/").includes("..") || !p.replace(/\/?[^/]*[*?[].*$/, ""))
           throw new Error(`cannot lock "${p}": use a path relative to the repository root, not a pattern for everything`)
-      // A task locks only what it may change: a file outside its scope is not its to reserve, and a
-      // lock there would block the task that may touch it (LIVE-07).
-      const outside = t.scope.length ? want.filter((p) => !t.scope.some((s) => overlaps(p, s))) : []
-      if (outside.length) throw new Error(`cannot lock ${outside.join(", ")}: outside ${id}'s scope (${t.scope.join(", ")})`)
       const conflicts = this.locks().filter((l) => !(l.task === id && l.attempt === a.n) && want.some((p) => overlaps(p, l.path)))
       if (conflicts.length) return { ok: false as const, conflicts }
       for (const p of want) writeJson(this.lockFile(p), { path: p, task: id, attempt: a.n, expires: Date.now() + LEASE_MS } satisfies Lock)
@@ -717,6 +725,26 @@ export class Board {
       const l = readJson<Lock>(path.join(this.locksDir, f))
       if (l?.task === id) fs.rmSync(path.join(this.locksDir, f), { force: true })
     }
+  }
+
+  /**
+   * A task holds no lock outside its scope: the file is not its to change, and the lock would
+   * block the task that may touch it (LIVE-07). Called when the runtime records a task's state
+   * and when its gate fails after the last round, so a stray lock never survives the round.
+   */
+  private scopeLocks(t: Task) {
+    if (!t.scope.length) return
+    for (const l of this.locks()) {
+      if (l.task !== t.id || t.scope.some((s) => overlaps(l.path, s))) continue
+      fs.rmSync(this.lockFile(l.path), { force: true })
+      this.event("unlock", { path: l.path, task: t.id, by: "scope" })
+    }
+  }
+
+  /** A failure recorded for an open attempt is stale once the worker runs again or the gate passes. */
+  private clearFailure(a: Attempt) {
+    if (a.failure !== undefined && a.note === a.failure) a.note = undefined
+    a.failure = undefined
   }
 }
 

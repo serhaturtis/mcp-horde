@@ -84,14 +84,22 @@ describe("fleet fixes: ownership and helpers", () => {
     assert.deepEqual(scopeGlobs(["src/", "./test/a.ts", "lib\\x\\"]), ["src/**", "test/a.ts", "lib/x/**"])
   })
 
-  test("a task's locks never name paths outside its scope", async () => {
+  test("the fleet's board activity drops a task's locks outside its scope", async () => {
     const { tmp, repo } = makeRepo("http://127.0.0.1:1")
     const board = await Board.open(repo, path.join(tmp, "board-state"))
     const task = (await board.plan([{ title: "Scoped", goal: "g", scope: ["src/a.ts"] }])).tasks[0]!
     const { attempt } = await board.assign(task.id)
-    await assert.rejects(board.lock(task.id, attempt.token, ["package.json"]), new RegExp(`outside ${task.id}'s scope \\(src/a\\.ts\\)`))
-    assert.deepEqual(board.locks(), [], "a refused lock takes nothing")
     await board.lock(task.id, attempt.token, ["src/a.ts"])
+    // A lock on a file the task may not change is taken (the worker's own command) but not kept.
+    await board.lock(task.id, attempt.token, ["package.json"])
+    assert.deepEqual(
+      board
+        .locks()
+        .map((l) => l.path)
+        .sort(),
+      ["package.json", "src/a.ts"],
+    )
+    await board.recordActivity(task.id, attempt.n, { state: "idle", gate: "fail 2/2" })
     assert.deepEqual(
       board.locks().map((l) => l.path),
       ["src/a.ts"],
@@ -534,7 +542,7 @@ describe("fleet fixes: gates, tasks and worktrees (real opencode, mock LLM)", { 
     assert.equal(closed.attempts[0]?.note, "disposed")
   })
 
-  test("a gate verdict updates the news file at once and board_summary shows the task failed-but-open", async () => {
+  test("a gate verdict updates the news file at once and board_summary shows the task failed with its attempt open", async () => {
     const { repo: r } = makeRepo(mock.url, { permission: { bash: "allow" } })
     fs.writeFileSync(path.join(r, "horde.json"), JSON.stringify({ verify: { checks: { nope: `node -e "process.exit(1)"` } }, tiers: ["mock/mock"] }))
     git(r, "add", ".")
@@ -572,9 +580,14 @@ describe("fleet fixes: gates, tasks and worktrees (real opencode, mock LLM)", { 
     )
     assert.ok(Date.now() - seen < 1_000, `the news file named the task within a second of the verdict (${Date.now() - seen}ms)`)
     const summary = renderSummary(await Board.open(r, boardState), 4_000)
-    assert.match(summary, new RegExp(`failed \\(open\\)  ${id} "`), summary)
-    assert.match(summary, /gate failed after 2 rounds; open for horde_tell/, summary)
+    assert.match(summary, new RegExp(`failed  ${id} "`), summary)
     assert.doesNotMatch(summary, new RegExp(`review  ${id}`), "no verdict is pending: it is not in review")
+    const board = await Board.open(r, boardState)
+    const failed = board.task(id)
+    assert.equal(failed.status, "failed")
+    assert.equal(failed.attempts[0]?.endedAt, undefined, "the attempt stays open for horde_tell")
+    assert.match(failed.attempts[0]?.failure ?? "", /gate failed after 2 rounds; open for horde_tell/)
+    assert.match(failed.attempts[0]?.note ?? "", /gate failed after 2 rounds/)
     await h.call("horde_drop", { id })
   })
 
