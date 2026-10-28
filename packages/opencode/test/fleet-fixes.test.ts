@@ -4,7 +4,8 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { after, before, describe, mock as mockTimers, test } from "node:test"
-import { Board } from "@mcp-horde/board"
+import { Board, renderSummary } from "@mcp-horde/board"
+import { lockDirFor } from "@mcp-horde/verify"
 import type { Backend } from "../src/backend.js"
 import type { Config } from "../src/config.js"
 import { Fleet, GATE_REVIEW_TIMEOUT_MS, type Hooks, type Snapshot, scopeGlobs } from "../src/fleet.js"
@@ -82,6 +83,20 @@ describe("fleet fixes: ownership and helpers", () => {
   test("scope paths become globs for the profile and the gate's audit", () => {
     assert.deepEqual(scopeGlobs(["src/", "./test/a.ts", "lib\\x\\"]), ["src/**", "test/a.ts", "lib/x/**"])
   })
+
+  test("a task's locks never name paths outside its scope", async () => {
+    const { tmp, repo } = makeRepo("http://127.0.0.1:1")
+    const board = await Board.open(repo, path.join(tmp, "board-state"))
+    const task = (await board.plan([{ title: "Scoped", goal: "g", scope: ["src/a.ts"] }])).tasks[0]!
+    const { attempt } = await board.assign(task.id)
+    await assert.rejects(board.lock(task.id, attempt.token, ["package.json"]), new RegExp(`outside ${task.id}'s scope \\(src/a\\.ts\\)`))
+    assert.deepEqual(board.locks(), [], "a refused lock takes nothing")
+    await board.lock(task.id, attempt.token, ["src/a.ts"])
+    assert.deepEqual(
+      board.locks().map((l) => l.path),
+      ["src/a.ts"],
+    )
+  })
 })
 
 let h: Harness
@@ -89,13 +104,20 @@ let mock: Mock
 let repo: string
 let tmp: string
 let boardState: string
+/** The Claude Code session id the harness server publishes its news file under. */
+const NEWS_SESSION = "test-news-session"
 
 describe("fleet fixes: gates, tasks and worktrees (real opencode, mock LLM)", { timeout: 600_000 }, () => {
   before(async () => {
     mock = await startMockLlm()
     ;({ tmp, repo } = makeRepo(mock.url))
     boardState = path.join(tmp, "board-state")
-    h = await connect({ ...isolatedEnv(tmp, repo), HORDE_OPENCODE_MAX_RUNNING: "2", HORDE_BOARD_STATE_DIR: boardState })
+    h = await connect({
+      ...isolatedEnv(tmp, repo),
+      HORDE_OPENCODE_MAX_RUNNING: "2",
+      HORDE_BOARD_STATE_DIR: boardState,
+      CLAUDE_CODE_SESSION_ID: NEWS_SESSION,
+    })
   })
 
   after(async () => {
@@ -105,6 +127,15 @@ describe("fleet fixes: gates, tasks and worktrees (real opencode, mock LLM)", { 
   })
 
   const idOf = (text: string) => text.match(/\bt-[0-9a-f]+\b/)![0]
+  /** The fleet's record on disk for the agent working a task (it is written as the gate decides). */
+  function agentRecord(taskId: string): AgentRecord | undefined {
+    const dir = path.join(tmp, "state", "agents")
+    for (const f of fs.readdirSync(dir)) {
+      const r = JSON.parse(fs.readFileSync(path.join(dir, f), "utf8")) as AgentRecord
+      if (r.task?.id === taskId) return r
+    }
+    return undefined
+  }
   /** The next outcome other than a permission request (this repo's config asks before shell). */
   async function settle(id: string): Promise<string> {
     for (;;) {
@@ -491,6 +522,100 @@ describe("fleet fixes: gates, tasks and worktrees (real opencode, mock LLM)", { 
     assert.match(la, /not landed/, la)
     assert.match(lb, /^landed /, lb)
   })
+
+  test("opencode_dispose closes a task-bound agent's board attempt as failed", async () => {
+    const board = await Board.open(repo, boardState)
+    const task = (await board.plan([{ title: "Dispose me", goal: "Wait a while.\nRUN: sleep 60", scope: ["disp.txt"] }])).tasks[0]!
+    await h.call("opencode_spawn", { task: task.id, name: "dispose-me", permissions: "allow" })
+    await h.call("opencode_dispose", { id: "dispose-me", worktree: "discard" })
+    const closed = board.task(task.id)
+    assert.equal(closed.status, "failed", "the task is closed, not working forever")
+    assert.equal(closed.attempts[0]?.outcome, "failed")
+    assert.equal(closed.attempts[0]?.note, "disposed")
+  })
+
+  test("a gate verdict updates the news file at once and board_summary shows the task failed-but-open", async () => {
+    const { repo: r } = makeRepo(mock.url, { permission: { bash: "allow" } })
+    fs.writeFileSync(path.join(r, "horde.json"), JSON.stringify({ verify: { checks: { nope: `node -e "process.exit(1)"` } }, tiers: ["mock/mock"] }))
+    git(r, "add", ".")
+    git(r, "commit", "-qm", "checks")
+    const started = await h.call("horde_do", {
+      directory: r,
+      goal: "Write the file.\nRUN: echo hi > g.txt && git add g.txt && git commit -qm g",
+      done: ["g.txt says hi"],
+      scope: ["g.txt"],
+    })
+    const id = idOf(started)
+    // The record is written just before the news file: its final verdict marks the gate's decision.
+    const record = await until(
+      async () => {
+        const r = agentRecord(id)
+        return r?.gateState?.verdict?.final ? r : undefined
+      },
+      180_000,
+      50,
+    )
+    const seen = Date.now()
+    assert.ok(seen - record.gateState!.verdict!.at < 1_000, "the verdict was just recorded")
+    const newsFile = path.join(tmp, "state", "news", `${NEWS_SESSION}.json`)
+    await until(
+      async () => {
+        try {
+          const news = JSON.parse(fs.readFileSync(newsFile, "utf8")) as { waiting: { id: string }[] }
+          return news.waiting.some((w) => w.id === id)
+        } catch {
+          return false
+        }
+      },
+      5_000,
+      25,
+    )
+    assert.ok(Date.now() - seen < 1_000, `the news file named the task within a second of the verdict (${Date.now() - seen}ms)`)
+    const summary = renderSummary(await Board.open(r, boardState), 4_000)
+    assert.match(summary, new RegExp(`failed \\(open\\)  ${id} "`), summary)
+    assert.match(summary, /gate failed after 2 rounds; open for horde_tell/, summary)
+    assert.doesNotMatch(summary, new RegExp(`review  ${id}`), "no verdict is pending: it is not in review")
+    await h.call("horde_drop", { id })
+  })
+
+  test("a gate whose check never started does not consume a round or reach the worker", async () => {
+    const { repo: r } = makeRepo(mock.url, { permission: { bash: "allow" } })
+    fs.writeFileSync(
+      path.join(r, "horde.json"),
+      JSON.stringify({ verify: { checks: { test: { command: "true", slots: 1 } }, timeoutSeconds: 2 }, tiers: ["mock/mock"] }),
+    )
+    git(r, "add", ".")
+    git(r, "commit", "-qm", "checks")
+    // Hold the check's only slot as a live process: withLock waits, and the retry cannot start either.
+    const lockDir = await lockDirFor(r, path.join(tmp, "xdg-state", "mcp-horde", "verify"))
+    fs.mkdirSync(lockDir, { recursive: true })
+    const lockFile = path.join(lockDir, "check-test.0.lock")
+    fs.writeFileSync(lockFile, JSON.stringify({ pid: process.pid, host: os.hostname(), token: "held" }))
+    const before = mock.requests.length
+    try {
+      const started = await h.call("horde_do", {
+        directory: r,
+        goal: "Write the file.\nRUN: echo hi > s.txt && git add s.txt && git commit -qm s",
+        done: ["s.txt says hi"],
+        scope: ["s.txt"],
+      })
+      const id = idOf(started)
+      const out = await h.call("horde_wait", { ids: [id], timeout_seconds: 120 })
+      assert.match(out, /FAILED/, out)
+      assert.match(out, /check-test/, out)
+      assert.match(out, new RegExp(`held by pid ${process.pid}`), out)
+      assert.match(out, /not the worker's failure/, out)
+      assert.doesNotMatch(out, /checks failed after 1 round/, "the lost slot was not counted as the worker's round")
+      const fixes = mock.requests.slice(before).filter((b) => JSON.stringify(b).includes("This task is not done yet"))
+      assert.equal(fixes.length, 0, "the lost slot was never sent back to the worker")
+      const record = agentRecord(id)
+      assert.equal(record?.gateState?.round, 0, "no round was consumed")
+      assert.equal(record?.gateState?.verdict?.final, true)
+      await h.call("horde_drop", { id })
+    } finally {
+      fs.rmSync(lockFile, { force: true })
+    }
+  })
 })
 
 describe("fleet fixes: a brief OpenCode stall is absorbed by the wait", () => {
@@ -514,7 +639,7 @@ describe("fleet fixes: a brief OpenCode stall is absorbed by the wait", () => {
       info: { key: "local" },
       events: new EventEmitter(),
       streaming: false,
-      dead: true,
+      dead: false,
     } as unknown as Backend
     const config: Config = {
       username: "opencode",
@@ -542,7 +667,10 @@ describe("fleet fixes: a brief OpenCode stall is absorbed by the wait", () => {
       const fleetAny = fleet as unknown as {
         activeSet: () => Promise<Set<string>>
         snapshot: (ref: string, active?: Set<string>) => Promise<Snapshot>
+        tick: () => Promise<void>
       }
+      // The background tick is the monitor's job, not this wait's: keep its activeSet() call out.
+      fleetAny.tick = async () => {}
       fleetAny.activeSet = async () => {
         if (++activeCalls === 1) throw new Error("listing active sessions failed: aborted due to timeout")
         return new Set(["ses_wait"])
@@ -700,6 +828,20 @@ describe("fleet fixes: request and refresh deadlines", () => {
       dead: true,
     }) as unknown as Backend
 
+  test("get does not blame another session for a record with no owner", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "horde-owner-"))
+    const store = new Store(tmp)
+    const fleet = new Fleet(backendFor({}), configFor(tmp), store, hooksFor())
+    try {
+      store.put({ id: "ses_orphan", server: "local", directory: tmp, policy: "ask", questions: "ask", limits: {}, createdAt: 0, reportedSeq: 0 })
+      // syncStore would claim it; this is the fallback after a claim that did not happen.
+      ;(fleet as unknown as { syncStore: () => void }).syncStore = () => {}
+      await assert.rejects(fleet.get("ses_orphan"), (err: Error) => !/another MCP session/.test(err.message) && /has no live owner/.test(err.message))
+    } finally {
+      fleet.close()
+    }
+  })
+
   test("a request whose promise never settles rejects at the bound, naming it once", async (t) => {
     mockTimers.timers.enable({ apis: ["setTimeout"] })
     t.after(() => mockTimers.timers.reset())
@@ -832,5 +974,60 @@ describe("fleet fixes: request and refresh deadlines", () => {
     } finally {
       fleet.close()
     }
+  })
+})
+
+describe("fleet fixes: a backend that dies mid-task", { timeout: 600_000 }, () => {
+  let mock: Mock
+  let hb: Harness
+  let tmp: string
+  let repo: string
+
+  before(async () => {
+    mock = await startMockLlm()
+    ;({ tmp, repo } = makeRepo(mock.url, { permission: { bash: "allow" } }))
+    hb = await connect({
+      ...isolatedEnv(tmp, repo),
+      HORDE_OPENCODE_MAX_RUNNING: "2",
+      HORDE_BOARD_STATE_DIR: path.join(tmp, "board-state"),
+    })
+  })
+
+  after(async () => {
+    await hb?.call("opencode_server", { action: "stop" }).catch(() => undefined)
+    await hb?.close()
+    mock?.close()
+  })
+
+  test("a killed backend ends the in-flight wait at once and settles its agent as gone", async () => {
+    fs.writeFileSync(path.join(repo, "horde.json"), JSON.stringify({ verify: { checks: { ok: "true" } }, tiers: ["mock/mock"] }))
+    git(repo, "add", ".")
+    git(repo, "commit", "-qm", "checks")
+    const started = await hb.call("horde_do", {
+      directory: repo,
+      goal: "Wait a while.\nRUN: sleep 120",
+      done: ["it waited"],
+      scope: ["w.txt"],
+    })
+    const id = started.match(/\bt-[0-9a-f]+\b/)![0]
+    await until(async () => /— RUNNING/.test(await hb.call("opencode_status", { ids: [id] })), 90_000, 250)
+    const server = JSON.parse(fs.readFileSync(path.join(tmp, "state", "server.json"), "utf8")) as { pid: number }
+    process.kill(server.pid, "SIGKILL")
+    const waitStart = Date.now()
+    const waited = await hb.call("horde_wait", { ids: [id], timeout_seconds: 20 })
+    const waitedMs = Date.now() - waitStart
+    assert.match(waited, /the OpenCode server went away; calling again reconnects/, waited)
+    assert.doesNotMatch(waited, /Nothing finished within 20s/, "the wait answered instead of timing out")
+    assert.ok(waitedMs < 15_000, `the wait answered in ${waitedMs}ms, not at its deadline`)
+    const statusStart = Date.now()
+    const status = await hb.call("opencode_status", { ids: [id] })
+    assert.doesNotMatch(status, /— RUNNING/, status)
+    assert.match(status, /its OpenCode session is gone: the backend restarted at /, status)
+    assert.match(status, /horde_tell restarts the work from its worktree, horde_drop gives it up/, status)
+    assert.ok(Date.now() - statusStart < 30_000, "the next call reconnected without a long wait")
+    const outcome = await hb.call("horde_wait", { ids: [id], timeout_seconds: 20 })
+    assert.match(outcome, /FAILED/, outcome)
+    assert.match(outcome, /horde_tell restarts the work from its worktree, horde_drop gives it up/, outcome)
+    await hb.call("horde_drop", { id })
   })
 })

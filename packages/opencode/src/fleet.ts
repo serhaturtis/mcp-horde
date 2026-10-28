@@ -92,6 +92,14 @@ const TICK_MS = 120_000
 const REFRESH_MS = 120_000
 /** How often the owner's heartbeat is written into its records. */
 const HEARTBEAT_MS = 30_000
+/** What a wait, a status read or a call on a dead backend answers: the next call reconnects. */
+const SERVER_GONE = "the OpenCode server went away; calling again reconnects"
+
+/** What a stranded agent (its backend died mid-turn) says, and what to do instead of waiting. */
+const GONE_PREFIX = "its OpenCode session is gone"
+function goneMessage(at: number): string {
+  return `${GONE_PREFIX}: the backend restarted at ${new Date(at).toISOString()}; horde_tell restarts the work from its worktree, horde_drop gives it up`
+}
 
 export interface Pending {
   permissions: PermissionRequest[]
@@ -264,6 +272,11 @@ interface Live {
   handedToCaller: Set<string>
   /** When the agent last went from running to settled. */
   settledAt: number
+  /**
+   * Set when this agent's backend died mid-turn. The turn is gone with it: the agent stays
+   * settled as an error until a new prompt restarts it.
+   */
+  stranded?: boolean
   /** Bumped on every prompt we send; refreshes started before it do not publish state. */
   gen: number
   /** Bumped on every refresh run; an abandoned run must not publish over a newer one. */
@@ -423,6 +436,45 @@ function gateCheck(c: CheckResult): GateCheckSummary {
   return { name: c.name, pass: c.pass, summary: checkSummary(c), ...(c.baseline ? { baseline: c.baseline } : {}) }
 }
 
+/** A check that never started because its slot stayed taken for the whole wait. */
+export interface SlotBlocked {
+  slot: string
+  count: number
+  waited: number
+}
+
+/**
+ * The check's result when it never started because its slot stayed taken: not a verdict about
+ * the work, so a gate round must not count it against the worker.
+ */
+export function slotBlocked(c: CheckResult): SlotBlocked | undefined {
+  if (c.pass || c.stopped || c.code !== null) return undefined
+  const text = c.extracted.failures.map((f) => f.message).join("\n")
+  const m = /could not start: waited (\d+)s for (check-[\w.-]+): all (\d+) of its slot\(s\) stayed taken/.exec(text)
+  return m ? { slot: m[2]!, count: Number(m[3]), waited: Number(m[1]) } : undefined
+}
+
+/** The final answer when the gate could not start: the slot, who holds it, and that the work is not to blame. */
+async function slotFailureText(stuck: SlotBlocked[], directory: string): Promise<string> {
+  const dir = await lockDirFor(directory, verifyStateDir()).catch(() => undefined)
+  const parts: string[] = []
+  for (const s of stuck) {
+    const holders: string[] = []
+    for (let i = 0; dir && i < s.count; i++) {
+      try {
+        const h = JSON.parse(await fs.readFile(path.join(dir, `${s.slot}.${i}.lock`), "utf8")) as { pid?: number; host?: string }
+        if (h.pid) holders.push(`pid ${h.pid}${h.host ? ` on ${h.host}` : ""}`)
+      } catch {
+        // The lock went away or is unreadable; another slot index may still name its holder.
+      }
+    }
+    parts.push(
+      `waited ${s.waited}s for ${s.slot} (all ${s.count} of its slot(s) stayed taken${holders.length ? `, held by ${holders.join(", ")}` : ""}${dir ? `; locks in ${dir}` : ""})`,
+    )
+  }
+  return `the checks could not start, so this task's work was not judged: ${parts.join("; ")}. This is not the worker's failure: horde_tell again once the slot is free, or horde_drop it.`
+}
+
 /** What the agent is told when the review finds criteria not met (the gate's lead line comes first). */
 export function reviewFeedback(r: ReviewSummary): string {
   return [
@@ -527,9 +579,11 @@ export class Fleet {
 
   /**
    * Stop monitoring and hand our agents over: another MCP process may claim them at once.
-   * A restart keeps the news file (outcomes still wait to be reported); an exit removes it.
+   * A restart keeps the news file (outcomes still wait to be reported) and, with `goneAt`, marks
+   * the turns in flight as taken by the dead backend; an exit removes the news file.
    */
-  close(opts: { keepNews?: boolean } = {}) {
+  close(opts: { keepNews?: boolean; goneAt?: number } = {}) {
+    const goneAt = opts.goneAt
     this.closed = true
     if (this.monitor) clearInterval(this.monitor)
     for (const l of this.live.values()) {
@@ -537,8 +591,11 @@ export class Fleet {
       l.gating = undefined
       l.fix = undefined
       for (const d of l.dialogs.values()) d.abort()
+      // A backend that died took the turns in flight with it: record that, so the next fleet
+      // settles those agents instead of showing them RUNNING (LIVE-02).
+      const stranded = goneAt !== undefined && (l.state === undefined || l.state === "running") ? { stopReason: goneMessage(goneAt) } : {}
       try {
-        this.store.update(l.record.id, { owner: undefined, ownerSeen: undefined })
+        this.store.update(l.record.id, { owner: undefined, ownerSeen: undefined, ...stranded })
       } catch {
         // best effort
       }
@@ -1292,6 +1349,7 @@ export class Fleet {
     }
     // Any refresh that started before this point must not publish its (now stale) state.
     live.gen++
+    live.stranded = undefined
     live.state = "running"
     live.liveText = ""
     live.sent = { at: Date.now(), id: sent.id }
@@ -1459,6 +1517,17 @@ export class Fleet {
       }
     }
     if (!opts.deleteSession) notes.push(`the session ${id} stays in OpenCode history`)
+    // A task-bound agent disposed through the lower-level tool still has to close its board
+    // attempt, or the task reads as working forever and the ledger never learns from it.
+    const task = live.record.task
+    if (task) {
+      const board = await Board.open(live.record.worktree?.repo ?? live.record.directory).catch(() => undefined)
+      const attempt = board
+        ?.tasks()
+        .find((t) => t.id === task.id)
+        ?.attempts.find((a) => a.n === task.attempt)
+      if (board && attempt && !attempt.endedAt) await board.fail(task.id, { reason: "disposed", retry: false }).catch(() => undefined)
+    }
     this.forget(id)
     notes.push(`stopped tracking ${name}`)
     return notes.join("\n")
@@ -1899,6 +1968,9 @@ export class Fleet {
 
   private async doRefresh(live: Live, activeIn?: Set<string>) {
     const id = live.record.id
+    // A backend death took this agent's turn with it: nothing on the new server describes it
+    // until a prompt restarts it (sendPrompt clears the mark).
+    if (live.stranded) return
     const gen = live.gen
     const token = live.run
     const before = live.state
@@ -2148,30 +2220,47 @@ export class Fleet {
     let text: string
     let checks: GateCheckSummary[] | undefined
     let review: ReviewSummary | undefined
+    let stuck: SlotBlocked[] = []
     try {
       // A worktree's commits are never on the target branch: its rules are horde.json at that
       // branch's tip, including a change the orchestrator committed while the task ran.
       const rulesAt = wt ? await git(wt.repo, "rev-parse", "HEAD").catch(() => undefined) : undefined
-      const v = await runGate(live.session?.location.directory ?? live.record.directory, {
-        base: start ?? cfg.base,
-        rulesAt,
-        audit: cfg.audit,
-        // Only an unaudited shared gate may use the human's working config; a worktree gate
-        // judges by the target branch's rules, which the work itself cannot rewrite.
-        settingsFrom: !wt && !cfg.audit ? "working" : "base",
-        checks: cfg.checks,
-        allowed: cfg.allowed,
-        related: cfg.related !== false,
-        stage: "work",
-        env: wt ? { HORDE_TASK: live.record.task?.id ?? live.record.name ?? live.record.id, HORDE_WORKTREE: wt.root } : undefined,
-        baseline: wt && start ? this.baselineFor(wt.repo, start, `${start.slice(0, 8)} where the task started`) : undefined,
-        signal: abort.signal,
-        stateDir: verifyStateDir(),
-      })
+      const directory = live.session?.location.directory ?? live.record.directory
+      const judge = () =>
+        runGate(directory, {
+          base: start ?? cfg.base,
+          rulesAt,
+          audit: cfg.audit,
+          // Only an unaudited shared gate may use the human's working config; a worktree gate
+          // judges by the target branch's rules, which the work itself cannot rewrite.
+          settingsFrom: !wt && !cfg.audit ? "working" : "base",
+          checks: cfg.checks,
+          allowed: cfg.allowed,
+          related: cfg.related !== false,
+          stage: "work",
+          env: wt ? { HORDE_TASK: live.record.task?.id ?? live.record.name ?? live.record.id, HORDE_WORKTREE: wt.root } : undefined,
+          baseline: wt && start ? this.baselineFor(wt.repo, start, `${start.slice(0, 8)} where the task started`) : undefined,
+          signal: abort.signal,
+          stateDir: verifyStateDir(),
+        })
+      const blockedIn = (v: { checks: CheckResult[]; pass: boolean }) => v.checks.map(slotBlocked).filter((x): x is SlotBlocked => !!x)
+      // Every failing check never started for lack of its slot: nothing about the work was judged.
+      const onlyStuck = (v: { checks: CheckResult[]; pass: boolean }) =>
+        !v.pass && v.checks.some((c) => !c.pass) && v.checks.every((c) => c.pass || !!slotBlocked(c))
+      let v = await judge()
+      if (onlyStuck(v) && !abort.signal.aborted) {
+        // A check that never started because its slot stayed taken is not the worker's failure:
+        // wait once more for the slot (bounded by the check's timeout again), and say nothing to
+        // the worker unless the work itself failed (NEW-03).
+        v = await judge()
+      }
       pass = v.pass
       text = v.text
       checks = v.checks.map(gateCheck)
+      stuck = onlyStuck(v) ? blockedIn(v) : []
+      if (!pass && stuck.length) text = await slotFailureText(stuck, directory)
     } catch (err) {
+      stuck = []
       text = `the gate could not run: ${(err as Error).message}`
     }
     // The checks pass: does the change do what the task asked? A criterion found not met goes back
@@ -2201,13 +2290,31 @@ export class Fleet {
     // A new instruction (or dispose, or shutdown) superseded this run: its verdict is about an old task.
     if (this.closed || abort.signal.aborted || this.live.get(id) !== live) return
     if (live.sent || live.sending || live.track.lastPromptedSeq > promptBefore || currentTurn(live.track)?.startSeq !== turn) return
-    const final = pass || round >= cfg.maxRounds || text.startsWith("the gate could not run") || !!review?.error
-    this.updateRecord(id, { gateState: { round, verdict: { turn, pass, final, text, at: Date.now(), checks, review } } })
+    // A round whose check never started judges nothing about the worker, so it does not count.
+    const blocked = !pass && stuck.length > 0
+    const final = blocked || pass || round >= cfg.maxRounds || text.startsWith("the gate could not run") || !!review?.error
+    const storedRound = blocked ? (live.record.gateState?.round ?? 0) : round
+    this.updateRecord(id, { gateState: { round: storedRound, verdict: { turn, pass, final, text, at: Date.now(), checks, review } } })
+    // A hook reads the news file; a verdict must show there at once, not at the next refresh.
+    this.publishNews()
+    if (blocked) {
+      // The slot, not the work, failed: report it and wait for horde_tell instead of a fix round.
+      await this.recordGateFailure(live, text)
+      return
+    }
     if (!final) {
       // The fix round wakes the agent: it waits for a running slot like any other wake-up.
       live.fix = { turn, round, text }
       await this.deliverFix(live)
-    }
+    } else if (!pass) await this.recordGateFailure(live, `gate failed after ${round} round${round === 1 ? "" : "s"}; open for horde_tell`)
+  }
+
+  /** The board learns a gate failed after its last round: shown as failed (open) for horde_tell. */
+  private async recordGateFailure(live: Live, reason: string) {
+    const task = live.record.task
+    if (!task) return
+    const board = await Board.open(live.record.worktree?.repo ?? live.record.directory).catch(() => undefined)
+    await board?.gateFailed(task.id, task.attempt, reason).catch(() => undefined)
   }
 
   /** Send a queued gate failure back to its agent once a running slot is free (else it stays queued for the next tick). */
@@ -2238,6 +2345,8 @@ export class Fleet {
     live.fix = undefined
     try {
       await this.sendPrompt(live, gateFeedback(fix.round, live.record.gate?.maxRounds ?? fix.round, fix.text), { files: [], inlined: [] })
+      // The task is back with its worker: the news file must say so now, not on the next refresh.
+      this.publishNews()
     } catch (err) {
       // The agent could not be told: report the failure instead of waiting forever.
       this.updateRecord(id, {
@@ -2799,6 +2908,7 @@ export class Fleet {
     timeoutMs: number,
     opts: { signal?: AbortSignal; onTick?: (snaps: Snapshot[], elapsedMs: number) => void; markReported?: boolean } = {},
   ): Promise<{ snapshots: Snapshot[]; news: Set<string>; errors: string[]; timedOut: boolean; nothingToWaitFor: boolean }> {
+    if (this.closed || this.backend.dead) return this.goneWait(refs, [])
     const lives = await Promise.all(refs.map((r) => this.get(r)))
     const ids = [...new Set(lives.map((l) => l.record.id))]
     const start = Date.now()
@@ -2806,6 +2916,9 @@ export class Fleet {
     let last: Snapshot[] = []
     const unreadableSince = new Map<string, number>()
     for (;;) {
+      // The backend died under the wait: answer at once instead of reading the store and
+      // blaming another session, or spinning until the timeout (LIVE-02).
+      if (this.closed || this.backend.dead) return this.goneWait(ids, last)
       // One round of reads, given up at the deadline or on abort even if a request hangs.
       const round = await this.untilDeadline(
         (async () => {
@@ -2865,6 +2978,30 @@ export class Fleet {
       last = snaps
       opts.onTick?.(snaps, Date.now() - start)
       await this.sleepUntilWoken(Math.min(this.backend.streaming ? 2_000 : 1_000, deadline - Date.now()), opts.signal)
+    }
+  }
+
+  /** The answer to a wait whose fleet or backend is gone: nothing was read, and one call fixes it. */
+  private goneWait(
+    refs: string[],
+    last: Snapshot[],
+  ): { snapshots: Snapshot[]; news: Set<string>; errors: string[]; timedOut: boolean; nothingToWaitFor: boolean } {
+    const ids = last.length
+      ? last.map((s) => s.id)
+      : refs.flatMap((r) => {
+          const live = this.live.get(r) ?? this.findByName(r)
+          if (live) return [live.record.id]
+          const record = this.store.agents(this.serverKey).find((x) => x.id === r || x.name === r)
+          return record ? [record.id] : []
+        })
+    const snapshots: Snapshot[] = []
+    // No snapshots: what the old fleet last saw is exactly the stale RUNNING this answer replaces.
+    return {
+      snapshots,
+      news: new Set(),
+      errors: ids.filter((id) => !this.gone.has(id)).map((id) => `${id}: ${SERVER_GONE}`),
+      timedOut: false,
+      nothingToWaitFor: false,
     }
   }
 
@@ -3035,6 +3172,18 @@ export class Fleet {
       lastNewEventAt: Date.now(),
     }
     this.live.set(record.id, live)
+    // A running turn whose backend died is gone: show it settled rather than RUNNING until a
+    // new prompt restarts it (the marker survives in the record; close() writes it on death).
+    if (record.stopReason?.startsWith(GONE_PREFIX)) this.strand(live)
+    return live
+  }
+
+  /** Settle an agent whose backend went away, with what happened and what the caller can do. */
+  private strand(live: Live): Live {
+    live.stranded = true
+    live.state = "error"
+    live.error = live.record.stopReason ?? goneMessage(Date.now())
+    live.settledAt = Date.now()
     return live
   }
 
@@ -3136,13 +3285,21 @@ export class Fleet {
 
   /** Resolve a session id or agent name. Unknown root sessions are adopted; child ids resolve to their root. */
   async get(ref: string): Promise<Live> {
+    if (this.closed) throw new Error(SERVER_GONE)
     let live = this.findByName(ref) ?? this.live.get(ref)
     if (live) return live
     this.syncStore(ref)
     live = this.findByName(ref) ?? this.live.get(ref)
     if (live) return live
     const foreign = this.store.agents(this.serverKey).find((r) => r.id === ref || r.name === ref)
-    if (foreign) throw new Error(`agent "${ref}" is driven by another MCP session (pid ${foreign.owner?.pid}); use that session, or close it first`)
+    if (foreign) {
+      // Only an agent another live session owns is a conflict. An ownerless record is one whose
+      // backend (or owner process) went away: never blame a session that does not drive it.
+      if (foreign.owner && foreign.owner.token !== SELF.token)
+        throw new Error(`agent "${ref}" is driven by another MCP session (pid ${foreign.owner.pid}); use that session, or close it first`)
+      if (foreign.stopReason?.startsWith(GONE_PREFIX)) return this.strand(this.live.get(foreign.id) ?? this.adoptRecord(foreign))
+      throw new Error(`agent "${ref}" has no live owner and is not tracked here; call again to claim it, or opencode_spawn a new agent`)
+    }
     if (!ref.startsWith("ses_")) throw new Error(`unknown agent "${ref}". Pass a session id (ses_…) or the name given at spawn; opencode_status lists them.`)
     const root = this.childToRoot.get(ref)
     if (root && this.live.has(root)) return this.live.get(root)!

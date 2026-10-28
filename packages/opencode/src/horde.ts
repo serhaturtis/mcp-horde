@@ -511,7 +511,9 @@ export async function outcome(fleet: Fleet, ref: string, opts: { live?: boolean 
         : s.state === "interrupted"
           ? `stopped: ${truncate(oneLine(s.error ?? "interrupted"), 200)}`
           : s.gate?.state === "fail"
-            ? `checks failed after ${s.gate.round} round(s)`
+            ? s.gate.round === 0
+              ? "the gate could not run, so its work was not judged"
+              : `checks failed after ${s.gate.round} round(s)`
             : "finished without a verdict"
   const lines = [say("FAILED", ` (${why})`)]
   if (s.gate?.state === "fail" && verdict?.text) lines.push(indent(truncate(verdict.text, 900), "  "))

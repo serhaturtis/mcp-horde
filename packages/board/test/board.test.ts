@@ -190,12 +190,12 @@ describe("board", () => {
     assert.match(run(`task ${api!.id} ${attempt.token}`), /API" — working/)
     assert.equal(run(`progress ${api!.id} ${attempt.token} "writing the limiter"`), "noted")
     assert.match(run(`finding "login reuses the session middleware" --paths "src/api/login.ts" --task ${api!.id} --token ${attempt.token}`), /^shared as n-/)
-    assert.match(run(`lock ${api!.id} ${attempt.token} "src/shared/rate.ts"`), /locked src\/shared\/rate\.ts/)
+    assert.match(run(`lock ${api!.id} ${attempt.token} "src/api/rate.ts"`), /locked src\/api\/rate\.ts/)
 
     // Another task cannot take the same path.
     const other = (await board.plan([{ title: "Other", goal: "x" }])).tasks[0]!
     const second = await board.assign(other.id)
-    assert.throws(() => run(`lock ${other.id} ${second.attempt.token} "src/shared"`), /refused: src\/shared\/rate\.ts is locked by t-/)
+    assert.throws(() => run(`lock ${other.id} ${second.attempt.token} "src/api"`), /refused: src\/api\/rate\.ts is locked by t-/)
     assert.throws(() => run(`task ${api!.id} wrongtoken`), /token does not match/)
 
     assert.match(
@@ -212,7 +212,7 @@ describe("board", () => {
     const summary = renderSummary(board)
     assert.match(summary, /^3 tasks: 1 claimed, 1 review, 1 open/)
     assert.match(summary, /review {2}t-\w+ "API": Added a sliding-window limiter.*\(confidence medium, 1 unverified, 1 question\(s\)\)/)
-    assert.match(summary, /locks {3}src\/shared\/rate\.ts → t-/)
+    assert.match(summary, /locks {3}src\/api\/rate\.ts → t-/)
     // Humans read the same from the command line.
     const human = `${cliArgv().join(" ")} status --state "${board.dir.replace(/\\/g, "/")}"`
     assert.match(sh(human, root), /^3 tasks: 1 claimed, 1 review, 1 open/)

@@ -11,7 +11,7 @@ import { type Config, inProject, loadConfig } from "./config.js"
 import { Fleet } from "./fleet.js"
 import { makeHooks } from "./hooks.js"
 import { News } from "./news.js"
-import { type AgentRecord, ownerAlive, Store } from "./state.js"
+import { type AgentRecord, ownerAlive, SELF, Store } from "./state.js"
 import { INSTRUCTIONS, registerTools } from "./tools.js"
 import { repoRoot, sweepWorktrees } from "./worktree.js"
 
@@ -90,28 +90,46 @@ const server = new McpServer(
 // dies or is stopped, the next call starts (or reconnects to) a fresh one.
 let backend: Promise<Backend> | undefined
 let fleet: Promise<Fleet> | undefined
+/** The last close of a fleet and backend: a new fleet must not be born before it finishes. */
+let cleanup: Promise<unknown> = Promise.resolve()
 
-function reset(keepNews = true) {
+/**
+ * Drop the current fleet and backend. A restart (reconnect) keeps the news file, whose outcomes
+ * still wait for a report, and marks the turns in flight as taken by the dead backend; when this
+ * process still has agents, the fleet is rebuilt at once so the next call finds them settled
+ * instead of paying for the restart (LIVE-02). An exit removes the news file.
+ */
+function reset(reconnect = false) {
   const f = fleet
   const b = backend
   fleet = undefined
   backend = undefined
-  // A restart is not an exit: the news file keeps naming outcomes that still wait for a report.
-  void f?.then((x) => x.close({ keepNews })).catch(() => undefined)
-  void b?.then((x) => x.close()).catch(() => undefined)
+  let retained = false
+  if (reconnect) {
+    try {
+      const { config, store } = load()
+      // Before close() hands them over: records of this process carry its token. Attached servers
+      // key their records by URL; managed ones by "local".
+      retained = store.agents(config.url ?? "local").some((r) => r.owner?.token === SELF.token)
+    } catch {
+      retained = false
+    }
+  }
+  cleanup = Promise.allSettled([f?.then((x) => x.close({ keepNews: reconnect, goneAt: reconnect ? Date.now() : undefined })), b?.then((x) => x.close())])
+  if (retained) void cleanup.then(() => getFleet()).catch(() => undefined)
 }
 
 const getBackend = async (): Promise<Backend> => {
   if (backend) {
     const current = await backend.catch(() => undefined)
     if (current && !current.dead) return current
-    reset()
+    reset(true)
   }
   const { config, store } = load()
   const started = Backend.start(config, store)
   backend = started
   started.then(
-    (b) => b.events.once("dead", () => backend === started && reset()),
+    (b) => b.events.once("dead", () => backend === started && reset(true)),
     () => {
       if (backend === started) backend = undefined
     },
@@ -120,6 +138,9 @@ const getBackend = async (): Promise<Backend> => {
 }
 
 const getFleet = async (): Promise<Fleet> => {
+  if (fleet) return fleet
+  // A fleet being closed still owns its records: wait, so it cannot clear them under the new one.
+  await cleanup
   const b = await getBackend()
   if (!fleet) {
     const { config, store } = load()

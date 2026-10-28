@@ -180,9 +180,13 @@ function attemptLine(t: Task, now: number): string {
 export function renderSummary(board: Board, budgetChars = 1500, now = Date.now()): string {
   const tasks = board.tasks()
   const by = (s: Task["status"]) => tasks.filter((t) => t.status === s)
+  // A gate that failed after its last round leaves the attempt open for horde_tell: it is failed,
+  // not in review, because no verdict is pending.
+  const failedOpen = (t: Task) => (t.status === "review" ? current(t)?.failure : undefined)
+  const statusOf = (t: Task) => (failedOpen(t) ? "failed" : t.status)
   const ready = board.ready(tasks)
   const counts = (["done", "working", "claimed", "review", "open", "blocked", "failed"] as const)
-    .map((s) => [s, by(s).length] as const)
+    .map((s) => [s, tasks.filter((t) => statusOf(t) === s).length] as const)
     .filter(([, n]) => n)
     .map(([s, n]) => `${n} ${s}`)
   const cost = tasks.reduce((n, t) => n + t.cost, 0)
@@ -194,7 +198,16 @@ export function renderSummary(board: Board, budgetChars = 1500, now = Date.now()
       required: true,
     },
   ]
-  for (const t of by("review")) {
+  for (const t of tasks) {
+    const failure = failedOpen(t)
+    if (failure)
+      sections.push({
+        text: `failed (open)  ${t.id} "${t.title}": ${truncate(failure, 160)}`,
+        group: "failed",
+        omitted: (n) => `failed … ${n} more`,
+      })
+  }
+  for (const t of by("review").filter((t) => !failedOpen(t))) {
     const r = t.reports[t.reports.length - 1]
     const flags = r
       ? [

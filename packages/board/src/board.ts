@@ -33,6 +33,11 @@ export interface Attempt {
   endedAt?: number
   outcome?: "accepted" | "failed" | "abandoned"
   note?: string
+  /**
+   * Why the attempt's gate failed after its last round. The attempt stays open for horde_tell,
+   * but the board shows it as failed (open) instead of in review.
+   */
+  failure?: string
   cost?: number
   /** The cost was given by the orchestrator (accept/fail): the runtime's estimate no longer replaces it. */
   costGiven?: boolean
@@ -437,7 +442,21 @@ export class Board {
       if (activity.cost !== undefined && !a.costGiven) a.cost = Math.max(a.cost ?? 0, activity.cost)
       if (activity.state) a.activity = { state: activity.state, gate: activity.gate, at: Date.now() }
       if (activity.model) Object.assign(a, { model: activity.model, variant: activity.variant })
+      // Running again or passing means the last round's failure is no longer the attempt's state.
+      if (activity.state === "running" || activity.gate?.startsWith("pass")) a.failure = undefined
       t.cost = totalCost(t)
+    })
+  }
+
+  /**
+   * The worker's gate failed after its last round. The attempt stays open (horde_tell can send
+   * more work), but no verdict is pending, so board_summary shows it as failed (open).
+   */
+  gateFailed(id: string, attempt: number, reason: string): Promise<Task> {
+    return this.update(id, (t) => {
+      const a = t.attempts.find((x) => x.n === attempt)
+      if (!a || a.endedAt) return
+      a.failure = reason.slice(0, MAX_NOTE)
     })
   }
 
@@ -599,6 +618,7 @@ export class Board {
       }
       t.reports.push(report)
       a.seenAt = report.at
+      a.failure = undefined
       this.renewLocks(id, a)
       t.status = "review"
       this.event("report", { task: id, attempt: a.n })
@@ -651,6 +671,10 @@ export class Board {
       for (const p of want)
         if (!p || p === "." || /^(\/|[A-Za-z]:)/.test(p) || p.split("/").includes("..") || !p.replace(/\/?[^/]*[*?[].*$/, ""))
           throw new Error(`cannot lock "${p}": use a path relative to the repository root, not a pattern for everything`)
+      // A task locks only what it may change: a file outside its scope is not its to reserve, and a
+      // lock there would block the task that may touch it (LIVE-07).
+      const outside = t.scope.length ? want.filter((p) => !t.scope.some((s) => overlaps(p, s))) : []
+      if (outside.length) throw new Error(`cannot lock ${outside.join(", ")}: outside ${id}'s scope (${t.scope.join(", ")})`)
       const conflicts = this.locks().filter((l) => !(l.task === id && l.attempt === a.n) && want.some((p) => overlaps(p, l.path)))
       if (conflicts.length) return { ok: false as const, conflicts }
       for (const p of want) writeJson(this.lockFile(p), { path: p, task: id, attempt: a.n, expires: Date.now() + LEASE_MS } satisfies Lock)
