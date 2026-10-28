@@ -41,6 +41,8 @@ export interface Config {
   channel: boolean
   /** How long a permission/question dialog may stay open before the request goes to the calling model. */
   elicitTimeoutMs: number
+  /** Names/globs of extra environment variables to pass to the backend (and its worker shells). */
+  passEnv: string[]
 }
 
 function policy(value: string | undefined): PermissionPolicy {
@@ -107,6 +109,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     worktreeDir: defaultWorktreeDir(env),
     channel: bool(env.HORDE_OPENCODE_CHANNEL, "HORDE_OPENCODE_CHANNEL"),
     elicitTimeoutMs: int(env.HORDE_OPENCODE_DIALOG_TIMEOUT, 600, "HORDE_OPENCODE_DIALOG_TIMEOUT") * 1000,
+    // Comma-separated names or globs (e.g. `*_API_KEY`) the backend passes through to `opencode serve`
+    // and so to worker shells, on top of the fixed allowlist. Anything else secret-looking is dropped.
+    passEnv: (env.HORDE_OPENCODE_PASS_ENV ?? "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean),
   }
 }
 

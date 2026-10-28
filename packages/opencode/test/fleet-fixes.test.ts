@@ -143,6 +143,13 @@ describe("fleet fixes: gates, tasks and worktrees (real opencode, mock LLM)", { 
       if (r.task?.id === taskId) return r
     }
     return undefined
+  const alive = (pid: number) => {
+    try {
+      process.kill(pid, 0)
+      return true
+    } catch {
+      return false
+    }
   }
   /** The next outcome other than a permission request (this repo's config asks before shell). */
   async function settle(id: string): Promise<string> {
@@ -627,11 +634,102 @@ describe("fleet fixes: gates, tasks and worktrees (real opencode, mock LLM)", { 
       await h.call("horde_drop", { id })
     } finally {
       fs.rmSync(lockFile, { force: true })
+  test("workers do not inherit the server's secrets: the canary, Claude and horde vars are dropped while PATH, HOME and opts survive", async () => {
+    const { tmp: et, repo: er } = makeRepo(mock.url)
+    const eh = await connect({
+      ...isolatedEnv(et, er),
+      OPENCODE_SERVER_PASSWORD: "parent-password-canary",
+      AUDIT_CANARY_SECRET: "canary-value",
+      CLAUDE_CODE_MESSAGING_TOKEN: "cc-token",
+      HORDE_OPENCODE_EXTRA: "horde-extra",
+      HORDE_OPENCODE_PASS_ENV: "DEEPSEEK_API_KEY",
+      DEEPSEEK_API_KEY: "deepseek-key",
+    })
+    try {
+      await eh.call("opencode_spawn", {
+        prompt: `TOOL: env | sort > env.txt`,
+        name: "envsec",
+        permissions: "allow",
+        wait: true,
+        timeout_seconds: 60,
+      })
+      const raw = fs.readFileSync(path.join(er, "env.txt"), "utf8")
+      const names = raw
+        .split("\n")
+        .map((l) => l.split("=")[0]!)
+        .filter(Boolean)
+      assert.ok(names.includes("PATH"), "PATH survives")
+      assert.ok(names.includes("HOME"), "HOME survives")
+      assert.ok(names.includes("DEEPSEEK_API_KEY"), "the opted-in provider key survives")
+      assert.ok(!names.includes("AUDIT_CANARY_SECRET"), "the canary is dropped")
+      assert.ok(!names.some((n) => n.startsWith("CLAUDE_")), "Claude Code's environment is dropped")
+      assert.ok(!names.some((n) => n.startsWith("HORDE_")), "the horde's own environment is dropped")
+      assert.ok(!raw.includes("parent-password-canary"), "the parent's OPENCODE_SERVER_PASSWORD is not reused")
+      assert.ok(!raw.includes("canary-value"), "the canary value never reaches the worker")
+    } finally {
+      await eh.call("opencode_server", { action: "stop" }).catch(() => undefined)
+      await eh.close()
+    }
+  })
+
+  test("a live shared server whose record has a wrong password is stopped before a new one is spawned", async () => {
+    const { tmp: bt, repo: br } = makeRepo(mock.url)
+    const env = isolatedEnv(bt, br)
+    const first = await connect(env)
+    const pidA = Number((await first.call("opencode_server", { action: "info" })).match(/pid (\d+)/)![1])
+    // Corrupt the record while the server keeps running.
+    const serverFile = path.join(env.HORDE_OPENCODE_STATE_DIR!, "server.json")
+    const rec = JSON.parse(fs.readFileSync(serverFile, "utf8"))
+    rec.password = "wrong-password"
+    fs.writeFileSync(serverFile, JSON.stringify(rec))
+    await first.close()
+    // A fresh MCP process reads the corrupted record and must stop the old server, not orphan it.
+    const second = await connect(env)
+    try {
+      await second.call("opencode_models")
+      await until(async () => !alive(pidA), 10_000)
+      const info = await second.call("opencode_server", { action: "info" })
+      const pidB = Number(info.match(/pid (\d+)/)![1])
+      assert.notEqual(pidB, pidA, "a new server was spawned")
+      assert.ok(alive(pidB), "the new server is running")
+      const recordAfter = JSON.parse(fs.readFileSync(serverFile, "utf8"))
+      assert.equal(recordAfter.pid, pidB, "the record points at the one live server, not an orphan")
+    } finally {
+      await second.call("opencode_server", { action: "stop" }).catch(() => undefined)
+      await second.close()
+    }
+  })
+
+  test("a version mismatch on reconnect warns once per process, and server.json records the version at spawn", async () => {
+    const { tmp: vt, repo: vr } = makeRepo(mock.url)
+    const env = isolatedEnv(vt, vr)
+    const first = await connect(env)
+    await first.call("opencode_server", { action: "info" })
+    const serverFile = path.join(env.HORDE_OPENCODE_STATE_DIR!, "server.json")
+    const rec = JSON.parse(fs.readFileSync(serverFile, "utf8"))
+    assert.match(rec.version, /^\d+\.\d+/, "server.json records the OpenCode version at spawn")
+    // Pretend the running server was started by an older binary than the one configured now.
+    rec.version = "9.9.9"
+    fs.writeFileSync(serverFile, JSON.stringify(rec))
+    await first.close()
+    const second = await connect(env)
+    try {
+      const firstStatus = await second.call("opencode_status")
+      assert.match(
+        firstStatus,
+        /the shared OpenCode server runs 9\.9\.9, the configured binary is \d+\.\d+\.\d+; opencode_server stop then any call restarts it/,
+        firstStatus,
+      )
+      const secondStatus = await second.call("opencode_status")
+      assert.doesNotMatch(secondStatus, /the shared OpenCode server runs 9\.9\.9/, "the warning is shown once per process")
+    } finally {
+      await second.call("opencode_server", { action: "stop" }).catch(() => undefined)
+      await second.close()
     }
   })
 })
 
-describe("fleet fixes: a brief OpenCode stall is absorbed by the wait", () => {
+describe("fleet fixes: a brief OpenCode stall is absorbed by the wait", () => 
   test("a wait round whose activeSet() rejects once returns the outcome instead of throwing", async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "horde-wait-"))
     const store = new Store(tmp)
@@ -667,6 +765,7 @@ describe("fleet fixes: a brief OpenCode stall is absorbed by the wait", () => {
       worktreeDir: path.join(tmp, "worktrees"),
       channel: false,
       elicitTimeoutMs: 600_000,
+      passEnv: [],
     }
     const hooks: Hooks = {
       canElicit: () => false,
@@ -714,10 +813,9 @@ describe("fleet fixes: a brief OpenCode stall is absorbed by the wait", () => {
     } finally {
       fleet.close()
     }
-  })
-})
+  }))
 
-describe("fleet fixes: outcomes after a wait", () => {
+describe("fleet fixes: outcomes after a wait", () => 
   test("outcome renders the wait's in-memory state without refreshing or re-reading the agent", async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "horde-outcome-"))
     const store = new Store(tmp)
@@ -741,6 +839,7 @@ describe("fleet fixes: outcomes after a wait", () => {
       worktreeDir: path.join(tmp, "worktrees"),
       channel: false,
       elicitTimeoutMs: 600_000,
+      passEnv: [],
     }
     const hooks: Hooks = {
       canElicit: () => false,
@@ -803,8 +902,7 @@ describe("fleet fixes: outcomes after a wait", () => {
       fleet.close()
       fs.rmSync(tmp, { recursive: true, force: true })
     }
-  })
-})
+  }))
 
 describe("fleet fixes: request and refresh deadlines", () => {
   // Drains the microtask queue (setImmediate is not mocked, so it runs after pending microtasks).
@@ -823,6 +921,7 @@ describe("fleet fixes: request and refresh deadlines", () => {
     worktreeDir: path.join(tmp, "worktrees"),
     channel: false,
     elicitTimeoutMs: 600_000,
+    passEnv: [],
   })
 
   const hooksFor = (): Hooks => ({
@@ -990,7 +1089,7 @@ describe("fleet fixes: request and refresh deadlines", () => {
   })
 })
 
-describe("fleet fixes: a backend that dies mid-task", { timeout: 600_000 }, () => {
+describe("fleet fixes: a backend that dies mid-task", timeout: 600_000 , () => {
   let mock: Mock
   let hb: Harness
   let tmp: string

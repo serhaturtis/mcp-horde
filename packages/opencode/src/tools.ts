@@ -239,11 +239,27 @@ export function registerTools(server: McpServer, ctx: Context) {
   const backendWarnings = async (): Promise<string[]> => {
     try {
       const b = await ctx.peekBackend?.()
-      return b && !b.dead ? b.info.warnings : []
+      // A copy: the caller appends the version warning, which must not stick to the backend's list.
+      return b && !b.dead ? [...b.info.warnings] : []
     } catch {
       return []
     }
   }
+  // The one-line version-mismatch warning, shown at most once per process on whichever of the
+  // delegated/status tools the caller hits first.
+  let versionWarningShown = false
+  const versionWarning = async (): Promise<string | undefined> => {
+    if (versionWarningShown) return undefined
+    try {
+      const b = await ctx.peekBackend?.()
+      if (!b || b.dead || !b.info.versionWarning) return undefined
+      versionWarningShown = true
+      return b.info.versionWarning
+    } catch {
+      return undefined
+    }
+  }
+  const VERSION_WARNING_TOOLS = new Set(["horde_do", "horde_wait", "opencode_status"])
   const tool = <S extends z.ZodRawShape>(
     name: string,
     description: string,
@@ -262,6 +278,10 @@ export function registerTools(server: McpServer, ctx: Context) {
         const fleet = await ctx.fleet()
         const text = await run(args, fleet, extra)
         const warnings = name === "opencode_status" ? await backendWarnings() : []
+        if (VERSION_WARNING_TOOLS.has(name)) {
+          const v = await versionWarning()
+          if (v) warnings.push(v)
+        }
         return ok(warnings.length ? `${text}\n\n⚠ ${warnings.join("\n⚠ ")}` : text)
       } catch (err) {
         return fail(err)

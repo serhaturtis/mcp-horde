@@ -1,4 +1,4 @@
-import { type ChildProcess, spawn } from "node:child_process"
+import { type ChildProcess, spawn, spawnSync } from "node:child_process"
 import { randomBytes } from "node:crypto"
 import { EventEmitter } from "node:events"
 import fs from "node:fs"
@@ -28,6 +28,8 @@ export interface ServerInfo {
   passwordFile?: string
   pid?: number
   warnings: string[]
+  /** A version mismatch with the configured binary, shown once per process (reconnect only). */
+  versionWarning?: string
 }
 
 /** A connection to an OpenCode server, spawned by us or attached to. */
@@ -89,6 +91,9 @@ export class Backend {
             if (known.bin && known.bin !== bin.command) {
               warnings.push(`The shared server runs ${known.bin}, but this process is configured for ${bin.command}. Stop it (opencode_server stop) to switch.`)
             }
+            // The record's version is the binary the server was started with; warn once when the
+            // configured binary is now a different version (a plugin or OpenCode upgrade).
+            const versionWarning = versionMismatch(known.version, await binaryVersion(bin))
             return {
               client,
               info: {
@@ -100,23 +105,32 @@ export class Backend {
                 password: known.password,
                 pid: known.pid,
                 warnings,
+                versionWarning,
               },
             }
           }
-          if (probe.reachable) {
+          // The record's server answers but not with our password, reset the connection, or hung.
+          // If its pid is still our `opencode serve` on the recorded port, stop it before starting
+          // a new one, so it does not linger as an orphan nothing can stop or attach to.
+          if (isOurSharedServer(known)) {
+            await stopPid(known.pid)
+            forgetShared(store, known)
+          } else if (probe.reachable) {
             throw new Error(
               `The recorded shared OpenCode server at ${known.url} (pid ${known.pid}) answers but is not usable: ${probe.reason}. ` +
                 "Check OPENCODE_SERVER_USERNAME/PASSWORD, or stop it with opencode_server stop.",
             )
-          }
-          if (probe.timedOut && pidAlive(known.pid)) {
+          } else if (probe.timedOut && pidAlive(known.pid)) {
             throw new Error(
               `The recorded shared OpenCode server at ${known.url} (pid ${known.pid}) is not responding. Stop it with opencode_server stop, then retry.`,
             )
+          } else {
+            forgetShared(store, known) // gone: start a new one
           }
-          forgetShared(store, known) // gone: start a new one
         }
-        const password = config.password ?? randomBytes(24).toString("hex")
+        // A fresh password per server, never the one this process was started with: our own
+        // OPENCODE_SERVER_PASSWORD is a secret, and reusing it would hand it to every worker shell.
+        const password = randomBytes(24).toString("hex")
         const { url, pid } = await spawnShared(config, store.dir, password)
         const client = connect(url, config.username, password)
         const version = await health(client, url)
@@ -128,7 +142,9 @@ export class Backend {
       return Backend.ready(client, info, config)
     }
 
-    const password = config.password ?? randomBytes(24).toString("hex")
+    // A fresh password, as above: the parent's OPENCODE_SERVER_PASSWORD is for attaching, not for
+    // the server we spawn.
+    const password = randomBytes(24).toString("hex")
     const { url, proc } = await spawnPrivate(config, password)
     const client = connect(url, config.username, password)
     const version = await health(client, url)
@@ -235,25 +251,24 @@ export async function stopServer(config: Config, store: Store, backend?: Backend
     const known: ServerRecord | undefined = store.server
     if (!known) return "No shared OpenCode server is recorded."
     const probe = await probeHealth(connect(known.url, known.username ?? config.username, known.password))
-    forgetShared(store, known)
     // A server that times out while its pid lives is ours, hung: the record's URL was its port.
     const hung = !probe.ok && probe.timedOut && pidAlive(known.pid)
-    if (!probe.ok && !hung) {
+    // A pid that is still our `opencode serve` on the recorded port is ours even when it answers
+    // with the wrong password or reset the connection: kill it rather than leave an orphan.
+    const ours = !probe.ok && isOurSharedServer(known)
+    if (!probe.ok && !hung && !ours) {
+      forgetShared(store, known)
       return `The recorded shared server (${known.url}, pid ${known.pid}) is not answering with its password (${probe.reason || "no answer"}), so nothing was killed (the pid may belong to another process now). The record was cleared.`
     }
-    killTree(known.pid, true)
-    const deadline = Date.now() + 5_000
-    while (pidAlive(known.pid) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 100))
-    if (pidAlive(known.pid) && !isWindows) {
-      try {
-        process.kill(-known.pid, "SIGKILL")
-      } catch {
-        // already gone
-      }
-    }
+    // Stop the process before dropping the record, so the password file survives until it is dead.
+    await stopPid(known.pid)
+    forgetShared(store, known)
     const left = pidAlive(known.pid) ? ` Warning: pid ${known.pid} is still alive; kill it by hand.` : ""
     if (hung) {
       return `The shared OpenCode server (pid ${known.pid}, ${known.url}) was not responding, so it was killed and its record cleared. Running agents were stopped with it.${left}`
+    }
+    if (!probe.ok) {
+      return `The shared OpenCode server (pid ${known.pid}, ${known.url}) was not answering with its password (${probe.reason || "no answer"}), so it was killed and its record cleared. Running agents were stopped with it.${left}`
     }
     return `Stopped the shared OpenCode server (pid ${known.pid}, ${known.url}). Running agents were stopped with it.${left}`
   })
@@ -263,6 +278,39 @@ export async function stopServer(config: Config, store: Store, backend?: Backend
 function forgetShared(store: Store, known: ServerRecord) {
   store.setServer(undefined)
   fs.rmSync(passwordFilePath(store.dir, "shared", known.url), { force: true })
+}
+
+/** The recorded pid's command line (arguments), or undefined when it cannot be read. */
+function processArgs(pid: number): string[] | undefined {
+  if (isWindows) return undefined
+  try {
+    return fs.readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0").filter(Boolean)
+  } catch {
+    return undefined
+  }
+}
+
+/** Whether the recorded pid is still our `opencode serve` on the recorded port. */
+function isOurSharedServer(known: ServerRecord): boolean {
+  if (!pidAlive(known.pid)) return false
+  const args = processArgs(known.pid)
+  if (args === undefined) return true // cannot read the command line (macOS): the pid check is all we have
+  const port = String(new URL(known.url).port)
+  return args.includes("serve") && args.includes("--port") && args.includes(port)
+}
+
+/** Stop a pid (SIGTERM, then SIGKILL after a grace period), waiting for it to exit. */
+async function stopPid(pid: number): Promise<void> {
+  killTree(pid, true)
+  const deadline = Date.now() + 5_000
+  while (pidAlive(pid) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 100))
+  if (pidAlive(pid) && !isWindows) {
+    try {
+      process.kill(-pid, "SIGKILL")
+    } catch {
+      // already gone
+    }
+  }
 }
 
 /** Whether the recorded shared server answers with its password; never starts one. */
@@ -419,6 +467,78 @@ export function shimTarget(shim: string): string | undefined {
   return matches.filter((m) => !/(^|\\)node\.exe$/i.test(m)).pop()
 }
 
+/**
+ * The environment `opencode serve` is started with, and so the environment every worker shell
+ * inherits. Built from an allowlist, never from `...process.env`: this MCP server's own shell
+ * carries credentials (Claude Code's messaging token/socket and session id, provider API keys,
+ * the OPENCODE_SERVER_PASSWORD it attaches with) that a worker must not see. The board CLI a
+ * worker runs needs none of these: its state directory is passed through the brief's `--state`.
+ */
+export function serverEnv(
+  opts: { username: string; password?: string; passEnv?: string[] },
+  env: NodeJS.ProcessEnv = process.env,
+  platform: string = process.platform,
+): Record<string, string | undefined> {
+  const kept: Record<string, string | undefined> = {}
+  const always = /^(PATH|HOME|USER|LOGNAME|SHELL|LANG|TZ|TMPDIR|TEMP|TMP)$/
+  const proxyAndTls = /^(HTTPS?_PROXY|NO_PROXY|SSL_CERT_FILE|SSL_CERT_DIR|NODE_EXTRA_CA_CERTS)$/i
+  const windows = /^(SystemRoot|ComSpec|APPDATA|LOCALAPPDATA|USERPROFILE)$/
+  const pass = (opts.passEnv ?? []).map(
+    (p) =>
+      new RegExp(
+        `^${p
+          .split("*")
+          .map((s) => s.replace(/[.+?^${}()|[\]\\]/g, "\\$&"))
+          .join(".*")}$`,
+      ),
+  )
+  for (const [name, value] of Object.entries(env)) {
+    if (value === undefined) continue
+    // The server's auth is added back below with the values it was started with, never ours.
+    if (name === "OPENCODE_SERVER_PASSWORD" || name === "OPENCODE_SERVER_USERNAME") continue
+    if (
+      always.test(name) ||
+      proxyAndTls.test(name) ||
+      name.startsWith("LC_") ||
+      name.startsWith("XDG_") ||
+      name.startsWith("OPENCODE_") ||
+      (platform === "win32" && windows.test(name)) ||
+      pass.some((re) => re.test(name))
+    ) {
+      kept[name] = value
+    }
+    // Everything else is dropped: CLAUDE_*, HORDE_*, MCP_*, and any secret-looking name
+    // (KEY, TOKEN, SECRET, PASSWORD, CREDENTIAL) the user did not opt in via HORDE_OPENCODE_PASS_ENV.
+  }
+  kept.OPENCODE_SERVER_USERNAME = opts.username
+  kept.OPENCODE_SERVER_PASSWORD = opts.password
+  return kept
+}
+
+/**
+ * The one-line warning when the shared server was started with a different OpenCode version than
+ * the configured binary, or undefined when they match (or one is unknown).
+ */
+export function versionMismatch(serverVersion: string | undefined, configuredVersion: string | undefined): string | undefined {
+  if (!serverVersion || !configuredVersion || serverVersion === configuredVersion) return undefined
+  return `the shared OpenCode server runs ${serverVersion}, the configured binary is ${configuredVersion}; opencode_server stop then any call restarts it`
+}
+
+/** The bare "2.1.4" from `opencode --version` output ("opencode v2.1.4"). */
+function parseVersion(output: string | undefined): string | undefined {
+  return /(\d+\.\d+(?:\.\d+)?)/.exec(output ?? "")?.[1]
+}
+
+/** The configured binary's version, read once per reconnect (cheap: `opencode --version`). */
+function binaryVersion(bin: { command: string; shell: boolean }): string | undefined {
+  try {
+    const res = spawnSync(bin.command, ["--version"], { shell: bin.shell, encoding: "utf8" })
+    return parseVersion(res.stdout)
+  } catch {
+    return undefined
+  }
+}
+
 function serveArgs(port: number) {
   return ["serve", "--hostname", "127.0.0.1", "--port", String(port)]
 }
@@ -433,7 +553,7 @@ async function spawnShared(config: Config, stateDir: string, password: string): 
     const bin = resolveBinary(config.bin)
     const proc = spawn(bin.command, serveArgs(port), {
       cwd: workingDir(config),
-      env: { ...process.env, OPENCODE_SERVER_USERNAME: config.username, OPENCODE_SERVER_PASSWORD: password },
+      env: serverEnv({ username: config.username, password, passEnv: config.passEnv }),
       stdio: ["ignore", log, log],
       detached: true,
       windowsHide: true,
@@ -488,7 +608,7 @@ async function spawnPrivate(config: Config, password: string) {
   const proc = spawn(process.execPath, [...supervisor, String(process.pid), resolveBinary(config.bin).command, ...serveArgs(port)], {
     // Our own directory, so loader flags resolve; the supervisor starts OpenCode in the agent directory.
     cwd: fileURLToPath(new URL(".", import.meta.url)),
-    env: { ...process.env, OPENCODE_SERVER_USERNAME: config.username, OPENCODE_SERVER_PASSWORD: password, HORDE_SUPERVISED_CWD: workingDir(config) },
+    env: { ...serverEnv({ username: config.username, password, passEnv: config.passEnv }), HORDE_SUPERVISED_CWD: workingDir(config) },
     // stdin stays open as a lifeline: the supervisor stops OpenCode when it closes.
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,

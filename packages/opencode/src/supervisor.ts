@@ -14,8 +14,13 @@ if (!parent || !bin) {
 }
 
 const isWindows = process.platform === "win32"
+// OpenCode inherits our (already allowlisted) environment; drop the internal hand-off variable so
+// it never reaches a worker shell.
+const env = { ...process.env }
+delete env.HORDE_SUPERVISED_CWD
 const child = spawn(bin, args, {
   cwd: process.env.HORDE_SUPERVISED_CWD || process.cwd(),
+  env,
   stdio: ["ignore", "inherit", "inherit"],
   windowsHide: true,
   // A resolved .exe needs no shell; only fall back to one for .cmd/.bat shims.

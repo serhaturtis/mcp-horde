@@ -176,14 +176,16 @@ The model, effort, profile, directory, policies and limits are chosen by the cal
 | `HORDE_OPENCODE_DIALOG_TIMEOUT` | `600` | Seconds a permission or question dialog waits for the human before the request goes to the calling model. |
 | `HORDE_OPENCODE_STATE_DIR` | `~/.local/state/mcp-horde/opencode` | One record per agent (`agents/<id>.json`), the shared-server record, and one password file per server (`server-password-shared-<port>`, removed when the shared server is stopped; `server-password-private-<pid>-<port>`, removed when its MCP process exits). All mode 0600. |
 | `HORDE_OPENCODE_WORKTREE_DIR` | `~/.local/share/mcp-horde/worktrees` | Where isolated worktrees go. |
+| `HORDE_OPENCODE_PASS_ENV` | none | Extra environment variables to pass to `opencode serve` (and so to worker shells) on top of the fixed allowlist: comma-separated names or `*` globs, e.g. `DEEPSEEK_API_KEY` or `*_API_KEY`. Provider keys OpenCode needs must be listed here, since everything else — including anything secret-looking and every `CLAUDE_*`, `HORDE_*` and `MCP_*` variable — is dropped. |
 
 An invalid variable or `horde.json` does not keep the server from starting: every tool call answers with the error instead (a fixed `horde.json` is picked up by the next call; variables need a restart).
 
 ### Security
 
-- **Workers can see the server password.** `opencode serve` takes its password only from the `OPENCODE_SERVER_PASSWORD` environment variable (it has no flag or file for it), and OpenCode passes its environment on to the tools it runs. A worker's shell commands can therefore read the password and call the server's API, for example to answer its own permission requests. Treat permission policies as guard rails against mistakes, not as a boundary against a hostile model; run untrusted work in a container or VM. (Worktree `setup` commands do get the variable stripped.)
+- **Workers get an allowlisted environment.** `opencode serve` is started with a fixed allowlist (PATH, HOME, locale, proxy and TLS variables, `XDG_*`, `OPENCODE_*`), plus anything you name in `HORDE_OPENCODE_PASS_ENV`. Your own shell's secrets — Claude Code's messaging token/socket and session id, every `CLAUDE_*`, `HORDE_*` and `MCP_*` variable, and any other key/token — are dropped, and a fresh random password is generated for the server rather than reusing the one you attached with.
+- **Workers can still see the server password.** `opencode serve` takes its password only from the `OPENCODE_SERVER_PASSWORD` environment variable (it has no flag or file for it), and OpenCode passes its environment on to the tools it runs. A worker's shell commands can therefore read that generated password and call the server's API, for example to answer its own permission requests. Treat permission policies as guard rails against mistakes, not as a boundary against a hostile model; run untrusted work in a container or VM. (Worktree `setup` commands do get the variable stripped.)
 - **Plain http.** Basic auth over `http://` to a non-loopback `HORDE_OPENCODE_URL` sends the password in clear text; the server warns about it (in `opencode_status` and `opencode_server info`) unless `HORDE_OPENCODE_ALLOW_INSECURE=1`. Use https or a tunnel.
-- **Stopping the shared server** only kills the recorded pid when the server answers with its recorded password, or when it does not answer at all while that pid is alive (a hung server); anything else just clears the record.
+- **Stopping the shared server** kills the recorded pid when the server answers with its recorded password, when it does not answer while that pid is alive (a hung server), or when the pid is still this horde's `opencode serve` on the recorded port even though it answers unauthorized or reset the connection; only a pid that is gone or belongs to another process is just forgotten (the password file is kept until the process is dead).
 
 ## Example (Claude Code orchestrating DeepSeek and Kimi)
 
@@ -210,7 +212,7 @@ These are set by OpenCode or by MCP:
 - **Variants come from OpenCode:** it gives most models default effort variants; a model whose config sets `variants: {}` has none.
 - **Deprecated models are refused:** a model its provider retired is listed as unsupported and rejected at spawn.
 - **The dashboard is the TUI:** there is no Claude-Code-style agent panel. Use `opencode_server info`, then `opencode attach`.
-- **Version pinned:** tested with opencode 2.1.x; other versions trigger a warning in `opencode_status`. A shared server started by a different `opencode` binary is reused with a warning; `opencode_server stop` replaces it.
+- **Version pinned:** tested with opencode 2.1.x; other versions trigger a warning in `opencode_status`. The shared-server record keeps the version it was started with, so after an OpenCode or plugin upgrade a reconnect warns once (on the first `horde_do`, `horde_wait` or `opencode_status`); `opencode_server stop` then any call restarts it on the configured binary.
 
 ## Development
 

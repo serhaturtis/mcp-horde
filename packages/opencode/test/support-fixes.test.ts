@@ -8,7 +8,7 @@ import { after, describe, test } from "node:test"
 import type { McpServer } from "@modelcontextprotocol/server"
 import type { PermissionRequest } from "@opencode/client"
 import { ASK_GUARDED_PROFILE, ASK_PROFILE, unsupportedSchema, validate } from "../src/ask.js"
-import { passwordFilePath, stopServer } from "../src/backend.js"
+import { passwordFilePath, serverEnv, stopServer, versionMismatch } from "../src/backend.js"
 import { type Config, inProject, loadConfig } from "../src/config.js"
 import { profileRules, type Snapshot } from "../src/fleet.js"
 import { makeHooks, permissionMessage } from "../src/hooks.js"
@@ -146,6 +146,67 @@ describe("server support", () => {
   test("password files are per server", () => {
     assert.notEqual(passwordFilePath("/s", "shared", "http://127.0.0.1:1"), passwordFilePath("/s", "private", "http://127.0.0.1:1"))
     assert.notEqual(passwordFilePath("/s", "shared", "http://127.0.0.1:1"), passwordFilePath("/s", "shared", "http://127.0.0.1:2"))
+  })
+
+  test("the backend environment is an allowlist: secrets and horde/claude vars are dropped, auth and opts survive", () => {
+    const env = serverEnv(
+      { username: "me", password: "server-pw", passEnv: ["*_API_KEY"] },
+      {
+        PATH: "/bin",
+        HOME: "/home/u",
+        USER: "u",
+        LOGNAME: "u",
+        SHELL: "/bin/bash",
+        LANG: "C",
+        LC_ALL: "C",
+        TZ: "UTC",
+        TMPDIR: "/tmp",
+        XDG_CONFIG_HOME: "/x",
+        HTTP_PROXY: "http://p",
+        https_proxy: "http://p",
+        NO_PROXY: "localhost",
+        SSL_CERT_FILE: "/ca",
+        OPENCODE_SESSION_ID: "ses_x",
+        OPENCODE_SERVER_PASSWORD: "parent-pw",
+        OPENCODE_SERVER_USERNAME: "parent-user",
+        DEEPSEEK_API_KEY: "dk",
+        ANTHROPIC_API_KEY: "ak",
+        CLAUDE_CODE_MESSAGING_TOKEN: "cc",
+        CLAUDECODE: "1",
+        HORDE_OPENCODE_STATE_DIR: "/h",
+        MCP_SERVER: "mcp",
+        AUDIT_CANARY_SECRET: "canary",
+        SOME_RANDOM_VAR: "x",
+      } as NodeJS.ProcessEnv,
+      "linux",
+    )
+    // The fixed allowlist and opts survive.
+    assert.equal(env.PATH, "/bin")
+    assert.equal(env.HOME, "/home/u")
+    assert.equal(env.LC_ALL, "C")
+    assert.equal(env.OPENCODE_SESSION_ID, "ses_x")
+    assert.equal(env.DEEPSEEK_API_KEY, "dk")
+    assert.equal(env.ANTHROPIC_API_KEY, "ak")
+    // Auth is the server's own values, never the parent's.
+    assert.equal(env.OPENCODE_SERVER_USERNAME, "me")
+    assert.equal(env.OPENCODE_SERVER_PASSWORD, "server-pw")
+    // Everything else is dropped, secret-looking or not.
+    assert.equal(env.CLAUDE_CODE_MESSAGING_TOKEN, undefined)
+    assert.equal(env.CLAUDECODE, undefined)
+    assert.equal(env.HORDE_OPENCODE_STATE_DIR, undefined)
+    assert.equal(env.MCP_SERVER, undefined)
+    assert.equal(env.AUDIT_CANARY_SECRET, undefined)
+    assert.equal(env.SOME_RANDOM_VAR, undefined)
+  })
+
+  test("the version mismatch warning names both versions and is absent when they match or are unknown", () => {
+    assert.equal(
+      versionMismatch("2.1.4", "2.1.1"),
+      "the shared OpenCode server runs 2.1.4, the configured binary is 2.1.1; opencode_server stop then any call restarts it",
+    )
+    assert.equal(versionMismatch("2.1.1", "2.1.1"), undefined)
+    assert.equal(versionMismatch(undefined, "2.1.1"), undefined)
+    assert.equal(versionMismatch("2.1.4", undefined), undefined)
   })
 
   test("agents belong to the session's project by directory or worktree checkout", () => {
