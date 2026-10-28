@@ -52,7 +52,7 @@ Also reported by gates (high confidence): fleet.ts:2151 `const rulesAt = wt ? aw
 
 ## SEC-04 — A cloned repository's horde.json runs commands on the user's machine at the first horde_do, before any verdict and without a consent step
 
-- [ ] *(open)*
+- [x] closed in b859d63 — **Executed evidence:** per the recorded decision: horde_do's first answer in a repository lists workers.setup, every check and workers.land with cwd and env names; a changed command set since the last task is announced once and recorded under the state dir; a check cwd or workers path outside the repository is rejected (tests in horde.test.ts and verify.test.ts; task t-7442's gate review 3 of 3 met; verify suite 108 pass)
 - **Severity:** medium · **Confidence:** high
 - **Location:** `packages/opencode/src/horde.ts:130`
 
