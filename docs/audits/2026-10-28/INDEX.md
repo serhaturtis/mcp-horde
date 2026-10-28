@@ -144,6 +144,9 @@ Each scope file ends with its verified-clean records (what was constructed or ex
 - [x] **NEW-02** (closed 01623f0; executed evidence: maxRunning defaults from the core count, horde_do states the useful parallelism for slot-limited checks and refuses under a load average above the core count unless maxRunning is set explicitly (unit tests; task t-80ff's gate review 4 of 4 met)) [medium] Admission counts tasks, not load: `opencode.maxRunning` (default 8) ignores cores, check slots and what else the machine runs
   `packages/opencode/src/config.ts` — Eight concurrent tasks on a 16-core machine already running other sessions' workers drove the load average to 51 and the shared backend into "not answering" blips. Fix: default maxRunning to min(8, cores / 2); when a check with `slots: 1` exists, say in horde_do's first answer how many tasks can usefully run; refuse or queue a horde_do when the 1-minute load average exceeds the core count, with the reason.
 
+- [x] **NEW-03** (closed 1d0afc9; executed evidence: a gate round whose check never started because its slot stayed taken no longer consumes a worker round and the second failure names the slot and its holder, task t-f289's gate and the final ci run) [medium] A check that could not start because a slot stayed taken for the whole wait counted as a failed round against the worker
+  `packages/opencode/src/fleet.ts` — Observed 2026-10-28 on the docs task: "could not start: waited 1800s for check-test: all 1 of its slot(s) stayed taken" ended its second round as FAILED although nothing about its work was judged.
+
 ## Decisions taken during remediation (unattended session)
 
 - SEC-01: workers keep an unprompted shell by default; the trust model is now stated in the plugin README and the setup skill, with the `permission` knob documented, rather than switching every worker to `shell: ask` (which would prompt the user for every command a worker runs).
