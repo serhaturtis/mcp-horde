@@ -30,6 +30,8 @@ export interface ServerInfo {
   warnings: string[]
   /** A version mismatch with the configured binary, shown once per process (reconnect only). */
   versionWarning?: string
+  /** The allowlisted environment a session gets for its shell, without the server's auth. */
+  workerEnv?: Record<string, string>
 }
 
 /** A connection to an OpenCode server, spawned by us or attached to. */
@@ -49,7 +51,38 @@ export class Backend {
   ) {
     this.events.setMaxListeners(0)
     proc?.once("exit", () => this.markDead())
+    this.isolateSessions()
     void this.pump()
+  }
+
+  /**
+   * OpenCode runs the shell tool with the session's environment when it has one, else the server's
+   * (which carries OPENCODE_SERVER_PASSWORD). Give every session this process creates the
+   * allowlisted environment before it is used, and the same to the subagent sessions it spawns,
+   * so a worker's shell never inherits the server's password or our own shell's secrets.
+   */
+  private isolateSessions() {
+    const workerEnv = this.info.workerEnv
+    if (!workerEnv) return
+    const owned = new Set<string>()
+    const set = (sessionID: string) => this.client.session.environment({ sessionID, variables: workerEnv }, { signal: AbortSignal.timeout(30_000) })
+    const create = this.client.session.create.bind(this.client.session)
+    this.client.session.create = async (...args: Parameters<typeof create>) => {
+      const session = await create(...args)
+      owned.add(session.id)
+      await set(session.id)
+      return session
+    }
+    // Subagents are created by OpenCode itself, not through our client: cover a session whose
+    // parent we already own as soon as its creation event arrives (best effort).
+    this.events.on("event", (e) => {
+      const raw = e as { type?: string; data?: { sessionID?: unknown; parentID?: unknown } }
+      if (raw.type !== "session.created") return
+      const { sessionID, parentID } = raw.data ?? {}
+      if (typeof sessionID !== "string" || typeof parentID !== "string" || !owned.has(parentID) || owned.has(sessionID)) return
+      owned.add(sessionID)
+      void set(sessionID).catch(() => undefined)
+    })
   }
 
   static async start(config: Config, store: Store): Promise<Backend> {
@@ -71,9 +104,19 @@ export class Backend {
       }
       const client = connect(config.url, config.username, config.password)
       const version = await health(client, config.url)
+      const env = serverEnv({ username: config.username, password: config.password, passEnv: config.passEnv })
       return Backend.ready(
         client,
-        { url: config.url, mode: "attached", key: config.url, version, username: config.username, password: config.password, warnings },
+        {
+          url: config.url,
+          mode: "attached",
+          key: config.url,
+          version,
+          username: config.username,
+          password: config.password,
+          warnings,
+          workerEnv: workerEnvironment(env),
+        },
         config,
       )
     }
@@ -94,6 +137,7 @@ export class Backend {
             // The record's version is the binary the server was started with; warn once when the
             // configured binary is now a different version (a plugin or OpenCode upgrade).
             const versionWarning = versionMismatch(known.version, await binaryVersion(bin))
+            const env = serverEnv({ username, password: known.password, passEnv: config.passEnv })
             return {
               client,
               info: {
@@ -106,6 +150,7 @@ export class Backend {
                 pid: known.pid,
                 warnings,
                 versionWarning,
+                workerEnv: workerEnvironment(env),
               },
             }
           }
@@ -131,12 +176,26 @@ export class Backend {
         // A fresh password per server, never the one this process was started with: our own
         // OPENCODE_SERVER_PASSWORD is a secret, and reusing it would hand it to every worker shell.
         const password = randomBytes(24).toString("hex")
-        const { url, pid } = await spawnShared(config, store.dir, password)
+        const env = serverEnv({ username: config.username, password, passEnv: config.passEnv })
+        const { url, pid } = await spawnShared(config, store.dir, password, env)
         const client = connect(url, config.username, password)
         const version = await health(client, url)
         const record: ServerRecord = { url, password, pid, startedAt: Date.now(), bin: bin.command, version, username: config.username }
         store.setServer(record)
-        return { client, info: { url, mode: "shared" as const, key: "local", version, username: config.username, password, pid, warnings } }
+        return {
+          client,
+          info: {
+            url,
+            mode: "shared" as const,
+            key: "local",
+            version,
+            username: config.username,
+            password,
+            pid,
+            warnings,
+            workerEnv: workerEnvironment(env),
+          },
+        }
       })
       info.passwordFile = writePasswordFile(passwordFilePath(store.dir, "shared", info.url), info.password!)
       return Backend.ready(client, info, config)
@@ -145,7 +204,8 @@ export class Backend {
     // A fresh password, as above: the parent's OPENCODE_SERVER_PASSWORD is for attaching, not for
     // the server we spawn.
     const password = randomBytes(24).toString("hex")
-    const { url, proc } = await spawnPrivate(config, password)
+    const env = serverEnv({ username: config.username, password, passEnv: config.passEnv })
+    const { url, proc } = await spawnPrivate(config, env)
     const client = connect(url, config.username, password)
     const version = await health(client, url)
     // One file per private server, removed when this process exits (stale ones of dead processes are swept).
@@ -165,6 +225,7 @@ export class Backend {
         passwordFile,
         pid: proc.pid,
         warnings,
+        workerEnv: workerEnvironment(env),
       },
       config,
       proc,
@@ -515,6 +576,15 @@ export function serverEnv(
   return kept
 }
 
+/** The shell environment a session gets: the allowlist without the server's auth. */
+function workerEnvironment(env: Record<string, string | undefined>): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const [name, value] of Object.entries(env)) {
+    if (value !== undefined && name !== "OPENCODE_SERVER_PASSWORD" && name !== "OPENCODE_SERVER_USERNAME") out[name] = value
+  }
+  return out
+}
+
 /**
  * The one-line warning when the shared server was started with a different OpenCode version than
  * the configured binary, or undefined when they match (or one is unknown).
@@ -544,7 +614,7 @@ function serveArgs(port: number) {
 }
 
 /** A detached server that outlives this process; its output goes to a log file. */
-async function spawnShared(config: Config, stateDir: string, password: string): Promise<{ url: string; pid: number }> {
+async function spawnShared(config: Config, stateDir: string, password: string, env: Record<string, string | undefined>): Promise<{ url: string; pid: number }> {
   const logPath = path.join(stateDir, "opencode-server.log")
   let lastError: Error | undefined
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -553,7 +623,7 @@ async function spawnShared(config: Config, stateDir: string, password: string): 
     const bin = resolveBinary(config.bin)
     const proc = spawn(bin.command, serveArgs(port), {
       cwd: workingDir(config),
-      env: serverEnv({ username: config.username, password, passEnv: config.passEnv }),
+      env,
       stdio: ["ignore", log, log],
       detached: true,
       windowsHide: true,
@@ -600,7 +670,7 @@ function readTail(file: string): string {
 }
 
 /** A server owned by this process, stopped by a watchdog even if we are killed. */
-async function spawnPrivate(config: Config, password: string) {
+async function spawnPrivate(config: Config, env: Record<string, string | undefined>) {
   const port = await freePort()
   // Built: supervisor.js next to this file. From source (tsx): supervisor.ts with our loader flags.
   const js = fileURLToPath(new URL("./supervisor.js", import.meta.url))
@@ -608,7 +678,7 @@ async function spawnPrivate(config: Config, password: string) {
   const proc = spawn(process.execPath, [...supervisor, String(process.pid), resolveBinary(config.bin).command, ...serveArgs(port)], {
     // Our own directory, so loader flags resolve; the supervisor starts OpenCode in the agent directory.
     cwd: fileURLToPath(new URL(".", import.meta.url)),
-    env: { ...serverEnv({ username: config.username, password, passEnv: config.passEnv }), HORDE_SUPERVISED_CWD: workingDir(config) },
+    env: { ...env, HORDE_SUPERVISED_CWD: workingDir(config) },
     // stdin stays open as a lifeline: the supervisor stops OpenCode when it closes.
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,

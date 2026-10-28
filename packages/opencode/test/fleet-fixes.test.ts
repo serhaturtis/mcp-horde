@@ -664,6 +664,8 @@ describe("fleet fixes: gates, tasks and worktrees (real opencode, mock LLM)", { 
       assert.ok(!names.includes("AUDIT_CANARY_SECRET"), "the canary is dropped")
       assert.ok(!names.some((n) => n.startsWith("CLAUDE_")), "Claude Code's environment is dropped")
       assert.ok(!names.some((n) => n.startsWith("HORDE_")), "the horde's own environment is dropped")
+      assert.ok(!names.includes("OPENCODE_SERVER_PASSWORD"), "the server password is not in the worker's environment")
+      assert.ok(!names.includes("OPENCODE_SERVER_USERNAME"), "the server's auth user is not in the worker's environment")
       assert.ok(!raw.includes("parent-password-canary"), "the parent's OPENCODE_SERVER_PASSWORD is not reused")
       assert.ok(!raw.includes("canary-value"), "the canary value never reaches the worker")
     } finally {
