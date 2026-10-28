@@ -26,7 +26,13 @@ export async function startMockLlm(): Promise<{ url: string; close: () => void; 
     let body = ""
     for await (const c of req) body += c
     if (req.url?.endsWith("/models")) return void res.end(JSON.stringify({ data: [{ id: "mock" }] }))
-    const b = JSON.parse(body || "{}") as { stream?: boolean; messages?: Msg[]; tools?: { function: { name: string } }[]; reasoning_effort?: string }
+    const b = JSON.parse(body || "{}") as {
+      model?: string
+      stream?: boolean
+      messages?: Msg[]
+      tools?: { function: { name: string } }[]
+      reasoning_effort?: string
+    }
     requests.push(b)
     const msgs = b.messages ?? []
     const last = msgs[msgs.length - 1]
@@ -51,7 +57,8 @@ export async function startMockLlm(): Promise<{ url: string; close: () => void; 
         JSON.stringify({ type: "error", error: { type: "FreeTierError", message: "OpenCode's free tier can only be used from within OpenCode." } }),
       )
     }
-    if (userText.includes("FAIL400")) {
+    // A model that always fails: tiers can name "mock/fail" to make a reviewer or worker error at once.
+    if (userText.includes("FAIL400") || b.model === "fail") {
       res.writeHead(400, { "content-type": "application/json" })
       return void res.end(JSON.stringify({ error: { message: "bad request from mock", type: "invalid_request_error" } }))
     }

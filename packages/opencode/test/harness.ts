@@ -56,6 +56,8 @@ export function makeRepo(mockUrl: string, extra: Record<string, unknown> = {}) {
               variants: { high: { reasoningEffort: "high" }, low: { reasoningEffort: "low" } },
             },
             other: { name: "Other mock", tool_call: true, variants: {} },
+            // Answers every request with HTTP 400 at once (see mock-llm.ts).
+            fail: { name: "Failing mock", tool_call: true },
             // $1.50 per mock step (10 input + 5 output tokens), for cost limits.
             pricey: { name: "Pricey mock", tool_call: true, cost: { input: 100_000, output: 100_000 } },
           },

@@ -50,7 +50,7 @@
         "kind": "test"
       },
       "opencode": {
-        "command": "node --conditions=source --import tsx --import ../../scripts/test-env.mjs --test --test-concurrency=1 test/unit.test.ts test/core.test.ts test/modes.test.ts test/flow.test.ts test/dist.test.ts test/plugin.test.ts test/fleet-fixes.test.ts test/support-fixes.test.ts test/horde.test.ts",
+        "command": "node --conditions=source --import tsx --import ../../scripts/test-env.mjs --test --test-concurrency=3 test/unit.test.ts test/core.test.ts test/modes.test.ts test/flow.test.ts test/dist.test.ts test/plugin.test.ts test/fleet-fixes.test.ts test/support-fixes.test.ts test/horde.test.ts test/horde-more.test.ts",
         "cwd": "packages/opencode",
         "kind": "test",
         "slots": 1,
