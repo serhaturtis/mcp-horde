@@ -22,7 +22,7 @@ The audit fires for every documented category I constructed (deleted/moved/skipp
 
 ## GAT-02 — `git update-index --skip-worktree` hides any edit (horde.json, package.json, tests) from every audit path
 
-- [ ] *(open)*
+- [x] closed in 7995364 — **Executed evidence:** packages/verify/src/audit.ts adds a blocking tests finding for skip-worktree and assume-unchanged entries of git ls-files -v and still audits their on-disk content; task t-99b7's per-hole test in verify.test.ts constructs the evasion; npm test -w @mcp-horde/verify → 103 pass; gate review 5 of 5 met
 - **Severity:** high **BLOCKING** · **Confidence:** high
 - **Location:** `packages/verify/src/audit.ts:271`
 
@@ -34,7 +34,7 @@ The audit fires for every documented category I constructed (deleted/moved/skipp
 
 ## GAT-03 — Check scripts outside package.json are not rule-guarded: Makefile targets and shell scripts a check runs can be rewritten freely
 
-- [ ] *(open)*
+- [x] closed in 7995364 — **Executed evidence:** gate.ts passes the checks (name, command, cwd) into audit(), which treats scripts a check command names (Makefile/justfile/Taskfile targets, sh/python/node scripts and one level below) as rule files; tests for a Makefile check and a  check block (verify suite 103 pass)
 - **Severity:** high **BLOCKING** · **Confidence:** high
 - **Location:** `packages/verify/src/audit.ts:518`
 
@@ -46,7 +46,7 @@ The audit fires for every documented category I constructed (deleted/moved/skipp
 
 ## GAT-04 — horde.json changes outside `verify` (workers.land, workers.setup, tiers, context) are not audited, yet the orchestrator executes them after landing
 
-- [ ] *(open)*
+- [x] closed in 7995364 — **Executed evidence:** any content change to horde.json is a blocking rule-change finding naming the changed top-level keys (test with workers.land and tiers; verify suite 103 pass)
 - **Severity:** medium · **Confidence:** high
 - **Location:** `packages/verify/src/audit.ts:562`
 
@@ -70,7 +70,7 @@ The audit fires for every documented category I constructed (deleted/moved/skipp
 
 ## GAT-06 — Assertion removal and snapshot rewrites only warn (never block), and a snapshot rewrite of 20 lines or fewer is silent
 
-- [ ] *(open)*
+- [x] closed in 7995364 — **Executed evidence:** a test file losing all or more than half of its assertions, and a snapshot mostly replaced, now block; smaller losses warn; docs/DESIGN.md §4.3 updated (verify suite 103 pass)
 - **Severity:** medium · **Confidence:** high
 - **Location:** `packages/verify/src/audit.ts:674`
 
@@ -82,7 +82,7 @@ The audit fires for every documented category I constructed (deleted/moved/skipp
 
 ## GAT-07 — Verdict cache ignores git-ignored inputs: a changed .env or linked dependency leaves a cached PASS
 
-- [ ] *(open)*
+- [x] closed in 494e12d — **Executed evidence:** gate.ts: passing verdicts expire after ten minutes and the key covers size+mtime of top-level ignored files outside dependency directories; the verdict names what the key does not cover; tests in verify.test.ts (98 pass at the time, 103 now); task t-2b31's gate review 4 of 4 met
 - **Severity:** medium · **Confidence:** high
 - **Location:** `packages/verify/src/gate.ts:86`
 
@@ -106,7 +106,7 @@ The audit fires for every documented category I constructed (deleted/moved/skipp
 
 ## GAT-09 — Untracked artefacts of the worker's own test runs (e.g. __pycache__ in a repo whose .gitignore lacks it) block the gate as binaries
 
-- [ ] *(open)*
+- [x] closed in 494e12d — **Executed evidence:** known runner caches present before the gate are treated as check output and a blocking finding on such a path hints at .gitignore (test with an untracked __pycache__)
 - **Severity:** low · **Confidence:** high
 - **Location:** `packages/verify/src/gate.ts:326`
 
@@ -118,7 +118,7 @@ The audit fires for every documented category I constructed (deleted/moved/skipp
 
 ## GAT-10 — Checks inherit provider API keys; only OPENCODE_SERVER_* and HORDE_* are stripped
 
-- [ ] *(open)*
+- [x] closed in 494e12d — **Executed evidence:** run.ts strips *_API_KEY, *_TOKEN, *_SECRET, *_PASSWORD and the listed provider keys from check environments unless the check's env sets them; HORDE_TASK and HORDE_WORKTREE still reach task checks (tests)
 - **Severity:** low · **Confidence:** high
 - **Location:** `packages/verify/src/run.ts:54`
 
