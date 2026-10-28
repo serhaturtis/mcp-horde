@@ -4,7 +4,7 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { after, test } from "node:test"
-import { Board, cliArgv, workerCommand } from "../src/lib.js"
+import { Board, cliArgv, projectOf, workerCommand } from "../src/lib.js"
 
 const temps: string[] = []
 after(() => {
@@ -17,8 +17,13 @@ function tmp() {
 }
 
 /** Run a command the way a worker's shell tool would, returning stdout or throwing with stderr. */
-function sh(command: string, cwd: string): string {
-  return execSync(command, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, NODE_TEST_CONTEXT: "" } }).trim()
+function sh(command: string, cwd: string, env: NodeJS.ProcessEnv = {}): string {
+  return execSync(command, {
+    cwd,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    env: { ...process.env, NODE_TEST_CONTEXT: "", ...env },
+  }).trim()
 }
 
 test("a --state path that does not exist is refused instead of becoming an empty board", async () => {
@@ -44,4 +49,45 @@ test("a --state path that does not exist is refused instead of becoming an empty
   // The path from the brief still reaches the board, for workers and humans.
   assert.match(sh(`${workerCommand(right)} task ${t.id} ${attempt.token}`, tmp()), /"x" — working/)
   assert.match(sh(`${cliArgv().join(" ")} status --state "${right}"`, tmp()), /1 task: 1 working/)
+})
+
+test("status and remove refuse a directory with no board instead of creating one", async () => {
+  const root = tmp()
+  const state = path.join(root, "state")
+  const env = { HORDE_BOARD_STATE_DIR: state }
+  const cli = cliArgv().join(" ")
+  // An existing board so the refusal can name the boards in the state root.
+  new Board(path.join(state, "notrepo-aaaaaaaaaa"))
+
+  const plain = path.join(root, "notrepo")
+  fs.mkdirSync(plain)
+  const plainKey = (await projectOf(plain)).key
+  const refusal = (command: string, cwd: string, expected: string, listed?: string) => {
+    let message = ""
+    try {
+      sh(command, cwd, env)
+      assert.fail(`expected a refusal: ${command}`)
+    } catch (e) {
+      message = (e as Error).message
+    }
+    const parts = [`no board exists at ${expected}`, ...(listed ? [`boards in ${state}: ${listed}`] : []), "copy the --state path from your brief exactly"]
+    for (const part of parts) assert.ok(message.includes(part), `${part}\n${message}`)
+  }
+  const before = fs.readdirSync(state).sort()
+  const plainBoard = path.join(state, plainKey)
+  refusal(`${cli} status --repo "${plain}"`, root, plainBoard, "notrepo-aaaaaaaaaa")
+  refusal(`${cli} status`, plain, plainBoard, "notrepo-aaaaaaaaaa")
+  refusal(`${cli} remove --repo "${plain}"`, root, plainBoard, "notrepo-aaaaaaaaaa")
+  refusal(`${cli} remove --repo "${plain}" --yes`, root, plainBoard, "notrepo-aaaaaaaaaa")
+  assert.deepEqual(fs.readdirSync(state).sort(), before, "a refused command creates nothing")
+
+  // A git repository whose board was never created is refused the same way.
+  const gitRepo = path.join(root, "gitrepo")
+  fs.mkdirSync(gitRepo)
+  execSync("git init -q", { cwd: gitRepo })
+  const gitBoard = path.join(state, (await projectOf(gitRepo)).key)
+  const beforeGit = fs.readdirSync(state).sort()
+  refusal(`${cli} status --repo "${gitRepo}"`, root, gitBoard)
+  refusal(`${cli} remove --repo "${gitRepo}"`, root, gitBoard)
+  assert.deepEqual(fs.readdirSync(state).sort(), beforeGit, "a refused command creates nothing")
 })

@@ -69,13 +69,12 @@ const csv = (values?: string[]) =>
 const USAGE =
   "usage: horde --state <dir> task|progress|report|finding|findings|recall|lock|unlock …\n       horde status [task id] | watch [--interval <seconds>]  [--repo <dir> | --state <dir>]\n       horde remove [--repo <dir>] [--yes]"
 
-/** Refuse a --state directory that is not there: a typo would otherwise create an empty board at it. */
-function knownState(state: string) {
-  if (fs.existsSync(state)) return
+/** The refusal for a board that is not there: a typo would otherwise create an empty board at it. */
+function noBoard(state: string, all = false) {
   const root = path.dirname(state)
   const name = path.basename(state)
   const dash = name.lastIndexOf("-")
-  const prefix = dash > 0 ? name.slice(0, dash + 1) : name
+  const prefix = all ? "" : dash > 0 ? name.slice(0, dash + 1) : name
   const siblings = fs.existsSync(root)
     ? fs
         .readdirSync(root, { withFileTypes: true })
@@ -83,7 +82,7 @@ function knownState(state: string) {
         .map((d) => d.name)
         .sort()
     : []
-  throw new Error(
+  return new Error(
     [
       `no board exists at ${state}`,
       ...(siblings.length ? [`boards in ${root}: ${siblings.join(", ")}`] : []),
@@ -92,12 +91,39 @@ function knownState(state: string) {
   )
 }
 
+/** Refuse a --state directory that is not there: a typo would otherwise create an empty board at it. */
+function knownState(state: string) {
+  if (!fs.existsSync(state)) throw noBoard(state)
+}
+
+/**
+ * The existing board of the repository containing `directory`. Human commands never open a
+ * board that is not there: a mistyped --repo or a run outside a repository would create an
+ * empty one at a new key.
+ */
+async function projectBoard(directory: string) {
+  const inRepo = await git(directory, "rev-parse", "--git-common-dir")
+    .then(() => true)
+    .catch(() => false)
+  const project = await projectOf(directory)
+  const stateRoot = defaultStateRoot()
+  const boardDir = inRepo
+    ? [project.key, ...(project.legacyKey ? [project.legacyKey] : [])].map((k) => path.join(stateRoot, k)).find((p) => fs.existsSync(p))
+    : undefined
+  if (!boardDir) throw noBoard(path.join(stateRoot, project.key), true)
+  return { ...project, stateRoot, boardDir }
+}
+
 /** The board a person asked for: --state, else the one of --repo or the current directory's repository. */
 async function humanBoard(flags: Flags) {
   const repo = path.resolve(flags.repo?.[0] ?? process.cwd())
   const state = flags.state?.[0]
-  if (state) knownState(state)
-  return { board: state ? new Board(state) : await Board.open(repo), tiers: loadTiers(repo), repo }
+  if (state) {
+    knownState(state)
+    return { board: new Board(state), tiers: loadTiers(repo), repo }
+  }
+  const { boardDir } = await projectBoard(repo)
+  return { board: new Board(boardDir), tiers: loadTiers(repo), repo }
 }
 
 /** The board at a glance, or one task in full: what a human checks while the horde works. */
@@ -110,8 +136,7 @@ async function status(args: string[], flags: Flags): Promise<string> {
 /** Everything the horde keeps for one repository: board, worktrees, horde/* branches, check logs and locks. */
 async function remove(flags: Flags): Promise<string> {
   const dir = path.resolve(flags.repo?.[0] ?? process.cwd())
-  const { root, key, legacyKey } = await projectOf(dir)
-  const stateRoot = defaultStateRoot()
+  const { root, key, legacyKey, stateRoot } = await projectBoard(dir)
   const verifyRoot = defaultStateDir()
   const worktreeRoot = defaultWorktreeDir()
 

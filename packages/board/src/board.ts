@@ -112,6 +112,21 @@ const MAX_NOTE = 500
 const MAX_REPORT = 2000
 const MAX_ITEM = 300
 
+/** Words and punctuation that say "no file" rather than naming one. */
+const NO_CLAIM = new Set(["none", "n/a", "na", "nothing", "nil", "null", "-", ".", "...", "(none)"])
+
+const placeholder = (p: string) => {
+  const s = p.trim().toLowerCase()
+  return !s || NO_CLAIM.has(s) || /^[.-]+$/.test(s)
+}
+
+/** Whether a report entry names a path at all: a placeholder, a bare word or a command is no claim. */
+export function claimsPath(p: string): boolean {
+  const s = p.trim().toLowerCase()
+  if (placeholder(s) || /\s/.test(s)) return false
+  return s.includes("/") || /\.[a-z]{1,5}$/.test(s)
+}
+
 // ------------------------------------------------------------------ project
 
 /**
@@ -395,7 +410,7 @@ export class Board {
     // is still a claim the diff does not support.
     const isFile = (p: string) => fs.existsSync(path.join(root, p)) || fs.existsSync(path.join(ws.path, p))
     // A bare word such as "none" says nothing about the diff; a path has a slash or an extension.
-    const claimedPath = (p: string) => Boolean(p) && (isFile(p) || (!/\s/.test(p) && /[./]/.test(p)))
+    const claimedPath = (p: string) => Boolean(p) && !placeholder(p) && (isFile(p) || claimsPath(p))
     const changed = r.filesChanged.map(norm).filter(claimedPath)
     const testPaths = r.testsAdded.map(norm).filter(claimedPath)
     const tests = testPaths.filter((p) => diff.includes(p) || !isFile(p))
