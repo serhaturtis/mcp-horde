@@ -70,6 +70,11 @@ export interface Track {
   ids: Set<string>
   /** The conversation this was built from, oldest first (the stable prefix is reused on the next read). */
   messages: SessionMessageInfo[]
+  /**
+   * The server's opaque cursor just after the newest message read: the next read asks for
+   * only what comes after it. Undefined when the server gave none (the next read is whole).
+   */
+  cursor?: string
 }
 
 /** Prices a step from its token usage when OpenCode reports no cost. */

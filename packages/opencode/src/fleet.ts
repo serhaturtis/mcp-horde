@@ -34,7 +34,7 @@ import { type Config, inProject, type PermissionPolicy } from "./config.js"
 import { News, type NewsWait, type NewsWork } from "./news.js"
 import { type Detail, inputSummary, renderTranscript } from "./render.js"
 import { type AgentRecord, type GateConfig, type Limits, ownerAlive, type ReviewSummary, SELF, type Store } from "./state.js"
-import { buildTrack, type CostEstimator, costSince, currentTurn, emptyTrack, latestTool, stablePrefix, type Track, type Turn, turnsSince } from "./tracker.js"
+import { buildTrack, type CostEstimator, costSince, currentTurn, emptyTrack, latestTool, type Track, type Turn, turnsSince } from "./tracker.js"
 import {
   BASELINE_MESSAGE,
   commitAll,
@@ -313,6 +313,8 @@ interface Live {
   lastNewEventAt: number
   /** The board of the agent's repository: the only one its trusted commands may name. */
   boardDir?: string
+  /** The conversation may have lost messages (a revert): the next refresh reads all of it. */
+  resync?: boolean
   /** The last activity written to the board (task-bound agents). */
   activity?: { key: string; write: Promise<void> }
 }
@@ -332,6 +334,13 @@ async function req<T>(what: string, p: Promise<T>, ms = REQUEST_MS + REQUEST_GRA
 function isNotFound(err: unknown): boolean {
   const e = err as { name?: string; cause?: { status?: number } } | undefined
   return /NotFoundError$/.test(e?.name ?? "") || e?.cause?.status === 404
+}
+
+/** Whether a message can still change after it was read (an open step, or a running compaction). */
+function stillChanging(m: SessionMessageInfo): boolean {
+  if (m.type === "assistant") return !m.time.completed
+  if (m.type === "compaction") return m.status === "running"
+  return false
 }
 
 /** Request options that give up after `ms` (the SDK passes them to fetch). */
@@ -2100,9 +2109,10 @@ export class Fleet {
     const replaying = !live.loaded
     const turnsBefore = live.track.turns.length ? currentTurn(live.track)!.startSeq : -1
     const seqBefore = live.track.seq
-    const track = await this.readHistory(id, live.track, live.session.location.directory)
+    const track = await this.readHistory(id, live.track, live.session.location.directory, live.resync)
     if (live.run !== token || this.closed) return
     live.track = track
+    live.resync = false
     // Grace windows run on local receive times, so a skewed server clock cannot shorten or stretch them.
     const seenAt = Date.now()
     if (live.track.seq !== seqBefore || replaying) live.lastNewEventAt = seenAt
@@ -2196,38 +2206,74 @@ export class Fleet {
     this.maybePush(live)
   }
 
-  private async readHistory(sessionID: string, track: Track, directory: string): Promise<Track> {
+  private async readHistory(sessionID: string, track: Track, directory: string, full = false): Promise<Track> {
     // Pricing comes from the catalog; load it once per directory.
     if (!this.modelCache.has(directory)) await this.models(directory).catch(() => undefined)
-    const [messages, inbox] = await Promise.all([
-      this.conversation(sessionID, track.messages),
+    const [read, inbox] = await Promise.all([
+      this.conversation(sessionID, track, full),
       req("reading the inbox", this.api.session.inbox.list({ sessionID }, timed())),
     ])
-    return buildTrack(messages, inbox, this.estimator(directory))
+    const built = buildTrack(read.messages, inbox, this.estimator(directory))
+    built.cursor = read.cursor
+    return built
   }
 
   /**
-   * The conversation, oldest first. Everything through the last `idle` marker never changes,
-   * so only newer messages are read; when that marker is gone (a revert), all of it is.
-   * ponytail: an open turn is re-read whole on every refresh; read by message if long turns get slow.
+   * The conversation, oldest first. With a track, only the messages after its cursor are read
+   * (the cursor is an opaque position, not the whole open turn); the newest message is read
+   * again while it can still change. Without one, or after a revert, the whole timeline is.
+   * A cursor the server no longer accepts falls back to that full read.
    */
-  private async conversation(sessionID: string, known: SessionMessageInfo[] = []): Promise<SessionMessageInfo[]> {
-    const keep = stablePrefix(known)
-    const anchor = known[keep - 1]
+  private async conversation(sessionID: string, track?: Track, full = false): Promise<{ messages: SessionMessageInfo[]; cursor?: string }> {
+    if (!track?.cursor || !track.messages.length || full) return this.readAll(sessionID)
     const fresh: SessionMessageInfo[] = []
+    let cursor = track.cursor
+    try {
+      for (let page = 0; page < 1000; page++) {
+        const res = await req("reading the conversation", this.api.message.list({ sessionID, limit: 100, cursor }, timed()))
+        // A cursor that points into history we already have is stale (a reverted timeline): read it all.
+        if (res.data.some((m) => track.ids.has(m.id))) return this.readAll(sessionID)
+        fresh.push(...res.data)
+        if (res.data.length < 100) {
+          cursor = res.cursor.next ?? cursor
+          break
+        }
+        if (!res.cursor.next) break
+        cursor = res.cursor.next
+      }
+    } catch (err) {
+      if (isNotFound((err as Error).cause)) throw err
+      return this.readAll(sessionID)
+    }
+    const knownLast = track.messages[track.messages.length - 1]
+    let messages = fresh.length ? [...track.messages, ...fresh] : track.messages
+    // The cursor is past the newest message we knew, so its later content (a step finishing,
+    // a compaction completing) would be missed: read that one message again while it is open.
+    if (knownLast && stillChanging(knownLast)) {
+      try {
+        const updated = await req("reading the newest message", this.api.session.message.get({ sessionID, messageID: knownLast.id }, timed()))
+        messages = messages.slice()
+        messages[track.messages.length - 1] = updated
+      } catch (err) {
+        if (isNotFound((err as Error).cause)) return this.readAll(sessionID)
+        throw err
+      }
+    }
+    return { messages, cursor }
+  }
+
+  /** The whole conversation, oldest first, with a cursor just past its newest message. */
+  private async readAll(sessionID: string): Promise<{ messages: SessionMessageInfo[]; cursor?: string }> {
+    const messages: SessionMessageInfo[] = []
     let cursor: string | undefined
     for (let page = 0; page < 1000; page++) {
-      // The cursor already encodes the order.
-      const res = await req("reading the conversation", this.api.message.list({ sessionID, limit: 100, ...(cursor ? { cursor } : { order: "desc" }) }, timed()))
-      for (const m of res.data) {
-        if (anchor && m.id === anchor.id) return [...known.slice(0, keep), ...fresh.reverse()]
-        if (anchor && m.time.created < anchor.time.created) return this.conversation(sessionID)
-        fresh.push(m)
-      }
-      if (!res.cursor.next || res.data.length < 100) break
-      cursor = res.cursor.next
+      const res = await req("reading the conversation", this.api.message.list({ sessionID, limit: 100, ...(cursor ? { cursor } : { order: "asc" }) }, timed()))
+      messages.push(...res.data)
+      if (res.data.length < 100) return { messages, cursor: res.cursor.next ?? cursor }
+      cursor = res.cursor.next ?? cursor
+      if (!res.cursor.next) break
     }
-    return anchor ? this.conversation(sessionID) : fresh.reverse()
+    return { messages, cursor }
   }
 
   /** What the caller sees of the gate. Undefined when the agent has none, or none applies to its state. */
@@ -2875,7 +2921,7 @@ export class Fleet {
     opts: { turns?: number; to?: string },
   ): Promise<{ snapshot: Snapshot; files: { path: string; status: string }[]; turns: number }> {
     const sessionID = live.record.id
-    const conversation = () => this.conversation(sessionID)
+    const conversation = async () => (await this.conversation(sessionID)).messages
     let messages = await conversation()
     const ids = messages.map((m) => m.id)
     // OpenCode undoes the given message and everything after it.
@@ -2912,6 +2958,8 @@ export class Fleet {
     }
     const staged = await req("staging the revert", this.api.session.revert.stage({ sessionID, messageID: from, files: true }, timed()))
     await req("committing the revert", this.api.session.revert.commit({ sessionID }, timed()))
+    // Messages are gone: the incremental cursor now points into a different timeline.
+    live.resync = true
     await this.refresh(live)
     // The gate judged work that no longer exists, and what is left was judged before: the
     // current turn is not gated again; the agent's next turn is.
@@ -3221,9 +3269,14 @@ export class Fleet {
           } else this.updateRecord(live.record.id, { pauseAfterStep: undefined })
         }
         break
+      case "session.revert.committed":
+        live.resync = true
+        break
     }
+    // One refresh per step (and per turn/request), not one per tool event: a refresh reads the
+    // conversation tail, so a burst of tool events would only queue the same read again.
     if (
-      /^session\.(inbox\.delivered|step\.(started|ended|failed)|tool\.(success|failed)|execution\.|idle$|status$|revert\.committed|compaction\.(ended|failed))|^(permission|form)\./.test(
+      /^session\.(inbox\.delivered|step\.(ended|failed)|idle$|execution\.(started|succeeded|failed|interrupted)|revert\.committed|compaction\.(ended|failed))|^(permission|form)\./.test(
         raw.type,
       )
     ) {

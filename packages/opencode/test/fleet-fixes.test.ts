@@ -4,15 +4,16 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { after, before, describe, mock as mockTimers, test } from "node:test"
-import { Board, renderSummary } from "@mcp-horde/board"
+import { Board, Board, renderSummary } from "@mcp-horde/board"
 import { lockDirFor } from "@mcp-horde/verify"
 import type { Backend } from "../src/backend.js"
+import { Backend } from "../src/backend.js"
 import type { Config } from "../src/config.js"
 import { Fleet, GATE_REVIEW_TIMEOUT_MS, type Hooks, type Snapshot, scopeGlobs } from "../src/fleet.js"
 import { outcome } from "../src/horde.js"
 import { type AgentRecord, OWNER_STALE_MS, ownerAlive, SELF, Store } from "../src/state.js"
 import { emptyTrack, type Track } from "../src/tracker.js"
-import { connect, git, type Harness, isolatedEnv, type Mock, makeRepo, until } from "./harness.js"
+import { connect, git, type Harness, isolatedEnv, type Mock, makeRepo, opencodeBin, until } from "./harness.js"
 import { startMockLlm } from "./mock-llm.js"
 
 describe("fleet fixes: ownership and helpers", () => {
@@ -1143,5 +1144,118 @@ describe("fleet fixes: a backend that dies mid-task", timeout: 600_000 , () => {
     assert.match(outcome, /FAILED/, outcome)
     assert.match(outcome, /horde_tell restarts the work from its worktree, horde_drop gives it up/, outcome)
     await hb.call("horde_drop", { id })
+describe("fleet fixes: a long open turn is read incrementally (real opencode, mock LLM)", { timeout: 600_000 }, () => {
+  test("150 shell steps decode message JSON about once, not the whole transcript on every refresh", async () => {
+    const mock = await startMockLlm()
+    const { tmp, repo } = makeRepo(mock.url, { permission: { bash: "allow" } })
+    // The private server takes its environment from this process.
+    const saved = new Map<string, string | undefined>()
+    for (const [key, value] of Object.entries(isolatedEnv(tmp, repo))) {
+      saved.set(key, process.env[key])
+      process.env[key] = value
+    }
+    const config: Config = {
+      username: "opencode",
+      allowInsecure: false,
+      serverMode: "private",
+      bin: opencodeBin,
+      directory: repo,
+      defaultPermissions: "allow",
+      maxRunning: 0,
+      maxRunningFrom: "test",
+      stateDir: path.join(tmp, "state"),
+      worktreeDir: path.join(tmp, "worktrees"),
+      channel: false,
+      elicitTimeoutMs: 600_000,
+    }
+    let backend: Backend | undefined
+    let fleet: Fleet | undefined
+    try {
+      const store = new Store(config.stateDir)
+      // OpenCode starts its server (and any workers) with this process's execArgv; the test
+      // runner's --import of scripts/test-env.mjs is relative to packages/opencode and would
+      // make the server fail to resolve it from its own directory.
+      const argv = process.execArgv
+      process.execArgv = []
+      try {
+        backend = await Backend.start(config, store)
+      } finally {
+        process.execArgv = argv
+      }
+      // The read counter: every message the fleet decodes (list pages and single re-reads) is
+      // added as its JSON size, so this measures what the old whole-turn re-reads decoded.
+      let decoded = 0
+      let lists = 0
+      let gets = 0
+      const client = backend.client
+      const counting = {
+        ...client,
+        message: {
+          ...client.message,
+          list: async (input: Parameters<typeof client.message.list>[0], opts?: Parameters<typeof client.message.list>[1]) => {
+            lists++
+            const res = await client.message.list(input, opts)
+            decoded += Buffer.byteLength(JSON.stringify(res.data))
+            return res
+          },
+        },
+        session: {
+          ...client.session,
+          message: {
+            ...client.session.message,
+            get: async (input: Parameters<typeof client.session.message.get>[0], opts?: Parameters<typeof client.session.message.get>[1]) => {
+              gets++
+              const message = await client.session.message.get(input, opts)
+              decoded += Buffer.byteLength(JSON.stringify(message))
+              return message
+            },
+          },
+        },
+      }
+      // The real event stream, with the counting client in front of it.
+      const readBackend = {
+        get client() {
+          return counting
+        },
+        get info() {
+          return backend!.info
+        },
+        events: backend.events,
+        get streaming() {
+          return backend!.streaming
+        },
+        get dead() {
+          return backend!.dead
+        },
+      } as unknown as Backend
+      fleet = new Fleet(readBackend, config, store, {
+        canElicit: () => false,
+        askPermission: async () => undefined,
+        askQuestion: async () => undefined,
+        settled: () => {},
+      })
+      const { snapshot } = await fleet.spawn({ prompt: "STEPS: 150", name: "long", directory: repo, isolation: "none", permissions: "allow" })
+      const waited = await fleet.waitFor([snapshot.id], "all", 600_000, { markReported: false })
+      assert.deepEqual(waited.errors, [])
+      assert.equal(waited.snapshots[0]?.state, "idle")
+      assert.ok((waited.snapshots[0]?.steps ?? 0) >= 150, `only ${waited.snapshots[0]?.steps} steps ran`)
+      const live = await fleet.get(snapshot.id)
+      const transcript = Buffer.byteLength(JSON.stringify(live.track.messages))
+      assert.ok(transcript > 0)
+      const ratio = decoded / transcript
+      assert.ok(
+        decoded < transcript * 3,
+        `decoded ${decoded} bytes over ${lists} list and ${gets} get reads: ${ratio.toFixed(1)}x the ${transcript}-byte transcript (the old whole-turn read was quadratic)`,
+      )
+    } finally {
+      fleet?.close()
+      backend?.close()
+      mock.close()
+      for (const [key, value] of saved) {
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+      fs.rmSync(tmp, { recursive: true, force: true })
+    }
   })
 })
