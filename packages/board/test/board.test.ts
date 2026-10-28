@@ -422,10 +422,14 @@ describe("board", () => {
     assert.match(scopedBrief, /Edits outside the scope are refused/)
     assert.match(scopedBrief, /a write through the shell outside the scope fails the audit just the same/)
     assert.match(scopedBrief, /report their paths with the report --question command and stop/)
+    const shared =
+      "Do not kill processes you did not start (no pkill -f, no killall), and do not use shared services such as a dev stack, a shared database or a live model unless the task says so; the checks you run by hand must be the ones the gate runs."
+    assert.ok(scopedBrief.includes(shared), scopedBrief)
     assert.doesNotMatch(scopedBrief, /Before changing anything outside it, lock the paths/)
     assert.doesNotMatch(scopedBrief, /Before editing outside your scope: .* lock /)
     const unscopedAttempt = await board.assign(unscoped!.id)
     const unscopedBrief = renderBrief(board, board.task(unscoped!.id), unscopedAttempt.attempt)
+    assert.ok(unscopedBrief.includes(shared), unscopedBrief)
     assert.match(unscopedBrief, /Before changing anything outside it, lock the paths/)
     assert.match(unscopedBrief, /Before editing outside your scope: .* lock /)
   })
