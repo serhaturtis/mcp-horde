@@ -366,6 +366,107 @@ describe("gate", () => {
     assert.match(fs.readFileSync(path.join(stateDir, "logs", logs[0]!, "test.log"), "utf8"), /^\$ node --test test\/math\.test\.mjs/)
   })
 
+  test("a git-ignored input and the ten-minute TTL both stop a cached pass; the note says what the key covers", async () => {
+    const { root, base } = repo({
+      "horde.json": JSON.stringify({
+        verify: { checks: { test: "node -e \"process.exit(require('node:fs').readFileSync('.env','utf8').trim() === 'good' ? 0 : 1)\"" } },
+      }),
+      ".gitignore": ".env\n",
+    })
+    write(root, { ".env": "good\n" })
+    const stateDir = tmp()
+    const first = await gate(root, { base, stateDir })
+    assert.equal(first.pass, true, first.text)
+    assert.equal(first.cached, false)
+    const cached = await gate(root, { base, stateDir })
+    assert.equal(cached.cached, true)
+    assert.match(cached.text, /\(cached: tree unchanged\)/)
+    assert.match(cached.text, /ignored files below the first level are not part of the key/)
+
+    // Same size, new contents and mtime: only the ignored-file metadata can tell them apart.
+    const env = path.join(root, ".env")
+    write(root, { ".env": "evil\n" })
+    const mtime = fs.statSync(env).mtimeMs + 5000
+    fs.utimesSync(env, new Date(mtime), new Date(mtime))
+    const after = await gate(root, { base, stateDir })
+    assert.equal(after.cached, false, "an ignored input changed")
+    assert.equal(after.pass, false, after.text)
+
+    write(root, { ".env": "good\n" })
+    const good = await gate(root, { base, stateDir, fresh: true })
+    assert.equal(good.pass, true, good.text)
+    assert.equal((await gate(root, { base, stateDir })).cached, true)
+    const now = Date.now
+    try {
+      // Ten minutes after the pass was stored: it must run again even on an unchanged tree.
+      Date.now = () => now() + 10 * 60_000 + 1
+      const expired = await gate(root, { base, stateDir })
+      assert.equal(expired.cached, false, "a pass older than ten minutes is not reused")
+      assert.equal(expired.pass, true, expired.text)
+    } finally {
+      Date.now = now
+    }
+  })
+
+  test("an untracked runner cache present before the gate does not block it; a tracked one hints at .gitignore", async () => {
+    const { root, base } = repo({
+      "horde.json": JSON.stringify({ verify: { checks: { ok: 'node -e "0"' } } }),
+      "src/a.ts": "1\n",
+    })
+    // A worker's earlier test run left this behind, and .gitignore does not name it.
+    write(root, { "__pycache__/x.pyc": Buffer.from([0, 1, 2]) })
+    const v = await gate(root, { base, allowed: ["src/**"], stateDir: tmp() })
+    assert.equal(v.pass, true, v.text)
+    assert.ok(!v.text.includes("__pycache__"), v.text)
+
+    // Committed (so it is the worker's, not a cache the checks wrote): still blocking, with the way out.
+    write(root, { "__pycache__/x.pyc": Buffer.from([0, 0, 1]) })
+    git(root, "add", "-A")
+    git(root, "commit", "-qm", "commit a runner cache")
+    const tracked = await gate(root, { base, stateDir: tmp() })
+    assert.equal(tracked.pass, false, tracked.text)
+    const line = tracked.blockers.find((b) => b.includes("__pycache__/x.pyc"))
+    assert.ok(line, tracked.blockers.join("\n"))
+    assert.match(line!, /add it to \.gitignore/)
+  })
+
+  test("checks do not inherit credentials unless the check's own env names one", async () => {
+    const names = [
+      "ANTHROPIC_API_KEY",
+      "OPENAI_API_KEY",
+      "DEEPSEEK_API_KEY",
+      "GOOGLE_API_KEY",
+      "GEMINI_API_KEY",
+      "MOONSHOT_API_KEY",
+      "GROQ_API_KEY",
+      "OPENROUTER_API_KEY",
+      "AWS_SECRET_ACCESS_KEY",
+      "GITHUB_TOKEN",
+      "GH_TOKEN",
+      "NPM_TOKEN",
+      "SOME_API_KEY",
+      "SOME_TOKEN",
+      "SOME_SECRET",
+      "SOME_PASSWORD",
+    ]
+    const saved = new Map(names.map((n) => [n, process.env[n]]))
+    try {
+      for (const n of names) process.env[n] = "inherited"
+      // ALLOWED_API_KEY passes the same suffix rule, and only the check's env may set it.
+      const script = `node -e "const names='${names.join(",")}'.split(',');const seen=names.filter(n=>process.env[n]);if(seen.length||process.env.ALLOWED_API_KEY!=='yes'){console.error('saw '+seen.concat(process.env.ALLOWED_API_KEY?['ALLOWED_API_KEY']:[]).join(','));process.exit(1)}"`
+      const { root } = repo({
+        "horde.json": JSON.stringify({ verify: { checks: { env: { command: script, env: { ALLOWED_API_KEY: "yes" } } } } }),
+      })
+      const v = await gate(root, { stateDir: tmp() })
+      assert.equal(v.pass, true, v.text)
+    } finally {
+      for (const [n, value] of saved) {
+        if (value === undefined) delete process.env[n]
+        else process.env[n] = value
+      }
+    }
+  })
+
   test("a runner whose failures a wrapper hides still fails the gate", async () => {
     const { root, base } = repo({
       "horde.json": JSON.stringify({ verify: { checks: { test: "node run.mjs" } } }),

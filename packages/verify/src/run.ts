@@ -53,6 +53,35 @@ const CI_ENV = { CI: "1", NO_COLOR: "1", TERM: "dumb", PY_COLORS: "0", CARGO_TER
  */
 const STRIP_ENV = ["FORCE_COLOR", "CLICOLOR_FORCE", "NODE_TEST_CONTEXT", "OPENCODE_SERVER_", "HORDE_"]
 
+/**
+ * Inherited credentials a check must not see: the caller's keys are not the project's. Suffix
+ * matching covers the many *_API_KEY/*_TOKEN/*_SECRET/*_PASSWORD names; the list covers keys
+ * whose names do not end that way (AWS_SECRET_ACCESS_KEY). A check that needs one names it in
+ * its horde.json `env`, which is applied after the strip.
+ */
+const SECRET_ENV = /_(?:API_KEY|TOKEN|SECRET|PASSWORD)$/
+const KNOWN_SECRET_ENV = [
+  "ANTHROPIC_API_KEY",
+  "OPENAI_API_KEY",
+  "DEEPSEEK_API_KEY",
+  "GOOGLE_API_KEY",
+  "GEMINI_API_KEY",
+  "MOONSHOT_API_KEY",
+  "GROQ_API_KEY",
+  "OPENROUTER_API_KEY",
+  "AWS_SECRET_ACCESS_KEY",
+  "GITHUB_TOKEN",
+  "GH_TOKEN",
+  "NPM_TOKEN",
+]
+
+/** The inherited credential names to strip, both the known ones and whatever this process has. */
+function secretEnvNames(): string[] {
+  const names = new Set(KNOWN_SECRET_ENV)
+  for (const name of Object.keys(process.env)) if (SECRET_ENV.test(name)) names.add(name)
+  return [...names]
+}
+
 /** Per-directory log location, stable across runs (the latest run replaces the previous one). */
 export function logDirFor(base: string, directory: string): string {
   const key = createHash("sha256").update(path.resolve(directory)).digest("hex").slice(0, 16)
@@ -68,6 +97,11 @@ export function logFileFor(logDir: string, check: string): string {
 export async function runChecks(checks: Check[], opts: RunChecksOptions): Promise<CheckResult[]> {
   if (opts.logDir) fs.mkdirSync(opts.logDir, { recursive: true, mode: 0o700 })
   const results: CheckResult[] = []
+  const secrets = secretEnvNames()
+  // Task variables (HORDE_TASK, HORDE_WORKTREE, …) reach checks on purpose, but no inherited
+  // credential does: only the check's own env may set one.
+  const sharedEnv: Record<string, string> = {}
+  for (const [k, v] of Object.entries(opts.env ?? {})) if (!secrets.includes(k) && !SECRET_ENV.test(k)) sharedEnv[k] = v
   for (const check of checks) {
     if (opts.signal?.aborted) break
     opts.onProgress?.(`${check.name}: ${check.command}`)
@@ -76,8 +110,8 @@ export async function runChecks(checks: Check[], opts: RunChecksOptions): Promis
         cwd: check.cwd,
         timeoutMs: opts.timeoutMs,
         signal: opts.signal,
-        env: { ...CI_ENV, ...opts.env, ...check.env },
-        stripEnv: [...STRIP_ENV, ...(check.stripEnv ?? [])],
+        env: { ...CI_ENV, ...sharedEnv, ...check.env },
+        stripEnv: [...STRIP_ENV, ...secrets, ...(check.stripEnv ?? [])],
         maxChars: MAX_LOG_CHARS,
         onProgress: (line) => opts.onProgress?.(`${check.name}: ${line}`),
         progressMs: 10_000,

@@ -71,12 +71,26 @@ export interface Verdict {
   text: string
 }
 
-const cache = new Map<string, Omit<Verdict, "cached" | "text">>()
+const cache = new Map<string, { at: number; verdict: Omit<Verdict, "cached" | "text"> }>()
 const CACHE_LIMIT = 50
+/**
+ * A passing verdict is reused for at most ten minutes. The tree key cannot see everything a
+ * check reads (an ignored file's contents, a service's state), so a pass eventually expires
+ * even when git sees no change.
+ */
+const VERDICT_TTL_MS = 10 * 60_000
+
+/** Directories whose contents are installed or generated, not inputs a check's key can afford to stat. */
+const KEY_SKIP_DIRS = new Set(["node_modules", ".venv", "venv", "vendor", "target", "dist", "build", ".git"])
+/** How many ignored files the key looks at: enough for the usual .env/.cache at the root, bounded. */
+const KEY_IGNORED_LIMIT = 200
 
 /**
- * A key that changes whenever anything a check could see changes. Any git error means no key
- * (never cached): an empty diff standing in for one that failed would match a different tree.
+ * A key that changes when HEAD, the diff, an untracked file, or an ignored file at the root or
+ * one level below changes. Deeper ignored files and the contents of dependency directories are
+ * not part of the key (the verdict names the former), and a pass also expires after
+ * VERDICT_TTL_MS. Any git error means no key (never cached): an empty diff standing in for one
+ * that failed would match a different tree.
  */
 async function treeKey(directory: string, extra: unknown): Promise<string | undefined> {
   try {
@@ -84,10 +98,21 @@ async function treeKey(directory: string, extra: unknown): Promise<string | unde
     const head = await git(root, "rev-parse", "--verify", "HEAD")
     const h = createHash("sha256").update(head).update("\0")
     h.update(await gitRaw(root, ["-c", "core.quotePath=false", "diff", "--no-ext-diff", "--binary", "HEAD"]))
-    for (const p of splitZ(await gitRaw(root, ["-c", "core.quotePath=false", "ls-files", "--others", "--exclude-standard", "-z"]))) {
+    const stat = async (p: string) => {
       const st = await fs.stat(path.join(root, p)).catch(() => undefined)
       h.update(`\0${p}\0${st?.size ?? -1}\0${st?.mtimeMs ?? -1}`)
     }
+    for (const p of splitZ(await gitRaw(root, ["-c", "core.quotePath=false", "ls-files", "--others", "--exclude-standard", "-z"]))) await stat(p)
+    // Git-ignored files are inputs too (.env, a local config, a linked checkout); their names and
+    // metadata stand in for contents the key cannot hash cheaply.
+    const ignored = splitZ(await gitRaw(root, ["-c", "core.quotePath=false", "ls-files", "--others", "--ignored", "--exclude-standard", "-z"]))
+      .filter((p) => {
+        const parts = p.split("/")
+        return parts.length <= 2 && !parts.some((part) => KEY_SKIP_DIRS.has(part))
+      })
+      .sort()
+      .slice(0, KEY_IGNORED_LIMIT)
+    for (const p of ignored) await stat(p)
     return h.update("\0").update(JSON.stringify(extra)).digest("hex")
   } catch {
     return undefined // not a git repository, no commit yet, or git failed: never cached
@@ -304,7 +329,10 @@ export async function gate(directory: string, opts: GateOptions = {}): Promise<V
     baseline: opts.baseline?.commit ?? null,
   })
   const hit = key && !opts.fresh ? cache.get(key) : undefined
-  if (hit) return { ...hit, cached: true, text: render(hit, budget, true) }
+  if (hit && key) {
+    if (Date.now() - hit.at < VERDICT_TTL_MS) return { ...hit.verdict, cached: true, text: render(hit.verdict, budget, true) }
+    cache.delete(key)
+  }
 
   const started = Date.now()
   let plans = new Map<Check, Narrowing>()
@@ -354,13 +382,15 @@ export async function gate(directory: string, opts: GateOptions = {}): Promise<V
         generated: settings.audit.generated,
       })
     : undefined
-  // Files the checks wrote are not the work: drop them from the audit's account.
+  // Files the checks wrote are not the work: drop them from the audit's account. Runner caches
+  // count as check output even when they were already there before this run (a worker's own
+  // earlier test run leaves __pycache__ and friends behind).
   if (auditResult && preUntracked) {
-    const written = [...(await untracked(dir))].filter((p) => !preUntracked.has(p))
-    if (written.length) {
-      const set = new Set(written)
-      auditResult.files = auditResult.files.filter((p) => !set.has(p))
-      auditResult.findings = auditResult.findings.filter((f) => !f.file || !set.has(f.file))
+    const postUntracked = await untracked(dir)
+    const output = new Set([...[...postUntracked].filter((p) => !preUntracked.has(p)), ...[...postUntracked].filter((p) => isRunnerCachePath(p))])
+    if (output.size) {
+      auditResult.files = auditResult.files.filter((p) => !output.has(p))
+      auditResult.findings = auditResult.findings.filter((f) => !f.file || !output.has(f.file))
     }
   }
   const blockers = [
@@ -386,13 +416,26 @@ export async function gate(directory: string, opts: GateOptions = {}): Promise<V
   // A cancelled run and a failing one both say nothing worth replaying: a failure may be the
   // environment's, and a retry on the same tree must run again.
   if (key && !opts.signal?.aborted && verdict.pass) {
-    cache.set(key, verdict)
+    cache.set(key, { at: Date.now(), verdict })
     if (cache.size > CACHE_LIMIT) cache.delete(cache.keys().next().value!)
   }
   return { ...verdict, cached: false, text: render(verdict, budget, false) }
 }
 
 const NO_CHECKS = "no checks to run (configure verify.checks in horde.json)"
+
+/**
+ * Caches and reports test runners write for themselves. They are check output even when they
+ * predate the gate (a worker ran the tests before asking for a verdict), so they do not block.
+ */
+const RUNNER_CACHE_DIRS = new Set(["__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox", ".nyc_output", ".cache", "htmlcov", "coverage"])
+const RUNNER_CACHE_FILES = /^(\.coverage(?:\..*)?|coverage\.(?:xml|json|out)|coverage-final\.json|lcov\.info)$/
+
+function isRunnerCachePath(p: string): boolean {
+  const parts = p.replace(/\\/g, "/").split("/")
+  if (parts.some((part) => RUNNER_CACHE_DIRS.has(part))) return true
+  return RUNNER_CACHE_FILES.test(parts[parts.length - 1] ?? "")
+}
 
 /** Locks for checks' slots: one directory per repository (its common git dir), shared by all its worktrees. */
 export async function lockDirFor(dir: string, stateDir: string): Promise<string> {
@@ -426,7 +469,9 @@ function summary(c: CheckResult): string {
 }
 
 function findingLine(f: Finding): string {
-  return `${f.category}: ${f.file ? `${f.file}${f.line ? `:${f.line}` : ""} ` : ""}${f.text}`
+  const line = `${f.category}: ${f.file ? `${f.file}${f.line ? `:${f.line}` : ""} ` : ""}${f.text}`
+  // A tracked runner cache is still the worker's: keep it blocking, but name the way out.
+  return f.severity === "block" && f.file && isRunnerCachePath(f.file) ? `${line} (add it to .gitignore)` : line
 }
 
 /**
@@ -444,7 +489,7 @@ export function render(v: Omit<Verdict, "cached" | "text">, budget: number, cach
     noChecks && "no checks to run",
     v.warnings.length && `${v.warnings.length} warning${v.warnings.length > 1 ? "s" : ""}`,
   ].filter(Boolean)
-  const head = `${v.pass ? "PASS" : "FAIL"}${parts.length ? ` · ${parts.join(", ")}` : ""} · ${formatDuration(v.durationMs)}${cached ? " (cached: tree unchanged)" : ""}`
+  const head = `${v.pass ? "PASS" : "FAIL"}${parts.length ? ` · ${parts.join(", ")}` : ""} · ${formatDuration(v.durationMs)}${cached ? " (cached: tree unchanged) — ignored files below the first level are not part of the key" : ""}`
   const sections: Section[] = [{ text: head, required: true }]
   if (noChecks) sections.push({ text: `✗ ${NO_CHECKS}`, required: true })
   // One status line per check, failing ones first.
