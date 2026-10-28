@@ -98,8 +98,15 @@ describe("lifecycle log", () => {
 
   test("a server's start and how it ended: exit code, uncaught exception, signal", { skip: process.platform === "win32" }, async () => {
     const state = tmp()
+    // A log left world-readable by an older version is made private on the first note.
+    fs.mkdirSync(path.join(state, "mcp-horde"), { recursive: true, mode: 0o755 })
+    fs.writeFileSync(path.join(state, "mcp-horde", "servers.log"), "", { mode: 0o644 })
     await done(child(state, "exit"))
     assert.match(log(state), /probe pid \d+: started \(version 1\.2\.3, parent \d+\)\n.*probe pid \d+: exited with code 3 after \d+s/)
+    assert.equal(fs.statSync(path.join(state, "mcp-horde", "servers.log")).mode & 0o777, 0o600, "the log is private to the user")
+    const fresh = tmp()
+    await done(child(fresh, "exit"))
+    assert.equal(fs.statSync(path.join(fresh, "mcp-horde")).mode & 0o777, 0o700, "a new state root is private to the user")
     await done(child(state, "throw"))
     assert.match(log(state), /probe pid \d+: uncaught exception: Error: boom/)
     const waiting = child(state, "wait")

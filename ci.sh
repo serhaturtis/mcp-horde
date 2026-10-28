@@ -20,8 +20,10 @@ for arg; do
 done
 
 set -x
-if [[ $install || ! -d node_modules ]]; then npm ci; fi
+# A node_modules that drifted from package-lock.json would bundle and test something else: npm ci it back.
+if [[ $install || ! -d node_modules ]] || ! node scripts/check-install.mjs; then npm ci; fi
 npm run lint
+node scripts/check-tests-listed.mjs
 npm run typecheck
 node scripts/bundle-plugin.mjs --check
 node scripts/eval-tools.mjs --check

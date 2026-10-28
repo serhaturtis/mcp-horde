@@ -66,7 +66,22 @@ if (process.argv.includes("--check")) {
     .readdirSync(tmp, { recursive: true })
     .filter((f) => !fs.statSync(path.join(tmp, f)).isDirectory())
     .filter((f) => !fs.existsSync(path.join(out, f)) || !fs.readFileSync(path.join(out, f)).equals(fs.readFileSync(path.join(tmp, f))))
+  // The other direction: a file left in the output that a fresh build no longer produces.
+  const orphans = fs
+    .readdirSync(out, { recursive: true })
+    .filter((f) => !fs.statSync(path.join(out, f)).isDirectory())
+    .filter((f) => !fs.existsSync(path.join(tmp, f)))
   fs.rmSync(tmp, { recursive: true, force: true })
+  const pluginVersion = JSON.parse(fs.readFileSync(path.join(root, "plugins", "horde", ".claude-plugin", "plugin.json"), "utf8")).version
+  const serverVersion = JSON.parse(fs.readFileSync(path.join(root, "packages", "opencode", "package.json"), "utf8")).version
+  if (pluginVersion !== serverVersion) {
+    console.error(`plugins/horde/.claude-plugin/plugin.json says version ${pluginVersion}, packages/opencode/package.json ${serverVersion}: keep them equal`)
+    process.exit(1)
+  }
+  if (orphans.length) {
+    console.error(`plugins/horde/servers holds files a fresh build does not produce (${orphans.join(", ")}): delete them`)
+    process.exit(1)
+  }
   if (stale.length) {
     console.error(`plugins/horde/servers is out of date (${stale.join(", ")}): run npm run bundle and commit the result`)
     process.exit(1)

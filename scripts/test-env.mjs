@@ -6,6 +6,10 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 
+// A shell that points the horde's state directories somewhere (HORDE_*_STATE_DIR) must not reach
+// the tests: they build their own isolated environments and would read or write that state instead.
+for (const name of ["HORDE_BOARD_STATE_DIR", "HORDE_VERIFY_STATE_DIR", "HORDE_OPENCODE_STATE_DIR", "HORDE_OPENCODE_WORKTREE_DIR"]) delete process.env[name]
+
 if (!process.env.HORDE_TEST_STATE_HOME) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "horde-test-state-"))
   process.env.HORDE_TEST_STATE_HOME = dir

@@ -18,8 +18,10 @@ export function recordLifecycle(name: string, version: string): void {
   const file = path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state"), "mcp-horde", "servers.log")
   const note = (what: string) => {
     try {
-      fs.mkdirSync(path.dirname(file), { recursive: true })
-      fs.appendFileSync(file, `${new Date().toISOString()} ${name} pid ${process.pid}: ${what}\n`)
+      // Private to the user: the log names sessions and pids, and Node's fatal-error reports land beside it.
+      fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
+      fs.appendFileSync(file, `${new Date().toISOString()} ${name} pid ${process.pid}: ${what}\n`, { mode: 0o600 })
+      if (!isWindows && (fs.statSync(file).mode & 0o077) !== 0) fs.chmodSync(file, 0o600)
     } catch {
       // Logging must never be what breaks a server.
     }
