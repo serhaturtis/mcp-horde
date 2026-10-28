@@ -735,6 +735,12 @@ describe("related tests", () => {
     assert.equal(narrowCommand(check("jest --ci"), ["a.test.js"]), "jest --ci --runTestsByPath a.test.js", "jest reads bare arguments as patterns")
     assert.equal(narrowCommand(check("go test ./..."), ["internal/calc/calc_test.go", "a_test.go"]), "go test ./internal/calc .")
     assert.equal(narrowCommand(check("go test ./pkg"), ["pkg/a_test.go"]), undefined, "only ./... is replaced")
+    assert.equal(
+      narrowCommand(check("node --import tsx --test --test-concurrency=1 test/a.test.ts test/b.test.ts"), ["test/b.test.ts"]),
+      "node --import tsx --test --test-concurrency=1 test/b.test.ts",
+      "node --test keeps its flags and swaps the listed files for the related ones",
+    )
+    assert.equal(narrowCommand(check("node --test"), ["test/b.test.ts"]), undefined, "node --test without a file list discovers tests itself")
     assert.equal(narrowCommand(check("jest && echo done"), ["a.test.js"]), undefined)
     assert.equal(narrowCommand(check("cargo test"), ["tests/a.rs"]), undefined)
     assert.equal(narrowCommand(check("pytest"), ["src/a.test.ts"]), undefined, "no tests for this runner")

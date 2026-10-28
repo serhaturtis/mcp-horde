@@ -95,6 +95,14 @@ export function narrowCommand(check: Check, tests: string[]): string | undefined
   const byPath = (r: string | undefined) => (r === "jest" ? "--runTestsByPath " : "")
   if (runner && !/[;&|]/.test(cmd)) return js.length ? `${cmd} ${byPath(runner)}${js.map(quote).join(" ")}` : undefined
   if (/^go\s+test\b/.test(cmd) && /\s\.\/\.\.\.(\s|$)/.test(cmd)) return go.length ? cmd.replace(/\s\.\/\.\.\.(?=\s|$)/, ` ${go.join(" ")}`) : undefined
+  // `node --test` with an explicit file list (how this repository's packages run theirs): the
+  // listed test files are replaced by the related ones; flags and loaders stay as they are.
+  if (/^node(\s|$)/.test(cmd) && /\s--test(\s|$)/.test(cmd) && !SHELL.test(cmd) && !CD.test(cmd)) {
+    const tokens = cmd.split(/\s+/).filter(Boolean)
+    const listed = tokens.filter((t) => !t.startsWith("-") && isRunnableTest(t))
+    if (listed.length && js.length) return [...tokens.filter((t) => !listed.includes(t)), ...js.map(quote)].join(" ")
+    return undefined
+  }
   if (/^npm\s+(test|run\s+test)$/.test(cmd) && js.length) {
     const script = npmScript(check.cwd, "test")
     // Only a single vitest/jest call with flags: anything else (chained commands, node --test

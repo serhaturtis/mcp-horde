@@ -1,14 +1,60 @@
 {
-  "tiers": ["deepseek/deepseek-flash", "deepseek/deepseek-v4-pro"],
+  "tiers": ["deepseek/deepseek-flash"],
   "workers": {
     "setup": "npm ci --prefer-offline --no-audit --no-fund && npm run build"
   },
   "verify": {
     "timeoutSeconds": 1800,
     "checks": {
-      "typecheck": { "command": "npm run typecheck", "kind": "typecheck" },
-      "lint": { "command": "npm run lint", "kind": "lint" },
-      "test": { "command": "npm test", "kind": "test", "slots": 1 }
+      "typecheck": {
+        "command": "npm run typecheck",
+        "kind": "typecheck"
+      },
+      "lint": {
+        "command": "npm run lint",
+        "kind": "lint"
+      },
+      "hooks": {
+        "command": "node --test *.test.mjs",
+        "cwd": "plugins/horde/hooks",
+        "kind": "test"
+      },
+      "core": {
+        "command": "node --conditions=source --import tsx --import ../../scripts/test-env.mjs --test test/core.test.ts",
+        "cwd": "packages/core",
+        "kind": "test"
+      },
+      "context": {
+        "command": "node --conditions=source --import tsx --import ../../scripts/test-env.mjs --test --test-concurrency=1 test/context.test.ts",
+        "cwd": "packages/context",
+        "kind": "test"
+      },
+      "verify": {
+        "command": "node --conditions=source --import tsx --import ../../scripts/test-env.mjs --test --test-concurrency=1 test/extract.test.ts test/verify.test.ts",
+        "cwd": "packages/verify",
+        "kind": "test"
+      },
+      "board": {
+        "command": "node --conditions=source --import tsx --import ../../scripts/test-env.mjs --test --test-concurrency=1 test/board.test.ts test/cli.test.ts test/unplan.test.ts",
+        "cwd": "packages/board",
+        "kind": "test"
+      },
+      "ledger": {
+        "command": "node --conditions=source --import tsx --import ../../scripts/test-env.mjs --test --test-concurrency=1 test/ledger.test.ts",
+        "cwd": "packages/ledger",
+        "kind": "test"
+      },
+      "review": {
+        "command": "node --conditions=source --import tsx --import ../../scripts/test-env.mjs --test --test-concurrency=1 test/review.test.ts",
+        "cwd": "packages/review",
+        "kind": "test"
+      },
+      "opencode": {
+        "command": "node --conditions=source --import tsx --import ../../scripts/test-env.mjs --test --test-concurrency=1 test/unit.test.ts test/core.test.ts test/modes.test.ts test/flow.test.ts test/dist.test.ts test/plugin.test.ts test/fleet-fixes.test.ts test/support-fixes.test.ts test/horde.test.ts",
+        "cwd": "packages/opencode",
+        "kind": "test",
+        "slots": 1
+      }
     },
     "audit": {
       "generated": ["plugins/horde/servers/**"]
