@@ -10,7 +10,7 @@ Ground truth: ci.sh green in full (427 tests, none skipped), no hosted CI; one t
 
 ## LIVE-01 — Every opencode server's heap peaks at 2-3 GB in a day-long session, within reach of the 4.3 GB limit the design note says was handled
 
-- [ ] *(open)*
+- [x] closed in 26d7228 — **Executed evidence:** the fleet reads only new messages of an open turn per refresh and coalesces refreshes per step (tracker cursor); test 'a long open turn is read incrementally' runs a 150-step agent and asserts linear decoded volume (task t-e4cf's gate review 3 of 3 met; final ci run below)
 - **Severity:** high **BLOCKING** · **Confidence:** high · **Also reported by:** boot: Open turns are re-read whole on every refresh (~2 refreshes per step): quadratic churn explains the 1.4-2.7 GB RSS and 'heap 2632 MB' highs of pid 1049645; retention per agent is under 1 MB
 - **Location:** `packages/opencode/src/fleet.ts`
 
@@ -52,7 +52,7 @@ Also reported by gates (high confidence): packages/opencode/package.json test sc
 
 ## LIVE-04 — horde_do starts a paid worker on a detached HEAD although only horde_land refuses it
 
-- [ ] *(open)*
+- [x] closed in 01623f0 — **Executed evidence:** horde_do refuses a detached HEAD before any task or worktree exists (test in horde.test.ts; task t-80ff's gate review 4 of 4 met)
 - **Severity:** medium · **Confidence:** high · **Also reported by:** boot: horde_do starts and pays a worker on a detached HEAD; only horde_land refuses, after the work is done
 - **Location:** `packages/opencode/src/horde.ts`
 

@@ -22,7 +22,7 @@ The horde's trust model is honest in docs/DESIGN.md §8 and packages/opencode/RE
 
 ## SEC-02 — The server password and Claude Code's messaging token/socket and session id are inherited by every worker shell
 
-- [ ] *(open)*
+- [x] closed in 9cb4b60 — **Executed evidence:** backend.ts builds the backend's environment from an allowlist and sets each worker session's shell environment to it (a43c8c2); HORDE_OPENCODE_PASS_ENV documented; harness test asserts the canary, CLAUDE_CODE_*, HORDE_* and OPENCODE_SERVER_PASSWORD are absent from a worker shell while PATH and HOME are present (task t-e8e8's gate review 4 of 4 met)
 - **Severity:** high **BLOCKING** · **Confidence:** high · **Also reported by:** live: Confirmed live: a worker's shell inherits the backend password, Claude Code's messaging token and socket, the session id, every HORDE_* setting and any secret in the user's shell
 - **Location:** `packages/opencode/src/backend.ts:436`
 
@@ -36,7 +36,7 @@ Also reported by live (high confidence): Live probe (scratchpad/audit/live/out/e
 
 ## SEC-03 — A worker can move the user's branch from its worktree so the gate reads the worker's own loosened horde.json
 
-- [ ] *(open)*
+- [x] closed in d8ff37a — **Executed evidence:** rulesAt is the tip the orchestrator's process observed, recorded on the agent; a tip reachable from the worker's branch and differing from the base refuses the gate and the landing (test 'a worker that moves the target branch onto its own commit is refused')
 - **Severity:** medium · **Confidence:** high · **Also reported by:** recent: Gate rules now come from a ref the worker can move (main checkout HEAD), not an immutable commit; gates: A worker's shell can move the target branch, making its own horde.json 'the rules at the tip'; only OpenCode's default-allow shell policy stands in the way
 - **Location:** `packages/opencode/src/fleet.ts:2151`
 

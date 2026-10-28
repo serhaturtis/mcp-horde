@@ -10,7 +10,7 @@ The audit fires for every documented category I constructed (deleted/moved/skipp
 
 ## GAT-01 — Land-stage gate reads the worktree's on-disk horde.json, so a worker's rewritten checks judge what lands
 
-- [ ] *(open)*
+- [x] closed in d8ff37a — **Executed evidence:** gate() honours rulesAt without a base and detectChecks reads manifests from that commit; landLoop passes the observed tip; tests 'gate honours rulesAt without a base' and 'for the detected checks too' in verify.test.ts and horde.test.ts (task t-1912's gate green; final ci run below)
 - **Severity:** high **BLOCKING** · **Confidence:** high
 - **Location:** `packages/verify/src/gate.ts:290`
 
@@ -58,7 +58,7 @@ The audit fires for every documented category I constructed (deleted/moved/skipp
 
 ## GAT-05 — A task started from a repository subdirectory is gated on different checks at land than in its rounds (none when the checks live only in the subdirectory)
 
-- [ ] *(open)*
+- [x] closed in d8ff37a — **Executed evidence:** landing gates the same directory as the rounds (test 'a task started from a subdirectory is gated at landing by the subdirectory's checks')
 - **Severity:** medium · **Confidence:** high
 - **Location:** `packages/opencode/src/fleet.ts:1692`
 
@@ -94,7 +94,7 @@ The audit fires for every documented category I constructed (deleted/moved/skipp
 
 ## GAT-08 — A check that rewrites a tracked file makes later checks judge a tree that is not the one that lands
 
-- [ ] *(open)*
+- [x] closed in d8ff37a — **Executed evidence:** a check that modified tracked files refuses the fast-forward naming them (test 'a check that rewrites a tracked file refuses the fast-forward, naming it')
 - **Severity:** low · **Confidence:** high
 - **Location:** `packages/opencode/src/fleet.ts:1713`
 
@@ -130,7 +130,7 @@ The audit fires for every documented category I constructed (deleted/moved/skipp
 
 ## GAT-11 — horde.json workers.land/setup are read from the main checkout's working file, not from the branch tip
 
-- [ ] *(open)*
+- [x] closed in d8ff37a — **Executed evidence:** workers.land and workers.setup are read at the observed tip (test 'landing runs the committed workers.land, not an uncommitted edit in the checkout')
 - **Severity:** low · **Confidence:** high
 - **Location:** `packages/opencode/src/fleet.ts:1666`
 

@@ -10,7 +10,7 @@ Boot and failure modes of the opencode server are mostly fail-fast with actionab
 
 ## BOOT-01 — A shared-server record that answers 'unauthorized' or fails its probe with a non-timeout transport error is forgotten and a second `opencode serve` is spawned; the first keeps running as an orphan that nothing can stop or attach to
 
-- [ ] *(open)*
+- [x] closed in 9cb4b60 — **Executed evidence:** a live but unusable shared server is stopped before a new one is spawned and opencode_server stop kills it (test, same gate)
 - **Severity:** medium · **Confidence:** high
 - **Location:** `packages/opencode/src/backend.ts:106`
 
@@ -46,7 +46,7 @@ Boot and failure modes of the opencode server are mostly fail-fast with actionab
 
 ## BOOT-04 — horde_do in a non-git directory fails fast but creates a board for the plain directory, records a failed task, and records the start failure twice
 
-- [ ] *(open)*
+- [x] closed in 01623f0 — **Executed evidence:** horde_do refuses a non-git directory before board.plan and a failed start is recorded once (test)
 - **Severity:** low · **Confidence:** high
 - **Location:** `packages/opencode/src/horde.ts:157`
 
@@ -70,7 +70,7 @@ Boot and failure modes of the opencode server are mostly fail-fast with actionab
 
 ## BOOT-06 — Backend lifecycle: started lazily, stopped by nobody, reused across plugin and opencode versions with only a bin-string comparison and an 'untested' warning shown by opencode_status
 
-- [ ] *(open)*
+- [x] closed in 9cb4b60 — **Executed evidence:** server.json records the OpenCode version and a mismatch on reconnect is reported once per process (test 'the shared OpenCode server runs 9.9.9 …' in fleet-fixes.test.ts)
 - **Severity:** low · **Confidence:** high
 - **Location:** `packages/opencode/src/backend.ts:89`
 

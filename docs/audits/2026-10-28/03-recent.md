@@ -10,7 +10,7 @@ Re-reviewed the 45 commits since 5a2606d (36 non-rebundle) by reading every diff
 
 ## REC-01 — horde_land replays squash-merged work as empty commits and fast-forwards them onto the branch
 
-- [ ] *(open)*
+- [x] closed in d8ff37a — **Executed evidence:** a squash-merged task lands nothing and partly merged work drops the commits that became empty (two tests in horde.test.ts)
 - **Severity:** medium · **Confidence:** high
 - **Location:** `packages/opencode/src/fleet.ts:1603`
 
@@ -46,7 +46,7 @@ Re-reviewed the 45 commits since 5a2606d (36 non-rebundle) by reading every diff
 
 ## REC-04 — Binaries and scope hints parse the budget-trimmed verdict and silently disappear when audit lines are dropped
 
-- [ ] *(open)*
+- [x] closed in 01623f0 — **Executed evidence:** the scope and binaries hints are built from the stored audit findings and survive a trimmed verdict (test)
 - **Severity:** low · **Confidence:** high
 - **Location:** `packages/opencode/src/horde.ts:632`
 
