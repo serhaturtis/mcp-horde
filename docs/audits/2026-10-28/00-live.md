@@ -38,7 +38,7 @@ Also reported by boot (high confidence): Live probe PD (probe-flow.ts, built dis
 
 ## LIVE-03 — packages/opencode/test/support-fixes.test.ts (22 tests) has never run under npm test
 
-- [ ] *(open)*
+- [x] closed in 9bfba96 — **Executed evidence:** packages/opencode/package.json lists test/support-fixes.test.ts; ./ci.sh log (scratchpad audit/ci-batchA.log) shows its four suites ok (22 tests) and 'every test file is named by a script'; the new guard scripts/check-tests-listed.mjs fails on a planted packages/verify/test/zz-unlisted.test.ts (exit 1) and passes after its removal
 - **Severity:** medium **BLOCKING** · **Confidence:** high · **Also reported by:** gates: packages/opencode/test/support-fixes.test.ts (22 passing tests) is never run by npm test or ci.sh; e2e.test.ts only with --live
 - **Location:** `packages/opencode/package.json:35`
 

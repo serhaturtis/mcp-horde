@@ -106,7 +106,7 @@ Checked the deploy path (install.sh line by line and in --dry-run on this machin
 
 ## DEP-09 — bundle-plugin.mjs --check compares only files the fresh build produces and builds from whatever node_modules is present
 
-- [ ] *(open)*
+- [x] closed in 9bfba96 — **Executed evidence:** scripts/bundle-plugin.mjs --check now also flags orphans: with a planted plugins/horde/servers/zz-orphan.js it exits 1 naming it, and passes after removal; ci.sh runs scripts/check-install.mjs (node_modules versus package-lock.json, npm ci when they differ): 'node_modules matches package-lock.json'
 - **Severity:** low · **Confidence:** high · **Also reported by:** gates: Bundle check is one-directional and compares against whatever node_modules holds
 - **Location:** `scripts/bundle-plugin.mjs:62`
 
@@ -120,7 +120,7 @@ Also reported by gates (high confidence): bundle-plugin.mjs:60-66 `stale = readd
 
 ## DEP-10 — plugin.json and the marketplace entry carry no version: validator warns, clone installs show 0.1.0 forever
 
-- [ ] *(open)*
+- [x] closed in 9bfba96 — **Executed evidence:** plugins/horde/.claude-plugin/plugin.json carries version 0.2.0, checked equal to packages/opencode/package.json by bundle-plugin.mjs --check; claude plugin validate plugins/horde → 'Validation passed' with no version warning
 - **Severity:** low · **Confidence:** high
 - **Location:** `plugins/horde/.claude-plugin/plugin.json:1`
 

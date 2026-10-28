@@ -136,7 +136,7 @@ Also reported by gates (high confidence): fleet.ts:2151 `const rulesAt = wt ? aw
 
 ## SEC-11 — servers.log and the state root are created with the umask on a fresh machine (world-readable under 022)
 
-- [ ] *(open)*
+- [x] closed in 9bfba96 — **Executed evidence:** packages/core/src/process.ts creates the state root 0700 and the log 0600 and chmods a wider log once; npm test -w @mcp-horde/core → 24 pass, including the new mode assertions on a pre-existing 0644 log
 - **Severity:** low · **Confidence:** high
 - **Location:** `packages/core/src/process.ts:21`
 

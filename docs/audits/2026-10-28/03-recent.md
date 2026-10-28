@@ -70,7 +70,7 @@ Re-reviewed the 45 commits since 5a2606d (36 non-rebundle) by reading every diff
 
 ## REC-06 — Board test suite fails under the HORDE_* state-dir overrides the project tells auditors and users to use
 
-- [ ] *(open)*
+- [x] closed in 9bfba96 — **Executed evidence:** HORDE_BOARD_STATE_DIR and HORDE_VERIFY_STATE_DIR pointed at scratch dirs: npm test -w @mcp-horde/board → tests 35 pass 35 fail 0 (was 33/35); scripts/test-env.mjs deletes the four HORDE_* state overrides before any test runs
 - **Severity:** low · **Confidence:** high
 - **Location:** `packages/board/test/board.test.ts`
 

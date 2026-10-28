@@ -94,7 +94,7 @@ Boot and failure modes of the opencode server are mostly fail-fast with actionab
 
 ## BOOT-08 — Test harness leaves a temp git repository per run under /tmp: 763 'horde-oc-*' directories, 1.6 GB, in two days
 
-- [ ] *(open)*
+- [x] closed in 9bfba96 — **Executed evidence:** packages/opencode/test/harness.ts removes every makeRepo temp dir at process exit: running test/plugin.test.ts left the count of /tmp/horde-oc-* directories unchanged (793 before, 793 after; the 793 predate the fix and are the user's to delete)
 - **Severity:** low · **Confidence:** high
 - **Location:** `packages/opencode/test/harness.ts:31`
 
