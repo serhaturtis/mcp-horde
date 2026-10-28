@@ -27,7 +27,7 @@ The project's checks judge every task, so `horde_do` refuses in a repository whe
 
 - **goal**: what and why, the files or functions you already know, the conventions to follow, the shape of the result. Never "improve the auth code".
 - **done**: observable criteria a reviewer can check against the diff ("returns 429 after 5 failed attempts", "a test covers the window expiring"). Passing checks is the gate's job; you need not list it.
-- **scope**: the paths it may change. Tasks running at the same time must not overlap.
+- **scope**: the paths it may change. Tasks running at the same time must not overlap. OpenCode refuses edits outside it; a write through the shell outside it is not prevented but caught by the audit, so it costs a round.
 - **Small**: one concern, a few files. Split bigger work into tasks that land one by one; start a dependent task after its dependency has landed.
 - **Core first**: when a change needs a design decision, make it and build the piece that checks it (a validator, a contract, a test) here; then hand off what that makes checkable: the tests, the docs, an investigation of the paths it touches.
 
@@ -42,4 +42,4 @@ The project's checks judge every task, so `horde_do` refuses in a repository whe
 - A plan of many tasks with dependencies: `board_plan`, then `opencode_spawn { task }` per ready task (`board_next`).
 - Best of N on a hard, well-specified task: `horde_do` the same goal two or three times, land the best READY one, `horde_drop` the rest. To compare long diffs without reading them, ask a cheap model as judge with `opencode_ask` and a `schema`.
 - Steering mid-step, reading a transcript, pausing: `opencode_message`, `opencode_output`, `opencode_interrupt` with the task id.
-- `horde watch` in a terminal shows the board live.
+- `node <plugin dir>/servers/cli.js watch` in a terminal shows the board live.

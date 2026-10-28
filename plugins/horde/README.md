@@ -8,6 +8,10 @@ Bundles the horde for Claude Code:
 - **Hooks** (`hooks/delegate.mjs`): at session start, and at the start of each subagent that can edit, a paragraph in the agent's context on what the horde does and what work it suits. Once per prompt, when an agent has edited four files by hand without delegating, a note next to that edit says a separate piece of the remaining work could go to a worker.
 - **Evals** (`evals/`): requests that should and should not be delegated, graded on whether `horde_do` was called; see [`evals/README.md`](evals/README.md).
 
+## What a worker can do
+
+A worker is an OpenCode session running as you: its edit tools are confined to the task's scope, but OpenCode does not prompt for shell commands by default, so it can run anything you can, and the audit and the checks judge the result rather than preventing it. It works in its own worktree, yet it can reach your checkout and your files. Set OpenCode's `permission` rules (an `opencode.json` in the repository with `"permission": { "bash": "ask" }`) or run the horde under a sandbox when that is not acceptable.
+
 To install it for every project, run `./install.sh` in a clone of this repository, or without one:
 
 ```sh
@@ -30,7 +34,7 @@ Optional, in the repository's `horde.json`: the worker models per tier, cheapest
 
 ```json
 {
-  "tiers": [{ "model": "deepseek/deepseek-v4-flash", "variant": "high" }, "moonshot/kimi-k3"],
+  "tiers": [{ "model": "deepseek/deepseek-v4-flash", "variant": "high" }, "moonshotai/kimi-k3"],
   "opencode": { "maxRunning": 4 },
   "verify": { "checks": { "test": "npm test" } },
   "workers": { "brief": ["docs/lane_brief.md"] }
@@ -46,6 +50,24 @@ To use the same worker defaults in every repository, put `tiers` and `opencode` 
 ```
 
 To follow the horde from a terminal: `node <plugin dir>/servers/cli.js watch` in the repository shows the board live (tasks, their agents' state and gate verdicts, costs, locks, recent events); `status` prints it once (add a task id for one task in full).
+
+### Environment variables
+
+Set these in the shell before starting Claude Code; the plugin's MCP servers inherit that environment.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `HORDE_OPENCODE_SERVER` | `shared` | `shared`: one detached `opencode serve` that outlives MCP restarts. `private`: one server per MCP process, stopped with it. |
+| `HORDE_OPENCODE_BIN` | `opencode` | Binary used to start `opencode serve`. |
+| `HORDE_OPENCODE_URL` | none | Attach to a server you run yourself instead of starting one. |
+| `HORDE_OPENCODE_PERMISSIONS` | `user` | What a permission request does: `user` asks you, `ask` gives it to the calling model, `allow` and `deny` decide automatically. |
+| `HORDE_OPENCODE_MAX_RUNNING` | `horde.json` `opencode.maxRunning`, else 8 | Maximum number of workers running at once (`0` = unlimited). |
+| `HORDE_OPENCODE_CHANNEL` | off | Push Claude Code channel notifications when a worker settles (`1`/`true`/`yes`/`on`). |
+| `HORDE_OPENCODE_DIALOG_TIMEOUT` | `600` | Seconds a permission or question dialog waits for you before it goes to the calling model. |
+| `HORDE_OPENCODE_STATE_DIR` | `~/.local/state/mcp-horde/opencode` | Agent records, the shared-server record and its password file. |
+| `HORDE_OPENCODE_WORKTREE_DIR` | `~/.local/share/mcp-horde/worktrees` | Where task worktrees go. |
+| `HORDE_BOARD_STATE_DIR` | `~/.local/state/mcp-horde/board` | Where boards (task history, findings, memory) are stored. |
+| `HORDE_VERIFY_STATE_DIR` | `~/.local/state/mcp-horde/verify` | Where check logs are kept. |
 
 ## Requirements
 
@@ -86,7 +108,10 @@ claude mcp add opencode -- node "$PWD/plugins/horde/servers/opencode.js"
 claude mcp add board    -- node "$PWD/plugins/horde/servers/board.js"
 claude mcp add verify   -- node "$PWD/plugins/horde/servers/verify.js"
 claude mcp add context  -- node "$PWD/plugins/horde/servers/context.js"
+claude mcp add ledger   -- node "$PWD/plugins/horde/servers/ledger.js"
 ```
+
+This path registers the five servers but installs no hooks, so none of the notes above appear in your agents' context. To load the whole plugin from the checkout instead, hooks included, start Claude Code with `claude --plugin-dir plugins/horde`.
 
 Copy `skills/horde`, `skills/setup` and `skills/remove` into your project's `.claude/skills/` for the procedure and the repository setup.
 

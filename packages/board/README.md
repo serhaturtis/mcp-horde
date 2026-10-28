@@ -52,7 +52,7 @@ The brief contains the exact commands, so workers never have to construct them:
         --unverified "did not load-test" --question "…" --confidence medium
 ```
 
-For people, `horde status` (in the repository, or `--repo <dir>` / `--state <board>`) prints the board summary, and `horde status <task id>` one task in full with its report checked against the diff. `horde watch` shows the board live in the terminal: every task with its status, tier and model, cost, and what its agent is doing (state and gate verdict, recorded by `opencode` for task-bound agents), held locks and the latest board events; ↑↓ selects a task, enter opens it in full (esc back), q quits; `--interval <seconds>` sets the refresh (default 1). Without a terminal it prints one frame. Both only read, and it is not a worker command, so the fleet never approves it on a worker's behalf. From the plugin: `node <plugin>/servers/cli.js status` (or `watch`).
+For people, the plugin CLI prints the board: `node <plugin>/servers/cli.js status` (in the repository, or `--repo <dir>` / `--state <board>`) gives the summary, and `status <task id>` gives one task in full with its report checked against the diff. `watch` shows the board live in the terminal: every task with its status, tier and model, cost, and what its agent is doing (state and gate verdict, recorded by `opencode` for task-bound agents), held locks and the latest board events; ↑↓ selects a task, enter opens it in full (esc back), q quits; `--interval <seconds>` sets the refresh (default 1). Without a terminal it prints one frame. Both only read, and it is not a worker command, so the fleet never approves it on a worker's behalf.
 
 A finding must name its attempt (`--task`, `--token`): briefs show where each finding came from. Locks take repository-relative paths (not `**`, absolute paths or `..`); a new attempt, a failure, a block or a reopen releases the task's locks. `board_accept` refuses a task that is already done, and `board_fail` refuses one with no running attempt (so a retried call cannot escalate twice; change a tier with `board_edit`).
 
@@ -67,7 +67,7 @@ OpenCode does not offer agents the tools of an injected MCP server (verified on 
 A task's `tier` indexes `tiers` in the repository's `horde.json`, cheapest first:
 
 ```json
-{ "tiers": [{ "model": "deepseek/deepseek-v4-flash", "variant": "high" }, "moonshot/kimi-k3"] }
+{ "tiers": [{ "model": "deepseek/deepseek-v4-flash", "variant": "high" }, "moonshotai/kimi-k3"] }
 ```
 
 `board_next` and `board_task` show the tier's model, `opencode_spawn { task }` uses it when no `model` is passed, and the tier past the last entry is the orchestrator's: spawning a task there is refused with that explanation.

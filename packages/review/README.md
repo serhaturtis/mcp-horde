@@ -6,7 +6,7 @@ It is a library: the `review_task` tool of [`@mcp-horde/opencode`](../opencode) 
 
 ```text
 review_task id:"t-3fa2"
-  review t-3fa2 "Rate limit login" by moonshot/kimi-k3: 1/3 met, 1 not met
+  review t-3fa2 "Rate limit login" by moonshotai/kimi-k3: 1/3 met, 1 not met
   ✓ 1. 429 after 5 failures per minute — src/api/login.ts:40-52, test/api/login.test.ts:12
       returns 429 once the window holds 5 failures
   ✗ 2. the limit is configurable — src/api/login.ts:8

@@ -9,14 +9,14 @@ Learns which worker model to start a task on, from what the board already record
 
 ```text
 ledger_suggest apply:true
-  t-3fa2 "Refactor the scheduler": tier 1 (moonshot/kimi-k3) → set: similar refactor work in src/core failed on
-  tier 0 (deepseek/deepseek-v4-flash): 0 of 3 similar attempts passed; on tier 1 (moonshot/kimi-k3) 3 of 3 similar attempts passed
+  t-3fa2 "Refactor the scheduler": tier 1 (moonshotai/kimi-k3) → set: similar refactor work in src/core failed on
+  tier 0 (deepseek/deepseek-v4-flash): 0 of 3 similar attempts passed; on tier 1 (moonshotai/kimi-k3) 3 of 3 similar attempts passed
   t-9c01 "Add tests for the parser": tier 0 stands (no evidence against the cheaper tiers)
 
 ledger_stats
   By model, myapp:
   deepseek/deepseek-v4-flash: 14/17 accepted (82%) · 1.3 gate rounds · $0.04 per accepted
-  moonshot/kimi-k3: 5/5 accepted (100%) · 1.0 gate rounds · $0.31 per accepted
+  moonshotai/kimi-k3: 5/5 accepted (100%) · 1.0 gate rounds · $0.31 per accepted
 ```
 
 ## How it decides

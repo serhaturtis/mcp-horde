@@ -127,10 +127,10 @@ With `isolation: "worktree"`, the agent gets a new worktree on branch `horde/<na
 
 ### Push notifications (Claude Code channels)
 
-With `HORDE_OPENCODE_CHANNEL=1`, the server also pushes a `<channel source="opencode">` message into the Claude Code session each time an agent settles, so Claude doesn't need to block in `opencode_wait`. Channels are a Claude Code research preview. For a custom server, start Claude Code with:
+With `HORDE_OPENCODE_CHANNEL=1`, the server also pushes a `<channel source="opencode">` message into the Claude Code session each time an agent settles, so Claude doesn't need to block in `opencode_wait`. Channels are a Claude Code research preview. For a custom server, start Claude Code with the plugin form (the plugin's server is registered as `plugin:horde@mcp-horde`; a server registered under another name uses `server:<name>`); this is the form seen on Claude Code 2.1.312:
 
 ```sh
-claude --dangerously-load-development-channels server:opencode
+claude --dangerously-load-development-channels plugin:horde@mcp-horde
 ```
 
 Requirements: claude.ai or Console auth, and on Team/Enterprise plans the org setting `channelsEnabled`. Pushes are best effort, so `opencode_wait` still returns every result once, even if a push was already delivered.
@@ -192,7 +192,7 @@ opencode_models query:"deepseek"                → deepseek/deepseek-flash … 
 opencode_spawn  name:"api-tests" model:"deepseek/deepseek-flash" variant:"high" isolation:"worktree"
                 worktree:{link:["node_modules"]} limits:{max_cost_usd:1}
                 prompt:"Add integration tests for src/api/users.ts covering …"
-opencode_spawn  name:"docs" model:"moonshot/kimi-k3" agent:"build" prompt:"Update docs/api.md …"
+opencode_spawn  name:"docs" model:"moonshotai/kimi-k3" agent:"build" prompt:"Update docs/api.md …"
 opencode_wait                                     → docs IDLE, result: "Updated docs/api.md …"
 opencode_status ids:["api-tests"]                 → RUNNING, doing: shell: npm test · $0.21
 opencode_message id:"api-tests" message:"Use the fixtures in test/fixtures."   (steer)
