@@ -4,7 +4,7 @@ import fs from "node:fs/promises"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
 import { Board, current, isTrustedCommand, renderBrief } from "@mcp-horde/board"
-import { formatUsd, git, loadTiers, loadWorkers, oneLine, tierLabel, tierModel, withLock } from "@mcp-horde/core"
+import { formatUsd, git, loadTiers, oneLine, tierLabel, tierModel, withLock } from "@mcp-horde/core"
 import {
   checkVerdicts,
   collectReview,
@@ -44,6 +44,7 @@ import {
   hasUncommitted,
   judgeCommits,
   landSync,
+  loadWorkersAt,
   mergeWorktree,
   removeWorktree,
   restoreWorktree,
@@ -1156,8 +1157,11 @@ export class Fleet {
     let prompted = false
     try {
       if (input.isolation === "worktree") {
-        // horde.json "workers" says how to prepare a worktree; without it, ignored dependency directories are linked.
-        const workers = loadWorkers(directory)
+        // horde.json "workers" at the tip the worktree checks out (not the working file, which a
+        // worker can rewrite) says how to prepare a worktree; without it, ignored dependency
+        // directories are linked. "HEAD" is the tip; outside a repository loadWorkersAt falls back
+        // to the working file, and createWorktree reports the real "needs a git repository".
+        const workers = await loadWorkersAt(directory, "HEAD")
         const made = await createWorktree(directory, name, {
           rootDir: this.config.worktreeDir,
           includeUncommitted: input.worktree?.includeUncommitted ?? true,
@@ -1213,6 +1217,7 @@ export class Fleet {
         reportedSeq: 0,
         gate: await gateConfig(gate, directory, !!worktree),
         investigate: input.investigate,
+        ...(worktree ? { observedTip: await git(worktree.repo, "rev-parse", "HEAD") } : {}),
       }
       this.store.put(record)
       const live = this.adoptRecord(record)
@@ -1276,6 +1281,8 @@ export class Fleet {
     const live = await this.get(ref)
     const id = live.record.id
     await this.refresh(live)
+    const moved = await this.observeTip(live)
+    if (moved) throw new Error(moved)
     if (this.config.maxRunning > 0) await this.refreshUnknown()
     // Waking a settled agent takes a running slot.
     const waking = !!live.state && SETTLED.has(live.state) && live.state !== "needs_input"
@@ -1410,6 +1417,8 @@ export class Fleet {
     const live = await this.get(ref)
     const id = live.record.id
     await this.refresh(live)
+    const moved = await this.observeTip(live)
+    if (moved) throw new Error(moved)
     const perm = live.pending.permissions.find((p) => p.id === requestID)
     const question = live.pending.questions.find((q) => q.id === requestID)
     if (!perm && !question) {
@@ -1544,6 +1553,8 @@ export class Fleet {
     if (!wt) throw new Error(`${name} does not run in a worktree (spawn with isolation "worktree")`)
     if (action === "diff") return worktreeDiff(wt, opts.maxChars ?? 20_000)
     await this.refresh(live)
+    const moved = await this.observeTip(live)
+    if (moved) throw new Error(moved)
     // Only a diff while it works: its tree is changing, and a request it waits on may be answered any moment.
     if (this.working(live))
       throw new Error(
@@ -1564,7 +1575,10 @@ export class Fleet {
     }
     const result = await this.withoutGate(live, () => mergeWorktree(wt, name, opts.strategy ?? "merge"))
     if (!result.merged || result.merged === wt.merged) return result.text
-    this.updateRecord(live.record.id, { worktree: { ...wt, merged: result.merged } })
+    // The merge moved the target (a fast-forward puts its tip on the worker's branch): record the
+    // new tip so a later gate does not read it as a tip the worker moved.
+    const merged = await git(wt.repo, "rev-parse", "HEAD").catch(() => undefined)
+    this.updateRecord(live.record.id, { worktree: { ...wt, merged: result.merged }, ...(merged ? { observedTip: merged } : {}) })
     if (opts.check === false) return result.text
     // The worker's gate judged its branch alone; this judges your checkout with everything merged so far.
     try {
@@ -1591,9 +1605,56 @@ export class Fleet {
   private async followRebase(live: Live, wt: Worktree): Promise<Worktree> {
     const followed = await followRebase(wt)
     if (followed === wt) return wt
-    this.updateRecord(live.record.id, { worktree: followed })
+    // The worker rebased onto the target (after a landing conflict): the orchestrator's recorded
+    // tip moves with it, so the next gate and landing judge by the same commit the worker is on.
+    const tip = await git(wt.repo, "rev-parse", "HEAD").catch(() => undefined)
+    this.updateRecord(live.record.id, { worktree: followed, ...(tip ? { observedTip: tip } : {}) })
     await this.rebindTaskBase(live, followed)
     return followed
+  }
+
+  /**
+   * Refuse when the target branch's tip moved onto the worker's branch: the current tip is a strict
+   * descendant of the recorded one and reachable from the worker's branch. The worker cannot rewrite
+   * a commit, so a tip it moved to its own commit (the only way to make its own horde.json the
+   * rules) is a descendant of the recorded tip and reachable from its branch; a backward reset or a
+   * forward move the orchestrator made is not the worker's, and is not refused here.
+   */
+  private async movedTip(wt: Worktree, recorded: string): Promise<string | undefined> {
+    const current = await git(wt.repo, "rev-parse", "HEAD")
+    if (current === recorded) return undefined
+    const head = await git(wt.root, "rev-parse", "HEAD").catch(() => "")
+    if (!head) return undefined
+    const ahead = await git(wt.repo, "merge-base", "--is-ancestor", recorded, current).then(
+      () => true,
+      () => false,
+    )
+    if (!ahead) return undefined
+    const onBranch = await git(wt.repo, "merge-base", "--is-ancestor", current, head).then(
+      () => true,
+      () => false,
+    )
+    if (!onBranch) return undefined
+    return `the target branch's tip is on the worker's branch; the worker moved it (recorded ${recorded.slice(0, 10)}, now ${current.slice(0, 10)})`
+  }
+
+  /**
+   * Re-read the target branch's tip on a caller call (horde_tell, horde_land, a sync) and record it
+   * as observed. Returns the explanation when the worker moved the tip, so the caller can refuse;
+   * otherwise the tip is recorded and the caller proceeds. Only caller calls re-observe: the refresh
+   * loop never updates observedTip, so a ref the worker moved between calls is never taken as its own.
+   */
+  private async observeTip(live: Live): Promise<string | undefined> {
+    const wt = live.record.worktree
+    if (!wt) return undefined
+    const recorded = live.record.observedTip
+    if (recorded) {
+      const moved = await this.movedTip(wt, recorded)
+      if (moved) return moved
+    }
+    const current = await git(wt.repo, "rev-parse", "HEAD")
+    if (current !== recorded) this.updateRecord(live.record.id, { observedTip: current })
+    return undefined
   }
 
   /**
@@ -1620,6 +1681,13 @@ export class Fleet {
     await this.refresh(live)
     if (this.working(live))
       throw new Error(`${name} is still ${live.state === "needs_input" ? "waiting for an answer" : "working"}; horde_wait for its outcome first`)
+    // The tip the landing judges by is the one the orchestrator observed; a move onto the worker's
+    // branch refuses, whatever the gate decided.
+    const moved = await this.observeTip(live)
+    if (moved) {
+      const target = await git(live.record.worktree!.repo, "symbolic-ref", "-q", "--short", "HEAD").catch(() => "")
+      return { landed: false, target, why: "moved", text: moved }
+    }
     if (!this.readyToLand(live)) {
       const g = this.gateView(live)
       throw new Error(
@@ -1656,6 +1724,11 @@ export class Fleet {
       let wt = live.record.worktree!
       const target = await git(wt.repo, "symbolic-ref", "-q", "--short", "HEAD").catch(() => "")
       if (!target) throw new Error(`your checkout ${wt.repo} is on a detached HEAD; switch to a branch first`)
+      // The landing judges by the tip the orchestrator observed. Re-read it each attempt (a retry
+      // after the tip moved from outside re-records the new tip); a move onto the worker's branch
+      // refuses (the worker moved it) before anything else runs.
+      const moved = await this.observeTip(live)
+      if (moved) return { landed: false, target, why: "moved", text: moved }
       // After a landing conflict the worker rebased its branch onto the target: the recorded base
       // must follow it or the next gate and landing count the target's commits as the worker's.
       wt = await this.followRebase(live, wt)
@@ -1665,6 +1738,9 @@ export class Fleet {
       const hook = await commitMsgHook(wt.repo)
       if (hook && !message && (await hasUncommitted(wt))) return { landed: false, target, why: "leftovers", text: hook }
       const tip = await git(wt.repo, "rev-parse", "HEAD")
+      // The rules the land gate and workers.land read come from the tip the orchestrator observed,
+      // never the live HEAD (which the worker can move) nor the worktree's on-disk files.
+      const rulesAt = live.record.observedTip ?? tip
       // 0. Work already on the branch (cherry-picked or merged by hand) would be replayed as empty
       // commits by the rebase below, checked for minutes, then fast-forwarded as empty commits. By
       // patch-id: every one already there means nothing to land; only some means landing the rest
@@ -1681,7 +1757,7 @@ export class Fleet {
           await board.accept(task.id, { note: `already on ${target}` }).catch(() => undefined)
           await this.dispose(id, { worktree: "discard" })
           await git(wt.repo, "branch", "-D", wt.branch).catch(() => undefined)
-          return { landed: true, target, commits: own.length, checks: [], already: true }
+          return { landed: true, target, commits: own.length, checks: [], already: "patch" }
         }
         if (on.length) {
           return {
@@ -1698,10 +1774,21 @@ export class Fleet {
       // conflict leaves both as they were; anything else failing is reported by its own cause.
       let leftover = false
       let resolved = 0
+      let emptied: { dropped: number; total: number } | undefined
       try {
-        const synced = await landSync(wt, name)
+        const synced = await landSync(wt, name, rulesAt)
+        // A squash-merged task: the rebase replayed its commits as empties. Nothing to land, so
+        // close the task without moving the branch.
+        if (synced.already) {
+          const board = await Board.open(wt.repo)
+          await board.accept(task.id, { note: `already on ${target}` }).catch(() => undefined)
+          await this.dispose(id, { worktree: "discard" })
+          await git(wt.repo, "branch", "-D", wt.branch).catch(() => undefined)
+          return { landed: true, target, commits: own.length, checks: [], already: "tree" }
+        }
         leftover = synced.leftover ?? false
         resolved = synced.resolved ?? 0
+        emptied = synced.emptied
         if (synced.worktree) {
           wt = synced.worktree
           // The verdict stands for landing again; a new turn is gated as usual.
@@ -1735,7 +1822,7 @@ export class Fleet {
       // top (judged by the repository's hooks), keeping the branch's pre-step commit to restore if
       // this attempt does not fast-forward, so the worker's branch never keeps the land step's
       // commit or files.
-      const land = loadWorkers(wt.repo).land
+      const land = (await loadWorkersAt(wt.repo, rulesAt)).land
       let judged = ""
       let beforeLand: string | undefined
       if (land) {
@@ -1761,10 +1848,11 @@ export class Fleet {
           return { landed: false, target, why: "message", text: refused, hook }
         }
       }
-      const v = await runGate(wt.root, {
+      const v = await runGate(wt.path, {
         audit: false,
         related: false,
         stage: "land",
+        rulesAt,
         env: { HORDE_TASK: task.id, HORDE_WORKTREE: wt.root },
         baseline: this.baselineFor(wt.repo, tip, `${target}'s tip`),
         signal,
@@ -1773,6 +1861,21 @@ export class Fleet {
       if (!v.pass) {
         if (beforeLand) await restoreWorktree(wt, beforeLand).catch(() => undefined)
         return { landed: false, target, why: "checks", text: v.text, checks: v.checks.map(gateCheck) }
+      }
+      // A check that rewrites a tracked file makes the checks judge a tree that is not the one that
+      // lands: refuse to fast-forward when tracked files are modified, naming them (workers.land is
+      // where a project regenerates such files as part of the landing).
+      const dirty = (await git(wt.root, "status", "--porcelain", "--untracked-files=no").catch(() => "")).split("\n").filter(Boolean)
+      if (dirty.length) {
+        // Put the branch back as the checks found it (and drop the check's own edits), so a retry
+        // does not commit them as the worker's work.
+        await restoreWorktree(wt, beforeLand ?? judged).catch(() => undefined)
+        return {
+          landed: false,
+          target,
+          why: "dirty",
+          text: `the checks modified tracked files, so the tree that would land is not the one they judged:\n${dirty.join("\n")}\nSet horde.json "workers.land" to the command that regenerates them.`,
+        }
       }
       // 3. Under a per-repository lock, fast-forward your branch only if it is still at the tip the
       // checks saw; otherwise go round again (rebase onto the new tip, check again).
@@ -1815,6 +1918,7 @@ export class Fleet {
         checks: v.checks.map(gateCheck),
         branchKept: unmerged.length ? wt.branch : undefined,
         ...(resolved ? { resolved } : {}),
+        ...(emptied ? { emptied } : {}),
       }
     }
     throw new Error(`your branch kept moving while ${name} was being landed; call horde_land again`)
@@ -1832,6 +1936,8 @@ export class Fleet {
   async setScope(ref: string, paths: string[]): Promise<void> {
     if (!paths.length) throw new Error("scope needs at least one path or glob")
     const live = await this.get(ref)
+    const moved = await this.observeTip(live)
+    if (moved) throw new Error(moved)
     const id = live.record.id
     const scope: Scope = { paths, outside: live.record.scope?.outside ?? "deny" }
     const session = await this.session(id)
@@ -1846,6 +1952,8 @@ export class Fleet {
   async setDone(ref: string, criteria: string[]): Promise<void> {
     if (!criteria.length) throw new Error("done needs at least one criterion")
     const live = await this.get(ref)
+    const moved = await this.observeTip(live)
+    if (moved) throw new Error(moved)
     const task = live.record.task
     if (!task) throw new Error(`${live.record.name ?? live.record.id} has no task on the board`)
     await (await Board.open(live.record.worktree?.repo ?? live.record.directory)).edit(task.id, { acceptance: criteria })
@@ -2187,7 +2295,7 @@ export class Fleet {
       label,
       checkout: async () => {
         const name = `base-${commit.slice(0, 8)}-${randomBytes(2).toString("hex")}`
-        const workers = loadWorkers(repo)
+        const workers = await loadWorkersAt(repo, commit)
         const { worktree } = await createWorktree(repo, name, {
           rootDir: this.config.worktreeDir,
           includeUncommitted: false,
@@ -2214,7 +2322,15 @@ export class Fleet {
     // prompt that arrives after this run starts supersedes its verdict.
     const promptBefore = live.track.lastPromptedSeq
     let wt = live.record.worktree
-    if (wt) wt = await this.followRebase(live, wt)
+    let recorded: string | undefined
+    let moved: string | undefined
+    if (wt) {
+      // The rules come from the tip the orchestrator observed, not the live HEAD (which the worker
+      // can move from its worktree); refuse when the worker moved the target onto its own branch.
+      recorded = live.record.observedTip ?? (await git(wt.repo, "rev-parse", "HEAD").catch(() => undefined))
+      if (recorded) moved = await this.movedTip(wt, recorded)
+    }
+    if (wt && !moved) wt = await this.followRebase(live, wt)
     const start = wt ? workStart(wt) : undefined
     let pass = false
     let text: string
@@ -2222,43 +2338,48 @@ export class Fleet {
     let review: ReviewSummary | undefined
     let stuck: SlotBlocked[] = []
     try {
-      // A worktree's commits are never on the target branch: its rules are horde.json at that
-      // branch's tip, including a change the orchestrator committed while the task ran.
-      const rulesAt = wt ? await git(wt.repo, "rev-parse", "HEAD").catch(() => undefined) : undefined
-      const directory = live.session?.location.directory ?? live.record.directory
-      const judge = () =>
-        runGate(directory, {
-          base: start ?? cfg.base,
-          rulesAt,
-          audit: cfg.audit,
-          // Only an unaudited shared gate may use the human's working config; a worktree gate
-          // judges by the target branch's rules, which the work itself cannot rewrite.
-          settingsFrom: !wt && !cfg.audit ? "working" : "base",
-          checks: cfg.checks,
-          allowed: cfg.allowed,
-          related: cfg.related !== false,
-          stage: "work",
-          env: wt ? { HORDE_TASK: live.record.task?.id ?? live.record.name ?? live.record.id, HORDE_WORKTREE: wt.root } : undefined,
-          baseline: wt && start ? this.baselineFor(wt.repo, start, `${start.slice(0, 8)} where the task started`) : undefined,
-          signal: abort.signal,
-          stateDir: verifyStateDir(),
-        })
-      const blockedIn = (v: { checks: CheckResult[]; pass: boolean }) => v.checks.map(slotBlocked).filter((x): x is SlotBlocked => !!x)
-      // Every failing check never started for lack of its slot: nothing about the work was judged.
-      const onlyStuck = (v: { checks: CheckResult[]; pass: boolean }) =>
-        !v.pass && v.checks.some((c) => !c.pass) && v.checks.every((c) => c.pass || !!slotBlocked(c))
-      let v = await judge()
-      if (onlyStuck(v) && !abort.signal.aborted) {
-        // A check that never started because its slot stayed taken is not the worker's failure:
-        // wait once more for the slot (bounded by the check's timeout again), and say nothing to
-        // the worker unless the work itself failed (NEW-03).
-        v = await judge()
+      if (moved) {
+        // The worker moved the target branch: the rules the gate would read are the worker's own.
+        pass = false
+        text = moved
+      } else {
+        // A worktree's commits are never on the target branch: its rules are horde.json at the tip
+        // the orchestrator observed, including a change the orchestrator committed while the task ran.
+        const directory = live.session?.location.directory ?? live.record.directory
+        const judge = () =>
+          runGate(directory, {
+            base: start ?? cfg.base,
+            rulesAt: wt ? recorded : undefined,
+            audit: cfg.audit,
+            // Only an unaudited shared gate may use the human's working config; a worktree gate
+            // judges by the target branch's rules, which the work itself cannot rewrite.
+            settingsFrom: !wt && !cfg.audit ? "working" : "base",
+            checks: cfg.checks,
+            allowed: cfg.allowed,
+            related: cfg.related !== false,
+            stage: "work",
+            env: wt ? { HORDE_TASK: live.record.task?.id ?? live.record.name ?? live.record.id, HORDE_WORKTREE: wt.root } : undefined,
+            baseline: wt && start ? this.baselineFor(wt.repo, start, `${start.slice(0, 8)} where the task started`) : undefined,
+            signal: abort.signal,
+            stateDir: verifyStateDir(),
+          })
+        const blockedIn = (v: { checks: CheckResult[]; pass: boolean }) => v.checks.map(slotBlocked).filter((x): x is SlotBlocked => !!x)
+        // Every failing check never started for lack of its slot: nothing about the work was judged.
+        const onlyStuck = (v: { checks: CheckResult[]; pass: boolean }) =>
+          !v.pass && v.checks.some((c) => !c.pass) && v.checks.every((c) => c.pass || !!slotBlocked(c))
+        let v = await judge()
+        if (onlyStuck(v) && !abort.signal.aborted) {
+          // A check that never started because its slot stayed taken is not the worker's failure:
+          // wait once more for the slot (bounded by the check's timeout again), and say nothing to
+          // the worker unless the work itself failed (NEW-03).
+          v = await judge()
+        }
+        pass = v.pass
+        text = v.text
+        checks = v.checks.map(gateCheck)
+        stuck = onlyStuck(v) ? blockedIn(v) : []
+        if (!pass && stuck.length) text = await slotFailureText(stuck, directory)
       }
-      pass = v.pass
-      text = v.text
-      checks = v.checks.map(gateCheck)
-      stuck = onlyStuck(v) ? blockedIn(v) : []
-      if (!pass && stuck.length) text = await slotFailureText(stuck, directory)
     } catch (err) {
       stuck = []
       text = `the gate could not run: ${(err as Error).message}`
@@ -2292,7 +2413,7 @@ export class Fleet {
     if (live.sent || live.sending || live.track.lastPromptedSeq > promptBefore || currentTurn(live.track)?.startSeq !== turn) return
     // A round whose check never started judges nothing about the worker, so it does not count.
     const blocked = !pass && stuck.length > 0
-    const final = blocked || pass || round >= cfg.maxRounds || text.startsWith("the gate could not run") || !!review?.error
+    const final = blocked || pass || round >= cfg.maxRounds || text.startsWith("the gate could not run") || !!review?.error || !!moved
     const storedRound = blocked ? (live.record.gateState?.round ?? 0) : round
     this.updateRecord(id, { gateState: { round: storedRound, verdict: { turn, pass, final, text, at: Date.now(), checks, review } } })
     // A hook reads the news file; a verdict must show there at once, not at the next refresh.
@@ -3322,7 +3443,18 @@ export class Fleet {
 }
 
 export type LandResult =
-  | { landed: true; target: string; commits: number; checks: GateCheckSummary[]; branchKept?: string; already?: true; resolved?: number }
+  | {
+      landed: true
+      target: string
+      commits: number
+      checks: GateCheckSummary[]
+      branchKept?: string
+      /** "patch": patch-identical (cherry-picked); "tree": the work's tree is already there (squash-merged). */
+      already?: "patch" | "tree"
+      resolved?: number
+      /** Commits that became empty on the target (squash-merged work) and were dropped before landing. */
+      emptied?: { dropped: number; total: number }
+    }
   | {
       landed: false
       target: string
@@ -3331,9 +3463,10 @@ export type LandResult =
        * still has uncommitted changes in a repository whose hook would judge the commit; land:
        * horde.json "workers.land" failed or its commit was refused by the repository's hooks;
        * already: some of the task's commits are already on the target, so landing would replay
-       * them as empty commits.
+       * them as empty commits; moved: the worker moved the target branch onto its own branch;
+       * dirty: a check modified tracked files, so the tree that would land is not the one judged.
        */
-      why: "conflict" | "checks" | "uncommitted" | "message" | "leftovers" | "land" | "already"
+      why: "conflict" | "checks" | "uncommitted" | "message" | "leftovers" | "land" | "already" | "moved" | "dirty"
       text: string
       checks?: GateCheckSummary[]
       /** why "message": the hook that refused it. */

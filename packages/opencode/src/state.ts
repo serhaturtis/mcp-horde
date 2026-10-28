@@ -106,6 +106,13 @@ export interface AgentRecord {
   pauseAfterStep?: boolean
   gate?: GateConfig
   gateState?: GateState
+  /**
+   * The target branch's tip as the orchestrator's own process observed it (at spawn, after a
+   * landing conflict's rebase, and at each caller call). The gate and the landing judge by this
+   * commit, never by a ref a worker can move (`git update-ref` from its worktree shares refs with
+   * the checkout).
+   */
+  observedTip?: string
   /** Paths its edits are confined to (enforced by its profile). */
   scope?: { paths: string[]; outside?: "deny" | "ask" }
   /** The board task this agent works (opencode_spawn task). */

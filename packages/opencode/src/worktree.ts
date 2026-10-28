@@ -3,7 +3,7 @@ import { constants, type Dirent, existsSync } from "node:fs"
 import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
-import { branchSlug, GIT_ENV, git, gitRaw, globMatcher, loadWorkers, repoKey, runCommand, splitZ, type Workers } from "@mcp-horde/core"
+import { branchSlug, GIT_ENV, git, gitRaw, globMatcher, loadWorkers, repoKey, runCommand, splitZ, validateHordeFile, type Workers } from "@mcp-horde/core"
 import { loadSettingsAt } from "@mcp-horde/verify"
 
 const isWindows = process.platform === "win32"
@@ -37,6 +37,56 @@ export interface Worktree {
 /** Where the agent's not-yet-merged work starts. */
 export function workStart(wt: Worktree): string {
   return wt.merged ?? wt.baseline ?? wt.base
+}
+
+/** The `workers` section of a parsed horde.json, validated like core's loadWorkers; unset fields keep their defaults. */
+function parseWorkers(data: Record<string, unknown>, file: string): Workers {
+  const raw = data.workers
+  if (raw === undefined) return {}
+  const where = `${file}: "workers"`
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error(`${where} must be an object { "link"?: [...], "setup"?: "…", "brief"?: [...] }`)
+  const { link, setup, brief, land } = raw as Workers
+  if (link !== undefined && (!Array.isArray(link) || link.some((l) => typeof l !== "string"))) throw new Error(`${where}.link must be an array of paths`)
+  if (setup !== undefined && typeof setup !== "string") throw new Error(`${where}.setup must be a command string`)
+  if (brief !== undefined && (!Array.isArray(brief) || brief.some((f) => typeof f !== "string"))) throw new Error(`${where}.brief must be an array of paths`)
+  if (land !== undefined && typeof land !== "string") {
+    if (!land || typeof land !== "object" || Array.isArray(land) || typeof (land as { command?: unknown }).command !== "string")
+      throw new Error(`${where}.land must be a command string or { "command": "…", "message"?: "…" }`)
+    if ((land as { message?: unknown }).message !== undefined && typeof (land as { message?: unknown }).message !== "string")
+      throw new Error(`${where}.land.message must be a string`)
+  }
+  return { ...(link ? { link } : {}), ...(setup ? { setup } : {}), ...(brief ? { brief } : {}), ...(land ? { land } : {}) }
+}
+
+/**
+ * `workers` as horde.json had them at `commit`, the mirror of loadSettingsAt for the section the
+ * orchestrator executes (worktree setup, the land command). The same file loadWorkers would find
+ * is looked up in that commit; when none existed there, no workers apply: a working-tree horde.json
+ * is the work's own change, not a command the orchestrator runs.
+ */
+export async function loadWorkersAt(directory: string, commit: string): Promise<Workers> {
+  const top = await git(directory, "rev-parse", "--show-toplevel").catch(() => undefined)
+  if (!top) return loadWorkers(directory)
+  const realTop = await fs.realpath(top).catch(() => top)
+  for (let dir = await fs.realpath(directory).catch(() => path.resolve(directory)); ; dir = path.dirname(dir)) {
+    const rel = path.relative(realTop, dir).replace(/\\/g, "/")
+    if (rel.startsWith("..") || path.isAbsolute(rel)) break
+    const file = rel ? `${rel}/horde.json` : "horde.json"
+    const text = await gitRaw(realTop, ["show", `${commit}:${file}`]).catch(() => undefined)
+    if (text !== undefined) {
+      let data: unknown
+      try {
+        data = JSON.parse(text)
+      } catch (err) {
+        throw new Error(`${file} at ${commit} is not valid JSON: ${(err as Error).message}`)
+      }
+      if (!data || typeof data !== "object" || Array.isArray(data)) throw new Error(`${file} at ${commit} must contain a JSON object`)
+      validateHordeFile(data as Record<string, unknown>, `${file} at ${commit}`)
+      return parseWorkers(data as Record<string, unknown>, `${file} at ${commit}`)
+    }
+    if (!rel) break
+  }
+  return {}
 }
 
 export interface WorktreeOptions {
@@ -762,6 +812,12 @@ interface RebaseOptions {
   generated?: string[]
   /** Whether horde.json names a workers.land command to regenerate the generated files. */
   land?: boolean
+  /**
+   * What to do with commits that become empty while replaying: "keep" (the default, for a sync,
+   * where every original commit must have a replay so the baseline is the first one) or "drop"
+   * (landing, where a squash-merged task's commits are already on the target and must not land).
+   */
+  empty?: "keep" | "drop"
 }
 
 /**
@@ -799,10 +855,23 @@ async function rebaseOntoTip(
   }
   let resolved = 0
   try {
-    // Reapply commits even when the target already has the same patch, and keep the ones that
-    // become empty. Every original commit then has a replay, so the baseline is the first one;
-    // no commit message or count can be spoofed.
-    await git(wt.root, ...NO_SIGN, ...identity, "-c", "core.editor=true", "rebase", "--empty=keep", "--reapply-cherry-picks", "--onto", tip, start, wt.branch)
+    // Reapply commits even when the target already has the same patch. A sync keeps the ones that
+    // become empty (every original commit then has a replay, so the baseline is the first one); a
+    // landing drops them (a squash-merged task is already on the target and must not land).
+    await git(
+      wt.root,
+      ...NO_SIGN,
+      ...identity,
+      "-c",
+      "core.editor=true",
+      "rebase",
+      `--empty=${opts.empty ?? "keep"}`,
+      "--reapply-cherry-picks",
+      "--onto",
+      tip,
+      start,
+      wt.branch,
+    )
   } catch (err) {
     // The rebase stopped on a conflict. Resolve generated-only conflicts in the target's favour,
     // then carry on; `--continue` stops again at the next conflict, so loop until it finishes.
@@ -892,7 +961,11 @@ export async function syncWorktree(wt: Worktree, name: string): Promise<{ text: 
  * checks judge exactly the tree that will land. The user's carried-over changes stay
  * uncommitted in their checkout. On a conflict the worktree is unchanged.
  */
-export async function landSync(wt: Worktree, name: string): Promise<{ text: string; worktree?: Worktree; leftover?: boolean; resolved?: number }> {
+export async function landSync(
+  wt: Worktree,
+  name: string,
+  rulesAt = "HEAD",
+): Promise<{ text: string; worktree?: Worktree; leftover?: boolean; resolved?: number; already?: boolean; emptied?: { dropped: number; total: number } }> {
   const notes: string[] = []
   const committed = await commitAll(wt, `horde: work from ${name}`)
   if (committed) notes.push(committed)
@@ -904,15 +977,45 @@ export async function landSync(wt: Worktree, name: string): Promise<{ text: stri
   const start = workStart(wt)
   if (start === tip)
     return { text: [...notes, `${wt.branch} is already on ${target} (${tip.slice(0, 10)}); nothing to rebase`].join("\n"), leftover: !!committed }
-  // A conflict confined to generated paths is resolved in the target's favour: workers.land regenerates them.
-  const settings = await loadSettingsAt(wt.repo, "HEAD")
-  const land = loadWorkers(wt.repo).land
-  const { commits: replayed, resolved } = await rebaseOntoTip(wt, target, tip, start, { generated: settings.audit.generated, land: !!land })
+  // The generated-file conflict rules and the land command come from the observed tip's horde.json
+  // (`rulesAt`), never the worktree's on-disk file, which a worker can rewrite.
+  const settings = await loadSettingsAt(wt.repo, rulesAt)
+  const land = (await loadWorkersAt(wt.repo, rulesAt)).land
+  // The task's own commits replayed. `--empty=drop` means a squash-merged task's commits, already
+  // on the target, disappear instead of landing as empties; the survivors are what lands.
+  const total = Number((await git(wt.root, "rev-list", "--count", `${start}..HEAD`)).trim())
+  const { commits: replayed, resolved } = await rebaseOntoTip(wt, target, tip, start, {
+    generated: settings.audit.generated,
+    land: !!land,
+    empty: "drop",
+  })
+  // When nothing is left and the tree is exactly the tip's, the work is already on the branch.
+  if (
+    await git(wt.root, "diff", "--quiet", tip, "HEAD").then(
+      () => true,
+      () => false,
+    )
+  ) {
+    return {
+      text: [...notes, `${wt.branch}'s commits are already in ${target} (${tip.slice(0, 10)}); nothing to land`].join("\n"),
+      already: true,
+      leftover: !!committed,
+    }
+  }
+  const surviving = replayed.length
+  const emptied = total > surviving ? { dropped: total - surviving, total } : undefined
+  if (emptied) notes.push(`${emptied.dropped} of ${emptied.total} commits became empty on ${target}`)
   if (resolved) notes.push(`resolved ${resolved} conflict(s) in generated files with ${target}'s version; the land step regenerated them`)
   notes.push(
-    `rebased ${replayed.length} commit(s) of ${wt.branch} onto ${target} (${tip.slice(0, 10)})${wt.baseline ? "; the carried-over changes stay in your checkout" : ""}`,
+    `rebased ${surviving} commit(s) of ${wt.branch} onto ${target} (${tip.slice(0, 10)})${wt.baseline ? "; the carried-over changes stay in your checkout" : ""}`,
   )
-  return { text: notes.join("\n"), worktree: { ...wt, base: tip, baseline: undefined, merged: undefined }, leftover: !!committed, resolved }
+  return {
+    text: notes.join("\n"),
+    worktree: { ...wt, base: tip, baseline: undefined, merged: undefined },
+    leftover: !!committed,
+    resolved,
+    emptied,
+  }
 }
 
 /**

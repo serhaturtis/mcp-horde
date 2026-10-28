@@ -630,6 +630,52 @@ describe("gate", () => {
       v.blockers.join("\n"),
     )
   })
+
+  test("gate honours rulesAt without a base: the commit's horde.json, not the working tree's", async () => {
+    const { root, base } = repo({
+      "horde.json": JSON.stringify({ verify: { checks: { test: `node -e "process.exit(1)"` } } }),
+    })
+    // The worker loosens the working-tree horde.json; the gate must still read the commit's.
+    write(root, { "horde.json": JSON.stringify({ verify: { checks: { test: "true" } } }) })
+    const v = await gate(root, { rulesAt: base, stage: "land", audit: false, related: false, stateDir: tmp() })
+    assert.equal(v.pass, false, v.text)
+    assert.match(v.text, /✗ test · exit 1/, "the commit's check ran, not the worker's replacement")
+  })
+
+  test("gate honours rulesAt for the detected checks too: the commit's manifest, not the working tree's", async () => {
+    const { root, base } = repo({
+      "package.json": JSON.stringify({ scripts: { test: `node -e "process.exit(1)"` } }),
+    })
+    // The worker rewrites the working-tree manifest; detection must read the commit's.
+    write(root, { "package.json": JSON.stringify({ scripts: {} }) })
+    const settings = await loadSettingsAt(root, base)
+    const checks = await detectChecks(root, settings, base)
+    assert.deepEqual(
+      checks.map((c) => c.name),
+      ["test"],
+      "the commit's script names the check",
+    )
+    const v = await gate(root, { rulesAt: base, stage: "land", audit: false, related: false, stateDir: tmp() })
+    assert.equal(v.pass, false, v.text)
+    assert.match(v.text, /✗ test · exit 1/, "the check ran from the commit's manifest")
+  })
+
+  test("detectChecks lists nested modules from the commit's tree, not the working tree's", async () => {
+    const { root, base } = repo({ "go.mod": "module x\n", "svc/go.mod": "module y\n", "svc/a.go": "package a\n" })
+    // The worker deletes the nested module from the working tree; the commit still has it.
+    fs.rmSync(path.join(root, "svc", "go.mod"))
+    assert.deepEqual(
+      (await detectChecks(root)).map((c) => c.name),
+      ["vet", "test"],
+      "the working tree has one module",
+    )
+    const settings = await loadSettingsAt(root, base)
+    assert.deepEqual(
+      (await detectChecks(root, settings, base)).map((c) => c.name),
+      ["vet", "vet:svc", "test", "test:svc"],
+      "the commit has both modules",
+    )
+  })
 })
 
 describe("baseline", () => {

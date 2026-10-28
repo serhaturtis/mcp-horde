@@ -309,11 +309,12 @@ export async function gate(directory: string, opts: GateOptions = {}): Promise<V
   // The diff starts where HEAD meets base; the rules come from rulesAt (base by default), a
   // commit on the target branch, so the work cannot rewrite them.
   const base = opts.base ? await diffBase(await git(dir, "rev-parse", "--show-toplevel"), opts.base) : undefined
-  // In a worktree the rules are the target branch's, so the work cannot rewrite them; a caller
-  // may name a later commit there to include a rule change made while the work ran. In a shared
-  // directory the human's working horde.json is the configuration; the caller must say so.
-  const settings = base && opts.settingsFrom !== "working" ? await loadSettingsAt(dir, opts.rulesAt ?? base) : loadSettings(dir)
-  const all = await detectChecks(dir, settings)
+  // The rules come from rulesAt when the caller names the commit the work will land on (a land
+  // gate has no base), else from base (a worktree gate); in a shared directory the human's working
+  // horde.json is the configuration, and the caller says so with settingsFrom "working".
+  const rulesCommit = opts.rulesAt ?? (base && opts.settingsFrom !== "working" ? base : undefined)
+  const settings = rulesCommit ? await loadSettingsAt(dir, rulesCommit) : loadSettings(dir)
+  const all = await detectChecks(dir, settings, rulesCommit)
   const selected = opts.checks?.length ? pick(all, opts.checks) : all
   const doAudit = opts.audit !== false && !!base
   const budget = opts.budgetChars ?? 1500

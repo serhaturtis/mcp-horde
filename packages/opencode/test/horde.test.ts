@@ -1313,6 +1313,170 @@ console.log("1..0")
     assert.equal((await Board.open(r, boardState())).task(id).tier, 0)
     await h.call("horde_drop", { id })
   })
+
+  test("landing runs the committed workers.land, not an uncommitted edit in the checkout", async () => {
+    const { repo: r } = makeRepo(mock.url)
+    fs.writeFileSync(
+      path.join(r, "horde.json"),
+      JSON.stringify({
+        verify: { checks: { test: "true" } },
+        workers: { land: `node -e "require('fs').writeFileSync('generated.txt','committed')"` },
+        tiers: ["mock/mock", "mock/pricey"],
+      }),
+    )
+    git(r, "add", "horde.json")
+    git(r, "commit", "-qm", "checks")
+    // The orchestrator edits the checkout's working horde.json without committing it: only the
+    // commit the work lands on is the rules, so the committed command must run.
+    fs.writeFileSync(
+      path.join(r, "horde.json"),
+      JSON.stringify({
+        verify: { checks: { test: "true" } },
+        workers: { land: `node -e "require('fs').writeFileSync('generated.txt','working')"` },
+        tiers: ["mock/mock", "mock/pricey"],
+      }),
+    )
+    const id = idOf(
+      await h.call("horde_do", {
+        directory: r,
+        goal: "Write worker.txt.\nRUN: echo ok > worker.txt && git add worker.txt && git commit -qm worker",
+        done: ["worker.txt exists"],
+        scope: ["worker.txt"],
+      }),
+    )
+    await settle(id)
+    const landed = await h.call("horde_land", { id })
+    assert.match(landed, new RegExp(`^landed ${id} on master:`), landed)
+    assert.equal(fs.readFileSync(path.join(r, "generated.txt"), "utf8").trim(), "committed", "the committed workers.land ran, not the working edit")
+  })
+
+  test("a worker that moves the target branch onto its own commit is refused", async () => {
+    const { repo: r } = makeRepo(mock.url)
+    fs.writeFileSync(path.join(r, "horde.json"), JSON.stringify({ verify: { checks: { test: "true" } }, tiers: ["mock/mock", "mock/pricey"] }))
+    git(r, "add", "horde.json")
+    git(r, "commit", "-qm", "checks")
+    const started = await h.call("horde_do", {
+      directory: r,
+      goal: [
+        "Write the file.",
+        "RUN: echo ok > moved.txt && git add moved.txt && git commit -qm moved",
+        // The worker commits a loosened horde.json and points the target branch at it: the rules
+        // it would have the gate read are its own.
+        `RUN: node -e "require('fs').writeFileSync('horde.json', JSON.stringify({verify:{checks:{test:'true'}},audit:{off:['scope','tests','secrets','binaries']}}))" && git add horde.json && git commit -qm loosen`,
+        "RUN: git update-ref refs/heads/master $(git rev-parse HEAD)",
+      ].join("\n"),
+      done: ["moved.txt exists"],
+      scope: ["moved.txt"],
+    })
+    const id = idOf(started)
+    const out = await settle(id)
+    assert.match(out, new RegExp(`^${id} FAILED`), out)
+    assert.match(out, /the target branch's tip is on the worker's branch; the worker moved it/, out)
+    // The landing refuses too, rather than "not ready to land".
+    const refused = await h.call("horde_land", { id })
+    assert.match(refused, /^not landed: the target branch's tip is on the worker's branch; the worker moved it/, refused)
+    await h.call("opencode_dispose", { id, worktree: "discard" })
+  })
+
+  test("work already squash-merged onto master is recognised and closed without empty commits", async () => {
+    const { repo: r } = makeRepo(mock.url)
+    fs.writeFileSync(path.join(r, "horde.json"), JSON.stringify({ verify: { checks: { test: "true" } }, tiers: ["mock/mock", "mock/pricey"] }))
+    git(r, "add", "horde.json")
+    git(r, "commit", "-qm", "checks")
+    const started = await h.call("horde_do", {
+      directory: r,
+      // Two commits: the squash's patch-id matches neither, so only the tree comparison sees it.
+      goal: "Write two files.\nRUN: echo one > one.txt && git add one.txt && git commit -qm one\nRUN: echo two > two.txt && git add two.txt && git commit -qm two",
+      done: ["one.txt and two.txt exist"],
+      scope: ["one.txt", "two.txt"],
+    })
+    const id = idOf(started)
+    const branch = started.match(/worktree (horde\/[\w-]+)/)![1]!
+    await settle(id)
+    const before = git(r, "rev-parse", "HEAD")
+    // The orchestrator squash-merges the worker's branch by hand.
+    git(r, "merge", "--squash", branch)
+    git(r, "commit", "-qm", "squash merge")
+    assert.equal(git(r, "rev-list", "--count", `${before}..HEAD`), "1", "master now has the worker's change")
+    const landed = await h.call("horde_land", { id })
+    assert.match(landed, new RegExp(`^${id}'s 2 commit\\(s\\) are already on master \\(the work's tree is already there\\): nothing to land`), landed)
+    assert.equal(git(r, "rev-list", "--count", `${before}..HEAD`), "1", "no empty commit was added on top of the squash merge")
+    assert.equal(git(r, "branch", "--list", "horde/*"), "", "the branch is gone")
+  })
+
+  test("a partly squash-merged task drops the commits that became empty and lands the rest", async () => {
+    const { repo: r } = makeRepo(mock.url)
+    fs.writeFileSync(path.join(r, "horde.json"), JSON.stringify({ verify: { checks: { test: "true" } }, tiers: ["mock/mock", "mock/pricey"] }))
+    git(r, "add", "horde.json")
+    git(r, "commit", "-qm", "checks")
+    const started = await h.call("horde_do", {
+      directory: r,
+      goal: "Write two files.\nRUN: echo a > a.txt && git add a.txt && git commit -qm a\nRUN: echo b > b.txt && git add b.txt && git commit -qm b",
+      done: ["a.txt and b.txt exist"],
+      scope: ["a.txt", "b.txt"],
+    })
+    const id = idOf(started)
+    await settle(id)
+    // Master gets a.txt through a different commit (a.txt + c.txt), so the worker's a.txt commit
+    // replays empty while b.txt lands.
+    fs.writeFileSync(path.join(r, "a.txt"), "a\n")
+    fs.writeFileSync(path.join(r, "c.txt"), "c\n")
+    git(r, "add", "a.txt", "c.txt")
+    git(r, "commit", "-qm", "master a and c")
+    const landed = await h.call("horde_land", { id })
+    assert.match(landed, new RegExp(`^landed ${id} on master: 1 commit\\(s\\)`), landed)
+    assert.match(landed, /1 of 2 commits became empty on master/, landed)
+    assert.equal(git(r, "show", "--name-only", "--format=", "HEAD"), "b.txt", "only b.txt landed")
+  })
+
+  test("a check that rewrites a tracked file refuses the fast-forward, naming it", async () => {
+    const { repo: r } = makeRepo(mock.url)
+    fs.writeFileSync(path.join(r, "data.txt"), "stale\n")
+    fs.writeFileSync(
+      path.join(r, "horde.json"),
+      JSON.stringify({
+        verify: { checks: { test: "true", gen: { command: `node -e "require('fs').writeFileSync('data.txt','generated')"`, when: "land" } } },
+        tiers: ["mock/mock", "mock/pricey"],
+      }),
+    )
+    git(r, "add", ".")
+    git(r, "commit", "-qm", "checks")
+    const id = idOf(
+      await h.call("horde_do", {
+        directory: r,
+        goal: "Write worker.txt.\nRUN: echo ok > worker.txt && git add worker.txt && git commit -qm worker",
+        done: ["worker.txt exists"],
+        scope: ["worker.txt"],
+      }),
+    )
+    await settle(id)
+    const before = git(r, "rev-parse", "HEAD")
+    const refused = await h.call("horde_land", { id })
+    assert.match(refused, /not landed: the checks modified tracked files/, refused)
+    assert.match(refused, /data\.txt/, refused)
+    assert.match(refused, /workers\.land/, refused)
+    assert.equal(git(r, "rev-parse", "HEAD"), before, "master did not move")
+    await h.call("horde_drop", { id })
+  })
+
+  test("a task started from a subdirectory is gated at landing by the subdirectory's checks", async () => {
+    const { repo: r } = makeRepo(mock.url)
+    fs.mkdirSync(path.join(r, "api"), { recursive: true })
+    fs.writeFileSync(path.join(r, "api", "package.json"), JSON.stringify({ scripts: { test: "true" } }))
+    git(r, "add", ".")
+    git(r, "commit", "-qm", "api package")
+    const started = await h.call("horde_do", {
+      directory: path.join(r, "api"),
+      goal: "Write api.txt.\nRUN: echo ok > api.txt && git add api.txt && git commit -qm api",
+      done: ["api.txt says ok"],
+    })
+    const id = idOf(started)
+    const ready = await settle(id)
+    assert.match(ready, new RegExp(`^${id} READY`), ready)
+    const landed = await h.call("horde_land", { id })
+    assert.match(landed, new RegExp(`^landed ${id} on master: 1 commit\\(s\\)`), landed)
+    assert.ok(fs.existsSync(path.join(r, "api", "api.txt")), "the subdirectory's work landed")
+  })
 })
 
 describe("the gate review runs outside the worker limit and its failure fails the task", { timeout: 600_000 }, () => {

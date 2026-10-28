@@ -553,14 +553,17 @@ export async function outcome(fleet: Fleet, ref: string, opts: { live?: boolean 
 
 function renderLanding(id: string, r: LandResult): string {
   if (r.landed) {
-    if (r.already)
-      return `${id}'s ${r.commits} commit(s) are already on ${r.target} (patch-identical): nothing to land · task done, worktree and branch removed`
+    if (r.already) {
+      const how = r.already === "tree" ? "the work's tree is already there" : "patch-identical"
+      return `${id}'s ${r.commits} commit(s) are already on ${r.target} (${how}): nothing to land · task done, worktree and branch removed`
+    }
     const kept = r.branchKept ? ` (branch ${r.branchKept} kept: not all of its commits are on ${r.target})` : ""
     const lines = [
       `landed ${id} on ${r.target}: ${r.commits} commit(s) · ${checksLine(r.checks)} on ${r.target}'s tip before updating it · task done, worktree${r.branchKept ? "" : " and branch"} removed${kept}`,
     ]
     for (const c of r.checks) if (c.baseline && !c.baseline.pass) lines.push(`⚠ ${c.name} fails at ${c.baseline.label} too (not caused by this work)`)
     if (r.resolved) lines.push(`resolved ${r.resolved} conflict(s) in generated files with ${r.target}'s version; the land step regenerated them`)
+    if (r.emptied) lines.push(`${r.emptied.dropped} of ${r.emptied.total} commits became empty on ${r.target}`)
     return lines.join("\n")
   }
   if (r.why === "leftovers")
@@ -587,6 +590,8 @@ function renderLanding(id: string, r: LandResult): string {
       `${r.target} is unchanged; the worker is now on top of it.`,
       `→ horde_tell {id: "${id}", message: "<what to fix>"} (it is checked again; then horde_land again) · horde_drop {id: "${id}"}`,
     ].join("\n")
+  if (r.why === "moved") return [`not landed: ${r.text}`, `→ horde_drop {id: "${id}"}`].join("\n")
+  if (r.why === "dirty") return [`not landed: ${r.text}`, `→ horde_drop {id: "${id}"}`].join("\n")
   if (r.why === "already") {
     const { on, total } = r.alreadyOn ?? { on: 0, total: 0 }
     return [

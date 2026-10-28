@@ -182,16 +182,19 @@ const realpath = (p: string) => {
  * The checks for a directory: horde.json's when it defines any, otherwise
  * detected from the manifests of the nearest project root (walking up to the
  * repository root, so an agent in a subdirectory of a monorepo package still
- * finds that package's scripts).
+ * finds that package's scripts). With `commit` (the gate's rulesAt), the
+ * manifests are read from that commit, never the working tree, so a worker
+ * cannot rename the scripts its own gate runs.
  */
-export async function detectChecks(directory: string, settings = loadSettings(directory)): Promise<Check[]> {
+export async function detectChecks(directory: string, settings = loadSettings(directory), commit?: string): Promise<Check[]> {
   if (settings.checks) return settings.checks
   const top = await git(directory, "rev-parse", "--show-toplevel").catch(() => undefined)
   // Real paths on both sides: a symlinked or 8.3-named directory must still meet the top.
   const stop = top ? realpath(top) : undefined
+  const ctx = detectCtx(stop, commit)
   let dir = realpath(directory)
   for (;;) {
-    const found = detectIn(dir, stop)
+    const found = await detectIn(dir, stop, ctx)
     if (found.length) return found.sort((a, b) => ORDER[a.kind] - ORDER[b.kind])
     if (isTop(dir, stop)) return []
     dir = path.dirname(dir)
@@ -212,20 +215,19 @@ export function checkScripts(checks: Check[]): string[] {
 const PLACEHOLDER_TEST = /no test specified/
 
 /** The package manager: `packageManager` in package.json, else the nearest lockfile, up to the repository root. */
-function packageManager(dir: string, stop: string | undefined): string {
+async function packageManager(dir: string, stop: string | undefined, ctx: DetectCtx): Promise<string> {
   for (let d = dir; ; d = path.dirname(d)) {
-    const has = (f: string) => fs.existsSync(path.join(d, f))
     try {
-      const pm = (JSON.parse(fs.readFileSync(path.join(d, "package.json"), "utf8")) as { packageManager?: unknown }).packageManager
+      const pm = (JSON.parse(await ctx.read(d, "package.json")) as { packageManager?: unknown }).packageManager
       const name = typeof pm === "string" ? pm.match(/^(npm|pnpm|yarn|bun)@/)?.[1] : undefined
       if (name) return name
     } catch {
       // No (readable) package.json here.
     }
-    if (has("pnpm-lock.yaml") || has("pnpm-workspace.yaml")) return "pnpm"
-    if (has("yarn.lock")) return "yarn"
-    if (has("bun.lockb") || has("bun.lock")) return "bun"
-    if (has("package-lock.json") || has("npm-shrinkwrap.json")) return "npm"
+    if ((await ctx.has(d, "pnpm-lock.yaml")) || (await ctx.has(d, "pnpm-workspace.yaml"))) return "pnpm"
+    if (await ctx.has(d, "yarn.lock")) return "yarn"
+    if ((await ctx.has(d, "bun.lockb")) || (await ctx.has(d, "bun.lock"))) return "bun"
+    if ((await ctx.has(d, "package-lock.json")) || (await ctx.has(d, "npm-shrinkwrap.json"))) return "npm"
     if (isTop(d, stop)) return "npm"
   }
 }
@@ -262,6 +264,67 @@ function findFiles(root: string, match: (name: string) => boolean, opts: { depth
   return out
 }
 
+/** The manifests detection consults, read from the working tree or from a commit (the gate's rulesAt). */
+interface DetectCtx {
+  has(dir: string, file: string): Promise<boolean>
+  read(dir: string, file: string): Promise<string>
+  /** Files under `dir` (relative to it) whose name matches, skipping dependency and hidden directories. */
+  find(dir: string, match: (name: string) => boolean, opts?: { depth?: number; limit?: number }): Promise<string[]>
+}
+
+function detectCtx(top: string | undefined, commit?: string): DetectCtx {
+  if (!top || !commit)
+    return {
+      has: async (dir, file) => fs.existsSync(path.join(dir, file)),
+      read: async (dir, file) => {
+        try {
+          return fs.readFileSync(path.join(dir, file), "utf8")
+        } catch {
+          return ""
+        }
+      },
+      find: async (dir, match, opts = {}) => findFiles(dir, match, opts),
+    }
+  // `git show <commit>:<rel>` for a file, `git ls-tree` for a listing, so a worker's rewrite of a
+  // manifest never changes what the gate detects.
+  const rel = (dir: string, file: string) => path.relative(top, path.join(dir, file)).replace(/\\/g, "/")
+  const inside = (p: string) => p !== "" && !p.startsWith("..") && !path.isAbsolute(p)
+  return {
+    has: async (dir, file) => {
+      const p = rel(dir, file)
+      return inside(p)
+        ? gitRaw(top, ["show", `${commit}:${p}`]).then(
+            () => true,
+            () => false,
+          )
+        : false
+    },
+    read: async (dir, file) => {
+      const p = rel(dir, file)
+      return inside(p) ? gitRaw(top, ["show", `${commit}:${p}`]).catch(() => "") : ""
+    },
+    find: async (dir, match, opts = {}) => {
+      const prefix = path.relative(top, dir).replace(/\\/g, "/")
+      if (prefix.startsWith("..") || path.isAbsolute(prefix)) return []
+      const args = ["ls-tree", "-r", "--name-only", commit]
+      if (prefix) args.push(prefix)
+      const listing = await gitRaw(top, args).catch(() => "")
+      const limit = opts.limit ?? 100
+      const depth = opts.depth ?? 4
+      const out: string[] = []
+      for (const p of listing.split("\n")) {
+        const relp = prefix ? p.slice(prefix.length + 1) : p
+        if (!relp) continue
+        const parts = relp.split("/")
+        if (parts.length - 1 > depth || parts.some((s) => s.startsWith(".") || SKIP_DIRS.has(s))) continue
+        if (match(path.posix.basename(p))) out.push(relp)
+        if (out.length >= limit) break
+      }
+      return out
+    },
+  }
+}
+
 /** Module directories a go.work uses (`use ./a` and `use ( ./a ./b )`). */
 function goWorkUses(text: string): string[] {
   const body = text.replace(/\/\/.*$/gm, "")
@@ -270,28 +333,22 @@ function goWorkUses(text: string): string[] {
   return uses.map((u) => u.replace(/^"|"$/g, ""))
 }
 
-function detectIn(dir: string, stop: string | undefined): Check[] {
+async function detectIn(dir: string, stop: string | undefined, ctx: DetectCtx): Promise<Check[]> {
   const out: Check[] = []
-  const has = (f: string) => fs.existsSync(path.join(dir, f))
-  const read = (f: string) => {
-    try {
-      return fs.readFileSync(path.join(dir, f), "utf8")
-    } catch {
-      return ""
-    }
-  }
+  const has = (f: string) => ctx.has(dir, f)
+  const read = (f: string) => ctx.read(dir, f)
   const add = (name: string, command: string, kind: CheckKind, source: string, extra: Partial<Check> = {}) =>
     out.push({ name, command, kind, cwd: dir, source, ...extra })
 
   // JavaScript / TypeScript
-  if (has("package.json")) {
+  if (await has("package.json")) {
     let scripts: Record<string, string> = {}
     try {
-      scripts = (JSON.parse(read("package.json")) as { scripts?: Record<string, string> }).scripts ?? {}
+      scripts = (JSON.parse(await read("package.json")) as { scripts?: Record<string, string> }).scripts ?? {}
     } catch {
       // A broken package.json is the project's problem; detect the rest.
     }
-    const pm = packageManager(dir, stop)
+    const pm = await packageManager(dir, stop, ctx)
     const run = (s: string) => (pm === "npm" ? (s === "test" ? "npm test" : `npm run ${s}`) : `${pm} run ${s}`)
     const typecheck = ["typecheck", "type-check", "check-types", "tsc"].find((s) => scripts[s])
     if (typecheck) add("typecheck", run(typecheck), "typecheck", `package.json scripts.${typecheck}`)
@@ -302,14 +359,15 @@ function detectIn(dir: string, stop: string | undefined): Check[] {
   }
 
   // Python
-  const pyproject = read("pyproject.toml")
-  if (pyproject || has("setup.py") || has("setup.cfg") || has("pytest.ini") || has("tox.ini")) {
-    const venv = [".venv/bin/python", "venv/bin/python", ".venv/Scripts/python.exe"].find(has)
+  const pyproject = await read("pyproject.toml")
+  if (pyproject || (await has("setup.py")) || (await has("setup.cfg")) || (await has("pytest.ini")) || (await has("tox.ini"))) {
+    let venv: string | undefined
+    for (const v of [".venv/bin/python", "venv/bin/python", ".venv/Scripts/python.exe"]) if (await has(v)) venv = v
     // The project's own environment manager when it has a lockfile for one (and it is installed).
     const py =
-      has("uv.lock") && onPath("uv")
+      (await has("uv.lock")) && onPath("uv")
         ? "uv run python"
-        : has("poetry.lock") && onPath("poetry")
+        : (await has("poetry.lock")) && onPath("poetry")
           ? "poetry run python"
           : venv
             ? `"${path.join(dir, venv)}"`
@@ -317,47 +375,47 @@ function detectIn(dir: string, stop: string | undefined): Check[] {
               ? "python"
               : "python3"
     // The project's code, not whatever an inherited PYTHONPATH or activated virtualenv points at.
-    const env = { PYTHONPATH: [...(has("src") ? [path.join(dir, "src")] : []), dir].join(path.delimiter) }
+    const env = { PYTHONPATH: [...((await has("src")) ? [path.join(dir, "src")] : []), dir].join(path.delimiter) }
     const pyCheck = { env, stripEnv: ["VIRTUAL_ENV"] }
-    if (/\[tool\.mypy\]/.test(pyproject) || has("mypy.ini")) add("typecheck", `${py} -m mypy .`, "typecheck", "mypy config", pyCheck)
-    if (/\[tool\.ruff/.test(pyproject) || has("ruff.toml") || has(".ruff.toml")) add("lint", `${py} -m ruff check .`, "lint", "ruff config", pyCheck)
+    if (/\[tool\.mypy\]/.test(pyproject) || (await has("mypy.ini"))) add("typecheck", `${py} -m mypy .`, "typecheck", "mypy config", pyCheck)
+    if (/\[tool\.ruff/.test(pyproject) || (await has("ruff.toml")) || (await has(".ruff.toml")))
+      add("lint", `${py} -m ruff check .`, "lint", "ruff config", pyCheck)
     const configured =
-      /\[tool\.pytest/.test(pyproject) || has("pytest.ini") || /\[tool:pytest\]/.test(read("setup.cfg")) || /^\[pytest\]/m.test(read("tox.ini"))
+      /\[tool\.pytest/.test(pyproject) ||
+      (await has("pytest.ini")) ||
+      /\[tool:pytest\]/.test(await read("setup.cfg")) ||
+      /^\[pytest\]/m.test(await read("tox.ini"))
     // A tests/ directory alone is not a pytest suite (it may hold fixtures for another runner).
-    if (configured || has("conftest.py") || findFiles(dir, (n) => /^test_.+\.py$|.+_test\.py$/.test(n), { limit: 1 }).length) {
+    if (configured || (await has("conftest.py")) || (await ctx.find(dir, (n) => /^test_.+\.py$|.+_test\.py$/.test(n), { limit: 1 })).length) {
       add("test", `${py} -m pytest -q`, "test", "pytest", pyCheck)
     }
   }
 
   // Rust
-  if (has("Cargo.toml")) {
-    const workspace = /^\[workspace\]/m.test(read("Cargo.toml"))
+  if (await has("Cargo.toml")) {
+    const workspace = /^\[workspace\]/m.test(await read("Cargo.toml"))
     add("test", `cargo test${workspace ? " --workspace" : ""} --color never`, "test", workspace ? "Cargo.toml [workspace]" : "Cargo.toml")
   }
 
   // Go: `./...` stops at nested modules, so each module (a go.work's, or every go.mod below this one) gets its own checks.
-  if (has("go.work") || has("go.mod")) {
-    const modules = has("go.work")
-      ? goWorkUses(read("go.work"))
-      : [
-          ".",
-          ...findFiles(dir, (n) => n === "go.mod", { depth: 6 })
-            .map((f) => path.posix.dirname(f))
-            .filter((d) => d !== "."),
-        ]
+  const hasGoWork = await has("go.work")
+  if (hasGoWork || (await has("go.mod"))) {
+    const modules = hasGoWork
+      ? goWorkUses(await read("go.work"))
+      : [".", ...(await ctx.find(dir, (n) => n === "go.mod", { depth: 6 })).map((f) => path.posix.dirname(f)).filter((d) => d !== ".")]
     for (const m of [...new Set(modules.map((u) => path.posix.normalize(u.replace(/\\/g, "/")).replace(/\/$/, "")))]) {
       const cwd = path.resolve(dir, m)
-      if (!fs.existsSync(path.join(cwd, "go.mod"))) continue
+      if (!(await ctx.has(dir, m === "." ? "go.mod" : `${m}/go.mod`))) continue
       const suffix = m === "." ? "" : `:${m}`
-      const source = m === "." ? "go.mod" : has("go.work") ? `go.work (${m})` : `${m}/go.mod`
+      const source = m === "." ? "go.mod" : hasGoWork ? `go.work (${m})` : `${m}/go.mod`
       add(`vet${suffix}`, "go vet ./...", "lint", source, { cwd })
       add(`test${suffix}`, "go test ./...", "test", source, { cwd })
     }
   }
 
   // Make, only when nothing more specific was found.
-  if (!out.length && (has("Makefile") || has("makefile"))) {
-    const mk = read("Makefile") || read("makefile")
+  if (!out.length && ((await has("Makefile")) || (await has("makefile")))) {
+    const mk = (await read("Makefile")) || (await read("makefile"))
     for (const [target, kind] of [
       ["lint", "lint"],
       ["check", "test"],
