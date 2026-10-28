@@ -10,7 +10,7 @@ Checked the deploy path (install.sh line by line and in --dry-run on this machin
 
 ## DEP-01 — Clone-path instructions (`claude mcp add`) omit the ledger server and the hooks
 
-- [ ] *(open)*
+- [x] closed in 919927a — **Executed evidence:** plugins/horde/README.md clone path now lists all five servers and says that path installs no hooks (worker t-3d63's docs commit, reviewed by hand and cherry-picked; git grep confirms the ledger line)
 - **Severity:** medium · **Confidence:** high
 - **Location:** `plugins/horde/README.md:85`
 
@@ -22,7 +22,7 @@ Checked the deploy path (install.sh line by line and in --dry-run on this machin
 
 ## DEP-02 — Example tier `moonshot/kimi-k3` names a provider id the OpenCode catalog does not have (it is `moonshotai`)
 
-- [ ] *(open)*
+- [x] closed in 919927a — **Executed evidence:** git grep moonshot/kimi-k3 outside docs/audits → only a test fixture string in packages/verify/test/verify.test.ts; every documentation example now reads moonshotai/kimi-k3
 - **Severity:** medium · **Confidence:** medium
 - **Location:** `plugins/horde/README.md:33`
 
@@ -34,7 +34,7 @@ Checked the deploy path (install.sh line by line and in --dry-run on this machin
 
 ## DEP-03 — The skill tells the orchestrator about `horde watch`, a command plugin users do not have
 
-- [ ] *(open)*
+- [x] closed in 919927a — **Executed evidence:** the horde skill and DESIGN.md name node <plugin dir>/servers/cli.js watch; the only remaining `horde watch` mentions are the CLI's own source comments
 - **Severity:** low · **Confidence:** high
 - **Location:** `plugins/horde/skills/horde/SKILL.md:45`
 
@@ -46,7 +46,7 @@ Checked the deploy path (install.sh line by line and in --dry-run on this machin
 
 ## DEP-04 — DESIGN.md documents a `parallel: true` verify option that the validator rejects
 
-- [ ] *(open)*
+- [x] closed in 919927a — **Executed evidence:** docs/DESIGN.md no longer documents parallel: true (git grep → no hit outside docs/audits)
 - **Severity:** low · **Confidence:** high
 - **Location:** `docs/DESIGN.md:177`
 
@@ -58,7 +58,7 @@ Checked the deploy path (install.sh line by line and in --dry-run on this machin
 
 ## DEP-05 — DESIGN.md §4.4 lists eight board tools that are not registered anywhere
 
-- [ ] *(open)*
+- [x] closed in 919927a — **Executed evidence:** docs/DESIGN.md §4.4 lists the 14 registered board tools (git grep board_archive → no hit outside docs/audits)
 - **Severity:** low · **Confidence:** high
 - **Location:** `docs/DESIGN.md:209`
 
@@ -70,7 +70,7 @@ Checked the deploy path (install.sh line by line and in --dry-run on this machin
 
 ## DEP-06 — Every documented horde.json example passes the validator; `context.*` and `when: "always"` are known to code but absent from plugin-facing docs
 
-- [ ] *(open)*
+- [x] closed in 919927a — **Executed evidence:** the setup skill's horde.json bullets mention the context section and when: always (plugins/horde/skills/setup/SKILL.md in 919927a)
 - **Severity:** low · **Confidence:** high
 - **Location:** `packages/core/src/config.ts:6`
 
@@ -82,7 +82,7 @@ Checked the deploy path (install.sh line by line and in --dry-run on this machin
 
 ## DEP-07 — Environment variables: 13 server settings documented only in package READMEs that a GitHub install does not carry; no doc says how to set env for plugin MCP servers
 
-- [ ] *(open)*
+- [x] closed in 919927a — **Executed evidence:** plugins/horde/README.md carries the environment variable table and how to set them (919927a)
 - **Severity:** low · **Confidence:** high
 - **Location:** `plugins/horde/README.md:53`
 
@@ -94,7 +94,7 @@ Checked the deploy path (install.sh line by line and in --dry-run on this machin
 
 ## DEP-08 — `--dangerously-load-development-channels` is accepted but hidden; its argument form differs between two READMEs
 
-- [ ] *(open)*
+- [x] closed in 919927a — **Executed evidence:** the channel flag is written as plugin:horde@mcp-horde in README.md, DESIGN.md and packages/opencode/README.md with Claude Code 2.1.312 noted (919927a)
 - **Severity:** low · **Confidence:** low
 - **Location:** `packages/opencode/README.md:134`
 

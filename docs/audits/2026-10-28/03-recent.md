@@ -82,7 +82,7 @@ Re-reviewed the 45 commits since 5a2606d (36 non-rebundle) by reading every diff
 
 ## REC-07 — News reminders stop after /clear or --continue: the server keeps its spawn-time session id
 
-- [ ] *(open)*
+- [x] closed in 0f05cad — **Executed evidence:** plugins/horde/hooks/news.mjs falls back to the news file of a live server whose parent is this Claude Code process when the session id's file is missing (test in news.test.mjs, 33 pass)
 - **Severity:** low · **Confidence:** medium
 - **Location:** `packages/opencode/src/news.ts:35`
 

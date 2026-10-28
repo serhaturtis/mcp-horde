@@ -31,7 +31,7 @@ Ground truth first: `./ci.sh` in full (427 tests, none skipped, exit 0), the pac
   `packages/verify/src/audit.ts:271` — audit.ts:271-339 changes() builds the change list from `git diff --name-status`, `git diff -U0` and `git ls-files --others --exclude-standard`; all three honour the skip-… → [02-gates.md](./02-gates.md#gat-02--)
 - [ ] **GAT-03** [high] Check scripts outside package.json are not rule-guarded: Makefile targets and shell scripts a check runs can be rewritten freely
   `packages/verify/src/audit.ts:518` — ruleChanges (audit.ts:518-594) watches horde.json verify, package.json scripts (+pre/post hooks), RUNNER_CONFIG, conftest.py, CHECK_CONFIG, pyproject/setup.cfg sections o… → [02-gates.md](./02-gates.md#gat-03--)
-- [ ] **SEC-01** [high] Workers get an unconfined shell that OpenCode never prompts for by default, and the plugin's user-facing docs do not say so
+- [x] **SEC-01** (closed 919927a) [high] Workers get an unconfined shell that OpenCode never prompts for by default, and the plugin's user-facing docs do not say so
   `packages/opencode/src/fleet.ts:369` — fleet.ts:363-371 withScope(): the task scope becomes OpenCode `edit` rules only ({"*": outside ?? "deny", <scope>: "allow"}); no `shell` rule is ever added (profileRules … → [05-security.md](./05-security.md#sec-01--)
 - [ ] **SEC-02** [high] The server password and Claude Code's messaging token/socket and session id are inherited by every worker shell (also: live)
   `packages/opencode/src/backend.ts:436` — backend.ts:436 spawnShared: `env: { ...process.env, OPENCODE_SERVER_USERNAME: config.username, OPENCODE_SERVER_PASSWORD: password }`; backend.ts:491 spawnPrivate does the… → [05-security.md](./05-security.md#sec-02--)
@@ -40,27 +40,27 @@ Ground truth first: `./ci.sh` in full (427 tests, none skipped, exit 0), the pac
 
 - [ ] **LIVE-04** [medium] horde_do starts a paid worker on a detached HEAD although only horde_land refuses it (also: boot)
   `packages/opencode/src/horde.ts` — Live probe (scratchpad/audit/live/out/detached/journey.log): `git checkout --detach HEAD` in the sample repo, then horde_do → 't-035f working … worktree horde/t-035f' (16… → [00-live.md](./00-live.md#live-04--)
-- [ ] **LIVE-05** [medium] DESIGN.md §4.2 describes worker-side MCP injection (OPENCODE_CONFIG_CONTENT, HORDE_WORKER_TOOLS) that the source never contained
+- [x] **LIVE-05** (closed 919927a) [medium] DESIGN.md §4.2 describes worker-side MCP injection (OPENCODE_CONFIG_CONTENT, HORDE_WORKER_TOOLS) that the source never contained
   `docs/DESIGN.md:149` — docs/DESIGN.md:149: 'When `opencode` starts the shared or private server it sets `OPENCODE_CONFIG_CONTENT` with `mcp` entries for the worker-side horde servers … (`HORDE_… → [00-live.md](./00-live.md#live-05--)
-- [ ] **LIVE-06** [low] A worker wrote through the shell what the edit rule refused, and only the gate caught it, one round later
+- [x] **LIVE-06** (closed 919927a) [low] A worker wrote through the shell what the edit rule refused, and only the gate caught it, one round later
   `plugins/horde/skills/horde/SKILL.md` — Journey log (scratchpad/audit/live/out/journey/journey.log), task t-42fa: 'refused outside its scope: edit package.json' and, in the same outcome, 'changed 3 file(s): pac… → [00-live.md](./00-live.md#live-06--)
 - [ ] **LIVE-07** [low] Observation: a task that failed its gate twice stays in board state 'review' and holds a lock on a path outside its scope
   `packages/opencode/src/fleet.ts` — Journey log, board_summary after t-42fa FAILED (checks failed after 2 rounds): '3 tasks: 1 done, 1 review, 1 failed · review t-42fa …; locks package.json → t-42fa'. t-42f… → [00-live.md](./00-live.md#live-07--)
-- [ ] **DEP-01** [medium] Clone-path instructions (`claude mcp add`) omit the ledger server and the hooks
+- [x] **DEP-01** (closed 919927a) [medium] Clone-path instructions (`claude mcp add`) omit the ledger server and the hooks
   `plugins/horde/README.md:85` — plugins/horde/README.md:85-88 lists four `claude mcp add` lines: opencode, board, verify, context. plugins/horde/.mcp.json registers five servers: opencode, board, verify… → [01-deploy.md](./01-deploy.md#dep-01--)
-- [ ] **DEP-02** [medium] Example tier `moonshot/kimi-k3` names a provider id the OpenCode catalog does not have (it is `moonshotai`)
+- [x] **DEP-02** (closed 919927a) [medium] Example tier `moonshot/kimi-k3` names a provider id the OpenCode catalog does not have (it is `moonshotai`)
   `plugins/horde/README.md:33` — grep -rn 'moonshot/kimi-k3' → plugins/horde/README.md:33, docs/DESIGN.md:319, packages/board/README.md:70, packages/opencode/README.md:195, packages/ledger/README.md:12,1… → [01-deploy.md](./01-deploy.md#dep-02--)
-- [ ] **DEP-03** [low] The skill tells the orchestrator about `horde watch`, a command plugin users do not have
+- [x] **DEP-03** (closed 919927a) [low] The skill tells the orchestrator about `horde watch`, a command plugin users do not have
   `plugins/horde/skills/horde/SKILL.md:45` — plugins/horde/skills/horde/SKILL.md:45: "`horde watch` in a terminal shows the board live." docs/DESIGN.md:228 and :454 likewise (`horde status`, `horde watch`). `which h… → [01-deploy.md](./01-deploy.md#dep-03--)
-- [ ] **DEP-04** [low] DESIGN.md documents a `parallel: true` verify option that the validator rejects
+- [x] **DEP-04** (closed 919927a) [low] DESIGN.md documents a `parallel: true` verify option that the validator rejects
   `docs/DESIGN.md:177` — docs/DESIGN.md:177: "Checks run sequentially by default (shared `node_modules`, ports); `parallel: true` in config opts in." grep -rn parallel packages/verify/src → no ou… → [01-deploy.md](./01-deploy.md#dep-04--)
-- [ ] **DEP-05** [low] DESIGN.md §4.4 lists eight board tools that are not registered anywhere
+- [x] **DEP-05** (closed 919927a) [low] DESIGN.md §4.4 lists eight board tools that are not registered anywhere
   `docs/DESIGN.md:209` — Names in docs but not in packages/*/src (comm of the two sorted lists): board_archive board_assign board_finding board_lock board_locks board_progress board_report board_… → [01-deploy.md](./01-deploy.md#dep-05--)
-- [ ] **DEP-06** [low] Every documented horde.json example passes the validator; `context.*` and `when: "always"` are known to code but absent from plugin-facing docs
+- [x] **DEP-06** (closed 919927a) [low] Every documented horde.json example passes the validator; `context.*` and `when: "always"` are known to code but absent from plugin-facing docs
   `packages/core/src/config.ts:6` — Run through validateHordeFile from packages/core/src/config.ts: DESIGN.md §5 example → accepted; setup SKILL.md example → accepted; plugin README example → accepted; user… → [01-deploy.md](./01-deploy.md#dep-06--)
-- [ ] **DEP-07** [low] Environment variables: 13 server settings documented only in package READMEs that a GitHub install does not carry; no doc says how to set env for plugin MCP servers
+- [x] **DEP-07** (closed 919927a) [low] Environment variables: 13 server settings documented only in package READMEs that a GitHub install does not carry; no doc says how to set env for plugin MCP servers
   `plugins/horde/README.md:53` — Read in packages/*/src (grep, scratchpad/audit/deploy): HORDE_OPENCODE_{SERVER,URL,BIN,DIRECTORY,PERMISSIONS,MAX_RUNNING,CHANNEL,DIALOG_TIMEOUT,STATE_DIR,WORKTREE_DIR,ALL… → [01-deploy.md](./01-deploy.md#dep-07--)
-- [ ] **DEP-08** [low] `--dangerously-load-development-channels` is accepted but hidden; its argument form differs between two READMEs
+- [x] **DEP-08** (closed 919927a) [low] `--dangerously-load-development-channels` is accepted but hidden; its argument form differs between two READMEs
   `packages/opencode/README.md:134` — claude --help | grep -i 'dangerously|channel' → only --allow-dangerously-skip-permissions and --dangerously-skip-permissions. `claude --dangerously-load-development-chann… → [01-deploy.md](./01-deploy.md#dep-08--)
 - [x] **DEP-09** (closed 9bfba96) [low] bundle-plugin.mjs --check compares only files the fresh build produces and builds from whatever node_modules is present (also: gates)
   `scripts/bundle-plugin.mjs:62` — scripts/bundle-plugin.mjs:62-74: builds into a tmp dir and reports `stale` = files of the tmp build that are missing or byte-different in plugins/horde/servers; it never … → [01-deploy.md](./01-deploy.md#dep-09--)
@@ -94,7 +94,7 @@ Ground truth first: `./ci.sh` in full (427 tests, none skipped, exit 0), the pac
   `packages/opencode/src/fleet.ts:2013` — publishNews() call sites: fleet.ts:1030 (task start), 2266/2279 (maybePush), 2785 (markReported), 3106 (dropLive). maybePush is called only from doRefresh (:2013). The ga… → [03-recent.md](./03-recent.md#rec-05--)
 - [x] **REC-06** (closed 9bfba96) [low] Board test suite fails under the HORDE_* state-dir overrides the project tells auditors and users to use
   `packages/board/test/board.test.ts` — Ran the package's own test command with HORDE_VERIFY_STATE_DIR, HORDE_BOARD_STATE_DIR, HORDE_OPENCODE_STATE_DIR, HORDE_OPENCODE_WORKTREE_DIR, XDG_STATE_HOME, XDG_DATA_HOM… → [03-recent.md](./03-recent.md#rec-06--)
-- [ ] **REC-07** [low] News reminders stop after /clear or --continue: the server keeps its spawn-time session id
+- [x] **REC-07** (closed 0f05cad) [low] News reminders stop after /clear or --continue: the server keeps its spawn-time session id
   `packages/opencode/src/news.ts:35` — news.ts:35 names the file after `process.env.CLAUDE_CODE_SESSION_ID` read once at construction; news.mjs readNews() opens `<stateDir>/news/<input.session_id>.json`. Claud… → [03-recent.md](./03-recent.md#rec-07--)
 - [ ] **BOOT-01** [medium] A shared-server record that answers 'unauthorized' or fails its probe with a non-timeout transport error is forgotten and a second `opencode serve` is spawned; the first keeps running as an orphan that nothing can stop or attach to
   `packages/opencode/src/backend.ts:106` — Live probe P4 (probe-flow.ts): started backend A (pid 3409688) via `opencode_server info`; rewrote server.json with password 'wrong-password'; new server process: `openco… → [04-boot.md](./04-boot.md#boot-01--)
@@ -116,7 +116,7 @@ Ground truth first: `./ci.sh` in full (427 tests, none skipped, exit 0), the pac
   `packages/opencode/src/fleet.ts:2151` — fleet.ts:2149-2157: `const rulesAt = wt ? await git(wt.repo, "rev-parse", "HEAD")` with the comment "a worktree gate judges by the target branch's rules, which the work i… → [05-security.md](./05-security.md#sec-03--)
 - [ ] **SEC-04** [medium] A cloned repository's horde.json runs commands on the user's machine at the first horde_do, before any verdict and without a consent step
   `packages/opencode/src/horde.ts:130` — horde.ts:130-134: `detectChecks(repo, await loadSettingsAt(repo, "HEAD"))` then `fleet.spawn(...)`; fleet.ts:1095-1105: `const workers = loadWorkers(directory)` and `setu… → [05-security.md](./05-security.md#sec-04--)
-- [ ] **SEC-05** [medium] The reviewer prompt gives no framing against text in the diff addressed to it, and a citation of a planted comment line passes the mechanical check
+- [x] **SEC-05** (closed ac81744) [medium] The reviewer prompt gives no framing against text in the diff addressed to it, and a citation of a planted comment line passes the mechanical check
   `packages/review/src/review.ts:284` — review.ts:260-290 reviewPrompt(): the task, criteria, rules and then `# The change …` followed by the raw diff; nothing says the change may contain comments or strings ad… → [05-security.md](./05-security.md#sec-05--)
 - [ ] **SEC-06** [medium] horde.json workers.brief can pull any file the user can read into the worker brief (path traversal out of the repository)
   `packages/board/src/render.ts:59` — render.ts:54-63: `fs.readFileSync(path.join(repo!, f), "utf8")` for each entry of `loadWorkers(repo).brief`, with no check that the result stays inside `repo` (compare va… → [05-security.md](./05-security.md#sec-06--)
@@ -126,7 +126,7 @@ Ground truth first: `./ci.sh` in full (427 tests, none skipped, exit 0), the pac
   `packages/opencode/src/horde.ts:489` — horde.ts:489 and :524: `worker: ${truncate(workerSaid, 240)}` (the report summary or final answer) in READY/FAILED outcomes; horde.ts:861-866: investigation findings rend… → [05-security.md](./05-security.md#sec-08--)
 - [ ] **SEC-09** [low] news.ts builds the news file path from CLAUDE_CODE_SESSION_ID without the basename check the hook applies
   `packages/opencode/src/news.ts:36` — news.ts:35-36: `constructor(stateDir, session = process.env.CLAUDE_CODE_SESSION_ID?.trim()) { if (session) this.file = path.join(stateDir, "news", `${session}.json`) }`; … → [05-security.md](./05-security.md#sec-09--)
-- [ ] **SEC-10** [low] The delegate hook runs git in whatever repository Claude opens without disabling config-driven command execution
+- [x] **SEC-10** (closed 0f05cad) [low] The delegate hook runs git in whatever repository Claude opens without disabling config-driven command execution
   `plugins/horde/hooks/delegate.mjs:56` — delegate.mjs:55-60: `execFileSync("git", ["-C", cwd, ...args])` for `rev-parse HEAD`, `rev-parse --show-toplevel` and `status --porcelain -z --untracked-files=all` on eve… → [05-security.md](./05-security.md#sec-10--)
 - [x] **SEC-11** (closed 9bfba96) [low] servers.log and the state root are created with the umask on a fresh machine (world-readable under 022)
   `packages/core/src/process.ts:21` — process.ts:18-22: `fs.mkdirSync(path.dirname(file), { recursive: true })` and `fs.appendFileSync(file, …)` with no mode; recordLifecycle runs at index.ts:16 before Store … → [05-security.md](./05-security.md#sec-11--)

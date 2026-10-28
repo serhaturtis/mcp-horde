@@ -66,7 +66,7 @@ Also reported by boot (high confidence): Live probe P7 (probe-flow.ts): `git che
 
 ## LIVE-05 — DESIGN.md §4.2 describes worker-side MCP injection (OPENCODE_CONFIG_CONTENT, HORDE_WORKER_TOOLS) that the source never contained
 
-- [ ] *(open)*
+- [x] closed in 919927a — **Executed evidence:** docs/DESIGN.md:149's OPENCODE_CONFIG_CONTENT/HORDE_WORKER_TOOLS paragraph replaced by what exists; the one remaining mention (§3.2) describes the canary test (919927a)
 - **Severity:** medium · **Confidence:** high
 - **Location:** `docs/DESIGN.md:149`
 
@@ -78,7 +78,7 @@ Also reported by boot (high confidence): Live probe P7 (probe-flow.ts): `git che
 
 ## LIVE-06 — A worker wrote through the shell what the edit rule refused, and only the gate caught it, one round later
 
-- [ ] *(open)*
+- [x] closed in 919927a — **Executed evidence:** plugins/horde/skills/horde/SKILL.md says a shell write outside the scope is caught by the audit and costs a round (919927a)
 - **Severity:** low · **Confidence:** high
 - **Location:** `plugins/horde/skills/horde/SKILL.md`
 

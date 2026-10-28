@@ -10,7 +10,7 @@ The horde's trust model is honest in docs/DESIGN.md §8 and packages/opencode/RE
 
 ## SEC-01 — Workers get an unconfined shell that OpenCode never prompts for by default, and the plugin's user-facing docs do not say so
 
-- [ ] *(open)*
+- [x] closed in 919927a — **Executed evidence:** decision recorded in INDEX: trust model documented rather than shell: ask by default; plugins/horde/README.md gained the 'What a worker can do' section (grep count 1) and the setup skill's Commit step the trust sentence (919927a); the permission knob is documented there
 - **Severity:** high **BLOCKING** · **Confidence:** high
 - **Location:** `packages/opencode/src/fleet.ts:369`
 
@@ -64,7 +64,7 @@ Also reported by gates (high confidence): fleet.ts:2151 `const rulesAt = wt ? aw
 
 ## SEC-05 — The reviewer prompt gives no framing against text in the diff addressed to it, and a citation of a planted comment line passes the mechanical check
 
-- [ ] *(open)*
+- [x] closed in ac81744 — **Executed evidence:** packages/review/src/review.ts: reviewPrompt rule against text addressed to the reviewer; checkVerdicts drops comment-only and reviewer-mentioning evidence and turns an evidence-less met into unclear; npm test -w @mcp-horde/review → 16 pass (planted-comment case, code citation, block comment, prompt rule); task t-7f18's gate: review 3 of 3 met
 - **Severity:** medium · **Confidence:** medium
 - **Location:** `packages/review/src/review.ts:284`
 
@@ -124,7 +124,7 @@ Also reported by gates (high confidence): fleet.ts:2151 `const rulesAt = wt ? aw
 
 ## SEC-10 — The delegate hook runs git in whatever repository Claude opens without disabling config-driven command execution
 
-- [ ] *(open)*
+- [x] closed in 0f05cad — **Executed evidence:** plugins/horde/hooks/delegate.mjs passes -c core.fsmonitor=false -c core.hooksPath=/dev/null to every git call and keeps its fallback state in a 0700 temp dir; node --test plugins/horde/hooks/*.test.mjs → 33 pass including the hostile core.fsmonitor test; task t-b08e's gate: 4 of 4 met
 - **Severity:** low · **Confidence:** high
 - **Location:** `plugins/horde/hooks/delegate.mjs:56`
 
