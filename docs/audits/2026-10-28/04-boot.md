@@ -22,7 +22,7 @@ Boot and failure modes of the opencode server are mostly fail-fast with actionab
 
 ## BOOT-02 — createWorktree leaks the worktree and branch when it fails between `git worktree add` and the cleanup try; `repoRoot` accepts an empty top-level, which produced the on-disk `agent-da39a3ee/t-ab0d` and ran every git call in the server's cwd
 
-- [ ] *(open)*
+- [x] closed in 6a682fb — **Executed evidence:** packages/core/src/worktree.ts repoRoot rejects an empty, relative or missing top level; createWorktree computes the sub-path before git worktree add and removes the worktree and branch on any later failure; tests in core.test.ts and support-fixes.test.ts (core 24 pass, opencode unit+support-fixes 99 pass); task t-273e's gate review 5 of 5 met
 - **Severity:** medium · **Confidence:** high
 - **Location:** `packages/opencode/src/worktree.ts:174`
 
@@ -34,7 +34,7 @@ Boot and failure modes of the opencode server are mostly fail-fast with actionab
 
 ## BOOT-03 — Leftovers under the worktree root that nothing sweeps: a Docker bind mount recreated the removed t-0164 worktree, empty per-repository folders accumulate, and records of vanished worktrees are hidden but never deleted
 
-- [ ] *(open)*
+- [x] closed in 6a682fb — **Executed evidence:** removeWorktree deletes an emptied per-repository folder and a start-up sweep prunes registrations, removes unregistered unreferenced folders and settles records whose directory is gone (tests, same runs)
 - **Severity:** low · **Confidence:** high
 - **Location:** `packages/opencode/src/worktree.ts:951`
 
@@ -82,7 +82,7 @@ Boot and failure modes of the opencode server are mostly fail-fast with actionab
 
 ## BOOT-07 — News file: `at` is refreshed only when the lists change, so the hook's 24 h staleness rule silences a session whose outcomes waited a day; the file is removed when the backend dies
 
-- [ ] *(open)*
+- [x] closed in 6a682fb — **Executed evidence:** news.ts refreshes at as a heartbeat every 30 minutes while outcomes wait and the file survives a backend restart (tests, same runs)
 - **Severity:** low · **Confidence:** high
 - **Location:** `packages/opencode/src/news.ts:57`
 

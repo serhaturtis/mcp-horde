@@ -112,7 +112,7 @@ Also reported by gates (high confidence): fleet.ts:2151 `const rulesAt = wt ? aw
 
 ## SEC-09 — news.ts builds the news file path from CLAUDE_CODE_SESSION_ID without the basename check the hook applies
 
-- [ ] *(open)*
+- [x] closed in 6a682fb — **Executed evidence:** news.ts writes nothing when CLAUDE_CODE_SESSION_ID is not a plain name (test, same runs)
 - **Severity:** low · **Confidence:** high
 - **Location:** `packages/opencode/src/news.ts:36`
 
@@ -148,7 +148,7 @@ Also reported by gates (high confidence): fleet.ts:2151 `const rulesAt = wt ? aw
 
 ## SEC-12 — Worktree directories are created with the umask, so copies of the repository can be more readable than the checkout
 
-- [ ] *(open)*
+- [x] closed in 6a682fb — **Executed evidence:** the worktree root, per-repository folders and new worktrees are created 0700 on POSIX (test, same runs)
 - **Severity:** low · **Confidence:** high
 - **Location:** `packages/opencode/src/worktree.ts:163`
 
