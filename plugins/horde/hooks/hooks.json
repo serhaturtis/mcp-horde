@@ -16,6 +16,16 @@
         "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash|mcp__plugin_horde_opencode__horde_do",
         "hooks": [{ "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/delegate.mjs\" PostToolUse", "timeout": 5 }]
       }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [{ "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/news.mjs\" UserPromptSubmit", "timeout": 5 }]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [{ "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/news.mjs\" Stop", "timeout": 5 }]
+      }
     ]
   }
 }
