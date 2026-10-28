@@ -7,8 +7,8 @@
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { Board } from "@mcp-horde/board"
-import { formatDuration, formatUsd, git, indent, loadTiers, oneLine, truncate, truncateHead, writeJson } from "@mcp-horde/core"
+import { Board, projectOf } from "@mcp-horde/board"
+import { formatDuration, formatUsd, git, indent, loadTiers, oneLine, truncate, truncateHead, type Workers, writeJson } from "@mcp-horde/core"
 import { type Check, detectChecks, loadSettingsAt } from "@mcp-horde/verify"
 import type { ServerContext } from "@modelcontextprotocol/server"
 import { z } from "zod"
@@ -26,8 +26,8 @@ import {
   SETTLED,
   type Snapshot,
 } from "./fleet.js"
-import type { AgentRecord, ReviewSummary } from "./state.js"
-import { BASELINE_MESSAGE, repoRoot, type Worktree, workStart } from "./worktree.js"
+import { type AgentRecord, commandSetHash, type ReviewSummary, TrustStore } from "./state.js"
+import { BASELINE_MESSAGE, loadWorkersAt, repoRoot, type Worktree, workStart } from "./worktree.js"
 
 // biome-ignore lint/suspicious/noExplicitAny: the registration helper is generic over each tool's schema
 type Tool = (name: string, description: string, shape: z.ZodRawShape, run: (args: any, fleet: Fleet, extra: ServerContext) => Promise<string>) => void
@@ -222,6 +222,17 @@ export function registerHorde(tool: Tool, opts: HordeOptions) {
       // Workers start from HEAD and their gates read HEAD's horde.json, so look there too.
       const checks = await detectChecks(repo, await loadSettingsAt(repo, "HEAD"))
       if (!checks.length) throw new Error(noChecks(repo, (await detectChecks(repo)).length > 0))
+      // The commands a clone's horde.json will run are named in the answer; a change since the
+      // last task here (a pull) is announced once, then the new set replaces the record.
+      const workers = await loadWorkersAt(root, "HEAD")
+      const commands = commandSet(root, checks, workers)
+      const commandLines = commands.map(trustLine)
+      const commandHash = commandSetHash(commandLines)
+      const trust = new TrustStore(path.join(fleet.stateDir, "trust"))
+      const trustKey = (await projectOf(root)).key
+      const previous = trust.get(trustKey)
+      const changed = previous && Array.isArray(previous.commands) && previous.hash !== commandHash ? trustChange(previous.commands, commandLines) : ""
+      const announced = changed ? `horde.json's commands changed since you last ran a task here: ${changed}` : ""
       const board = await Board.open(repo)
       const { tasks, warnings } = await board.plan([{ title: a.title ?? titleOf(a.goal), goal: a.goal, acceptance: a.done ?? [], scope: a.scope ?? [] }])
       const task = tasks[0]!
@@ -245,7 +256,11 @@ export function registerHorde(tool: Tool, opts: HordeOptions) {
           else await closeFailedStart(board, task.id, err)
           throw err
         })
-      if (a.wait) return (await collect(fleet, [snapshot.id], "all", a.timeout_seconds ?? opts.waitSeconds(), extra, opts)).text
+      trust.put(trustKey, { hash: commandHash, commands: commandLines, at: Date.now() })
+      if (a.wait) {
+        const text = (await collect(fleet, [snapshot.id], "all", a.timeout_seconds ?? opts.waitSeconds(), extra, opts)).text
+        return [[announced, ...plannedCommands(commands)].filter(Boolean).join("\n"), text].filter(Boolean).join("\n\n")
+      }
       const tiers = loadTiers(repo)
       const model = snapshot.model ? formatModel(snapshot.model) : "OpenCode's default model"
       const tier = tiers.length ? ` (tier ${board.task(task.id).tier} of ${tiers.length})` : ""
@@ -254,9 +269,10 @@ export function registerHorde(tool: Tool, opts: HordeOptions) {
       return [
         `${task.id} working: "${task.title}" · ${model}${tier} · worktree ${snapshot.worktree?.branch ?? "(none)"}`,
         ...[
+          announced,
           setup.join(" · "),
           task.scope.length ? `scope: ${task.scope.join(", ")}` : "",
-          plannedChecks(checks),
+          ...plannedCommands(commands),
           parallel ? `at most ${parallel.n} task(s) can usefully run at once on this repository (${parallel.why})` : "",
           ...warnings,
         ]
@@ -478,10 +494,66 @@ export function registerHorde(tool: Tool, opts: HordeOptions) {
   )
 }
 
-/** What will judge the work, so nobody assumes a gate that is not there. */
-function plannedChecks(checks: Check[]): string {
-  const list = checks.map((c) => `${c.name} (${truncate(c.command, 40)}${c.when === "land" ? ", before landing only" : ""})`).join(", ")
-  return `checked by: ${list} · the tests related to the change after each round, every check before landing`
+/** One command a horde.json will run: what it is, its text, its cwd and the names (not values) of its variables. */
+interface HordeCommand {
+  label: string
+  command: string
+  cwd: string
+  env: string[]
+  note?: string
+}
+
+/** The commands horde_do's first answer names: worktree setup, each check, then landing. */
+function commandSet(root: string, checks: Check[], workers: Workers): HordeCommand[] {
+  const rel = (p: string) => path.relative(root, p).replace(/\\/g, "/") || "."
+  const commands: HordeCommand[] = []
+  if (workers.setup) commands.push({ label: "workers.setup", command: workers.setup, cwd: rel(root), env: [] })
+  for (const c of checks)
+    commands.push({
+      label: `check ${c.name}`,
+      command: c.command,
+      cwd: rel(c.cwd),
+      env: Object.keys(c.env ?? {}).sort(),
+      ...(c.when === "land" ? { note: "before landing only" } : {}),
+    })
+  if (workers.land)
+    commands.push({
+      label: "workers.land",
+      command: typeof workers.land === "string" ? workers.land : workers.land.command,
+      cwd: rel(root),
+      env: [],
+    })
+  return commands
+}
+
+function commandPart(c: HordeCommand, maxCommand = 0): string {
+  const command = maxCommand ? truncate(c.command, maxCommand) : c.command
+  const env = c.env.length ? c.env.join(", ") : "none"
+  return `${command} · cwd: ${c.cwd} · env: ${env}${c.note ? ` · ${c.note}` : ""}`
+}
+
+/** A command set line as recorded and compared (the command is not truncated). */
+function trustLine(c: HordeCommand): string {
+  return `${c.label} (${commandPart(c)})`
+}
+
+/** The first-answer listing: setup and land beside the checks, each with its cwd and env names. */
+function plannedCommands(commands: HordeCommand[]): string[] {
+  const checks = commands.filter((c) => c.label.startsWith("check "))
+  const list = checks.map((c) => `${c.label} (${commandPart(c, 60)})`).join(", ")
+  const others = commands.filter((c) => !c.label.startsWith("check "))
+  const lines = [`checked by: ${list} · the tests related to the change after each round, every check before landing`]
+  if (others.length) lines.push(`also runs: ${others.map((c) => `${c.label} (${commandPart(c, 60)})`).join(" · ")}`)
+  return lines
+}
+
+/** " + workers.land (…) · − check pg (…)" between the recorded and current command sets. */
+function trustChange(before: string[], after: string[]): string {
+  const old = new Set(before)
+  const now = new Set(after)
+  const added = after.filter((c) => !old.has(c)).map((c) => `+ ${c}`)
+  const removed = before.filter((c) => !now.has(c)).map((c) => `− ${c}`)
+  return [...added, ...removed].join(" · ")
 }
 
 function noChecks(repo: string, uncommitted: boolean): string {

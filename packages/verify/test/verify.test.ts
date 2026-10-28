@@ -149,6 +149,11 @@ describe("detect", () => {
     assert.throws(() => loadSettings(root), /audit\.block must be a list of/)
     write(root, { "horde.json": JSON.stringify({ verify: { checks: { x: {} } } }) })
     assert.throws(() => loadSettings(root), /checks\.x needs a command/)
+    // A cloned repository's check must not run outside the checkout it was pointed at.
+    write(root, { "horde.json": JSON.stringify({ verify: { checks: { escape: { command: "true", cwd: "../outside" } } } }) })
+    assert.throws(() => loadSettings(root), /checks\.escape\.cwd must stay inside the repository/)
+    write(root, { "horde.json": JSON.stringify({ verify: { checks: { inside: { command: "true", cwd: "src" } } } }) })
+    assert.equal(loadSettings(root).checks![0]!.cwd, path.join(root, "src"))
   })
 })
 

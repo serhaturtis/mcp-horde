@@ -56,7 +56,7 @@ function categories(value: unknown, where: string): AuditCategory[] | undefined 
 
 /** The `verify` section of horde.json, validated, with defaults. */
 export function loadSettings(directory: string): VerifySettings {
-  return parseSettings(loadHordeFile(directory))
+  return parseSettings(loadHordeFile(directory), repositoryRoot(directory))
 }
 
 /**
@@ -85,14 +85,30 @@ export async function loadSettingsAt(directory: string, commit: string): Promise
       }
       if (!data || typeof data !== "object" || Array.isArray(data)) throw new Error(`${file} at ${commit} must contain a JSON object`)
       validateHordeFile(data as Record<string, unknown>, `${file} at ${commit}`)
-      return parseSettings({ root: dir, file: path.join(dir, "horde.json"), data: data as Record<string, unknown> })
+      return parseSettings({ root: dir, file: path.join(dir, "horde.json"), data: data as Record<string, unknown> }, realTop)
     }
     if (!rel) break
   }
-  return parseSettings({ root: path.resolve(directory), data: {} })
+  return parseSettings({ root: path.resolve(directory), data: {} }, repositoryRoot(directory))
 }
 
-function parseSettings(horde: HordeFile): VerifySettings {
+/** The repository root (the nearest ancestor with `.git`), or the directory itself when there is none. */
+function repositoryRoot(directory: string): string {
+  const start = path.resolve(directory)
+  for (let dir = start; ; ) {
+    if (fs.existsSync(path.join(dir, ".git"))) return dir
+    const parent = path.dirname(dir)
+    if (parent === dir) return start
+    dir = parent
+  }
+}
+
+function inside(root: string, p: string): boolean {
+  const rel = path.relative(root, p)
+  return rel === "" || (rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel))
+}
+
+function parseSettings(horde: HordeFile, repoRoot = horde.root): VerifySettings {
   const v = (horde.data.verify ?? {}) as Record<string, unknown>
   const where = `${horde.file ?? "horde.json"} verify`
   let checks: Check[] | undefined
@@ -104,7 +120,10 @@ function parseSettings(horde: HordeFile): VerifySettings {
       if (!s || typeof s.command !== "string" || !s.command.trim()) throw new Error(`${at} needs a command`)
       const kind = (s.kind ?? kindOf(name, s.command)) as CheckKind
       if (!["test", "typecheck", "lint", "build", "other"].includes(kind)) throw new Error(`${at}.kind is invalid`)
+      if (s.cwd !== undefined && typeof s.cwd !== "string") throw new Error(`${at}.cwd must be a string`)
       const cwd = typeof s.cwd === "string" ? path.resolve(horde.root, s.cwd) : horde.root
+      if (s.cwd !== undefined && !inside(realpath(repoRoot), realpath(cwd)))
+        throw new Error(`${at}.cwd must stay inside the repository ${realpath(repoRoot)}: "${s.cwd}" resolves outside it`)
       const env = s.env
       if (env !== undefined && (!env || typeof env !== "object" || Array.isArray(env) || Object.values(env).some((v) => typeof v !== "string")))
         throw new Error(`${at}.env must be an object of name → string`)
@@ -170,11 +189,12 @@ function kindOf(name: string, command: string): CheckKind {
 
 const ORDER: Record<CheckKind, number> = { typecheck: 0, lint: 1, build: 2, test: 3, other: 4 }
 
-const realpath = (p: string) => {
+const realpath = (p: string): string => {
   try {
     return fs.realpathSync.native(p)
   } catch {
-    return path.resolve(p)
+    const parent = path.dirname(p)
+    return parent === p ? path.resolve(p) : path.join(realpath(parent), path.basename(p))
   }
 }
 

@@ -200,6 +200,39 @@ export interface Workers {
   land?: string | { command: string; message?: string }
 }
 
+/** The repository root (the nearest ancestor with `.git`), or the directory itself when there is none. */
+function repositoryRoot(directory: string): string {
+  const start = path.resolve(directory)
+  for (let dir = start; ; ) {
+    if (fs.existsSync(path.join(dir, ".git"))) return dir
+    const parent = path.dirname(dir)
+    if (parent === dir) return start
+    dir = parent
+  }
+}
+
+/** A path's real path, resolving the nearest existing ancestor when the path itself does not exist yet. */
+function realpath(p: string): string {
+  try {
+    return fs.realpathSync.native(p)
+  } catch {
+    const parent = path.dirname(p)
+    return parent === p ? path.resolve(p) : path.join(realpath(parent), path.basename(p))
+  }
+}
+
+function inside(root: string, p: string): boolean {
+  const rel = path.relative(root, p)
+  return rel === "" || (rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel))
+}
+
+/** Reject a workers path that leaves the repository: a clone's horde.json must not reach outside it. */
+function checkInside(root: string, at: string, value: string): void {
+  const realRoot = realpath(root)
+  const real = realpath(path.resolve(root, value))
+  if (!inside(realRoot, real)) throw new Error(`${at} must stay inside the repository ${realRoot}: "${value}" resolves outside it`)
+}
+
 export function loadWorkers(directory: string): Workers {
   const { file, data } = loadHordeFile(directory)
   const raw = data.workers
@@ -210,6 +243,13 @@ export function loadWorkers(directory: string): Workers {
   if (link !== undefined && (!Array.isArray(link) || link.some((l) => typeof l !== "string"))) throw new Error(`${where}.link must be an array of paths`)
   if (setup !== undefined && typeof setup !== "string") throw new Error(`${where}.setup must be a command string`)
   if (brief !== undefined && (!Array.isArray(brief) || brief.some((f) => typeof f !== "string"))) throw new Error(`${where}.brief must be an array of paths`)
+  const root = repositoryRoot(directory)
+  link?.forEach((l, i) => {
+    checkInside(root, `${where}.link[${i}]`, l)
+  })
+  brief?.forEach((f, i) => {
+    checkInside(root, `${where}.brief[${i}]`, f)
+  })
   if (land !== undefined && typeof land !== "string") {
     if (!land || typeof land !== "object" || Array.isArray(land) || typeof (land as { command?: unknown }).command !== "string")
       throw new Error(`${where}.land must be a command string or { "command": "…", "message"?: "…" }`)

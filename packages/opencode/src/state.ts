@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto"
+import { createHash, randomBytes } from "node:crypto"
 import fs from "node:fs"
 import path from "node:path"
 import { SELF as PROCESS, pidAlive, readJson, sleepSync, withLock, writeAtomic } from "@mcp-horde/core"
@@ -133,6 +133,44 @@ export interface ServerRecord {
   version?: string
   /** Basic-auth user the server was started with. */
   username?: string
+}
+
+/** One repository's record of the horde.json commands last run there. */
+export interface TrustRecord {
+  /** SHA-256 of the command lines, so an unchanged set is not announced again. */
+  hash: string
+  /** The command lines ("workers.land (… · cwd … · env …)"), to name additions and removals. */
+  commands: string[]
+  /** When it was recorded. */
+  at: number
+}
+
+/** The hash of a command set, stable across processes. */
+export function commandSetHash(commands: string[]): string {
+  return createHash("sha256").update(commands.join("\n")).digest("hex")
+}
+
+/**
+ * Per-repository trust records, keyed like the board by the repository's common directory.
+ * They say which horde.json commands last ran here, so a pull that changes them is announced.
+ */
+export class TrustStore {
+  constructor(readonly dir: string) {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+  }
+
+  private file(key: string) {
+    if (!/^[A-Za-z0-9._-]+$/.test(key)) throw new Error(`invalid repository key "${key}"`)
+    return path.join(this.dir, `${key}.json`)
+  }
+
+  get(key: string): TrustRecord | undefined {
+    return readJson<TrustRecord>(this.file(key))
+  }
+
+  put(key: string, record: TrustRecord) {
+    writeAtomic(this.file(key), JSON.stringify(record, null, 2))
+  }
 }
 
 /** This process, as an agent owner. */

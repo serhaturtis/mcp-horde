@@ -91,7 +91,10 @@ describe("the simple path: horde_do, horde_wait, horde_land (real opencode, mock
     })
     assert.match(started, /^t-\w+ working: "Write the greeting file" · mock\/mock \(tier 0 of 2\) · worktree horde\/t-\w+/, started)
     assert.match(started, /scope: hello\.txt/)
-    assert.match(started, /checked by: test \(node check\.js\) · the tests related to the change after each round, every check before landing/)
+    assert.match(
+      started,
+      /checked by: check test \(node check\.js · cwd: \. · env: none\) · the tests related to the change after each round, every check before landing/,
+    )
     assert.match(started, /→ horde_wait \{ids: \["t-\w+"\]\}/)
     const id = idOf(started)
 
@@ -1284,6 +1287,38 @@ process.exit(1)
     })
     assert.match(started, /at most 1 task\(s\) can usefully run at once on this repository \(test has 1 slot\)/, started)
     await h.call("horde_drop", { id: idOf(started) })
+  })
+
+  test("the first answer names setup, every check and land with cwd and env names; a changed set is announced once", async () => {
+    const { repo: r } = makeRepo(mock.url)
+    const horde = (env: string, land: string) =>
+      JSON.stringify({
+        verify: { checks: { test: { command: 'node -e "0"', env: { [env]: "1" } } } },
+        workers: { setup: 'node -e "0"', land },
+        tiers: ["mock/mock"],
+      })
+    fs.writeFileSync(path.join(r, "horde.json"), horde("FOO", 'node -e "0"'))
+    git(r, "add", "horde.json")
+    git(r, "commit", "-qm", "commands")
+
+    const first = await h.call("horde_do", { directory: r, goal: "Write q.txt.\nRUN: echo ok > q.txt && git add q.txt && git commit -qm q", scope: ["q.txt"] })
+    assert.match(first, /workers\.setup \(node -e "0" · cwd: \. · env: none\)/, first)
+    assert.match(first, /check test \(node -e "0" · cwd: \. · env: FOO\)/, first)
+    assert.match(first, /workers\.land \(node -e "0" · cwd: \. · env: none\)/, first)
+    assert.doesNotMatch(first, /commands changed since/, first)
+    await h.call("horde_drop", { id: idOf(first) })
+
+    fs.writeFileSync(path.join(r, "horde.json"), horde("BAR", 'node -e "1"'))
+    git(r, "add", "horde.json")
+    git(r, "commit", "-qm", "change commands")
+    const second = await h.call("horde_do", { directory: r, goal: "Write r.txt.\nRUN: echo ok > r.txt && git add r.txt && git commit -qm r", scope: ["r.txt"] })
+    assert.match(second, /horde\.json's commands changed since you last ran a task here: .*\+ workers\.land .*− check test /, second)
+    await h.call("horde_drop", { id: idOf(second) })
+
+    const third = await h.call("horde_do", { directory: r, goal: "Write s.txt.\nRUN: echo ok > s.txt && git add s.txt && git commit -qm s", scope: ["s.txt"] })
+    assert.doesNotMatch(third, /commands changed since/, third)
+    assert.match(third, /check test \(node -e "0" · cwd: \. · env: BAR\)/, third)
+    await h.call("horde_drop", { id: idOf(third) })
   })
 
   test("horde_wait and opencode_status name the check a gate waits on and its slot holder", async () => {
