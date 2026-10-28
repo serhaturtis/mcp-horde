@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process"
-import { constants, existsSync } from "node:fs"
+import { constants, type Dirent, existsSync } from "node:fs"
 import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
@@ -60,12 +60,17 @@ export interface WorktreeOptions {
 const CARRY_MAX_FILES = 5_000
 const CARRY_MAX_BYTES = 200 * 1024 * 1024
 
-export async function repoRoot(directory: string): Promise<string> {
-  try {
-    return await git(directory, "rev-parse", "--show-toplevel")
-  } catch {
-    throw new Error(`isolation "worktree" needs a git repository, but ${directory} is not inside one`)
-  }
+export async function repoRoot(directory: string, run: (cwd: string, ...args: string[]) => Promise<string> = git): Promise<string> {
+  const notInside = () => new Error(`isolation "worktree" needs a git repository, but ${directory} is not inside one`)
+  if (!directory.trim()) throw notInside()
+  const top = await run(directory, "rev-parse", "--show-toplevel").catch(() => {
+    throw notInside()
+  })
+  const root = top.trim()
+  if (!root || !path.isAbsolute(root)) throw notInside()
+  const st = await fs.stat(root).catch(() => undefined)
+  if (!st?.isDirectory()) throw notInside()
+  return root
 }
 
 /** Validate a link path: relative, inside the repo, not "." and not tracked by git. */
@@ -152,15 +157,23 @@ export async function createWorktree(directory: string, name: string, opts: Work
         throw new Error(`isolation "worktree" needs at least one commit in ${repo}`)
       })
 
+  // Compute this before creating anything: a failure here must not leave a worktree behind.
+  // git reports resolved paths (e.g. /private/var on macOS), so compare like with like.
+  const sub = path.relative(await fs.realpath(repo), await fs.realpath(directory))
+
   // Pick a free path/branch; retry if a concurrent spawn takes it first.
   let root = ""
   let branch = ""
+  await fs.mkdir(opts.rootDir, { recursive: true, mode: 0o700 })
+  if (!isWindows) await fs.chmod(opts.rootDir, 0o700)
   for (let i = 1; ; i++) {
     const suffix = i === 1 ? "" : `-${i}`
     root = path.join(opts.rootDir, folder, `${slug}${suffix}`)
     branch = `horde/${slug}${suffix}`
     if ((await exists(root)) || (await branchExists(repo, branch))) continue
-    await fs.mkdir(path.dirname(root), { recursive: true })
+    const parent = path.dirname(root)
+    await fs.mkdir(parent, { recursive: true, mode: 0o700 })
+    if (!isWindows) await fs.chmod(parent, 0o700)
     try {
       await git(repo, "worktree", "add", "-b", branch, root, base)
       break
@@ -170,11 +183,11 @@ export async function createWorktree(directory: string, name: string, opts: Work
     }
   }
 
-  // git reports resolved paths (e.g. /private/var on macOS), so compare like with like.
-  const sub = path.relative(await fs.realpath(repo), await fs.realpath(directory))
   const worktree: Worktree = { path: path.join(root, sub), root, branch, base, repo, links }
 
   try {
+    // git creates the checkout with the umask; it carries the checkout's uncommitted work.
+    if (!isWindows) await fs.chmod(root, 0o700)
     if (opts.includeUncommitted) {
       opts.onProgress?.("carrying over uncommitted changes")
       const carried = await carryUncommitted(repo, root, notes, links)
@@ -235,6 +248,8 @@ export async function createWorktree(directory: string, name: string, opts: Work
     await git(repo, "worktree", "remove", "--force", root).catch(() => fs.rm(root, { recursive: true, force: true }))
     await git(repo, "worktree", "prune").catch(() => undefined)
     await git(repo, "branch", "-D", branch).catch(() => undefined)
+    const folder = path.dirname(root)
+    if (path.basename(folder) === repoKey(repo)) await fs.rmdir(folder).catch(() => undefined)
     throw err
   }
   return { worktree, notes }
@@ -976,7 +991,12 @@ export async function removeWorktree(wt: Worktree, name: string, discard: boolea
     notes.push(
       `could not fully remove worktree ${wt.root}; delete it by hand (${lastError || "no error reported"}; left: ${left.slice(0, 8).join(", ") || "nothing listed"})`,
     )
-  } else notes.push(`removed worktree ${wt.root}`)
+  } else {
+    notes.push(`removed worktree ${wt.root}`)
+    // The per-repository folder holds only this repository's worktrees: drop it once empty.
+    const folder = path.dirname(wt.root)
+    if (path.basename(folder) === repoKey(wt.repo)) await fs.rmdir(folder).catch(() => undefined)
+  }
   let ahead: number
   try {
     ahead = Number(await git(wt.repo, "rev-list", "--count", `${wt.baseline ?? wt.base}..${wt.branch}`))
@@ -993,6 +1013,107 @@ export async function removeWorktree(wt: Worktree, name: string, discard: boolea
     notes.push(`kept branch ${wt.branch} (${ahead} agent commit(s))`)
   }
   return notes.join("\n")
+}
+
+export interface SweepRecord {
+  id: string
+  worktree?: Worktree
+}
+
+export interface SweepResult {
+  /** Worktree folders (and emptied per-repository folders) this sweep deleted. */
+  removed: string[]
+  /** Repositories whose registrations were pruned. */
+  pruned: string[]
+  /** Records whose worktree directory is gone, with the error that settles them. */
+  gone: { id: string; root: string; error: string }[]
+}
+
+/** The repository a worktree directory belongs to, from the `.git` file `git worktree add` wrote. */
+async function worktreeRepo(root: string): Promise<string | undefined> {
+  const dot = path.join(root, ".git")
+  const st = await fs.stat(dot).catch(() => undefined)
+  if (!st?.isFile()) return undefined
+  const match = /^gitdir:\s*(.+)$/m.exec(await fs.readFile(dot, "utf8").catch(() => ""))
+  if (!match?.[1]) return undefined
+  const gitdir = path.resolve(root, match[1].trim())
+  // <repo>/.git/worktrees/<name>: the repository is three levels above the git directory.
+  return path.dirname(path.dirname(path.dirname(gitdir)))
+}
+
+/**
+ * Clean the worktree root at server start: prune stale registrations, delete folders no live
+ * record references and git does not register (a container can recreate a removed mount), and
+ * report records whose worktree directory is gone so the caller can settle them.
+ */
+export async function sweepWorktrees(rootDir: string, records: SweepRecord[] = [], log?: (line: string) => void): Promise<SweepResult> {
+  const result: SweepResult = { removed: [], pruned: [], gone: [] }
+  const referenced = new Set<string>()
+  const repos = new Set<string>()
+  for (const record of records) {
+    if (!record.worktree) continue
+    const root = path.resolve(record.worktree.root)
+    referenced.add(root)
+    if (record.worktree.repo) repos.add(path.resolve(record.worktree.repo))
+    if (!(await exists(root))) {
+      const error = `worktree directory ${record.worktree.root} is gone`
+      result.gone.push({ id: record.id, root: record.worktree.root, error })
+      log?.(`${record.id}: ${error}`)
+    }
+  }
+
+  const folders = (await fs.readdir(rootDir, { withFileTypes: true }).catch(() => [] as Dirent[])).filter((d) => d.isDirectory())
+  for (const folder of folders) {
+    for (const child of await fs.readdir(path.join(rootDir, folder.name), { withFileTypes: true }).catch(() => [] as Dirent[])) {
+      if (!child.isDirectory()) continue
+      const repo = await worktreeRepo(path.join(rootDir, folder.name, child.name))
+      if (repo) repos.add(repo)
+    }
+  }
+
+  for (const repo of repos) {
+    if (!(await exists(repo))) continue
+    try {
+      await git(repo, "worktree", "prune")
+      result.pruned.push(repo)
+    } catch (err) {
+      log?.(`could not prune worktrees of ${repo}: ${(err as Error).message.split("\n")[0]}`)
+    }
+  }
+
+  const registered = new Set<string>()
+  for (const repo of repos) {
+    const list = await git(repo, "worktree", "list", "--porcelain").catch(() => "")
+    for (const line of list.split("\n")) if (line.startsWith("worktree ")) registered.add(path.resolve(line.slice("worktree ".length)))
+  }
+
+  for (const folder of folders) {
+    const dir = path.join(rootDir, folder.name)
+    for (const child of await fs.readdir(dir, { withFileTypes: true }).catch(() => [] as Dirent[])) {
+      if (!child.isDirectory()) continue
+      const root = path.resolve(dir, child.name)
+      if (referenced.has(root) || registered.has(root)) continue
+      // A `.git` directory is somebody's own checkout, not a worktree this horde created.
+      if ((await fs.stat(path.join(root, ".git")).catch(() => undefined))?.isDirectory()) continue
+      try {
+        await fs.rm(root, { recursive: true, force: true })
+        result.removed.push(root)
+        log?.(`removed unregistered worktree folder ${root}`)
+      } catch (err) {
+        log?.(`could not remove unregistered worktree folder ${root}: ${(err as Error).message.split("\n")[0]}`)
+      }
+    }
+    if ((await fs.readdir(dir).catch(() => [""] as string[])).length === 0) {
+      try {
+        await fs.rmdir(dir)
+        result.removed.push(dir)
+        log?.(`removed empty worktree folder ${dir}`)
+      } catch {
+        // Another process recreated or filled it meanwhile.
+      }
+    }
+  }
+  return result
 }
 
 export async function exists(p: string) {

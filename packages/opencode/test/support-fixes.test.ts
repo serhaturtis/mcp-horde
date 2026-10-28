@@ -12,9 +12,21 @@ import { passwordFilePath, stopServer } from "../src/backend.js"
 import { type Config, inProject, loadConfig } from "../src/config.js"
 import { profileRules, type Snapshot } from "../src/fleet.js"
 import { makeHooks, permissionMessage } from "../src/hooks.js"
+import { News } from "../src/news.js"
 import { Store } from "../src/state.js"
 import { attachCommand, renderSnapshot } from "../src/tools.js"
-import { anchoredPattern, commitAll, createWorktree, dependencyLinks, excludeFromGit, removeWorktree, syncWorktree, workStart } from "../src/worktree.js"
+import {
+  anchoredPattern,
+  commitAll,
+  createWorktree,
+  dependencyLinks,
+  excludeFromGit,
+  removeWorktree,
+  repoRoot,
+  sweepWorktrees,
+  syncWorktree,
+  workStart,
+} from "../src/worktree.js"
 import { connect, git, pkg } from "./harness.js"
 
 const tmps: string[] = []
@@ -430,5 +442,136 @@ describe("worktree fixes", () => {
     const setUp = await createWorktree(r, "setup", { rootDir, includeUncommitted: false, setup: "mkdir node_modules && touch node_modules/own" })
     assert.ok(!fs.lstatSync(path.join(setUp.worktree.root, "node_modules")).isSymbolicLink())
     assert.ok(fs.existsSync(path.join(r, "node_modules", "pkg", "index.js")), "the checkout's node_modules is untouched")
+  })
+
+  test("repoRoot refuses an empty, relative or missing top level", async () => {
+    const r = repo()
+    const sub = path.join(r, "pkg")
+    fs.mkdirSync(sub)
+    assert.equal(await repoRoot(sub), fs.realpathSync.native(r), "a real checkout still resolves")
+    await assert.rejects(repoRoot(""), /not inside one/)
+    await assert.rejects(
+      repoRoot(r, async () => ""),
+      /not inside one/,
+    )
+    await assert.rejects(
+      repoRoot(r, async () => "relative/path"),
+      /not inside one/,
+    )
+    await assert.rejects(
+      repoRoot(r, async () => path.join(r, "missing")),
+      /not inside one/,
+    )
+  })
+
+  test("a failure after git worktree add removes the worktree and its branch", async () => {
+    const r = repo()
+    const rootDir = path.join(tmpDir(), "wt")
+    await assert.rejects(createWorktree(r, "leak", { rootDir, includeUncommitted: false, link: [], setup: "exit 1" }), /setup/)
+    const left = fs.existsSync(rootDir) ? fs.readdirSync(rootDir, { recursive: true }).map(String) : []
+    assert.ok(!left.some((p) => p.includes("leak")), `no worktree left: ${left.join(", ")}`)
+    assert.equal(git(r, "branch", "--list", "horde/leak"), "")
+    assert.doesNotMatch(git(r, "worktree", "list"), /horde\/leak/)
+  })
+
+  test("removeWorktree deletes the per-repository folder once it is empty", async () => {
+    const r = repo()
+    const rootDir = path.join(tmpDir(), "wt")
+    const { worktree } = await createWorktree(r, "empty", { rootDir, includeUncommitted: false, link: [] })
+    const folder = path.dirname(worktree.root)
+    assert.ok(fs.existsSync(folder))
+    await removeWorktree(worktree, "empty", true)
+    assert.equal(fs.existsSync(worktree.root), false)
+    assert.equal(fs.existsSync(folder), false, "the emptied per-repository folder is deleted")
+  })
+
+  test("the start-up sweep removes unregistered, unreferenced worktree folders", async () => {
+    const r = repo()
+    const rootDir = path.join(tmpDir(), "wt")
+    const { worktree } = await createWorktree(r, "keep", { rootDir, includeUncommitted: false, link: [] })
+    const folder = path.dirname(worktree.root)
+    // A container can recreate a removed worktree's mount sources as plain directories.
+    const leftover = path.join(folder, "t-0164")
+    fs.mkdirSync(path.join(leftover, "infrastructure", "nats", "nats.conf"), { recursive: true })
+    const empty = path.join(rootDir, "gone-12345678")
+    fs.mkdirSync(empty)
+    const lines: string[] = []
+    const swept = await sweepWorktrees(rootDir, [{ id: "ses_live", worktree }], (line) => lines.push(line))
+    assert.ok(fs.existsSync(worktree.root), "a live record keeps its worktree")
+    assert.equal(fs.existsSync(leftover), false)
+    assert.equal(fs.existsSync(empty), false)
+    assert.equal(fs.existsSync(folder), true, "the folder still holds a live worktree")
+    assert.deepEqual(swept.gone, [])
+    assert.ok(
+      lines.some((l) => l.includes(leftover)),
+      lines.join("\n"),
+    )
+    assert.ok(
+      lines.some((l) => l.includes(empty)),
+      lines.join("\n"),
+    )
+  })
+
+  test("the sweep reports a record whose worktree directory is gone and prunes its registration", async () => {
+    const r = repo()
+    const rootDir = path.join(tmpDir(), "wt")
+    const { worktree } = await createWorktree(r, "gone", { rootDir, includeUncommitted: false, link: [] })
+    fs.rmSync(worktree.root, { recursive: true, force: true })
+    assert.match(git(r, "worktree", "list"), /horde\/gone/, "git still registers the vanished worktree")
+    const swept = await sweepWorktrees(rootDir, [{ id: "ses_gone", worktree }])
+    assert.deepEqual(
+      swept.gone.map((g) => g.id),
+      ["ses_gone"],
+    )
+    assert.match(swept.gone[0]?.error ?? "", /worktree directory .* is gone/)
+    assert.doesNotMatch(git(r, "worktree", "list"), /horde\/gone/)
+    assert.equal(fs.existsSync(path.dirname(worktree.root)), false, "the emptied folder is gone too")
+  })
+
+  test("the worktree root, repository folder and worktree are mode 0700", { skip: process.platform === "win32" ? "POSIX modes" : false }, async () => {
+    const r = repo()
+    const rootDir = path.join(tmpDir(), "wt")
+    fs.mkdirSync(rootDir, { recursive: true, mode: 0o755 })
+    fs.chmodSync(rootDir, 0o755)
+    const { worktree } = await createWorktree(r, "mode", { rootDir, includeUncommitted: false, link: [] })
+    const mode = (p: string) => fs.statSync(p).mode & 0o777
+    assert.equal(mode(rootDir), 0o700)
+    assert.equal(mode(path.dirname(worktree.root)), 0o700)
+    assert.equal(mode(worktree.root), 0o700)
+  })
+})
+
+describe("news file fixes", () => {
+  const waitFor = async (file: string) => {
+    for (let i = 0; i < 100 && !fs.existsSync(file); i++) await new Promise((r) => setTimeout(r, 10))
+    return JSON.parse(fs.readFileSync(file, "utf8")) as { at: number }
+  }
+
+  test("an unchanged list is rewritten on the heartbeat while an outcome waits", async () => {
+    const dir = tmpDir()
+    const news = new News(dir, "heartbeat", { heartbeatMs: 50 })
+    const file = path.join(dir, "news", "heartbeat.json")
+    try {
+      news.update([{ id: "t-1", title: "waits", kind: "finished" }], [])
+      const first = await waitFor(file)
+      await new Promise((r) => setTimeout(r, 150))
+      const second = await waitFor(file)
+      assert.ok(second.at > first.at, `at was refreshed: ${first.at} -> ${second.at}`)
+    } finally {
+      await news.remove()
+    }
+  })
+
+  test("a session id that is not a plain file name writes no news file", async () => {
+    const dir = tmpDir()
+    for (const session of ["../escape", "a/b", ".", "..", "x.json"]) {
+      new News(dir, session).update([{ id: "t-1", title: "nope", kind: "finished" }], [])
+    }
+    await new Promise((r) => setTimeout(r, 50))
+    assert.equal(fs.existsSync(path.join(dir, "news")), false)
+    const valid = new News(dir, "plain_name-1")
+    valid.update([{ id: "t-1", title: "yes", kind: "finished" }], [])
+    await waitFor(path.join(dir, "news", "plain_name-1.json"))
+    await valid.remove()
   })
 })

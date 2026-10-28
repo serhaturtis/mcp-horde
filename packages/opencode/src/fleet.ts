@@ -525,8 +525,11 @@ export class Fleet {
     this.monitor.unref()
   }
 
-  /** Stop monitoring and hand our agents over: another MCP process may claim them at once. */
-  close() {
+  /**
+   * Stop monitoring and hand our agents over: another MCP process may claim them at once.
+   * A restart keeps the news file (outcomes still wait to be reported); an exit removes it.
+   */
+  close(opts: { keepNews?: boolean } = {}) {
     this.closed = true
     if (this.monitor) clearInterval(this.monitor)
     for (const l of this.live.values()) {
@@ -543,7 +546,7 @@ export class Fleet {
     this.live.clear()
     this.childToRoot.clear()
     this.wake()
-    return this.news.remove()
+    return opts.keepNews ? Promise.resolve() : this.news.remove()
   }
 
   /**

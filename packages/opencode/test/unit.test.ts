@@ -1,5 +1,6 @@
 import assert from "node:assert/strict"
 import { execFileSync, spawn } from "node:child_process"
+import { EventEmitter } from "node:events"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
@@ -7,10 +8,11 @@ import { describe, test } from "node:test"
 import { formatTokens, formatUsd, truncate, truncateHead } from "@mcp-horde/core"
 import type { FormInfo, SessionInboxInfo, SessionMessageInfo } from "@opencode/client"
 import { extractJson, validate } from "../src/ask.js"
-import { isLoopback, shimTarget } from "../src/backend.js"
-import { loadConfig } from "../src/config.js"
-import { defaultQuestionPolicy, defined, dismissAnswer, formAnswer, formatModel, parseModel, waitedOut } from "../src/fleet.js"
+import { type Backend, isLoopback, shimTarget } from "../src/backend.js"
+import { type Config, loadConfig } from "../src/config.js"
+import { defaultQuestionPolicy, defined, dismissAnswer, Fleet, formAnswer, formatModel, type Hooks, parseModel, waitedOut } from "../src/fleet.js"
 import { questionAnswers, questionSchema } from "../src/hooks.js"
+import { News } from "../src/news.js"
 import { type AgentRecord, Store } from "../src/state.js"
 import { price } from "../src/tools.js"
 import { buildTrack, costSince, currentTurn, latestTool, stablePrefix, turnsSince } from "../src/tracker.js"
@@ -468,6 +470,49 @@ describe("state store", () => {
     )
     fs.rmSync(worktree, { recursive: true, force: true })
     assert.deepEqual(store.agents("local"), [], "a removed worktree leaves no stale agent")
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+
+  test("a backend restart keeps the news file; a deliberate close removes it", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "horde-news-restart-"))
+    const store = new Store(dir)
+    const news = new News(dir, "restart")
+    const file = path.join(dir, "news", "restart.json")
+    news.update([{ id: "t-1", title: "waits", kind: "finished" }], [])
+    for (let i = 0; i < 100 && !fs.existsSync(file); i++) await new Promise((r) => setTimeout(r, 10))
+    assert.ok(fs.existsSync(file), "the news file was written")
+    const backend = {
+      client: {},
+      info: { key: "local" },
+      events: new EventEmitter(),
+      streaming: false,
+      dead: true,
+    } as unknown as Backend
+    const config: Config = {
+      username: "opencode",
+      allowInsecure: false,
+      serverMode: "shared",
+      bin: "opencode",
+      directory: dir,
+      defaultPermissions: "ask",
+      maxRunning: 0,
+      maxRunningFrom: "test",
+      stateDir: dir,
+      worktreeDir: path.join(dir, "worktrees"),
+      channel: false,
+      elicitTimeoutMs: 1_000,
+    }
+    const hooks: Hooks = {
+      canElicit: () => false,
+      askPermission: async () => undefined,
+      askQuestion: async () => undefined,
+      settled: () => {},
+    }
+    const fleet = new Fleet(backend, config, store, hooks, news)
+    await fleet.close({ keepNews: true })
+    assert.ok(fs.existsSync(file), "a restart keeps the outcome the hook still has to report")
+    await fleet.close()
+    assert.equal(fs.existsSync(file), false, "a deliberate shutdown removes it")
     fs.rmSync(dir, { recursive: true, force: true })
   })
 

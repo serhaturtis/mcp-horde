@@ -1,6 +1,9 @@
 #!/usr/bin/env node
+import fs from "node:fs"
+import path from "node:path"
+import { Board } from "@mcp-horde/board"
 import { loadSyntax } from "@mcp-horde/context"
-import { packageVersion, recordLifecycle } from "@mcp-horde/core"
+import { packageVersion, readJson, recordLifecycle } from "@mcp-horde/core"
 import { McpServer } from "@modelcontextprotocol/server"
 import { StdioServerTransport } from "@modelcontextprotocol/server/stdio"
 import { Backend, sharedServerAlive, stopServer } from "./backend.js"
@@ -8,9 +11,9 @@ import { type Config, inProject, loadConfig } from "./config.js"
 import { Fleet } from "./fleet.js"
 import { makeHooks } from "./hooks.js"
 import { News } from "./news.js"
-import { ownerAlive, Store } from "./state.js"
+import { type AgentRecord, ownerAlive, Store } from "./state.js"
 import { INSTRUCTIONS, registerTools } from "./tools.js"
-import { repoRoot } from "./worktree.js"
+import { repoRoot, sweepWorktrees } from "./worktree.js"
 
 const VERSION = packageVersion(import.meta.url)
 recordLifecycle("opencode", VERSION)
@@ -44,6 +47,34 @@ try {
 const news = loaded ? new News(loaded.config.stateDir) : undefined
 await news?.clear()
 
+// Every stored record, including ones syncStore/fleet hide because their worktree vanished.
+function storedAgents(store: Store): AgentRecord[] {
+  const dir = path.join(store.dir, "agents")
+  const records: AgentRecord[] = []
+  for (const file of fs.existsSync(dir) ? fs.readdirSync(dir) : []) {
+    if (!file.endsWith(".json")) continue
+    const record = readJson<AgentRecord>(path.join(dir, file))
+    if (record?.id) records.push(record)
+  }
+  return records
+}
+
+/** Clean leftovers in the worktree root and settle agents whose worktree is gone. */
+async function sweepStartup(): Promise<void> {
+  if (!loaded) return
+  const { config, store } = loaded
+  const swept = await sweepWorktrees(config.worktreeDir, storedAgents(store), (line) => process.stderr.write(`[mcp-horde/opencode] ${line}\n`))
+  for (const gone of swept.gone) {
+    const record = store.get(gone.id)
+    if (!record) continue
+    if (record.task) {
+      const board = await Board.open(record.worktree?.repo ?? record.directory).catch(() => undefined)
+      await board?.fail(record.task.id, { reason: `the agent could not continue: ${gone.error}`, retry: false }).catch(() => undefined)
+    }
+    store.remove(gone.id)
+  }
+}
+
 const server = new McpServer(
   { name: "opencode", version: VERSION },
   {
@@ -60,12 +91,13 @@ const server = new McpServer(
 let backend: Promise<Backend> | undefined
 let fleet: Promise<Fleet> | undefined
 
-function reset() {
+function reset(keepNews = true) {
   const f = fleet
   const b = backend
   fleet = undefined
   backend = undefined
-  void f?.then((x) => x.close()).catch(() => undefined)
+  // A restart is not an exit: the news file keeps naming outcomes that still wait for a report.
+  void f?.then((x) => x.close({ keepNews })).catch(() => undefined)
   void b?.then((x) => x.close()).catch(() => undefined)
 }
 
@@ -109,7 +141,7 @@ registerTools(server, {
     const { config, store } = load()
     const b = await backend?.catch(() => undefined)
     const text = await stopServer(config, store, b)
-    if (!config.url) reset()
+    if (!config.url) reset(false)
     return text
   },
 })
@@ -127,6 +159,9 @@ process.stdin.on("close", shutdown)
 // Grammars for code context (briefs, related tests); without them line patterns answer.
 await loadSyntax()
 await server.connect(new StdioServerTransport())
+void sweepStartup().catch((err) =>
+  process.stderr.write(`[mcp-horde/opencode] could not sweep the worktree root: ${err instanceof Error ? err.message : String(err)}\n`),
+)
 
 // Reconnect to agents left running by a previous process (shared server) so
 // policies, limits and notifications keep working without a tool call. Only
