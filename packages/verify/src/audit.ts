@@ -22,6 +22,8 @@ export interface AuditOptions {
   warn: AuditCategory[]
   /** package.json scripts the checks run (see checkScripts): changing one changes what the gate checks. */
   ruleScripts?: string[]
+  /** The checks the gate runs (command + cwd): changing a script one of them names is a rule change. */
+  checks?: { command: string; cwd: string }[]
   /**
    * Generated output (horde.json verify.audit.generated, read at base like the other rules, so the
    * work cannot add to it): regenerated bundles are not binaries, and minified code is not source.
@@ -339,6 +341,19 @@ async function changes(root: string, base: string): Promise<Change[]> {
   return [...byPath.values()]
 }
 
+/** Tracked files an index bit hides from `git diff` and `git status` (so from the change list above). */
+async function hiddenFiles(root: string): Promise<{ path: string; skip: boolean }[]> {
+  const out: { path: string; skip: boolean }[] = []
+  // `-v` prefixes each entry with one tag character then a space: `S` is skip-worktree, any
+  // lowercase tag marks assume-unchanged. A file with both reads `s`; either hides it.
+  for (const entry of splitZ(await gitRaw(root, [...Q, "ls-files", "-v", "-z"]))) {
+    const tag = entry[0] ?? ""
+    if (tag === "S") out.push({ path: entry.slice(2), skip: true })
+    else if (/[a-z]/.test(tag)) out.push({ path: entry.slice(2), skip: false })
+  }
+  return out
+}
+
 interface HistoricalSecret {
   commit: string
   file: string
@@ -420,6 +435,12 @@ async function sizeAt(root: string, rev: string, file: string): Promise<number> 
 
 /** Scripts a detected check runs, by convention, besides the ones the caller names. */
 const RULE_SCRIPTS = ["test", "typecheck", "type-check", "check-types", "tsc", "lint", "check", "build"]
+/** Manifest a check runs when its program is `make`, `just` or `task`: it is a rule, and names scripts one level down. */
+const MANIFESTS: Record<string, string[]> = {
+  make: ["Makefile", "makefile", "GNUmakefile"],
+  just: ["justfile"],
+  task: ["Taskfile.yml", "Taskfile.yaml"],
+}
 /** Test-runner configuration files: changing one changes which tests run and how. */
 const RUNNER_CONFIG =
   /(^|\/)(jest\.config\.[\w.]+|vitest\.(config|workspace)\.[\w.]+|pytest\.ini|tox\.ini|\.mocharc(\.[\w]+)?|karma\.conf(\.[\w]+)?|\.c8rc(\.json)?|\.nycrc(\.[\w]+)?)$/
@@ -510,12 +531,63 @@ async function checkDirs(root: string, base: string, directory: string): Promise
 }
 
 /**
- * Changes to what the gate itself checks with: horde.json's verify section, the package.json
- * scripts the checks run (and the scripts they reach, with their pre/post hooks), test-runner
- * and tool configs, pytest/ruff/mypy/coverage sections of pyproject.toml and setup.cfg. A worker
- * that edits these can make a failing suite pass.
+ * The scripts a check command names, plus one level of scripts those name in turn: rewriting any
+ * of them changes what the gate runs. A token that does not resolve to an existing non-test file
+ * (a flag, a program on PATH, a test file) is ignored, so the resolution is cheap and deterministic.
  */
-async function ruleChanges(root: string, base: string, all: Change[], scripts: string[], dirs: Set<string>): Promise<{ file: string; what: string }[]> {
+async function checkScriptPaths(root: string, checks: { command: string; cwd: string }[]): Promise<Set<string>> {
+  const out = new Set<string>()
+  const inside = (rel: string) => !rel.startsWith("..") && !path.isAbsolute(rel)
+  const relOf = (abs: string) => path.relative(root, abs).split(path.sep).join("/")
+  // A token naming an existing non-test file, resolved at `cwd` first, then the repository root.
+  const scriptAt = async (cwd: string, tok: string) => {
+    for (const abs of [path.resolve(cwd, tok), path.resolve(root, tok)]) {
+      const rel = relOf(abs)
+      if (!inside(rel) || isTestPath(rel)) continue
+      if (await isFile(root, rel)) return rel
+    }
+    return undefined
+  }
+  const refs = async (cwd: string, text: string) => {
+    const found = new Set<string>()
+    for (const tok of text.split(/\s+/).filter(Boolean)) {
+      const rel = await scriptAt(cwd, tok)
+      if (rel) found.add(rel)
+    }
+    return found
+  }
+  const program = (cmd: string) => path.posix.basename((cmd.trim().match(/^\S+/) ?? [""])[0]!.replace(/\\/g, "/"))
+  const level0 = new Set<string>()
+  for (const check of checks) {
+    for (const rel of await refs(check.cwd, check.command)) level0.add(rel)
+    for (const name of MANIFESTS[program(check.command)] ?? []) {
+      const rel = await scriptAt(check.cwd, name)
+      if (rel) level0.add(rel)
+    }
+  }
+  for (const rel of level0) out.add(rel)
+  // One level down: scripts the command's own scripts and manifests name.
+  for (const rel of [...level0]) {
+    const text = await fs.readFile(path.join(root, rel), "utf8").catch(() => "")
+    for (const child of await refs(path.dirname(path.join(root, rel)), text)) out.add(child)
+  }
+  return out
+}
+
+/**
+ * Changes to what the gate itself checks with: the whole of horde.json, the package.json scripts
+ * the checks run (and the scripts they reach, with their pre/post hooks), the scripts a check
+ * command names, test-runner and tool configs, pytest/ruff/mypy/coverage sections of pyproject.toml
+ * and setup.cfg. A worker that edits these can make a failing suite pass.
+ */
+async function ruleChanges(
+  root: string,
+  base: string,
+  all: Change[],
+  scripts: string[],
+  dirs: Set<string>,
+  checks: { command: string; cwd: string }[],
+): Promise<{ file: string; what: string }[]> {
   const out: { file: string; what: string }[] = []
   const before = (f: string) => gitRaw(root, ["show", `${base}:${f}`]).catch(() => "")
   const after = (f: string) => fs.readFile(path.join(root, f), "utf8").catch(() => "")
@@ -556,11 +628,15 @@ async function ruleChanges(root: string, base: string, all: Change[], scripts: s
   }
   const viteSuppressed = async (p: string) => /^vite\.config\..+$/.test(path.posix.basename(p)) && (await vitestAt(path.posix.dirname(p)))
   const local = new Set([...dirs].map((d) => path.relative(root, d).split(path.sep).join("/") || "."))
+  const checkPaths = await checkScriptPaths(root, checks)
   for (const c of all) {
     const file = c.path
     const old = c.from ?? c.path
     if (/(^|\/)horde\.json$/.test(file)) {
-      if (differs(json(await before(old)).verify, json(await after(file)).verify)) out.push({ file, what: "horde.json verify" })
+      // Any content change, not only verify: workers.* and tiers run on the orchestrator side.
+      const [a, b] = [json(await before(old)), json(await after(file))]
+      const changed = [...new Set([...Object.keys(a), ...Object.keys(b)])].filter((k) => differs(a[k], b[k]))
+      if (changed.length) out.push({ file, what: `horde.json ${changed.join(", ")}` })
     } else if (/(^|\/)package\.json$/.test(file)) {
       const [a, b] = [json(await before(old)), json(await after(file))]
       const sa = (a.scripts ?? {}) as Record<string, unknown>
@@ -588,6 +664,8 @@ async function ruleChanges(root: string, base: string, all: Change[], scripts: s
     } else if (/(^|\/)setup\.cfg$/.test(file)) {
       const what = sectionRule("setup.cfg", SETUP_CFG_RULES, await before(old), await after(file))
       if (what) out.push({ file, what })
+    } else if (checkPaths.has(file) || (c.from && checkPaths.has(c.from))) {
+      out.push({ file, what: file })
     }
   }
   return out
@@ -626,6 +704,28 @@ export async function audit(directory: string, opts: AuditOptions): Promise<Audi
     const sev = severityOf(category)
     if (!sev) return
     findings.push({ category, severity: soft ? "warn" : sev, ...f })
+  }
+
+  // A file hidden by an index bit is invisible to `git diff`/`git status`, so name it and still
+  // audit its on-disk content as a change: the other rules (rule changes, suppressions, secrets) apply.
+  const known = new Set(all.map((c) => c.path))
+  for (const h of await hiddenFiles(root)) {
+    add("tests", { file: h.path, text: `is hidden from git (${h.skip ? "skip-worktree" : "assume-unchanged"}); the audit cannot see its content` })
+    if (known.has(h.path)) continue
+    const c: Change = { path: h.path, status: "M", added: [], removed: [], binary: false }
+    const full = path.join(root, h.path)
+    const st = await fs.stat(full).catch(() => undefined)
+    if (st?.isFile() && st.size <= MAX_SCAN_BYTES) {
+      const buf = await fs.readFile(full)
+      if (buf.subarray(0, 8000).includes(0)) c.binary = true
+      else
+        c.added = buf
+          .toString("utf8")
+          .split("\n")
+          .map((text, i) => ({ line: i + 1, text }))
+    }
+    all.push(c)
+    known.add(h.path)
   }
 
   const scopes = [opts.allowed ?? [], ...(opts.scopes ?? [])].filter((s) => s.length).map((s) => globMatcher(s))
@@ -669,11 +769,39 @@ export async function audit(directory: string, opts: AuditOptions): Promise<Audi
         if (/^\s*(?:process\.exit|os\._exit|sys\.exit)\(/.test(a.text)) add("tests", { file: c.path, line: a.line, text: "exits the test process early" })
       }
     }
-    if (test) {
-      const lost = assertions(c.removed) - assertions(c.added.map((a) => a.text))
-      if (lost > 0 && c.status !== "D") add("tests", { file: c.path, text: `removes ${lost} assertion${lost === 1 ? "" : "s"}` }, true)
-      if (/\.snap$|__snapshots__\//.test(c.path) && c.removed.length > 20)
-        add("tests", { file: c.path, text: `rewrites a snapshot (${c.removed.length} lines removed)` }, true)
+    if (test && c.status !== "D") {
+      // A test that keeps its name but loses its assertions still "passes": losing every one, or
+      // more than half of them, is a neutered test (block); a smaller loss only warns.
+      const beforeText = await gitRaw(root, ["show", `${base}:${c.from ?? c.path}`]).catch(() => "")
+      const afterText = await fs.readFile(path.join(root, c.path), "utf8").catch(() => "")
+      const beforeLines = beforeText ? beforeText.split("\n") : []
+      const afterLines = afterText ? afterText.split("\n") : []
+      const before = assertions(beforeLines)
+      const after = assertions(afterLines)
+      const lost = before - after
+      if (lost > 0) {
+        const emptied = after === 0
+        const majority = !emptied && lost * 2 > before
+        const text = emptied
+          ? `removes all ${before} assertion${before === 1 ? "" : "s"}`
+          : majority
+            ? `removes ${lost} of ${before} assertions (more than half)`
+            : `removes ${lost} assertion${lost === 1 ? "" : "s"}`
+        add("tests", { file: c.path, text }, !(emptied || majority))
+      }
+      // A snapshot whose lines are mostly gone, or wholly replaced, is a rewrite (block); a smaller one warns.
+      if (/\.snap$|__snapshots__\//.test(c.path) && c.removed.length > 0) {
+        const beforeCount = beforeLines.length - (beforeLines[beforeLines.length - 1] === "" ? 1 : 0)
+        const removed = c.removed.length
+        const replaced = removed >= beforeCount
+        const majority = !replaced && removed * 2 > beforeCount
+        const text = replaced
+          ? `replaces a snapshot (all ${beforeCount} lines removed)`
+          : majority
+            ? `rewrites a snapshot (${removed} of ${beforeCount} lines removed, more than half)`
+            : `rewrites a snapshot (${removed} lines removed)`
+        add("tests", { file: c.path, text }, !(replaced || majority))
+      }
     }
     for (const a of c.added) {
       const sup = SUPPRESSIONS.find(([re]) => re.test(a.text))
@@ -717,7 +845,7 @@ export async function audit(directory: string, opts: AuditOptions): Promise<Audi
     } else if (LOCKFILES.test(c.path)) add("dependencies", { file: c.path, text: "updates a lockfile" }, true)
   }
 
-  for (const f of await ruleChanges(root, base, all, opts.ruleScripts ?? [], await checkDirs(root, base, directory)))
+  for (const f of await ruleChanges(root, base, all, opts.ruleScripts ?? [], await checkDirs(root, base, directory), opts.checks ?? []))
     add("tests", { file: f.file, text: `changes the rules the gate checks with: ${f.what}` })
 
   // A secret committed and then deleted still leaked: scan the commits, not only the net diff.
