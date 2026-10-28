@@ -24,7 +24,7 @@ Also reported by boot (medium confidence): Live: /proc/1049645/status VmRSS 1 38
 
 ## LIVE-02 — A backend that dies mid-task leaves the task stranded behind a misleading 'driven by another MCP session (pid undefined)' answer
 
-- [ ] *(open)*
+- [x] closed in 1d0afc9 — **Executed evidence:** index.ts reset(reconnect) rebuilds the fleet at once when this process still has agents and Fleet.close marks in-flight turns as taken by the dead backend; a wait on a closed fleet answers that the server went away; get() never blames another session for an owner-less record; harness test in fleet-fixes.test.ts (task t-f289's gate review 5 of 5 met; final ci run)
 - **Severity:** high **BLOCKING** · **Confidence:** high · **Also reported by:** boot: Backend death mid-task: the in-flight wait spins on a closed Fleet with a misleading 'driven by another MCP session (pid undefined)' error; recovery only on the next tool call
 - **Location:** `packages/opencode/src/fleet.ts:3142`
 
@@ -90,7 +90,7 @@ Also reported by boot (high confidence): Live probe P7 (probe-flow.ts): `git che
 
 ## LIVE-07 — Observation: a task that failed its gate twice stays in board state 'review' and holds a lock on a path outside its scope
 
-- [ ] *(open)*
+- [x] closed in 1d0afc9 — **Executed evidence:** a task whose gate failed after its rounds is shown failed-but-open by board_summary and locks are intersected with the scope (board.ts in 54b27d7; same gate)
 - **Severity:** low · **Confidence:** medium
 - **Location:** `packages/opencode/src/fleet.ts`
 

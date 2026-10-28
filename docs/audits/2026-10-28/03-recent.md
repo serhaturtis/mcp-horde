@@ -58,7 +58,7 @@ Re-reviewed the 45 commits since 5a2606d (36 non-rebundle) by reading every diff
 
 ## REC-05 — News file is not republished when a gate decides; it waits for the agent's next scheduled refresh
 
-- [ ] *(open)*
+- [x] closed in 1d0afc9 — **Executed evidence:** publishNews runs right after a gate verdict is recorded and after a fix round is handed over (test, same gate)
 - **Severity:** low · **Confidence:** high
 - **Location:** `packages/opencode/src/fleet.ts:2013`
 

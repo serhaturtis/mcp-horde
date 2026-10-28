@@ -21,7 +21,7 @@ Ground truth first: `./ci.sh` in full (427 tests, none skipped, exit 0), the pac
 
 - [x] **LIVE-01** (closed 26d7228) [high] Every opencode server's heap peaks at 2-3 GB in a day-long session, within reach of the 4.3 GB limit the design note says was handled (also: boot)
   `packages/opencode/src/fleet.ts` — grep 'new high' ~/.local/state/mcp-horde/servers.log (19 lines): pid 1049645 (digicorp session, started 2026-10-26T11:24): heap 570 MB at 11:36, 1426 MB at 14:31, 2163 MB… → [00-live.md](./00-live.md#live-01--)
-- [ ] **LIVE-02** [high] A backend that dies mid-task leaves the task stranded behind a misleading 'driven by another MCP session (pid undefined)' answer (also: boot)
+- [x] **LIVE-02** (closed 1d0afc9) [high] A backend that dies mid-task leaves the task stranded behind a misleading 'driven by another MCP session (pid undefined)' answer (also: boot)
   `packages/opencode/src/fleet.ts:3142` — Live probe (scratchpad/audit/live/out/backend-dies/journey.log): horde_do t-78bb (worker runs `sleep 120`); after 25 s SIGKILL of the private backend (pid 3245998); horde… → [00-live.md](./00-live.md#live-02--)
 - [x] **LIVE-03** (closed 9bfba96) [medium] packages/opencode/test/support-fixes.test.ts (22 tests) has never run under npm test (also: gates)
   `packages/opencode/package.json:35` — node -e 'require("./packages/opencode/package.json").scripts.test' lists test/unit, core, modes, flow, dist, plugin, fleet-fixes, horde (8 files); the directory holds 10 … → [00-live.md](./00-live.md#live-03--)
@@ -44,7 +44,7 @@ Ground truth first: `./ci.sh` in full (427 tests, none skipped, exit 0), the pac
   `docs/DESIGN.md:149` — docs/DESIGN.md:149: 'When `opencode` starts the shared or private server it sets `OPENCODE_CONFIG_CONTENT` with `mcp` entries for the worker-side horde servers … (`HORDE_… → [00-live.md](./00-live.md#live-05--)
 - [x] **LIVE-06** (closed 919927a) [low] A worker wrote through the shell what the edit rule refused, and only the gate caught it, one round later
   `plugins/horde/skills/horde/SKILL.md` — Journey log (scratchpad/audit/live/out/journey/journey.log), task t-42fa: 'refused outside its scope: edit package.json' and, in the same outcome, 'changed 3 file(s): pac… → [00-live.md](./00-live.md#live-06--)
-- [ ] **LIVE-07** [low] Observation: a task that failed its gate twice stays in board state 'review' and holds a lock on a path outside its scope
+- [x] **LIVE-07** (closed 1d0afc9) [low] Observation: a task that failed its gate twice stays in board state 'review' and holds a lock on a path outside its scope
   `packages/opencode/src/fleet.ts` — Journey log, board_summary after t-42fa FAILED (checks failed after 2 rounds): '3 tasks: 1 done, 1 review, 1 failed · review t-42fa …; locks package.json → t-42fa'. t-42f… → [00-live.md](./00-live.md#live-07--)
 - [x] **DEP-01** (closed 919927a) [medium] Clone-path instructions (`claude mcp add`) omit the ledger server and the hooks
   `plugins/horde/README.md:85` — plugins/horde/README.md:85-88 lists four `claude mcp add` lines: opencode, board, verify, context. plugins/horde/.mcp.json registers five servers: opencode, board, verify… → [01-deploy.md](./01-deploy.md#dep-01--)
@@ -90,7 +90,7 @@ Ground truth first: `./ci.sh` in full (427 tests, none skipped, exit 0), the pac
   `packages/board/src/board.ts:398` — 9c2b22d: `const claimedPath = (p) => Boolean(p) && (isFile(p) || (!/\s/.test(p) && /[./]/.test(p)))`. node -e with that predicate: "none" false, "n/a" true, "N/A" true, "… → [03-recent.md](./03-recent.md#rec-03--)
 - [x] **REC-04** (closed 01623f0) [low] Binaries and scope hints parse the budget-trimmed verdict and silently disappear when audit lines are dropped
   `packages/opencode/src/horde.ts:632` — outcome() takes `verdict = record.gateState?.verdict` (horde.ts:431) and feeds `verdict?.text` to scopeFiles (:621-630) and binaryFiles (:632-641); the 900-char `truncate… → [03-recent.md](./03-recent.md#rec-04--)
-- [ ] **REC-05** [low] News file is not republished when a gate decides; it waits for the agent's next scheduled refresh
+- [x] **REC-05** (closed 1d0afc9) [low] News file is not republished when a gate decides; it waits for the agent's next scheduled refresh
   `packages/opencode/src/fleet.ts:2013` — publishNews() call sites: fleet.ts:1030 (task start), 2266/2279 (maybePush), 2785 (markReported), 3106 (dropLive). maybePush is called only from doRefresh (:2013). The ga… → [03-recent.md](./03-recent.md#rec-05--)
 - [x] **REC-06** (closed 9bfba96) [low] Board test suite fails under the HORDE_* state-dir overrides the project tells auditors and users to use
   `packages/board/test/board.test.ts` — Ran the package's own test command with HORDE_VERIFY_STATE_DIR, HORDE_BOARD_STATE_DIR, HORDE_OPENCODE_STATE_DIR, HORDE_OPENCODE_WORKTREE_DIR, XDG_STATE_HOME, XDG_DATA_HOM… → [03-recent.md](./03-recent.md#rec-06--)
@@ -104,7 +104,7 @@ Ground truth first: `./ci.sh` in full (427 tests, none skipped, exit 0), the pac
   `packages/opencode/src/worktree.ts:951` — ~/.local/share/mcp-horde/worktrees/rp-integration-497e8607/t-0164 is not a git worktree (`git rev-parse` -> 'not a git repository'); it contains only two *directories* na… → [04-boot.md](./04-boot.md#boot-03--)
 - [x] **BOOT-04** (closed 01623f0) [low] horde_do in a non-git directory fails fast but creates a board for the plain directory, records a failed task, and records the start failure twice
   `packages/opencode/src/horde.ts:157` — Live probe P6 (probe-flow.ts): `horde_do {goal, directory: <plain dir with horde.json>}` -> 152 ms ERR 'isolation "worktree" needs a git repository, but .../pflow/plain i… → [04-boot.md](./04-boot.md#boot-04--)
-- [ ] **BOOT-05** [low] opencode_dispose of a task-bound agent never closes its board attempt: the task stays 'working' and the ledger learns nothing
+- [x] **BOOT-05** (closed 1d0afc9) [low] opencode_dispose of a task-bound agent never closes its board attempt: the task stays 'working' and the ledger learns nothing
   `packages/opencode/src/fleet.ts:1415` — fleet.ts:1415-1462 disposeHeld() interrupts, records activity (recordTaskActivity), commits/removes the worktree and forgets the record; there is no board.accept/board.fa… → [04-boot.md](./04-boot.md#boot-05--)
 - [x] **BOOT-06** (closed 9cb4b60) [low] Backend lifecycle: started lazily, stopped by nobody, reused across plugin and opencode versions with only a bin-string comparison and an 'untested' warning shown by opencode_status
   `packages/opencode/src/backend.ts:89` — Who starts it: index.ts:72-88 getBackend on the first tool call (never at boot, index.ts:57-59), spawnShared backend.ts:427-472 detached + unref. Who stops it: only stopS… → [04-boot.md](./04-boot.md#boot-06--)
@@ -141,7 +141,7 @@ Each scope file ends with its verified-clean records (what was constructed or ex
 
 - [x] **NEW-01** (closed 01623f0) [medium] horde_wait's timeout summary shows the worker's last action, not that its gate has been queued on a check slot
   `packages/opencode/src/horde.ts` — Observed 2026-10-28 with eight tasks sharing one `test` slot (`~/.local/state/mcp-horde/verify/locks/<repo>/check-test.0.lock` held by one server for 20+ minutes): the summary read "shell: … npm test" / "read: {}" for the running two and "the agents' status could not be read" for the rest. The orchestrator cannot tell a slow worker from a queued gate. Fix: when a gate round is waiting for a slot, say so in the wait summary and in opencode_status ("gate: waiting for the test slot held by t-xxxx, 14 min").
-- [ ] **NEW-02** [medium] Admission counts tasks, not load: `opencode.maxRunning` (default 8) ignores cores, check slots and what else the machine runs
+- [x] **NEW-02** (closed 01623f0; executed evidence: maxRunning defaults from the core count, horde_do states the useful parallelism for slot-limited checks and refuses under a load average above the core count unless maxRunning is set explicitly (unit tests; task t-80ff's gate review 4 of 4 met)) [medium] Admission counts tasks, not load: `opencode.maxRunning` (default 8) ignores cores, check slots and what else the machine runs
   `packages/opencode/src/config.ts` — Eight concurrent tasks on a 16-core machine already running other sessions' workers drove the load average to 51 and the shared backend into "not answering" blips. Fix: default maxRunning to min(8, cores / 2); when a check with `slots: 1` exists, say in horde_do's first answer how many tasks can usefully run; refuse or queue a horde_do when the 1-minute load average exceeds the core count, with the reason.
 
 ## Decisions taken during remediation (unattended session)

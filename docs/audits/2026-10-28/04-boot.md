@@ -58,7 +58,7 @@ Boot and failure modes of the opencode server are mostly fail-fast with actionab
 
 ## BOOT-05 — opencode_dispose of a task-bound agent never closes its board attempt: the task stays 'working' and the ledger learns nothing
 
-- [ ] *(open)*
+- [x] closed in 1d0afc9 — **Executed evidence:** disposeHeld closes an open board attempt as failed with reason disposed (test, same gate)
 - **Severity:** low · **Confidence:** high
 - **Location:** `packages/opencode/src/fleet.ts:1415`
 
