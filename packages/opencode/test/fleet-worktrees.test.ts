@@ -4,7 +4,7 @@ import path from "node:path"
 import { after, before, describe, test } from "node:test"
 import { Board, renderSummary } from "@mcp-horde/board"
 import type { AgentRecord } from "../src/state.js"
-import { createFleetEnv, type FleetEnv, NEWS_SESSION } from "./fleet-support.js"
+import { createFleetEnv, type FleetEnv, NEWS_SESSION, stopServer } from "./fleet-support.js"
 import { connect, git, type Harness, isolatedEnv, type Mock, makeRepo, until } from "./harness.js"
 
 describe("fleet fixes: gates, tasks and worktrees (real opencode, mock LLM)", { timeout: 600_000 }, () => {
@@ -197,7 +197,7 @@ describe("fleet fixes: gates, tasks and worktrees (real opencode, mock LLM)", { 
       assert.ok(!raw.includes("parent-password-canary"), "the parent's OPENCODE_SERVER_PASSWORD is not reused")
       assert.ok(!raw.includes("canary-value"), "the canary value never reaches the worker")
     } finally {
-      await eh.call("opencode_server", { action: "stop" }).catch(() => undefined)
+      await stopServer(eh)
       await eh.close()
     }
   })
@@ -225,7 +225,7 @@ describe("fleet fixes: gates, tasks and worktrees (real opencode, mock LLM)", { 
       const recordAfter = JSON.parse(fs.readFileSync(serverFile, "utf8"))
       assert.equal(recordAfter.pid, pidB, "the record points at the one live server, not an orphan")
     } finally {
-      await second.call("opencode_server", { action: "stop" }).catch(() => undefined)
+      await stopServer(second)
       await second.close()
     }
   })
@@ -253,7 +253,7 @@ describe("fleet fixes: gates, tasks and worktrees (real opencode, mock LLM)", { 
       const secondStatus = await second.call("opencode_status")
       assert.doesNotMatch(secondStatus, /the shared OpenCode server runs 9\.9\.9/, "the warning is shown once per process")
     } finally {
-      await second.call("opencode_server", { action: "stop" }).catch(() => undefined)
+      await stopServer(second)
       await second.close()
     }
   })

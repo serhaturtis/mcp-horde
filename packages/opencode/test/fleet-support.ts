@@ -21,6 +21,15 @@ export interface FleetEnv {
   close: () => Promise<void>
 }
 
+/** Teardown must not hide the test's own failure when the server is already gone. */
+export const stopServer = async (harness: Harness) => {
+  try {
+    await harness.call("opencode_server", { action: "stop" })
+  } catch (error) {
+    if (process.env.SHOW_OUTPUT) console.error(`opencode_server stop failed: ${(error as Error).message}`)
+  }
+}
+
 export async function createFleetEnv(): Promise<FleetEnv> {
   const mock = await startMockLlm()
   const { tmp, repo } = makeRepo(mock.url)
@@ -71,7 +80,7 @@ export async function createFleetEnv(): Promise<FleetEnv> {
     alive,
     settle,
     close: async () => {
-      await h.call("opencode_server", { action: "stop" }).catch(() => undefined)
+      await stopServer(h)
       await h.close()
       mock.close()
     },

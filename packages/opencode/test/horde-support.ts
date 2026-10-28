@@ -77,6 +77,15 @@ export async function createHordeEnv(): Promise<HordeEnv> {
     }
   }
 
+  /** Teardown must not hide the test's own failure when the server is already gone. */
+  const stopServer = async (harness: Harness) => {
+    try {
+      await harness.call("opencode_server", { action: "stop" })
+    } catch (error) {
+      if (process.env.SHOW_OUTPUT) console.error(`opencode_server stop failed: ${(error as Error).message}`)
+    }
+  }
+
   return {
     h,
     mock,
@@ -89,7 +98,7 @@ export async function createHordeEnv(): Promise<HordeEnv> {
     baselineLeftovers,
     settle,
     close: async () => {
-      await h.call("opencode_server", { action: "stop" }).catch(() => undefined)
+      await stopServer(h)
       await h.close()
       mock.close()
     },

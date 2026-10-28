@@ -335,19 +335,19 @@ describe("the simple path: horde_do, horde_wait, horde_land (real opencode, mock
     // audit lines are dropped; the hint must come from the stored findings instead.
     fs.writeFileSync(
       path.join(r, "noisy.js"),
-      `if (!require("fs").existsSync("b.txt")) {
-  console.log("TAP version 13")
-  console.log("1..0")
-  process.exit(0)
-}
+      `const fs = require("fs")
 console.log("TAP version 13")
-for (let i = 0; i < 12; i++) {
-  console.log("not ok " + (i + 1) + " - case " + i)
-  console.log("  ---")
-  console.log("  message: " + "x".repeat(300))
-  console.log("  ...")
+if (!fs.existsSync("b.txt")) {
+  console.log("1..0")
+} else {
+  for (let i = 0; i < 12; i++) {
+    console.log("not ok " + (i + 1) + " - case " + i)
+    console.log("  ---")
+    console.log("  message: " + "x".repeat(300))
+    console.log("  ...")
+  }
+  process.exitCode = 1
 }
-process.exit(1)
 `,
     )
     fs.writeFileSync(path.join(r, "horde.json"), JSON.stringify({ verify: { checks: { test: "node noisy.js" } }, tiers: ["mock/mock"] }))
