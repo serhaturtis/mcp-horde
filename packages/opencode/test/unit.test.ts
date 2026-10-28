@@ -538,6 +538,7 @@ describe("state store", () => {
     const config: Config = {
       username: "opencode",
       allowInsecure: false,
+      passEnv: [],
       serverMode: "shared",
       bin: "opencode",
       directory: dir,
