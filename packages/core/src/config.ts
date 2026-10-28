@@ -244,11 +244,11 @@ export function loadWorkers(directory: string): Workers {
   if (setup !== undefined && typeof setup !== "string") throw new Error(`${where}.setup must be a command string`)
   if (brief !== undefined && (!Array.isArray(brief) || brief.some((f) => typeof f !== "string"))) throw new Error(`${where}.brief must be an array of paths`)
   const root = repositoryRoot(directory)
+  // Link paths are used as symlink sources, so an outside one is rejected here. Brief entries are
+  // resolved one at a time by the brief renderer, which names an outside file without dropping the
+  // other house rules (a single refusal must not hide the rest).
   link?.forEach((l, i) => {
     checkInside(root, `${where}.link[${i}]`, l)
-  })
-  brief?.forEach((f, i) => {
-    checkInside(root, `${where}.brief[${i}]`, f)
   })
   if (land !== undefined && typeof land !== "string") {
     if (!land || typeof land !== "object" || Array.isArray(land) || typeof (land as { command?: unknown }).command !== "string")
