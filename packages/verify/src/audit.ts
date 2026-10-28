@@ -712,17 +712,21 @@ export async function audit(directory: string, opts: AuditOptions): Promise<Audi
   for (const h of await hiddenFiles(root)) {
     add("tests", { file: h.path, text: `is hidden from git (${h.skip ? "skip-worktree" : "assume-unchanged"}); the audit cannot see its content` })
     if (known.has(h.path)) continue
-    const c: Change = { path: h.path, status: "M", added: [], removed: [], binary: false }
     const full = path.join(root, h.path)
-    const st = await fs.stat(full).catch(() => undefined)
-    if (st?.isFile() && st.size <= MAX_SCAN_BYTES) {
-      const buf = await fs.readFile(full)
-      if (buf.subarray(0, 8000).includes(0)) c.binary = true
-      else
-        c.added = buf
-          .toString("utf8")
-          .split("\n")
-          .map((text, i) => ({ line: i + 1, text }))
+    const c: Change = { path: h.path, status: "M", added: [], removed: [], binary: false }
+    try {
+      const st = await fs.stat(full)
+      if (st.isFile() && st.size <= MAX_SCAN_BYTES) {
+        const buf = await fs.readFile(full)
+        if (buf.subarray(0, 8000).includes(0)) c.binary = true
+        else
+          c.added = buf
+            .toString("utf8")
+            .split("\n")
+            .map((text, i) => ({ line: i + 1, text }))
+      }
+    } catch {
+      // Gone since the index scan (e.g. a rename target outside the worktree): audit it as an empty change.
     }
     all.push(c)
     known.add(h.path)

