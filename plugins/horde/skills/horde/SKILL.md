@@ -10,7 +10,7 @@ You plan and judge; workers do the typing. Your context is the scarce resource: 
 ## The loop
 
 1. `horde_do { goal, done, scope }` for each independent piece of work; start several at once.
-2. `horde_wait` returns outcomes, and each one names the calls that fit next:
+2. Call `horde_wait` right after starting: `horde_do` returns as soon as a worker starts, and nothing arrives when it finishes. In Claude Code a wait longer than two minutes moves to the background and its result comes back as a task notification while you keep working. Outcomes still unread are named when you stop or when the user next speaks. `horde_wait` returns outcomes, and each one names the calls that fit next:
    - **READY** → `horde_land`. First look at what the outcome flags: an "unproven" criterion (send its ready-made `horde_tell` if it matters), "⚠ the worker's report names …" (it claims changes the diff does not have), files you did not expect. "⚠ <check> fails at … too" means that check already fails where the task started or on your branch: not the worker's doing and no reason to hold the task, but tell the user their branch is broken.
    - **NEEDS YOU** → `horde_tell`: an answer, or `approve` true/false. Questions about intent are yours to answer from the plan; refuse requests that go beyond the task, with a reason.
    - **FAILED** → read why, then one precise `horde_tell` hint; `model` for the stronger tier it names; `scope` when the fix is outside the task's files; `horde_drop` when the task itself was wrong.

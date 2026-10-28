@@ -39,6 +39,8 @@ Or from inside Claude Code: `/plugin marketplace add serhaturtis/mcp-horde`, the
 
 The plugin carries its servers as self-contained bundles (`plugins/horde/servers/`), so installing it is all it takes: no npm install, no build. It needs Node.js 20+ and [OpenCode](https://opencode.ai) on your `PATH`. The packages are not published to npm; see [`plugins/horde/README.md`](plugins/horde/README.md).
 
+Outcomes arrive when you ask for them: `horde_do` returns as soon as a worker starts, and a `horde_wait` that takes longer than two minutes moves to the background in Claude Code and comes back as a task notification while you keep working. If you stop or the user speaks again before you have read them, the plugin's hooks name the finished tasks, with a ready `horde_wait` call, and the ids still working. Push delivery is opt-in: set `HORDE_OPENCODE_CHANNEL=1` and start Claude Code with `claude --dangerously-load-development-channels plugin:horde@mcp-horde` to get a `<channel>` message when a worker settles (channels are a research preview, interactive sessions only, with a warning at each start).
+
 ## Design
 
 [`docs/DESIGN.md`](docs/DESIGN.md) describes the whole horde: how the servers fit around `opencode`, what was verified against OpenCode 2.1, what is still planned, and the build order.
