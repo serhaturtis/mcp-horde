@@ -49,7 +49,9 @@ function privateStateDir() {
   try {
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
     fs.chmodSync(dir, 0o700)
-  } catch {}
+  } catch {
+    // Best effort: an unwritable directory makes the state write fail, which the caller already ignores.
+  }
   return dir
 }
 

@@ -89,12 +89,16 @@ function parentPid(pid) {
     const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8")
     const ppid = Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[1])
     if (Number.isInteger(ppid) && ppid > 0) return ppid
-  } catch {}
+  } catch {
+    // No /proc here, so try ps below.
+  }
   try {
     const out = execFileSync("ps", ["-o", "ppid=", "-p", String(pid)], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim()
     const ppid = Number(out)
     if (out && Number.isInteger(ppid) && ppid > 0) return ppid
-  } catch {}
+  } catch {
+    // Neither /proc nor ps: callers keep the old behaviour when the parent cannot be read.
+  }
   return undefined
 }
 
