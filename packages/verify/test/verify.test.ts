@@ -320,6 +320,25 @@ describe("audit", () => {
     await assert.rejects(audit(root, { base: "nope", block: [], warn: [] }), /not a commit/)
   })
 
+  test("a data file a check reads is not a rule script; the script it runs is", async () => {
+    const show = (r: Awaited<ReturnType<typeof audit>>) => r.findings.map((f) => `${f.severity} ${f.category} ${f.file ?? ""} ${f.text}`)
+    const { root, base } = repo({
+      "horde.json": JSON.stringify({ verify: { checks: { test: "grep -q ok out.txt && sh run-tests.sh" } } }),
+      "out.txt": "nothing\n",
+      "run-tests.sh": "exit 0\n",
+    })
+    write(root, { "out.txt": "ok\n" })
+    const checks = [{ command: "grep -q ok out.txt && sh run-tests.sh", cwd: root }]
+    const l = show(await audit(root, { base, block: ["tests"], warn: [], checks }))
+    assert.ok(!l.some((x) => x.includes("out.txt changes the rules")), l.join("\n"))
+    write(root, { "run-tests.sh": "exit 1\n" })
+    const l2 = show(await audit(root, { base, block: ["tests"], warn: [], checks }))
+    assert.ok(
+      l2.some((x) => x.includes("run-tests.sh changes the rules the gate checks with")),
+      l2.join("\n"),
+    )
+  })
+
   test("skip-worktree and assume-unchanged files are named, and their content is still audited", async () => {
     const show = (r: Awaited<ReturnType<typeof audit>>) =>
       r.findings.map((f) => `${f.severity} ${f.category} ${f.file ?? ""}${f.line ? `:${f.line}` : ""} ${f.text}`)

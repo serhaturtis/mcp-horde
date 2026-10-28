@@ -436,6 +436,30 @@ async function sizeAt(root: string, rev: string, file: string): Promise<number> 
 /** Scripts a detected check runs, by convention, besides the ones the caller names. */
 const RULE_SCRIPTS = ["test", "typecheck", "type-check", "check-types", "tsc", "lint", "check", "build"]
 /** Manifest a check runs when its program is `make`, `just` or `task`: it is a rule, and names scripts one level down. */
+/** Programs whose first file argument is a script they run. */
+const INTERPRETERS = new Set([
+  "sh",
+  "bash",
+  "zsh",
+  "dash",
+  "ksh",
+  "fish",
+  "python",
+  "python3",
+  "python2",
+  "node",
+  "nodejs",
+  "deno",
+  "bun",
+  "tsx",
+  "ts-node",
+  "ruby",
+  "perl",
+  "php",
+  "pwsh",
+  "powershell",
+  "uv",
+])
 const MANIFESTS: Record<string, string[]> = {
   make: ["Makefile", "makefile", "GNUmakefile"],
   just: ["justfile"],
@@ -548,11 +572,26 @@ async function checkScriptPaths(root: string, checks: { command: string; cwd: st
     }
     return undefined
   }
+  // Only what a command executes: the program of each shell segment when it is a file in the
+  // repository (./ci.sh, scripts/run.sh), or the file an interpreter runs (sh x.sh, python t.py).
+  // A data file a check merely reads (grep ok out.txt, test -f built.js) is the work, not a rule.
   const refs = async (cwd: string, text: string) => {
     const found = new Set<string>()
-    for (const tok of text.split(/\s+/).filter(Boolean)) {
-      const rel = await scriptAt(cwd, tok)
-      if (rel) found.add(rel)
+    for (const line of text.split("\n")) {
+      for (const segment of line.split(/&&|\|\||;|\|/)) {
+        const toks = segment.trim().split(/\s+/).filter(Boolean)
+        while (toks.length && (toks[0] === "env" || toks[0] === "exec" || /^[A-Za-z_][A-Za-z0-9_]*=/.test(toks[0]!))) toks.shift()
+        if (!toks.length) continue
+        const program = path.posix.basename(toks[0]!.replace(/\\/g, "/"))
+        const own = await scriptAt(cwd, toks[0]!)
+        if (own) found.add(own)
+        if (!INTERPRETERS.has(program)) continue
+        // The first argument that is not a flag (python -m module and the like run no file).
+        const arg = toks.slice(1).find((t) => !t.startsWith("-"))
+        if (!arg || toks[1] === "-m" || toks[1] === "-c" || toks[1] === "-e") continue
+        const rel = await scriptAt(cwd, arg)
+        if (rel) found.add(rel)
+      }
     }
     return found
   }
