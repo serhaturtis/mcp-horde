@@ -6,7 +6,7 @@ import { type AuditResult, audit, diffBase, type Finding } from "./audit.js"
 import { type Check, checkScripts, detectChecks, loadSettings, loadSettingsAt } from "./detect.js"
 import type { Failure } from "./extract.js"
 import { changedFiles, type Narrowing, planRelated } from "./related.js"
-import { type CheckResult, logDirFor, runChecks } from "./run.js"
+import { type CheckResult, type CheckState, logDirFor, runChecks } from "./run.js"
 
 export interface GateOptions {
   /** Commit the work started from; the audit covers base → working tree. Without it, only checks run. */
@@ -33,6 +33,8 @@ export interface GateOptions {
   budgetChars?: number
   signal?: AbortSignal
   onProgress?: (message: string) => void
+  /** Called when a check starts, and while it waits for a slot (see RunChecksOptions.onCheck). */
+  onCheck?: (state: CheckState) => void
   /** Where logs go (verify_logs reads them back). */
   stateDir?: string
   /** Re-run even if an identical tree was already judged. */
@@ -358,6 +360,7 @@ export async function gate(directory: string, opts: GateOptions = {}): Promise<V
     signal: opts.signal,
     logDir: logDirFor(logBase, dir),
     onProgress: opts.onProgress,
+    onCheck: opts.onCheck,
     env: opts.env,
     lockDir,
   })

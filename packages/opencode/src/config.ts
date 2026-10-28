@@ -73,25 +73,34 @@ function bool(value: string | undefined, name: string): boolean {
 }
 
 /**
- * The running-agent limit: HORDE_OPENCODE_MAX_RUNNING, else horde.json `opencode.maxRunning`
- * (found from the default directory), else the user-level horde.json's, else 8.
+ * The default running limit follows the machine: one task per two cores, capped at 8 so a big
+ * host does not start a horde of its own, and at least 2 so a small one still runs a pair.
  */
-function maxRunning(env: NodeJS.ProcessEnv, directory: string): { maxRunning: number; maxRunningFrom: string } {
+export function defaultMaxRunning(cores: number): number {
+  return Math.min(8, Math.max(2, Math.floor(cores / 2)))
+}
+
+/**
+ * The running-agent limit: HORDE_OPENCODE_MAX_RUNNING, else horde.json `opencode.maxRunning`
+ * (found from the default directory), else the user-level horde.json's, else the core count's.
+ */
+function maxRunning(env: NodeJS.ProcessEnv, directory: string, cores: number): { maxRunning: number; maxRunningFrom: string } {
+  const fallback = defaultMaxRunning(cores)
   if (env.HORDE_OPENCODE_MAX_RUNNING)
-    return { maxRunning: int(env.HORDE_OPENCODE_MAX_RUNNING, 8, "HORDE_OPENCODE_MAX_RUNNING"), maxRunningFrom: "HORDE_OPENCODE_MAX_RUNNING" }
+    return { maxRunning: int(env.HORDE_OPENCODE_MAX_RUNNING, fallback, "HORDE_OPENCODE_MAX_RUNNING"), maxRunningFrom: "HORDE_OPENCODE_MAX_RUNNING" }
   const project = loadHordeFile(directory)
   const user = project.data.opencode === undefined ? loadUserHordeFile({ ...process.env, ...env }) : undefined
   const file = project.data.opencode === undefined ? user?.file : project.file
   const section = project.data.opencode === undefined ? user?.data.opencode : project.data.opencode
-  if (section === undefined) return { maxRunning: 8, maxRunningFrom: "default" }
+  if (section === undefined) return { maxRunning: fallback, maxRunningFrom: "default" }
   if (!section || typeof section !== "object" || Array.isArray(section)) throw new Error(`${file}: "opencode" must be an object`)
   const n = (section as Record<string, unknown>).maxRunning
-  if (n === undefined) return { maxRunning: 8, maxRunningFrom: "default" }
+  if (n === undefined) return { maxRunning: fallback, maxRunningFrom: "default" }
   if (typeof n !== "number" || !Number.isInteger(n) || n < 0) throw new Error(`${file}: "opencode.maxRunning" must be a non-negative integer (0 = unlimited)`)
   return { maxRunning: n, maxRunningFrom: project.data.opencode === undefined ? `${file} opencode.maxRunning` : "horde.json opencode.maxRunning" }
 }
 
-export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
+export function loadConfig(env: NodeJS.ProcessEnv = process.env, opts: { cores?: number } = {}): Config {
   const home = os.homedir()
   const stateHome = env.XDG_STATE_HOME || path.join(home, ".local", "state")
   const directory = path.resolve(env.HORDE_OPENCODE_DIRECTORY || process.cwd())
@@ -104,7 +113,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     bin: env.HORDE_OPENCODE_BIN || "opencode",
     directory,
     defaultPermissions: policy(env.HORDE_OPENCODE_PERMISSIONS),
-    ...maxRunning(env, directory),
+    ...maxRunning(env, directory, opts.cores ?? os.cpus().length),
     stateDir: path.resolve(env.HORDE_OPENCODE_STATE_DIR || path.join(stateHome, "mcp-horde", "opencode")),
     worktreeDir: defaultWorktreeDir(env),
     channel: bool(env.HORDE_OPENCODE_CHANNEL, "HORDE_OPENCODE_CHANNEL"),

@@ -16,7 +16,7 @@ import {
   reviewPrompt,
   type Verdict,
 } from "@mcp-horde/review"
-import { type CheckResult, lockDirFor, logDirFor, gate as runGate, defaultStateDir as verifyStateDir } from "@mcp-horde/verify"
+import { type CheckResult, type GateOptions, lockDirFor, logDirFor, gate as runGate, defaultStateDir as verifyStateDir } from "@mcp-horde/verify"
 import type {
   AgentInfo,
   FormInfo,
@@ -155,6 +155,10 @@ export interface GateView {
   text?: string
   /** retrying: the gate failed and its fix waits for a running slot (the running limit is reached). */
   queued?: boolean
+  /** running: the check now running (since when). */
+  check?: { name: string; since: number }
+  /** running: the check is waiting for a slot another run holds. */
+  waiting?: { check: string; slot: string; holder?: string; since: number }
 }
 
 /** How long a wait keeps retrying an agent it cannot read (a blip of the OpenCode server is retried). */
@@ -247,6 +251,9 @@ export interface Hooks {
   settled(snap: Snapshot): void
 }
 
+/** What verify reports while a check runs (run.ts's CheckState, reachable through the gate's option). */
+type GateCheckState = Parameters<NonNullable<GateOptions["onCheck"]>>[0]
+
 interface Live {
   record: AgentRecord
   track: Track
@@ -295,7 +302,7 @@ interface Live {
   running?: Promise<void>
   queued?: Promise<void>
   /** A gate run in flight, for the turn that started at `turn`. */
-  gating?: { turn: number; abort: AbortController }
+  gating?: { turn: number; abort: AbortController; check?: GateCheckState }
   /** Prompts being sent right now: a gate must not start on the turn they are about to supersede. */
   sending: number
   /** Operations on the worktree or session (merge, sync, revert, compact) that a gate must not overlap. */
@@ -441,6 +448,12 @@ export function checkSummary(c: Pick<CheckResult, "pass" | "extracted" | "stoppe
 
 /** A check's line in a stored verdict, with how it compared with the baseline when it was given one. */
 export type GateCheckSummary = Omit<GateCheck, "summary"> & { summary: string; baseline?: NonNullable<CheckResult["baseline"]> }
+
+/** A blocking audit finding kept beside the rendered verdict, so hints do not depend on its budget. */
+export type GateAuditFinding = { category: string; file?: string; text: string }
+
+/** What a stored verdict holds (the GateState verdict, including its compact audit findings). */
+export type StoredVerdict = NonNullable<NonNullable<AgentRecord["gateState"]>["verdict"]>
 
 function gateCheck(c: CheckResult): GateCheckSummary {
   return { name: c.name, pass: c.pass, summary: checkSummary(c), ...(c.baseline ? { baseline: c.baseline } : {}) }
@@ -1089,7 +1102,7 @@ export class Fleet {
       try {
         result = await this.startSpawn({ ...effective, prompt }, checked)
       } catch (err) {
-        await board.fail(taskId, { reason: `the agent could not start: ${(err as Error).message}` }).catch(() => undefined)
+        await board.fail(taskId, { reason: `the agent could not start: ${(err as Error).message}`, retry: false }).catch(() => undefined)
         throw err
       }
       const snap = result.snapshot
@@ -2284,7 +2297,25 @@ export class Fleet {
     const v = gs.verdict
     const turn = currentTurn(live.track)
     const view = { round: gs.round, maxRounds: cfg.maxRounds, text: v?.text }
-    if (live.gating) return { ...view, state: "running", round: gs.round + 1 }
+    if (live.gating) {
+      const state = live.gating.check
+      return {
+        ...view,
+        state: "running",
+        round: gs.round + 1,
+        ...(state ? { check: { name: state.check, since: state.since } } : {}),
+        ...(state?.phase === "waiting"
+          ? {
+              waiting: {
+                check: state.check,
+                slot: state.slot ?? state.check,
+                holder: state.holder?.task ?? (state.holder?.pid !== undefined ? `pid ${state.holder.pid}` : undefined),
+                since: state.since,
+              },
+            }
+          : {}),
+      }
+    }
     // A fix waiting for a running slot is still a fix round.
     if (live.fix && v && !v.final) return { ...view, state: "retrying", queued: true }
     // The tree changed under this turn (sync, revert): it is not judged again.
@@ -2381,6 +2412,7 @@ export class Fleet {
     let pass = false
     let text: string
     let checks: GateCheckSummary[] | undefined
+    let audit: GateAuditFinding[] | undefined
     let review: ReviewSummary | undefined
     let stuck: SlotBlocked[] = []
     try {
@@ -2392,6 +2424,9 @@ export class Fleet {
         // A worktree's commits are never on the target branch: its rules are horde.json at the tip
         // the orchestrator observed, including a change the orchestrator committed while the task ran.
         const directory = live.session?.location.directory ?? live.record.directory
+        const onCheck = (state: GateCheckState) => {
+          if (live.gating?.abort === abort) live.gating.check = state
+        }
         const judge = () =>
           runGate(directory, {
             base: start ?? cfg.base,
@@ -2407,6 +2442,7 @@ export class Fleet {
             env: wt ? { HORDE_TASK: live.record.task?.id ?? live.record.name ?? live.record.id, HORDE_WORKTREE: wt.root } : undefined,
             baseline: wt && start ? this.baselineFor(wt.repo, start, `${start.slice(0, 8)} where the task started`) : undefined,
             signal: abort.signal,
+            onCheck,
             stateDir: verifyStateDir(),
           })
         const blockedIn = (v: { checks: CheckResult[]; pass: boolean }) => v.checks.map(slotBlocked).filter((x): x is SlotBlocked => !!x)
@@ -2423,6 +2459,9 @@ export class Fleet {
         pass = v.pass
         text = v.text
         checks = v.checks.map(gateCheck)
+        audit = v.audit?.findings
+          .filter((f) => f.severity === "block")
+          .map((f) => ({ category: f.category, ...(f.file ? { file: f.file } : {}), text: f.text }))
         stuck = onlyStuck(v) ? blockedIn(v) : []
         if (!pass && stuck.length) text = await slotFailureText(stuck, directory)
       }
@@ -2461,7 +2500,8 @@ export class Fleet {
     const blocked = !pass && stuck.length > 0
     const final = blocked || pass || round >= cfg.maxRounds || text.startsWith("the gate could not run") || !!review?.error || !!moved
     const storedRound = blocked ? (live.record.gateState?.round ?? 0) : round
-    this.updateRecord(id, { gateState: { round: storedRound, verdict: { turn, pass, final, text, at: Date.now(), checks, review } } })
+    const verdict: StoredVerdict = { turn, pass, final, text, at: Date.now(), checks, review, ...(audit?.length ? { audit } : {}) }
+    this.updateRecord(id, { gateState: { round: storedRound, verdict } })
     // A hook reads the news file; a verdict must show there at once, not at the next refresh.
     this.publishNews()
     if (blocked) {

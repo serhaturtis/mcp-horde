@@ -5,6 +5,7 @@
  */
 
 import fs from "node:fs"
+import os from "node:os"
 import path from "node:path"
 import { Board } from "@mcp-horde/board"
 import { formatDuration, formatUsd, git, indent, loadTiers, oneLine, truncate, truncateHead, writeJson } from "@mcp-horde/core"
@@ -12,9 +13,21 @@ import { type Check, detectChecks, loadSettingsAt } from "@mcp-horde/verify"
 import type { ServerContext } from "@modelcontextprotocol/server"
 import { z } from "zod"
 import { extractJson, type JsonSchema, retryPrompt, schemaPrompt, validate } from "./ask.js"
-import { CapacityError, type Fleet, formatModel, formText, type LandResult, SETTLED, type Snapshot } from "./fleet.js"
+import { loadConfig } from "./config.js"
+import {
+  CapacityError,
+  type Fleet,
+  formatModel,
+  formText,
+  type GateAuditFinding,
+  type GateView,
+  gateUndecided,
+  type LandResult,
+  SETTLED,
+  type Snapshot,
+} from "./fleet.js"
 import type { AgentRecord, ReviewSummary } from "./state.js"
-import { BASELINE_MESSAGE, type Worktree, workStart } from "./worktree.js"
+import { BASELINE_MESSAGE, repoRoot, type Worktree, workStart } from "./worktree.js"
 
 // biome-ignore lint/suspicious/noExplicitAny: the registration helper is generic over each tool's schema
 type Tool = (name: string, description: string, shape: z.ZodRawShape, run: (args: any, fleet: Fleet, extra: ServerContext) => Promise<string>) => void
@@ -92,6 +105,65 @@ function noteCleanupFailure(err: Error, action: string, id: string): void {
   process.stderr.write(`[mcp-horde/opencode] could not ${action} ${id}: ${err.message}\n`)
 }
 
+/**
+ * Why a start is refused when the machine is already loaded: tasks, not just our own running
+ * count, decide whether another worker can do useful work. Undefined when the load is within it.
+ */
+export function busyRefusal(input: { load: number; cores: number; running: string[] }): string | undefined {
+  if (!(input.load > input.cores)) return undefined
+  const tasks = input.running.length
+    ? `${input.running.length} task(s) are running (${input.running.slice(0, 5).join(", ")}${input.running.length > 5 ? ", …" : ""})`
+    : "no task of this session is running"
+  return `the machine is busy: the 1-minute load average is ${input.load.toFixed(2)} over ${input.cores} core(s), and ${tasks}. Wait for one to finish, or set "opencode": {"maxRunning": N} in horde.json to choose your own limit.`
+}
+
+/** Whether the running limit was chosen (horde.json or the environment) rather than derived from the cores. */
+function chosenLimit(repo: string): boolean {
+  const config = loadConfig({ ...process.env, HORDE_OPENCODE_DIRECTORY: repo })
+  return config.maxRunningFrom !== "default"
+}
+
+/**
+ * How many tasks can usefully work at once: the smallest slot count (or an exclusive resource's
+ * one) among the checks every task runs. Undefined when no check limits concurrency.
+ */
+export function usefulParallelism(checks: Check[]): { n: number; why: string } | undefined {
+  const limited = checks.filter((c) => c.slots !== undefined || c.exclusive !== undefined)
+  if (!limited.length) return undefined
+  const n = Math.min(...limited.map((c) => (c.exclusive ? 1 : (c.slots ?? 1))))
+  const why = limited.map((c) => `${c.name} ${c.exclusive ? `needs ${c.exclusive} alone` : `has ${c.slots} slot${c.slots === 1 ? "" : "s"}`}`).join(", ")
+  return { n, why }
+}
+
+/** "gate round 2: test running for 3m20s", or the slot it waits for; undefined when no check is running. */
+export function gateProgress(g: GateView, now = Date.now()): string | undefined {
+  if (g.state !== "running") return undefined
+  const round = `gate round ${g.round}`
+  if (g.waiting) {
+    const holder = g.waiting.holder ? `held by ${g.waiting.holder}` : "held by another process"
+    return `${round}: waiting for the ${g.waiting.check} slot ${holder} for ${formatDuration(now - g.waiting.since)}`
+  }
+  if (g.check) return `${round}: ${g.check.name} running for ${formatDuration(now - g.check.since)}`
+  return `${round}: running its checks`
+}
+
+/**
+ * A failed start must be recorded once. fleet.spawn records a startSpawn failure on the task it
+ * assigned; this closes a planned task that never got an attempt (or one it left open).
+ */
+async function closeFailedStart(board: Board, taskId: string, err: Error): Promise<void> {
+  try {
+    const task = board.task(taskId)
+    const last = task.attempts.at(-1)
+    if (task.status === "failed" || last?.endedAt) return
+  } catch {
+    return // the task is already gone
+  }
+  await board
+    .fail(taskId, { reason: `could not start: ${err.message}`, retry: false })
+    .catch((e: Error) => noteCleanupFailure(e, "record the failed start of", taskId))
+}
+
 export function registerHorde(tool: Tool, opts: HordeOptions) {
   tool(
     "horde_do",
@@ -129,6 +201,23 @@ export function registerHorde(tool: Tool, opts: HordeOptions) {
     },
     async (a, fleet, extra) => {
       const repo = fleet.resolveDir(a.directory)
+      // The worker's work can only land from a branch, and its worktree needs a repository:
+      // refuse both before a board task or a worktree exists, not after the work is paid for.
+      const root = await repoRoot(repo)
+      const branch = await git(root, "symbolic-ref", "-q", "--short", "HEAD").catch(() => "")
+      if (!branch) throw new Error(`your checkout ${root} is on a detached HEAD; switch to a branch first`)
+      if (!chosenLimit(root)) {
+        const load = os.loadavg()[0] ?? 0
+        const cores = os.cpus().length || 1
+        if (load > cores) {
+          const running = await fleet
+            .list({})
+            .then((r) => r.snapshots.filter((s) => !SETTLED.has(s.state)).map((s) => s.task?.id ?? s.name ?? s.id))
+            .catch(() => [])
+          const refusal = busyRefusal({ load, cores, running })
+          if (refusal) throw new Error(refusal)
+        }
+      }
       // The checks judge the work: with none the gate can never pass, so say so before a worker spends anything.
       // Workers start from HEAD and their gates read HEAD's horde.json, so look there too.
       const checks = await detectChecks(repo, await loadSettingsAt(repo, "HEAD"))
@@ -153,10 +242,7 @@ export function registerHorde(tool: Tool, opts: HordeOptions) {
           // Nothing started: the plan entry must not linger as an open task. A running-limit refusal
           // started nothing and failed nothing, so it is forgotten rather than recorded as a failure.
           if (err instanceof CapacityError) await board.unplan(task.id).catch((e: Error) => noteCleanupFailure(e, "unplan", task.id))
-          else
-            await board
-              .fail(task.id, { reason: `could not start: ${err.message}`, retry: false })
-              .catch((e: Error) => noteCleanupFailure(e, "record the failed start of", task.id))
+          else await closeFailedStart(board, task.id, err)
           throw err
         })
       if (a.wait) return (await collect(fleet, [snapshot.id], "all", a.timeout_seconds ?? opts.waitSeconds(), extra, opts)).text
@@ -164,9 +250,16 @@ export function registerHorde(tool: Tool, opts: HordeOptions) {
       const model = snapshot.model ? formatModel(snapshot.model) : "OpenCode's default model"
       const tier = tiers.length ? ` (tier ${board.task(task.id).tier} of ${tiers.length})` : ""
       const setup = notes.filter((n) => !/^working t-/.test(n)).map((n) => n.replace(/ from the main checkout$/, ""))
+      const parallel = usefulParallelism(checks)
       return [
         `${task.id} working: "${task.title}" · ${model}${tier} · worktree ${snapshot.worktree?.branch ?? "(none)"}`,
-        ...[setup.join(" · "), task.scope.length ? `scope: ${task.scope.join(", ")}` : "", plannedChecks(checks), ...warnings]
+        ...[
+          setup.join(" · "),
+          task.scope.length ? `scope: ${task.scope.join(", ")}` : "",
+          plannedChecks(checks),
+          parallel ? `at most ${parallel.n} task(s) can usefully run at once on this repository (${parallel.why})` : "",
+          ...warnings,
+        ]
           .filter(Boolean)
           .map((l) => `  ${l}`),
         `→ horde_wait {ids: ["${task.id}"]} for the outcome`,
@@ -221,10 +314,7 @@ export function registerHorde(tool: Tool, opts: HordeOptions) {
           // Nothing started: the plan entry must not linger as an open task. A running-limit refusal
           // started nothing and failed nothing, so it is forgotten rather than recorded as a failure.
           if (err instanceof CapacityError) await board.unplan(task.id).catch((e: Error) => noteCleanupFailure(e, "unplan", task.id))
-          else
-            await board
-              .fail(task.id, { reason: `could not start: ${err.message}`, retry: false })
-              .catch((e: Error) => noteCleanupFailure(e, "record the failed start of", task.id))
+          else await closeFailedStart(board, task.id, err)
           throw err
         })
       if (a.wait) return (await collect(fleet, [snapshot.id], "all", a.timeout_seconds ?? opts.waitSeconds(), extra, opts)).text
@@ -408,7 +498,7 @@ function noChecks(repo: string, uncommitted: boolean): string {
 async function collect(fleet: Fleet, ids: string[], mode: "any" | "all", seconds: number, extra: ServerContext, opts: HordeOptions) {
   const r = await fleet.waitFor(ids, mode, seconds * 1000, { signal: extra.mcpReq.signal, onTick: opts.progress(extra) })
   const news = r.snapshots.filter((s) => r.news.has(s.id))
-  const working = r.snapshots.filter((s) => !r.news.has(s.id) && !SETTLED.has(s.state))
+  const working = r.snapshots.filter((s) => !r.news.has(s.id) && (!SETTLED.has(s.state) || (s.state === "idle" && gateUndecided(s))))
   const parts: string[] = []
   for (const s of news)
     parts.push(await outcome(fleet, s.id, { live: true }).catch((err: Error) => `${s.name ?? s.id}: could not read its outcome: ${err.message}`))
@@ -454,7 +544,7 @@ export async function outcome(fleet: Fleet, ref: string, opts: { live?: boolean 
   if (!SETTLED.has(s.state) || (s.gate && s.gate.state !== "pass" && s.gate.state !== "fail")) {
     const doing =
       s.gate?.state === "running"
-        ? "its checks are running"
+        ? (gateProgress(s.gate) ?? "its checks are running")
         : s.gate?.state === "retrying"
           ? `fixing what its checks found (round ${s.gate.round}/${s.gate.maxRounds})`
           : (s.activity ?? "working")
@@ -525,7 +615,7 @@ export async function outcome(fleet: Fleet, ref: string, opts: { live?: boolean 
   }
   if (workerSaid) lines.push(`  worker: ${truncate(workerSaid, 240)}`)
   lines.push(`  ${footer}`)
-  const binaryBlamed = binaryFiles(verdict?.text)
+  const binaryBlamed = binaryFiles(verdict?.audit)
   if (binaryBlamed.length) {
     const named = binaryBlamed.slice(0, 4).join(", ")
     lines.push(
@@ -536,7 +626,7 @@ export async function outcome(fleet: Fleet, ref: string, opts: { live?: boolean 
     )
   }
   const stronger = nextTier(repo, task?.tier)
-  const scopeBlamed = scopeFiles(verdict?.text)
+  const scopeBlamed = scopeFiles(verdict?.audit)
   lines.push(
     next(
       ...(reviewError
@@ -625,26 +715,14 @@ function checksLine(checks: { name: string; pass: boolean; summary?: string }[])
   return `checks ${all ? "✓ " : ""}${named.join(", ")}`
 }
 
-/** Files an audit 'scope' finding blamed, from the rendered verdict ("✗ scope: b.txt adds …"). */
-function scopeFiles(text?: string): string[] {
-  if (!text) return []
-  const files: string[] = []
-  for (const line of text.split("\n")) {
-    const m = /scope:\s+(\S+)\s+(adds|changes|deletes|moves)\b/.exec(line)
-    if (m) files.push(m[1]!)
-  }
-  return [...new Set(files)]
+/** Files a blocking audit 'scope' finding blamed, from the findings stored with the verdict. */
+function scopeFiles(audit?: GateAuditFinding[]): string[] {
+  return [...new Set((audit ?? []).filter((f) => f.category === "scope" && f.file).map((f) => f.file!))]
 }
 
-/** Files a blocking audit 'binaries' finding blamed, from the rendered verdict ("✗ binaries: a.png adds …"). */
-function binaryFiles(text?: string): string[] {
-  if (!text) return []
-  const files: string[] = []
-  for (const line of text.split("\n")) {
-    const m = /^\s*✗ binaries:\s+(\S+)\s+(?:adds or changes a binary file|file is [\d.]+ MB)/.exec(line)
-    if (m) files.push(m[1]!)
-  }
-  return [...new Set(files)]
+/** Files a blocking audit 'binaries' finding blamed, from the findings stored with the verdict. */
+function binaryFiles(audit?: GateAuditFinding[]): string[] {
+  return [...new Set((audit ?? []).filter((f) => f.category === "binaries" && f.file).map((f) => f.file!))]
 }
 
 /** "by mock/pricey", or "by mock/mock, the model that did the work"; empty when no model judged. */

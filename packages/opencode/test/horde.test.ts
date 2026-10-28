@@ -1,9 +1,10 @@
 import assert from "node:assert/strict"
+import { spawn } from "node:child_process"
 import fs from "node:fs"
 import path from "node:path"
 import { after, before, describe, test } from "node:test"
-import { Board } from "@mcp-horde/board"
-import { logDirFor } from "@mcp-horde/verify"
+import { Board, projectOf } from "@mcp-horde/board"
+import { lockDirFor, logDirFor } from "@mcp-horde/verify"
 import { connect, git, type Harness, isolatedEnv, type Mock, makeRepo, until } from "./harness.js"
 import { startMockLlm } from "./mock-llm.js"
 
@@ -446,6 +447,29 @@ describe("the simple path: horde_do, horde_wait, horde_land (real opencode, mock
     // Checks only in the working tree: the workers' gates read HEAD's horde.json and would find none.
     fs.writeFileSync(path.join(bare, "horde.json"), JSON.stringify({ verify: { checks: { test: "true" } } }))
     await assert.rejects(h.call("horde_do", { goal: "Change the README.", directory: bare }), /horde\.json are not committed, so nothing was started/)
+  })
+
+  test("horde_do refuses a detached HEAD before a board task or worktree exists", async () => {
+    const { repo: r } = makeRepo(mock.url)
+    fs.writeFileSync(path.join(r, "horde.json"), JSON.stringify({ verify: { checks: { test: "true" } }, tiers: ["mock/mock"] }))
+    git(r, "add", ".")
+    git(r, "commit", "-qm", "checks")
+    git(r, "checkout", "--detach", "-q")
+    await assert.rejects(h.call("horde_do", { directory: r, goal: "Say hi." }), (err: Error) => {
+      assert.ok(err.message.includes(`your checkout ${r} is on a detached HEAD; switch to a branch first`), err.message)
+      return true
+    })
+    assert.deepEqual((await Board.open(r, boardState())).tasks(), [], "no task was planned")
+    assert.equal(git(r, "branch", "--list", "horde/*"), "", "no worktree branch was created")
+  })
+
+  test("horde_do in a non-git directory refuses before creating a board", async () => {
+    const plain = path.join(tmp, "plain-not-a-repo")
+    fs.mkdirSync(plain, { recursive: true })
+    fs.writeFileSync(path.join(plain, "horde.json"), JSON.stringify({ verify: { checks: { test: "true" } } }))
+    await assert.rejects(h.call("horde_do", { directory: plain, goal: "Say hi." }), /isolation "worktree" needs a git repository/)
+    const { key } = await projectOf(plain)
+    assert.ok(!fs.existsSync(path.join(boardState(), key)), "no board was created for the plain directory")
   })
 
   test("horde_drop closes a task whose worker never started", async () => {
@@ -1208,6 +1232,112 @@ console.log("1..0")
     await h.call("horde_drop", { id })
   })
 
+  test("the FAILED outcome keeps a scope hint when a long check failure trims it from the verdict", async () => {
+    const { repo: r } = makeRepo(mock.url)
+    // Twelve TAP failures are more than the verdict's 1500-character budget, so its optional
+    // audit lines are dropped; the hint must come from the stored findings instead.
+    fs.writeFileSync(
+      path.join(r, "noisy.js"),
+      `if (!require("fs").existsSync("b.txt")) {
+  console.log("TAP version 13")
+  console.log("1..0")
+  process.exit(0)
+}
+console.log("TAP version 13")
+for (let i = 0; i < 12; i++) {
+  console.log("not ok " + (i + 1) + " - case " + i)
+  console.log("  ---")
+  console.log("  message: " + "x".repeat(300))
+  console.log("  ...")
+}
+process.exit(1)
+`,
+    )
+    fs.writeFileSync(path.join(r, "horde.json"), JSON.stringify({ verify: { checks: { test: "node noisy.js" } }, tiers: ["mock/mock"] }))
+    git(r, "add", ".")
+    git(r, "commit", "-qm", "checks")
+    const id = idOf(
+      await h.call("horde_do", {
+        directory: r,
+        goal: "Write b.txt.\nRUN: echo ok > b.txt && git add b.txt && git commit -qm b",
+        done: ["b.txt says ok"],
+        scope: ["a.txt"],
+      }),
+    )
+    const failed = await settle(id)
+    assert.match(failed, new RegExp(`^${id} FAILED`), failed)
+    assert.doesNotMatch(failed, /outside the allowed scope/, "the verdict text was trimmed before its audit lines")
+    assert.match(failed, /scope: \[\.\.\.\]\} to allow b\.txt/, failed)
+    await h.call("horde_drop", { id })
+  })
+
+  test("the first answer names the useful parallelism when a check has slots", async () => {
+    const { repo: r } = makeRepo(mock.url)
+    fs.writeFileSync(path.join(r, "horde.json"), JSON.stringify({ verify: { checks: { test: { command: "true", slots: 1 } } }, tiers: ["mock/mock"] }))
+    git(r, "add", "horde.json")
+    git(r, "commit", "-qm", "checks")
+    const started = await h.call("horde_do", {
+      directory: r,
+      goal: "Write p.txt.\nRUN: echo ok > p.txt && git add p.txt && git commit -qm p",
+      done: ["p.txt exists"],
+      scope: ["p.txt"],
+    })
+    assert.match(started, /at most 1 task\(s\) can usefully run at once on this repository \(test has 1 slot\)/, started)
+    await h.call("horde_drop", { id: idOf(started) })
+  })
+
+  test("horde_wait and opencode_status name the check a gate waits on and its slot holder", async () => {
+    const { repo: r } = makeRepo(mock.url, { permission: { bash: "allow" } })
+    fs.writeFileSync(
+      path.join(r, "horde.json"),
+      JSON.stringify({ verify: { checks: { test: { command: 'node -e "setTimeout(() => {}, 60000)"', slots: 1 } } }, tiers: ["mock/mock"] }),
+    )
+    git(r, "add", "horde.json")
+    git(r, "commit", "-qm", "checks")
+    const lockDir = await lockDirFor(r, path.join(tmp, "xdg-state", "mcp-horde", "verify"))
+    fs.mkdirSync(lockDir, { recursive: true })
+    const lockFile = path.join(lockDir, "check-test.0.lock")
+    // Another process holds the one test slot, heartbeating its lock as core's withLock does.
+    const holder = spawn(
+      process.execPath,
+      [
+        "-e",
+        `const fs = require("fs")
+const file = process.argv[1]
+fs.writeFileSync(file, JSON.stringify({ pid: process.pid, host: require("os").hostname(), token: "test" }))
+setInterval(() => { const t = new Date(); fs.utimesSync(file, t, t) }, 5000)
+setTimeout(() => process.exit(0), 60000)`,
+        lockFile,
+      ],
+      { stdio: "ignore" },
+    )
+    try {
+      await until(async () => fs.existsSync(lockFile))
+      const started = await h.call("horde_do", {
+        directory: r,
+        goal: "Write n.txt.\nRUN: echo ok > n.txt && git add n.txt && git commit -qm n",
+        done: ["n.txt exists"],
+        scope: ["n.txt"],
+      })
+      const id = idOf(started)
+      let waited = ""
+      const deadline = Date.now() + 30_000
+      while (!waited && Date.now() < deadline) {
+        const out = await h.call("horde_wait", { ids: [id], timeout_seconds: 1 })
+        const match = out.match(/gate round \d+: waiting for the test slot held by pid \d+ for \S+/)
+        if (match) waited = match[0]
+        else if (new RegExp(`^${id} (READY|FAILED|REPORT)`).test(out)) break
+      }
+      assert.match(waited, new RegExp(`^gate round \\d+: waiting for the test slot held by pid ${holder.pid} for `), waited)
+      const status = await h.call("opencode_status", { ids: [id] })
+      assert.match(status, new RegExp(`gate: running checks · gate round \\d+: waiting for the test slot held by pid ${holder.pid} for `), status)
+      await h.call("horde_drop", { id })
+    } finally {
+      holder.kill("SIGKILL")
+      fs.rmSync(lockFile, { force: true })
+    }
+  })
+
   test("an uncommitted horde.json is not carried over; the gate runs HEAD's and the notes say so", async () => {
     const { repo: r } = makeRepo(mock.url)
     const committed = "echo committed > marker.txt"
@@ -1629,6 +1759,14 @@ describe("the running-agent limit refuses a start without leaving a task on the 
     const tasks = (await Board.open(dir, lboardState())).tasks()
     assert.equal(tasks.length, 1, "the failed start keeps its task")
     assert.equal(tasks[0]!.status, "failed")
+    const board = await Board.open(dir, lboardState())
+    const events = fs
+      .readFileSync(path.join(board.dir, "events.jsonl"), "utf8")
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l) as { type: string; task?: string })
+      .filter((e) => e.type === "fail" && e.task === tasks[0]!.id)
+    assert.equal(events.length, 1, "the failed start is recorded once")
   })
 
   test("a second start at the running limit is refused and leaves no task behind", async () => {

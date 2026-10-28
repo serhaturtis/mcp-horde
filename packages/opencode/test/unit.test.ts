@@ -9,9 +9,21 @@ import { formatTokens, formatUsd, truncate, truncateHead } from "@mcp-horde/core
 import type { FormInfo, SessionInboxInfo, SessionMessageInfo } from "@opencode/client"
 import { extractJson, validate } from "../src/ask.js"
 import { type Backend, isLoopback, shimTarget } from "../src/backend.js"
-import { type Config, loadConfig } from "../src/config.js"
-import { defaultQuestionPolicy, defined, dismissAnswer, Fleet, formAnswer, formatModel, type Hooks, parseModel, waitedOut } from "../src/fleet.js"
+import { type Config, defaultMaxRunning, loadConfig } from "../src/config.js"
+import {
+  defaultQuestionPolicy,
+  defined,
+  dismissAnswer,
+  Fleet,
+  formAnswer,
+  formatModel,
+  type GateView,
+  type Hooks,
+  parseModel,
+  waitedOut,
+} from "../src/fleet.js"
 import { questionAnswers, questionSchema } from "../src/hooks.js"
+import { busyRefusal, gateProgress } from "../src/horde.js"
 import { News } from "../src/news.js"
 import { type AgentRecord, Store } from "../src/state.js"
 import { price } from "../src/tools.js"
@@ -349,7 +361,7 @@ describe("helpers", () => {
   })
 
   test("config parsing and validation", () => {
-    const c = loadConfig({ HOME: "/home/u", HORDE_OPENCODE_DIRECTORY: "/work" } as NodeJS.ProcessEnv)
+    const c = loadConfig({ HOME: "/home/u", HORDE_OPENCODE_DIRECTORY: "/work" } as NodeJS.ProcessEnv, { cores: 16 })
     assert.equal(c.serverMode, "shared")
     assert.equal(c.defaultPermissions, "user")
     assert.equal(c.maxRunning, 8)
@@ -365,10 +377,10 @@ describe("helpers", () => {
     assert.equal(loadConfig({ HORDE_OPENCODE_DIALOG_TIMEOUT: "30" } as NodeJS.ProcessEnv).elicitTimeoutMs, 30_000)
   })
 
-  test("the running-agent limit comes from the environment, else horde.json, else 8", () => {
+  test("the running-agent limit comes from the environment, else horde.json, else the core count", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "horde-limit-"))
     fs.mkdirSync(path.join(dir, ".git"))
-    const at = (env: Record<string, string> = {}) => loadConfig({ HORDE_OPENCODE_DIRECTORY: dir, ...env } as NodeJS.ProcessEnv)
+    const at = (env: Record<string, string> = {}) => loadConfig({ HORDE_OPENCODE_DIRECTORY: dir, ...env } as NodeJS.ProcessEnv, { cores: 16 })
     assert.equal(at().maxRunning, 8)
     fs.writeFileSync(path.join(dir, "horde.json"), JSON.stringify({ opencode: { maxRunning: 3 } }))
     assert.deepEqual([at().maxRunning, at().maxRunningFrom], [3, "horde.json opencode.maxRunning"])
@@ -377,6 +389,17 @@ describe("helpers", () => {
     assert.throws(() => at(), /"opencode\.maxRunning" must be a non-negative integer/)
     fs.writeFileSync(path.join(dir, "horde.json"), JSON.stringify({ opencode: 4 }))
     assert.throws(() => at(), /"opencode" must be an object/)
+  })
+
+  test("the default running limit is one task per two cores, between 2 and 8", () => {
+    assert.deepEqual([1, 2, 4, 6, 8, 12, 16, 64].map(defaultMaxRunning), [2, 2, 2, 3, 4, 6, 8, 8])
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "horde-limit-cores-"))
+    fs.mkdirSync(path.join(dir, ".git"))
+    const at = (cores: number) => loadConfig({ HORDE_OPENCODE_DIRECTORY: dir } as NodeJS.ProcessEnv, { cores })
+    assert.deepEqual([at(4).maxRunning, at(4).maxRunningFrom], [2, "default"])
+    assert.equal(at(64).maxRunning, 8)
+    fs.writeFileSync(path.join(dir, "horde.json"), JSON.stringify({ opencode: { maxRunning: 3 } }))
+    assert.equal(at(4).maxRunning, 3, "an explicit horde.json limit wins over the cores")
   })
 
   test("the running-agent limit falls back to the user-level horde.json", () => {
@@ -388,7 +411,7 @@ describe("helpers", () => {
     fs.writeFileSync(userFile, JSON.stringify({ opencode: { maxRunning: 5 }, tiers: ["deepseek/deepseek-flash"], workers: { setup: "echo ignored" } }))
     const xdg = process.env.XDG_CONFIG_HOME
     process.env.XDG_CONFIG_HOME = config
-    const at = (env: Record<string, string> = {}) => loadConfig({ HORDE_OPENCODE_DIRECTORY: dir, ...env } as NodeJS.ProcessEnv)
+    const at = (env: Record<string, string> = {}) => loadConfig({ HORDE_OPENCODE_DIRECTORY: dir, ...env } as NodeJS.ProcessEnv, { cores: 16 })
     try {
       assert.deepEqual([at().maxRunning, at().maxRunningFrom], [5, `${userFile} opencode.maxRunning`])
       fs.writeFileSync(path.join(dir, "horde.json"), JSON.stringify({ opencode: { maxRunning: 3 } }))
@@ -411,6 +434,30 @@ describe("helpers", () => {
       if (xdg === undefined) delete process.env.XDG_CONFIG_HOME
       else process.env.XDG_CONFIG_HOME = xdg
     }
+  })
+
+  test("a loaded machine refuses a start, naming the load and the running tasks", () => {
+    assert.equal(busyRefusal({ load: 8, cores: 16, running: [] }), undefined, "below the core count")
+    const refusal = busyRefusal({ load: 20.4, cores: 16, running: ["t-aaaa", "t-bbbb"] })!
+    assert.match(refusal, /1-minute load average is 20\.40 over 16 core\(s\)/)
+    assert.match(refusal, /2 task\(s\) are running \(t-aaaa, t-bbbb\)/)
+    assert.match(refusal, /"opencode": \{"maxRunning": N\} in horde\.json/)
+    assert.match(busyRefusal({ load: 3, cores: 2, running: [] })!, /no task of this session is running/)
+  })
+
+  test("a running gate says which check is running, or the slot it waits for", () => {
+    const now = Date.now()
+    const running = (extra: Partial<GateView>): GateView => ({ state: "running", round: 2, maxRounds: 2, ...extra })
+    assert.equal(gateProgress(running({ check: { name: "test", since: now - 200_000 } }), now), "gate round 2: test running for 3m20s")
+    assert.equal(
+      gateProgress(running({ waiting: { check: "test", slot: "check-test", holder: "t-1234", since: now - 240_000 } }), now),
+      "gate round 2: waiting for the test slot held by t-1234 for 4m00s",
+    )
+    assert.equal(
+      gateProgress(running({ waiting: { check: "test", slot: "check-test", holder: "pid 42", since: now - 60_000 } }), now),
+      "gate round 2: waiting for the test slot held by pid 42 for 1m00s",
+    )
+    assert.equal(gateProgress({ state: "pass", round: 2, maxRounds: 2 }, now), undefined)
   })
 })
 

@@ -7,7 +7,7 @@ import type { Backend } from "./backend.js"
 import { POLICIES } from "./config.js"
 import type { Fleet, GateView, Snapshot } from "./fleet.js"
 import { defined, formatModel, SETTLED, unsupportedReason } from "./fleet.js"
-import { HORDE_INSTRUCTIONS, registerHorde } from "./horde.js"
+import { gateProgress, HORDE_INSTRUCTIONS, registerHorde } from "./horde.js"
 import type { Turn } from "./tracker.js"
 
 type Extra = ServerContext
@@ -131,6 +131,8 @@ const GATE_STATE: Record<GateView["state"], string> = {
 
 function renderGate(g: GateView): string {
   const rounds = `round ${Math.max(1, g.round)}/${g.maxRounds}`
+  const progress = gateProgress(g)
+  if (progress) return `  gate: running checks · ${progress}`
   const head = `  gate: ${g.state === "retrying" && g.queued ? "failed; fix queued (waiting for a running slot)" : GATE_STATE[g.state]} (${rounds})`
   // A pass is one line; a final failure carries its verdict (already compact) so the caller can act.
   if (g.state === "fail" && g.text) return `${head}\n${indent(g.text, "    ")}`

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import { execFileSync } from "node:child_process"
+import { execFileSync, spawn } from "node:child_process"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
@@ -25,6 +25,7 @@ import {
   render,
   runChecks,
 } from "../src/lib.js"
+import type { CheckState } from "../src/run.js"
 
 const pkg = path.resolve(import.meta.dirname, "..")
 const temps: string[] = []
@@ -1774,6 +1775,43 @@ describe("checks that need the task, a stage or a slot", () => {
     fs.rmSync(log)
     await Promise.all([run("a", { slots: 2 }), run("b", { slots: 2 })])
     assert.deepEqual(order(), ["start", "start", "end", "end"], "both at once")
+  })
+
+  test("a check waiting for a slot reports the check, the holder and when the wait began", async () => {
+    const dir = tmp()
+    const lockDir = path.join(dir, "locks")
+    fs.mkdirSync(lockDir, { recursive: true })
+    const holder = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], { stdio: "ignore" })
+    const pid = holder.pid!
+    try {
+      // A lock in another process, exactly as core's withLock writes it.
+      fs.writeFileSync(path.join(lockDir, "check-suite.0.lock"), JSON.stringify({ pid, host: os.hostname(), token: "test" }))
+      const states: CheckState[] = []
+      let waiting: CheckState | undefined
+      await runChecks([{ name: "suite", command: 'node -e "0"', kind: "test", cwd: dir, source: "test", slots: 1 }], {
+        timeoutMs: 20_000,
+        lockDir,
+        onCheck: (s) => {
+          states.push(s)
+          if (s.phase !== "waiting") return
+          waiting ??= s
+          // The holder dies, so core takes its lock over and the check runs.
+          holder.kill("SIGKILL")
+        },
+      })
+      assert.ok(waiting, states.map((s) => s.phase).join(","))
+      assert.equal(waiting!.check, "suite")
+      assert.equal(waiting!.slot, "check-suite")
+      assert.equal(waiting!.holder?.pid, pid)
+      assert.ok(waiting!.since <= Date.now())
+      assert.ok(
+        states.some((s) => s.phase === "running" && s.check === "suite"),
+        "the check ran once the slot was free",
+      )
+    } finally {
+      holder.kill("SIGKILL")
+      fs.rmSync(lockDir, { recursive: true, force: true })
+    }
   })
 })
 

@@ -71,6 +71,8 @@ export interface GateState {
     at: number
     /** The checks that ran, one line each, for compact outcomes. */
     checks?: { name: string; pass: boolean; summary: string; baseline?: { label: string; pass: boolean; known: number } }[]
+    /** Blocking audit findings, kept beside the possibly-trimmed text so hints do not depend on its budget. */
+    audit?: { category: string; file?: string; text: string }[]
     review?: ReviewSummary
   }
 }

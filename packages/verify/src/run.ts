@@ -23,12 +23,35 @@ export interface CheckResult {
   baseline?: { label: string; pass: boolean; known: number }
 }
 
+/** A lock file's holder: the task when it recorded one, else the process that took it. */
+export interface CheckHolder {
+  pid?: number
+  host?: string
+  task?: string
+}
+
+/**
+ * What a check is doing right now: running, or waiting for a slot another run holds. `since` is
+ * when that state began (for a wait, when this run first found the slot taken).
+ */
+export interface CheckState {
+  check: string
+  phase: "running" | "waiting"
+  /** waiting: the lock name, e.g. "check-test". */
+  slot?: string
+  /** waiting: the lock file's holder. */
+  holder?: CheckHolder
+  since: number
+}
+
 export interface RunChecksOptions {
   timeoutMs: number
   signal?: AbortSignal
   /** Where to keep each check's full output. */
   logDir?: string
   onProgress?: (message: string) => void
+  /** Called when a check starts running, and while it waits for a slot, so a caller can say why it is slow. */
+  onCheck?: (state: CheckState) => void
   /** Stop after the first failing check (default: run them all, so the verdict is complete). */
   failFast?: boolean
   /** Variables for every check, e.g. a task's HORDE_TASK and HORDE_WORKTREE. */
@@ -163,16 +186,35 @@ async function holding<T>(check: Check, opts: RunChecksOptions, fn: () => Promis
     ...(check.exclusive ? [{ name: `resource-${check.exclusive}`, count: 1 }] : []),
   ]
   const dir = opts.lockDir
-  if (!needs.length || !dir) return fn()
+  const run = () => {
+    opts.onCheck?.({ check: check.name, phase: "running", since: Date.now() })
+    return fn()
+  }
+  if (!needs.length || !dir) return run()
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
   // Slots first, then the resource: the same order everywhere, so two checks never wait on each other.
-  return needs.reduceRight<() => Promise<T>>((inner, need) => () => slot(dir, need.name, need.count, check.name, opts, inner), fn)()
+  return needs.reduceRight<() => Promise<T>>((inner, need) => () => slot(dir, need.name, need.count, check.name, opts, inner), run)()
+}
+
+/** The holder a lock file records, if it is still readable. */
+function holderOf(file: string): CheckHolder | undefined {
+  try {
+    const h = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>
+    const holder: CheckHolder = {}
+    if (typeof h.pid === "number") holder.pid = h.pid
+    if (typeof h.host === "string") holder.host = h.host
+    if (typeof h.task === "string") holder.task = h.task
+    return holder
+  } catch {
+    return undefined
+  }
 }
 
 /** One of `count` slots named `name`, held while `fn` runs (core's withLock, so a dead holder frees it). */
 async function slot<T>(dir: string, name: string, count: number, check: string, opts: RunChecksOptions, fn: () => Promise<T>): Promise<T> {
   const deadline = Date.now() + opts.timeoutMs
   let said = false
+  let since: number | undefined
   for (;;) {
     for (let i = 0; i < count; i++) {
       let started = false
@@ -192,6 +234,10 @@ async function slot<T>(dir: string, name: string, count: number, check: string, 
     }
     if (opts.signal?.aborted) throw new Error(`cancelled while waiting for ${name}`)
     if (Date.now() > deadline) throw new Error(`waited ${Math.round(opts.timeoutMs / 1000)}s for ${name}: all ${count} of its slot(s) stayed taken`)
+    since ??= Date.now()
+    let holder: CheckHolder | undefined
+    for (let i = 0; i < count && !holder; i++) holder = holderOf(`${path.join(dir, `${name}.${i}.lock`)}`)
+    opts.onCheck?.({ check, phase: "waiting", slot: name, holder, since })
     if (!said) opts.onProgress?.(`${check}: waiting for ${name} (all ${count} slot${count > 1 ? "s" : ""} taken)`)
     said = true
     await new Promise((r) => setTimeout(r, 1000))
