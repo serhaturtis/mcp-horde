@@ -22,7 +22,7 @@ Re-reviewed the 45 commits since 5a2606d (36 non-rebundle) by reading every diff
 
 ## REC-02 — horde status/remove --repo <existing non-git dir> still creates an empty board (class of 4b775d1)
 
-- [ ] *(open)*
+- [x] closed in 915ae8b — **Executed evidence:** horde status/remove for a directory that is not a git repository or has no board refuse with the no-board message and create nothing (cli.test.ts, 40 pass)
 - **Severity:** low · **Confidence:** high
 - **Location:** `packages/board/src/cli.ts:100`
 
@@ -34,7 +34,7 @@ Re-reviewed the 45 commits since 5a2606d (36 non-rebundle) by reading every diff
 
 ## REC-03 — Report check still takes 'n/a', 'N/A', 'none.' as file-path claims
 
-- [ ] *(open)*
+- [x] closed in 915ae8b — **Executed evidence:** claimedPath treats none, n/a, nothing, -, ., ... and friends as no claim and requires a slash or an extension (board.test.ts, 40 pass)
 - **Severity:** low · **Confidence:** high
 - **Location:** `packages/board/src/board.ts:398`
 

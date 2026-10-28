@@ -76,7 +76,7 @@ Also reported by gates (high confidence): fleet.ts:2151 `const rulesAt = wt ? aw
 
 ## SEC-06 — horde.json workers.brief can pull any file the user can read into the worker brief (path traversal out of the repository)
 
-- [ ] *(open)*
+- [x] closed in 915ae8b — **Executed evidence:** packages/board/src/render.ts resolves each workers.brief entry with realpath and includes only files under the repository root, marking refused ones; test in board.test.ts (board suite 40 pass); task t-9680's gate review met
 - **Severity:** medium · **Confidence:** high
 - **Location:** `packages/board/src/render.ts:59`
 
@@ -88,7 +88,7 @@ Also reported by gates (high confidence): fleet.ts:2151 `const rulesAt = wt ? aw
 
 ## SEC-07 — The worker brief invites edits outside the scope after a lock, while the session rules deny them and the audit blocks them
 
-- [ ] *(open)*
+- [x] closed in 915ae8b — **Executed evidence:** the brief says edits outside the scope are refused and shell writes fail the audit, tells the worker to report needed paths instead of locking them, and (8e9f3e1) not to kill others' processes or use shared services; tests assert the sentences (40 pass)
 - **Severity:** low · **Confidence:** high
 - **Location:** `packages/board/src/render.ts:83`
 
@@ -100,7 +100,7 @@ Also reported by gates (high confidence): fleet.ts:2151 `const rulesAt = wt ? aw
 
 ## SEC-08 — Worker-authored text reaches the orchestrator and other workers without being framed as data
 
-- [ ] *(open)*
+- [x] closed in 915ae8b — **Executed evidence:** findings and notes from other workers in a brief are preceded by the data-framing sentence (test, 40 pass)
 - **Severity:** low · **Confidence:** medium
 - **Location:** `packages/opencode/src/horde.ts:489`
 

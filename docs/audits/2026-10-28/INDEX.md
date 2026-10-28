@@ -84,9 +84,9 @@ Ground truth first: `./ci.sh` in full (427 tests, none skipped, exit 0), the pac
   `packages/opencode/src/fleet.ts:1666` — fleet.ts:1666 `const land = loadWorkers(wt.repo).land` and :1100 `loadWorkers(directory)` → core config.ts:203 loadWorkers → loadHordeFile reads the file on disk; worktre… → [02-gates.md](./02-gates.md#gat-11--)
 - [ ] **REC-01** [medium] horde_land replays squash-merged work as empty commits and fast-forwards them onto the branch
   `packages/opencode/src/fleet.ts:1603` — fleet.ts:1596-1625 recognises 'work already on the branch' only via `git cherry -v tip HEAD start` (patch-id). Simulation in scratch (squash/): master <- `git merge --squ… → [03-recent.md](./03-recent.md#rec-01--)
-- [ ] **REC-02** [low] horde status/remove --repo <existing non-git dir> still creates an empty board (class of 4b775d1)
+- [x] **REC-02** (closed 915ae8b) [low] horde status/remove --repo <existing non-git dir> still creates an empty board (class of 4b775d1)
   `packages/board/src/cli.ts:100` — 4b775d1 added knownState() for --state only. Ran `HORDE_BOARD_STATE_DIR=<tmp>/state node packages/board/dist/cli.js status --repo <tmp>/notrepo` (an existing empty direct… → [03-recent.md](./03-recent.md#rec-02--)
-- [ ] **REC-03** [low] Report check still takes 'n/a', 'N/A', 'none.' as file-path claims
+- [x] **REC-03** (closed 915ae8b) [low] Report check still takes 'n/a', 'N/A', 'none.' as file-path claims
   `packages/board/src/board.ts:398` — 9c2b22d: `const claimedPath = (p) => Boolean(p) && (isFile(p) || (!/\s/.test(p) && /[./]/.test(p)))`. node -e with that predicate: "none" false, "n/a" true, "N/A" true, "… → [03-recent.md](./03-recent.md#rec-03--)
 - [ ] **REC-04** [low] Binaries and scope hints parse the budget-trimmed verdict and silently disappear when audit lines are dropped
   `packages/opencode/src/horde.ts:632` — outcome() takes `verdict = record.gateState?.verdict` (horde.ts:431) and feeds `verdict?.text` to scopeFiles (:621-630) and binaryFiles (:632-641); the 900-char `truncate… → [03-recent.md](./03-recent.md#rec-04--)
@@ -118,11 +118,11 @@ Ground truth first: `./ci.sh` in full (427 tests, none skipped, exit 0), the pac
   `packages/opencode/src/horde.ts:130` — horde.ts:130-134: `detectChecks(repo, await loadSettingsAt(repo, "HEAD"))` then `fleet.spawn(...)`; fleet.ts:1095-1105: `const workers = loadWorkers(directory)` and `setu… → [05-security.md](./05-security.md#sec-04--)
 - [x] **SEC-05** (closed ac81744) [medium] The reviewer prompt gives no framing against text in the diff addressed to it, and a citation of a planted comment line passes the mechanical check
   `packages/review/src/review.ts:284` — review.ts:260-290 reviewPrompt(): the task, criteria, rules and then `# The change …` followed by the raw diff; nothing says the change may contain comments or strings ad… → [05-security.md](./05-security.md#sec-05--)
-- [ ] **SEC-06** [medium] horde.json workers.brief can pull any file the user can read into the worker brief (path traversal out of the repository)
+- [x] **SEC-06** (closed 915ae8b) [medium] horde.json workers.brief can pull any file the user can read into the worker brief (path traversal out of the repository)
   `packages/board/src/render.ts:59` — render.ts:54-63: `fs.readFileSync(path.join(repo!, f), "utf8")` for each entry of `loadWorkers(repo).brief`, with no check that the result stays inside `repo` (compare va… → [05-security.md](./05-security.md#sec-06--)
-- [ ] **SEC-07** [low] The worker brief invites edits outside the scope after a lock, while the session rules deny them and the audit blocks them
+- [x] **SEC-07** (closed 915ae8b) [low] The worker brief invites edits outside the scope after a lock, while the session rules deny them and the audit blocks them
   `packages/board/src/render.ts:83` — render.ts:83: "Work in: <scope>. Before changing anything outside it, lock the paths (command below). If a lock is refused, another task owns them: do not edit them"; ren… → [05-security.md](./05-security.md#sec-07--)
-- [ ] **SEC-08** [low] Worker-authored text reaches the orchestrator and other workers without being framed as data
+- [x] **SEC-08** (closed 915ae8b) [low] Worker-authored text reaches the orchestrator and other workers without being framed as data
   `packages/opencode/src/horde.ts:489` — horde.ts:489 and :524: `worker: ${truncate(workerSaid, 240)}` (the report summary or final answer) in READY/FAILED outcomes; horde.ts:861-866: investigation findings rend… → [05-security.md](./05-security.md#sec-08--)
 - [x] **SEC-09** (closed 6a682fb) [low] news.ts builds the news file path from CLAUDE_CODE_SESSION_ID without the basename check the hook applies
   `packages/opencode/src/news.ts:36` — news.ts:35-36: `constructor(stateDir, session = process.env.CLAUDE_CODE_SESSION_ID?.trim()) { if (session) this.file = path.join(stateDir, "news", `${session}.json`) }`; … → [05-security.md](./05-security.md#sec-09--)
