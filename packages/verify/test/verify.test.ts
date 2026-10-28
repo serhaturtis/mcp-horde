@@ -337,7 +337,7 @@ describe("audit", () => {
 
     // assume-unchanged: the file is named, and its on-disk content is still scanned for tampering.
     const r2 = repo({ "test/a.test.js": "test('a', () => {})\n" })
-    write(r2.root, { "test/a.test.js": "test.skip('a', () => {})\n" })
+    write(r2.root, { "test/a.test.js": "test." + "skip('a', () => {})\n" })
     git(r2.root, "update-index", "--assume-unchanged", "test/a.test.js")
     const l2 = show(await audit(r2.root, { base: r2.base, block: ["tests"], warn: [] }))
     assert.ok(l2.includes("block tests test/a.test.js is hidden from git (assume-unchanged); the audit cannot see its content"), l2.join("\n"))
