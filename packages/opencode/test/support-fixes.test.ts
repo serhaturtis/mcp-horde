@@ -5,6 +5,7 @@ import net from "node:net"
 import os from "node:os"
 import path from "node:path"
 import { after, describe, test } from "node:test"
+import { scopeAvailable } from "@mcp-horde/core"
 import type { McpServer } from "@modelcontextprotocol/server"
 import type { PermissionRequest } from "@opencode/client"
 import { ASK_GUARDED_PROFILE, ASK_PROFILE, unsupportedSchema, validate } from "../src/ask.js"
@@ -276,6 +277,35 @@ describe("server support", () => {
       assert.equal(alive, false, "the tool process OpenCode started was stopped too")
     } finally {
       sup.kill("SIGKILL")
+    }
+  })
+
+  test("the shared backend records the opencode process and runs it in a horde-opencode scope", {
+    skip: process.platform !== "linux" ? "Linux systemd user scopes" : !scopeAvailable() ? "no systemd user manager" : false,
+    timeout: 180_000,
+  }, async () => {
+    const dir = tmpDir()
+    const h = await connect({
+      HORDE_OPENCODE_SERVER: "shared",
+      HORDE_OPENCODE_DIRECTORY: repo(),
+      HORDE_OPENCODE_STATE_DIR: path.join(dir, "state"),
+    })
+    let pid = 0
+    try {
+      const info = await h.call("opencode_server", { action: "info" })
+      pid = Number(info.match(/pid (\d+)/)![1])
+      const cmdline = fs.readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0").filter(Boolean)
+      assert.ok(
+        cmdline.some((arg) => /opencode/.test(arg)),
+        `recorded pid ${pid} is opencode: ${cmdline.join(" ")}`,
+      )
+      assert.ok(cmdline.includes("serve"), cmdline.join(" "))
+      const cgroup = fs.readFileSync(`/proc/${pid}/cgroup`, "utf8").trim()
+      assert.match(cgroup, /\/horde-opencode-\d+\.scope$/)
+      assert.notEqual(cgroup, fs.readFileSync("/proc/self/cgroup", "utf8").trim(), "not the test session's scope")
+    } finally {
+      await h.call("opencode_server", { action: "stop" }).catch(() => undefined)
+      await h.close()
     }
   })
 

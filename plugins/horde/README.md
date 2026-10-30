@@ -66,8 +66,12 @@ Set these in the shell before starting Claude Code; the plugin's MCP servers inh
 | `HORDE_OPENCODE_DIALOG_TIMEOUT` | `600` | Seconds a permission or question dialog waits for you before it goes to the calling model. |
 | `HORDE_OPENCODE_STATE_DIR` | `~/.local/state/mcp-horde/opencode` | Agent records, the shared-server record and its password file. |
 | `HORDE_OPENCODE_WORKTREE_DIR` | `~/.local/share/mcp-horde/worktrees` | Where task worktrees go. |
+| `HORDE_SCOPE` | on | On Linux with a systemd user manager, run the backends and every check, setup and land command in their own transient scopes (`horde-opencode-*`, `horde-check-*`); `off` disables it, and missing systemd support skips it silently. |
+| `HORDE_MEMORY_HIGH` | none | `MemoryHigh=` for those scopes, e.g. `32G` (digits with an optional `K`/`M`/`G`/`T` suffix) or a percentage; unset adds no property. |
 | `HORDE_BOARD_STATE_DIR` | `~/.local/state/mcp-horde/board` | Where boards (task history, findings, memory) are stored. |
 | `HORDE_VERIFY_STATE_DIR` | `~/.local/state/mcp-horde/verify` | Where check logs are kept. |
+
+systemd-oomd kills the largest cgroup when memory runs short. Without scopes the horde's backends, builds and tests share the Claude Code session's terminal scope, so their page cache can make that the victim; the scopes keep them separate, and `MemoryHigh` lets the kernel reclaim a build's page cache first.
 
 ## Requirements
 

@@ -177,6 +177,10 @@ The model, effort, profile, directory, policies and limits are chosen by the cal
 | `HORDE_OPENCODE_STATE_DIR` | `~/.local/state/mcp-horde/opencode` | One record per agent (`agents/<id>.json`), the shared-server record, and one password file per server (`server-password-shared-<port>`, removed when the shared server is stopped; `server-password-private-<pid>-<port>`, removed when its MCP process exits). All mode 0600. |
 | `HORDE_OPENCODE_WORKTREE_DIR` | `~/.local/share/mcp-horde/worktrees` | Where isolated worktrees go. |
 | `HORDE_OPENCODE_PASS_ENV` | none | Extra environment variables to pass to `opencode serve` (and so to worker shells) on top of the fixed allowlist: comma-separated names or `*` globs, e.g. `DEEPSEEK_API_KEY` or `*_API_KEY`. Provider keys OpenCode needs must be listed here, since everything else — including anything secret-looking and every `CLAUDE_*`, `HORDE_*` and `MCP_*` variable — is dropped. |
+| `HORDE_SCOPE` | on | On Linux with a reachable systemd user manager, run the shared and private `opencode serve` backends and every check, `workers.setup` and `workers.land` command in their own transient user scope (`horde-opencode-*`, `horde-check-*`). `off` disables it; a missing `systemd-run` or user manager skips it silently. |
+| `HORDE_MEMORY_HIGH` | none | `MemoryHigh=` for those scopes, e.g. `32G` (digits with an optional `K`/`M`/`G`/`T` suffix) or a percentage such as `75%`; unset adds no property. |
+
+systemd-oomd kills the largest cgroup when memory runs short. Without scopes the horde's servers, builds and tests live in the Claude Code session's terminal scope, so their page cache can make that the one killed; the scopes keep them separate, and `MemoryHigh` makes the kernel reclaim a build scope's page cache first.
 
 An invalid variable or `horde.json` does not keep the server from starting: every tool call answers with the error instead (a fixed `horde.json` is picked up by the next call; variables need a restart).
 

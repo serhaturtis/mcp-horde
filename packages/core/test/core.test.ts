@@ -12,8 +12,11 @@ import {
   loadHordeFile,
   loadTiers,
   loadWorkers,
+  memoryHigh,
   readJson,
   runCommand,
+  scopeAvailable,
+  scopeCommand,
   splitZ,
   tierLabel,
   tierModel,
@@ -131,6 +134,64 @@ describe("lifecycle log", () => {
 })
 
 describe("runCommand", () => {
+  const scopeEnv = { XDG_RUNTIME_DIR: "/run/user/1" } as NodeJS.ProcessEnv
+  const check = ["/bin/sh", "-c", "make test"]
+
+  test("the scope command builder names the unit and only adds MemoryHigh when set", () => {
+    const plain = scopeCommand(check, { unit: "horde-check-1-2", env: scopeEnv, platform: "linux", probe: () => true })
+    assert.equal(plain.command, "systemd-run")
+    assert.deepEqual(plain.args, ["--user", "--scope", "--quiet", "--unit=horde-check-1-2", "--", "/bin/sh", "-c", "make test"])
+    const high = scopeCommand(check, { unit: "horde-check-1-2", env: { ...scopeEnv, HORDE_MEMORY_HIGH: "32G" }, platform: "linux", probe: () => true })
+    assert.ok(high.args.includes("--property=MemoryHigh=32G"))
+    const percent = scopeCommand(check, { unit: "horde-check-1-2", env: { ...scopeEnv, HORDE_MEMORY_HIGH: "75%" }, platform: "linux", probe: () => true })
+    assert.ok(percent.args.includes("--property=MemoryHigh=75%"))
+  })
+
+  test("HORDE_SCOPE=off, a failed probe and a missing runtime directory leave the command alone", () => {
+    const original = { command: "/bin/sh", args: ["-c", "make test"], scoped: false }
+    assert.deepEqual(scopeCommand(check, { unit: "u", env: { ...scopeEnv, HORDE_SCOPE: "off" }, platform: "linux", probe: () => true }), original)
+    assert.deepEqual(scopeCommand(check, { unit: "u", env: scopeEnv, platform: "linux", probe: () => false }), original)
+    assert.deepEqual(scopeCommand(check, { unit: "u", env: {} as NodeJS.ProcessEnv, platform: "linux", probe: () => true }), original)
+    assert.deepEqual(scopeCommand(check, { unit: "u", env: scopeEnv, platform: "darwin", probe: () => true }), original)
+  })
+
+  test("HORDE_MEMORY_HIGH accepts sizes and percentages and rejects everything else", () => {
+    assert.equal(memoryHigh({ HORDE_MEMORY_HIGH: "32G" } as NodeJS.ProcessEnv), "32G")
+    assert.equal(memoryHigh({ HORDE_MEMORY_HIGH: "512m" } as NodeJS.ProcessEnv), "512m")
+    assert.equal(memoryHigh({ HORDE_MEMORY_HIGH: "80%" } as NodeJS.ProcessEnv), "80%")
+    assert.equal(memoryHigh({} as NodeJS.ProcessEnv), undefined)
+    for (const bad of ["32 GB", "1.5G", "G", "-1G", "32GB"]) {
+      assert.throws(() => memoryHigh({ HORDE_MEMORY_HIGH: bad } as NodeJS.ProcessEnv), /HORDE_MEMORY_HIGH/)
+    }
+  })
+
+  test("a check runs in its own horde-check scope", { skip: scopeAvailable() ? false : "no systemd user manager" }, async () => {
+    const dir = tmp()
+    const r = await runCommand("cat /proc/self/cgroup", { cwd: dir })
+    assert.equal(r.code, 0)
+    const line = r.output.trim().split("\n").at(-1)!
+    assert.match(line, /\/horde-check-\d+-\d+\.scope$/)
+    assert.notEqual(line, fs.readFileSync("/proc/self/cgroup", "utf8").trim(), "not the test process's own cgroup")
+  })
+
+  test("a scoped check's timeout still kills its whole process tree", {
+    skip: scopeAvailable() && process.platform !== "win32" ? false : "needs a systemd user scope",
+  }, async () => {
+    const dir = tmp()
+    const marker = path.join(dir, "scoped-grandchild-ran")
+    const child = path.join(dir, "scoped-child.js")
+    fs.writeFileSync(child, `setTimeout(() => require("fs").writeFileSync(${JSON.stringify(marker)}, "x"), 1500)`)
+    const parent = script(
+      dir,
+      "scoped-parent.cjs",
+      `require("child_process").spawn(process.execPath, [${JSON.stringify(child)}], { stdio: "ignore" }); setInterval(() => {}, 1000)`,
+    )
+    const r = await runCommand(parent, { cwd: dir, timeoutMs: 400 })
+    assert.equal(r.stopped, "timeout")
+    await new Promise((res) => setTimeout(res, 2500))
+    assert.equal(fs.existsSync(marker), false, "the grandchild was killed with its parent through the scope")
+  })
+
   test("exit codes and interleaved output", async () => {
     const dir = tmp()
     const ok = await runCommand(script(dir, "ok.js", "console.log('out'); console.error('err')"), { cwd: dir })

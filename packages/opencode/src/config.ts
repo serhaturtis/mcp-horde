@@ -1,6 +1,6 @@
 import os from "node:os"
 import path from "node:path"
-import { defaultWorktreeDir, loadHordeFile, loadUserHordeFile } from "@mcp-horde/core"
+import { defaultWorktreeDir, loadHordeFile, loadUserHordeFile, memoryHigh, scopeEnabled } from "@mcp-horde/core"
 
 /**
  * How permission requests (and questions) from an agent are handled.
@@ -43,6 +43,10 @@ export interface Config {
   elicitTimeoutMs: number
   /** Names/globs of extra environment variables to pass to the backend (and its worker shells). */
   passEnv: string[]
+  /** Run backends and checks in transient systemd user scopes; HORDE_SCOPE=off turns this off. */
+  scope?: boolean
+  /** HORDE_MEMORY_HIGH for those scopes (e.g. "32G", or a percentage); undefined sets no property. */
+  memoryHigh?: string
 }
 
 function policy(value: string | undefined): PermissionPolicy {
@@ -124,6 +128,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, opts: { cores?:
       .split(",")
       .map((s) => s.trim())
       .filter(Boolean),
+    // The Claude Code session must not own the horde's builds: their page cache would make its
+    // cgroup the one systemd-oomd kills. HORDE_SCOPE=off opts out; HORDE_MEMORY_HIGH is validated.
+    scope: scopeEnabled(env),
+    memoryHigh: memoryHigh(env),
   }
 }
 

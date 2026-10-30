@@ -6,7 +6,7 @@ import net from "node:net"
 import os from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
-import { killTree, pidAlive } from "@mcp-horde/core"
+import { killTree, pidAlive, scopeAvailable, scopeCommand } from "@mcp-horde/core"
 import { OpenCode, type OpenCodeClient } from "@opencode/client"
 import type { Config } from "./config.js"
 import type { ServerRecord, Store } from "./state.js"
@@ -613,6 +613,36 @@ function serveArgs(port: number) {
   return ["serve", "--hostname", "127.0.0.1", "--port", String(port)]
 }
 
+/** Quote one argument for the /bin/sh -c wrapper that records the server's pid. */
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`
+}
+
+/** Write our own pid before exec'ing the server, so systemd-run's pid is not the one recorded. */
+function pidCommand(pidFile: string, command: string[]): string[] {
+  return ["/bin/sh", "-c", `echo $$ > ${shellQuote(pidFile)}; exec ${command.map(shellQuote).join(" ")}`]
+}
+
+/** The wrapper's pid; systemd-run execs it, so its own pid is the same when the file is late. */
+async function scopedPid(proc: ChildProcess, pidFile: string): Promise<number> {
+  const deadline = Date.now() + 5_000
+  while (Date.now() < deadline) {
+    try {
+      const pid = Number(fs.readFileSync(pidFile, "utf8").trim())
+      if (Number.isInteger(pid) && pid > 0) {
+        fs.rmSync(pidFile, { force: true })
+        return pid
+      }
+    } catch {
+      // Not written yet.
+    }
+    if (proc.exitCode !== null || proc.signalCode !== null) break
+    await new Promise((r) => setTimeout(r, 20))
+  }
+  fs.rmSync(pidFile, { force: true })
+  return proc.pid!
+}
+
 /** A detached server that outlives this process; its output goes to a log file. */
 async function spawnShared(config: Config, stateDir: string, password: string, env: Record<string, string | undefined>): Promise<{ url: string; pid: number }> {
   const logPath = path.join(stateDir, "opencode-server.log")
@@ -621,16 +651,26 @@ async function spawnShared(config: Config, stateDir: string, password: string, e
     const port = await freePort()
     const log = fs.openSync(logPath, "w", 0o600)
     const bin = resolveBinary(config.bin)
-    const proc = spawn(bin.command, serveArgs(port), {
+    // The Claude Code session must not be the scope that owns the horde's builds: a systemd user
+    // scope keeps the server and its memory out of the terminal scope systemd-oomd would kill.
+    const scoped = config.scope !== false && scopeAvailable(process.env)
+    const pidFile = path.join(stateDir, `server-${port}.pid`)
+    const command = [bin.command, ...serveArgs(port)]
+    if (scoped) fs.rmSync(pidFile, { force: true })
+    const launch = scoped
+      ? scopeCommand(pidCommand(pidFile, command), { unit: `horde-opencode-${port}`, memoryHigh: config.memoryHigh, available: true })
+      : { command: bin.command, args: serveArgs(port) }
+    const proc = spawn(launch.command, launch.args, {
       cwd: workingDir(config),
       env,
       stdio: ["ignore", log, log],
       detached: true,
       windowsHide: true,
-      shell: bin.shell,
+      shell: scoped ? false : bin.shell,
     })
     fs.closeSync(log)
     proc.unref()
+    const pid = scoped ? await scopedPid(proc, pidFile) : proc.pid!
     const url = `http://127.0.0.1:${port}`
     const client = connect(url, config.username, password)
     try {
@@ -648,11 +688,11 @@ async function spawnShared(config: Config, stateDir: string, password: string, e
             if (probe.ok && proc.exitCode === null) return resolve()
             await new Promise((r) => setTimeout(r, 200))
           }
-          killTree(proc.pid!, true)
+          killTree(pid, true)
           reject(new Error(`Timed out waiting for \`${config.bin} serve\`; see ${logPath}`))
         })()
       })
-      return { url, pid: proc.pid! }
+      return { url, pid }
     } catch (err) {
       lastError = err as Error
       if (/Failed to launch/.test(lastError.message)) break
@@ -678,7 +718,14 @@ async function spawnPrivate(config: Config, env: Record<string, string | undefin
   const proc = spawn(process.execPath, [...supervisor, String(process.pid), resolveBinary(config.bin).command, ...serveArgs(port)], {
     // Our own directory, so loader flags resolve; the supervisor starts OpenCode in the agent directory.
     cwd: fileURLToPath(new URL(".", import.meta.url)),
-    env: { ...env, HORDE_SUPERVISED_CWD: workingDir(config) },
+    // The supervisor runs the private server in a scope: the Claude Code session must not own the
+    // horde's builds (its cgroup is the one systemd-oomd kills when page cache grows).
+    env: {
+      ...env,
+      HORDE_SUPERVISED_CWD: workingDir(config),
+      HORDE_SCOPE: config.scope === false ? "off" : "on",
+      ...(config.memoryHigh ? { HORDE_MEMORY_HIGH: config.memoryHigh } : {}),
+    },
     // stdin stays open as a lifeline: the supervisor stops OpenCode when it closes.
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,

@@ -18,13 +18,31 @@ const isWindows = process.platform === "win32"
 // it never reaches a worker shell.
 const env = { ...process.env }
 delete env.HORDE_SUPERVISED_CWD
-const child = spawn(bin, args, {
+// The Claude Code session must not be the scope that owns the horde's builds: its cgroup would
+// collect the private server's memory and page cache, and systemd-oomd kills the largest one.
+const portAt = args.indexOf("--port")
+const port = portAt >= 0 ? args[portAt + 1] : undefined
+// The supervisor is a standalone script (it must still run when the packages are not built), so
+// this mirrors scopeCommand in @mcp-horde/core rather than importing it.
+const off = ["off", "0", "false", "no"].includes((env.HORDE_SCOPE ?? "").trim().toLowerCase())
+const high = env.HORDE_MEMORY_HIGH?.trim()
+const scoped =
+  !isWindows &&
+  !off &&
+  !!env.XDG_RUNTIME_DIR &&
+  spawnSync("systemd-run", ["--user", "--scope", "--quiet", "--", "true"], { env, stdio: "ignore", timeout: 5_000 }).status === 0
+const launchArgs = scoped
+  ? ["--user", "--scope", "--quiet", `--unit=horde-opencode-${port ?? process.pid}`, ...(high ? [`--property=MemoryHigh=${high}`] : []), "--", bin, ...args]
+  : args
+delete env.HORDE_SCOPE
+delete env.HORDE_MEMORY_HIGH
+const child = spawn(scoped ? "systemd-run" : bin, launchArgs, {
   cwd: process.env.HORDE_SUPERVISED_CWD || process.cwd(),
   env,
   stdio: ["ignore", "inherit", "inherit"],
   windowsHide: true,
   // A resolved .exe needs no shell; only fall back to one for .cmd/.bat shims.
-  shell: isWindows && /\.(cmd|bat)$/i.test(bin),
+  shell: scoped ? false : isWindows && /\.(cmd|bat)$/i.test(bin),
   // Its own process group on POSIX, so stopping it also stops what it started (tool shells, LSPs, MCP servers).
   detached: !isWindows,
 })

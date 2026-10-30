@@ -74,6 +74,81 @@ export function killTree(pid: number, group: boolean, signal: NodeJS.Signals = "
   }
 }
 
+/** Whether HORDE_SCOPE asks for transient systemd user scopes (anything except off/0/false/no). */
+export function scopeEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const value = env.HORDE_SCOPE?.trim().toLowerCase()
+  return !(value === "off" || value === "0" || value === "false" || value === "no")
+}
+
+/** The validated HORDE_MEMORY_HIGH value, or undefined when it is unset. */
+export function memoryHigh(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const value = env.HORDE_MEMORY_HIGH?.trim()
+  if (!value) return undefined
+  if (!/^(?:\d+(?:[KMGT])?|\d+%)$/i.test(value)) {
+    throw new Error(`HORDE_MEMORY_HIGH must be a size (digits with an optional K/M/G/T suffix) or a percentage, got "${value}"`)
+  }
+  return value
+}
+
+/** Probe once per process: the answer cannot change for the life of a server. */
+let scopeProbe: boolean | undefined
+type ScopeProbe = (env: NodeJS.ProcessEnv) => boolean
+
+function probeSystemd(env: NodeJS.ProcessEnv): boolean {
+  try {
+    const res = spawnSync("systemd-run", ["--user", "--scope", "--quiet", "--", "true"], { env, stdio: "ignore", timeout: 5_000 })
+    return res.status === 0
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Whether a transient systemd user scope can be used here: Linux, not disabled, a user manager
+ * reachable through XDG_RUNTIME_DIR, and systemd-run working. Missing pieces just mean no scope.
+ */
+export function scopeAvailable(env: NodeJS.ProcessEnv = process.env, platform = process.platform, probe?: ScopeProbe): boolean {
+  if (platform !== "linux" || !scopeEnabled(env) || !env.XDG_RUNTIME_DIR) return false
+  // A supplied probe is a test override and must not decide the cached answer for this process.
+  if (probe) return probe(env)
+  if (scopeProbe === undefined) scopeProbe = probeSystemd(env)
+  return scopeProbe
+}
+
+export interface ScopeOptions {
+  /** Transient unit name, e.g. horde-check-<pid>-<n>. */
+  unit: string
+  /** MemoryHigh= for the scope; defaults to HORDE_MEMORY_HIGH. */
+  memoryHigh?: string
+  env?: NodeJS.ProcessEnv
+  platform?: NodeJS.Platform
+  /** Override the availability check (tests, or a caller that already probed). */
+  available?: boolean
+  probe?: ScopeProbe
+}
+
+export interface ScopedCommand {
+  command: string
+  args: string[]
+  /** True when the command runs through systemd-run. */
+  scoped: boolean
+}
+
+/**
+ * Build the command that runs in its own transient systemd user scope, or the command itself
+ * when no user manager is reachable (macOS, containers, WSL without systemd) or HORDE_SCOPE=off.
+ */
+export function scopeCommand(command: string[], opts: ScopeOptions): ScopedCommand {
+  const env = opts.env ?? process.env
+  const available = opts.available ?? scopeAvailable(env, opts.platform, opts.probe)
+  if (!available || command.length === 0) return { command: command[0] ?? "", args: command.slice(1), scoped: false }
+  const high = opts.memoryHigh ?? memoryHigh(env)
+  const args = ["--user", "--scope", "--quiet", `--unit=${opts.unit}`]
+  if (high) args.push(`--property=MemoryHigh=${high}`)
+  args.push("--", ...command)
+  return { command: "systemd-run", args, scoped: true }
+}
+
 export interface RunOptions {
   cwd: string
   /** Kill the whole process tree after this long (default 10 minutes). */
@@ -102,9 +177,14 @@ export interface RunResult {
   durationMs: number
 }
 
+/** Unique per horde process, so concurrent checks never share a transient unit. */
+let checkSequence = 0
+
 /**
  * Run a shell command in its own process group (Windows: its own tree), killed
- * as a whole on timeout or abort. Never rejects for a failing command: the
+ * as a whole on timeout or abort. On Linux with a systemd user manager it runs
+ * in its own transient scope, so its memory and page cache do not count against
+ * the session that started the horde. Never rejects for a failing command: the
  * result says what happened. Rejects only when the shell cannot be started.
  */
 export function runCommand(command: string, opts: RunOptions): Promise<RunResult> {
@@ -115,8 +195,16 @@ export function runCommand(command: string, opts: RunOptions): Promise<RunResult
   const maxChars = opts.maxChars ?? 1_000_000
   const half = Math.floor(maxChars / 2)
   const started = Date.now()
+  // The Claude Code session must not be the scope that owns the horde's builds: their page cache
+  // (cargo target/, node_modules) otherwise makes its cgroup the one systemd-oomd kills.
+  const scope = scopeCommand(["/bin/sh", "-c", command], {
+    unit: `horde-check-${process.pid}-${++checkSequence}`,
+    env: { ...process.env, ...opts.env },
+  })
   return new Promise((resolve, reject) => {
-    const child = spawn(command, { cwd: opts.cwd, env, shell: true, stdio: ["ignore", "pipe", "pipe"], detached: !isWindows, windowsHide: true })
+    const child = scope.scoped
+      ? spawn(scope.command, scope.args, { cwd: opts.cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: true, windowsHide: true })
+      : spawn(command, { cwd: opts.cwd, env, shell: true, stdio: ["ignore", "pipe", "pipe"], detached: !isWindows, windowsHide: true })
     // Head is kept verbatim; the tail is a rolling window. Both together never exceed maxChars.
     let head = ""
     let tail = ""
