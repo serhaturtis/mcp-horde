@@ -26,14 +26,13 @@ const port = portAt >= 0 ? args[portAt + 1] : undefined
 // this mirrors scopeCommand in @mcp-horde/core rather than importing it.
 const off = ["off", "0", "false", "no"].includes((env.HORDE_SCOPE ?? "").trim().toLowerCase())
 const high = env.HORDE_MEMORY_HIGH?.trim()
+const unit = `horde-opencode-${port ?? process.pid}`
 const scoped =
   !isWindows &&
   !off &&
   !!env.XDG_RUNTIME_DIR &&
   spawnSync("systemd-run", ["--user", "--scope", "--quiet", "--", "true"], { env, stdio: "ignore", timeout: 5_000 }).status === 0
-const launchArgs = scoped
-  ? ["--user", "--scope", "--quiet", `--unit=horde-opencode-${port ?? process.pid}`, ...(high ? [`--property=MemoryHigh=${high}`] : []), "--", bin, ...args]
-  : args
+const launchArgs = scoped ? ["--user", "--scope", "--quiet", `--unit=${unit}`, ...(high ? [`--property=MemoryHigh=${high}`] : []), "--", bin, ...args] : args
 delete env.HORDE_SCOPE
 delete env.HORDE_MEMORY_HIGH
 const child = spawn(scoped ? "systemd-run" : bin, launchArgs, {
@@ -70,6 +69,15 @@ const stop = () => {
     return
   }
   signalGroup("SIGTERM")
+  // The scope, not the pid, owns the tool shells and servers OpenCode started: stopping it reaches
+  // them all. Ignore failures; on a system without a user manager there is no scope to stop.
+  if (scoped) {
+    try {
+      spawnSync("systemctl", ["--user", "stop", `${unit}.scope`], { stdio: "ignore", timeout: 5_000 })
+    } catch {
+      // already gone
+    }
+  }
   // Escalate if it does not shut down.
   setTimeout(() => {
     if (child.exitCode === null && child.signalCode === null) signalGroup("SIGKILL")

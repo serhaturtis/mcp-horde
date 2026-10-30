@@ -158,7 +158,7 @@ export class Backend {
           // If its pid is still our `opencode serve` on the recorded port, stop it before starting
           // a new one, so it does not linger as an orphan nothing can stop or attach to.
           if (isOurSharedServer(known)) {
-            await stopPid(known.pid)
+            await stopPid(known.pid, known.url)
             forgetShared(store, known)
           } else if (probe.reachable) {
             throw new Error(
@@ -322,7 +322,7 @@ export async function stopServer(config: Config, store: Store, backend?: Backend
       return `The recorded shared server (${known.url}, pid ${known.pid}) is not answering with its password (${probe.reason || "no answer"}), so nothing was killed (the pid may belong to another process now). The record was cleared.`
     }
     // Stop the process before dropping the record, so the password file survives until it is dead.
-    await stopPid(known.pid)
+    await stopPid(known.pid, known.url)
     forgetShared(store, known)
     const left = pidAlive(known.pid) ? ` Warning: pid ${known.pid} is still alive; kill it by hand.` : ""
     if (hung) {
@@ -360,9 +360,26 @@ function isOurSharedServer(known: ServerRecord): boolean {
   return args.includes("serve") && args.includes("--port") && args.includes(port)
 }
 
-/** Stop a pid (SIGTERM, then SIGKILL after a grace period), waiting for it to exit. */
-async function stopPid(pid: number): Promise<void> {
+/**
+ * Stop the transient scope a shared server runs in. The recorded pid is opencode itself, not its
+ * process-group leader, so killTree cannot reach the tool shells, LSPs and MCP servers it started;
+ * stopping the scope stops every process in it. Missing systemd support and failures are ignored.
+ */
+function stopScope(url: string | undefined) {
+  if (isWindows || !url || !scopeAvailable({ ...process.env, HORDE_SCOPE: "on" })) return
+  const port = new URL(url).port
+  if (!port) return
+  try {
+    spawnSync("systemctl", ["--user", "stop", `horde-opencode-${port}.scope`], { stdio: "ignore", timeout: 5_000 })
+  } catch {
+    // No user manager or no such scope: the pid signal above is all we can do.
+  }
+}
+
+/** Stop a pid (SIGTERM, then SIGKILL after a grace period), and its scope, waiting for it to exit. */
+async function stopPid(pid: number, url?: string): Promise<void> {
   killTree(pid, true)
+  stopScope(url)
   const deadline = Date.now() + 5_000
   while (pidAlive(pid) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 100))
   if (pidAlive(pid) && !isWindows) {

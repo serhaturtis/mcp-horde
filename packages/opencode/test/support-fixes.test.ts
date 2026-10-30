@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import { execFileSync, spawn } from "node:child_process"
+import { execFileSync, spawn, spawnSync } from "node:child_process"
 import fs from "node:fs"
 import net from "node:net"
 import os from "node:os"
@@ -28,7 +28,8 @@ import {
   syncWorktree,
   workStart,
 } from "../src/worktree.js"
-import { connect, git, pkg } from "./harness.js"
+import { connect, git, isolatedEnv, makeRepo, pkg, until } from "./harness.js"
+import { startMockLlm } from "./mock-llm.js"
 
 const tmps: string[] = []
 const tmpDir = () => {
@@ -306,6 +307,56 @@ describe("server support", () => {
     } finally {
       await h.call("opencode_server", { action: "stop" }).catch(() => undefined)
       await h.close()
+    }
+  })
+
+  test("stopping the shared backend stops its whole scope, including a child the server started", {
+    skip: process.platform !== "linux" ? "Linux systemd user scopes" : !scopeAvailable() ? "no systemd user manager" : false,
+    timeout: 180_000,
+  }, async () => {
+    const mock = await startMockLlm()
+    const { tmp, repo } = makeRepo(mock.url)
+    const h = await connect({ ...isolatedEnv(tmp, repo), HORDE_OPENCODE_SERVER: "shared" })
+    let child = 0
+    let port = 0
+    const active = () => String(spawnSync("systemctl", ["--user", "is-active", `horde-opencode-${port}.scope`], { encoding: "utf8" }).stdout ?? "").trim()
+    const gone = async () => {
+      try {
+        process.kill(child, 0)
+        return false
+      } catch {
+        return true
+      }
+    }
+    try {
+      const pidFile = path.join(tmp, "child.pid")
+      await h.call("opencode_spawn", {
+        prompt: `TOOL: setsid sleep 300 >/dev/null 2>&1 & echo $! > ${pidFile}`,
+        permissions: "allow",
+        wait: true,
+        timeout_seconds: 60,
+      })
+      await until(async () => fs.existsSync(pidFile) && fs.readFileSync(pidFile, "utf8").trim(), 10_000)
+      child = Number(fs.readFileSync(pidFile, "utf8").trim())
+      const info = await h.call("opencode_server", { action: "info" })
+      port = Number(info.match(/127\.0\.0\.1:(\d+)/)![1])
+      assert.equal(active(), "active")
+      assert.match(fs.readFileSync(`/proc/${child}/cgroup`, "utf8").trim(), new RegExp(`/horde-opencode-${port}\\.scope$`))
+
+      await h.call("opencode_server", { action: "stop" })
+      await until(async () => active() !== "active", 10_000)
+      await until(gone, 10_000)
+    } finally {
+      await h.call("opencode_server", { action: "stop" }).catch(() => undefined)
+      await h.close()
+      mock.close()
+      if (child && !(await gone())) {
+        try {
+          process.kill(child, "SIGKILL")
+        } catch {
+          // already gone
+        }
+      }
     }
   })
 
