@@ -882,7 +882,7 @@ function findCycle(all: Task[]): string[] | undefined {
 function rank(notes: Note[], f: { tags?: string[]; paths?: string[]; query?: string }): Note[] {
   // Unicode letters and digits are words; \W would drop a non-Latin query and match everything.
   // Short Latin words ("a", "to") would match every note; a short non-Latin word is a real word.
-  const words = ((f.query ?? "").toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []).filter((w) => w.length > 2 || /[^\x00-\x7f]/.test(w))
+  const words = ((f.query ?? "").toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []).filter((w) => w.length > 2 || /\P{ASCII}/u.test(w))
   const hasQuery = f.query !== undefined
   const score = (n: Note) =>
     (f.tags ?? []).filter((t) => n.tags.includes(t)).length * 3 +
