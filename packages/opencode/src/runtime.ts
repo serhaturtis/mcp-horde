@@ -270,7 +270,15 @@ export class OpenCodeRuntime implements Runtime {
   }
 
   async models(directory?: string): Promise<ModelInfo[]> {
-    return (await req("listing models", this.client.model.list({ location: directory ? { directory } : undefined }, timed()))).data
+    // The first catalog read after a server start loads providers and the models.dev catalog; with
+    // several servers starting at once it takes well over the usual request deadline.
+    const list = () =>
+      req(
+        "listing models",
+        this.client.model.list({ location: directory ? { directory } : undefined }, timed(LONG_REQUEST_MS)),
+        LONG_REQUEST_MS + REQUEST_GRACE_MS,
+      )
+    return (await list()).data
   }
 
   async createSession(input: CreateSessionInput): Promise<SessionInfo> {
