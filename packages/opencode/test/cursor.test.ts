@@ -16,10 +16,7 @@ const bad = []
 for (const f of fs.readdirSync(".").filter((f) => f.endsWith(".txt"))) {
   if (fs.readFileSync(f, "utf8").trim() !== "ok") bad.push(f + " must say ok")
 }
-if (bad.length) {
-  console.error(bad.join("\\n"))
-  process.exit(1)
-}
+if (bad.length) throw new Error(bad.join("\\n"))
 `
 
 describe("the cursor runtime: Cursor's agent CLI as a worker", { timeout: 600_000 }, () => {
