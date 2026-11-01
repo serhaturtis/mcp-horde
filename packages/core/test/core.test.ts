@@ -367,6 +367,18 @@ describe("horde.json", () => {
     assert.throws(() => loadTiers(repo), /"tiers"\[0\] needs "model": "provider\/model"/)
   })
 
+  test("model tiers accept codex/ and cursor/ runtime ids beside provider/model", () => {
+    const repo = tmp()
+    fs.mkdirSync(path.join(repo, ".git"))
+    fs.writeFileSync(
+      path.join(repo, "horde.json"),
+      JSON.stringify({ tiers: [{ model: "codex/gpt-5" }, { model: "cursor/composer-1", variant: "high" }, { model: "deepseek/deepseek-chat" }] }),
+    )
+    assert.deepEqual(loadTiers(repo), [{ model: "codex/gpt-5" }, { model: "cursor/composer-1", variant: "high" }, { model: "deepseek/deepseek-chat" }])
+    fs.writeFileSync(path.join(repo, "horde.json"), JSON.stringify({ tiers: [{ model: "codex/" }] }))
+    assert.throws(() => loadTiers(repo), /"tiers"\[0\] needs "model": "provider\/model" \(or "codex\/…" \/ "cursor\/…"\)/)
+  })
+
   test("user-level horde.json supplies tiers unless the repository sets them", () => {
     const repo = tmp()
     fs.mkdirSync(path.join(repo, ".git"))

@@ -248,6 +248,44 @@ describe("helpers", () => {
     assert.equal(formatModel({ providerID: "a", id: "b", variant: "max" }), "a/b [max]")
   })
 
+  test("codex/ and cursor/ models select that runtime and are refused until it exists", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "horde-runtime-"))
+    const backend = { client: {}, info: { key: "local" }, events: new EventEmitter(), streaming: false, dead: true } as unknown as Backend
+    const config: Config = {
+      username: "opencode",
+      allowInsecure: false,
+      passEnv: [],
+      serverMode: "shared",
+      bin: "opencode",
+      directory: dir,
+      defaultPermissions: "ask",
+      maxRunning: 0,
+      maxRunningFrom: "test",
+      stateDir: dir,
+      worktreeDir: path.join(dir, "worktrees"),
+      channel: false,
+      elicitTimeoutMs: 1_000,
+    }
+    const hooks: Hooks = {
+      canElicit: () => false,
+      askPermission: async () => undefined,
+      askQuestion: async () => undefined,
+      settled: () => {},
+    }
+    const fleet = new Fleet(backend, config, new Store(dir), hooks)
+    try {
+      for (const [spec, kind] of [
+        ["codex/gpt-5", "codex"],
+        ["cursor/composer-1", "cursor"],
+      ] as const) {
+        await assert.rejects(fleet.spawn({ prompt: "hi", directory: dir, model: spec }), new RegExp(`the ${kind} runtime is not available yet`))
+      }
+    } finally {
+      fleet.close()
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
   test("question policy follows the permission policy", () => {
     assert.equal(defaultQuestionPolicy("user"), "user")
     assert.equal(defaultQuestionPolicy("ask"), "ask")

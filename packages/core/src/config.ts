@@ -159,11 +159,14 @@ export function loadUserHordeFile(env: NodeJS.ProcessEnv = process.env): { file:
 
 /** One model tier: what a task at this tier runs on. Tier 0 is the cheapest. */
 export interface Tier {
-  /** "provider/model", as opencode_models lists it. */
+  /** "provider/model", as opencode_models lists it, or "codex/model" / "cursor/model" for another runtime. */
   model: string
   /** Effort variant, e.g. "high". */
   variant?: string
 }
+
+/** A model id: OpenCode's "provider/model", or a "codex/" or "cursor/" runtime prefix (the rest is its model). */
+const MODEL_ID = /^[^/\s]+\/\S+$/
 
 /**
  * `horde.json` → `tiers`: the models tasks run on, cheapest first. A task's tier indexes
@@ -180,8 +183,8 @@ export function loadTiers(directory: string): Tier[] {
   if (!Array.isArray(raw)) throw new Error(`${where} must be an array of { "model": "provider/model", "variant"?: "…" }`)
   return raw.map((t, i) => {
     const entry = typeof t === "string" ? { model: t } : t
-    if (!entry || typeof entry !== "object" || typeof (entry as Tier).model !== "string" || !/^[^/\s]+\/\S+$/.test((entry as Tier).model))
-      throw new Error(`${where}[${i}] needs "model": "provider/model"`)
+    if (!entry || typeof entry !== "object" || typeof (entry as Tier).model !== "string" || !MODEL_ID.test((entry as Tier).model))
+      throw new Error(`${where}[${i}] needs "model": "provider/model" (or "codex/…" / "cursor/…")`)
     const { model, variant } = entry as Tier
     if (variant !== undefined && typeof variant !== "string") throw new Error(`${where}[${i}].variant must be a string`)
     return variant ? { model, variant } : { model }

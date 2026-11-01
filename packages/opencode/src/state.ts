@@ -3,6 +3,7 @@ import fs from "node:fs"
 import path from "node:path"
 import { SELF as PROCESS, pidAlive, readJson, sleepSync, withLock, writeAtomic } from "@mcp-horde/core"
 import type { PermissionPolicy } from "./config.js"
+import type { RuntimeKind } from "./runtime.js"
 import type { Worktree } from "./worktree.js"
 
 export interface Limits {
@@ -83,6 +84,8 @@ export interface AgentRecord {
   name?: string
   /** Stable identity of the OpenCode server the session lives on ("local" for managed servers). */
   server: string
+  /** Which agent runtime drives it; records written before the seam are OpenCode's. */
+  runtime?: RuntimeKind
   directory: string
   policy: PermissionPolicy
   questions: "user" | "ask" | "dismiss"

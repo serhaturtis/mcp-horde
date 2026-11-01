@@ -33,6 +33,7 @@ import type { Backend } from "./backend.js"
 import { type Config, inProject, type PermissionPolicy } from "./config.js"
 import { News, type NewsWait, type NewsWork } from "./news.js"
 import { type Detail, inputSummary, renderTranscript } from "./render.js"
+import { notSupported, OpenCodeRuntime, type Runtime, type RuntimeKind, within } from "./runtime.js"
 import { type AgentRecord, type GateConfig, type Limits, ownerAlive, type ReviewSummary, SELF, type Store } from "./state.js"
 import { buildTrack, type CostEstimator, costSince, currentTurn, emptyTrack, latestTool, type Track, type Turn, turnsSince } from "./tracker.js"
 import {
@@ -79,12 +80,6 @@ const DORMANT_REFRESH_MS = 10 * 60_000
 const CHILD_SCAN_MS = 30_000
 /** A child session with no activity for this long is no longer polled. */
 const CHILD_COOL_MS = 60_000
-/** Any single OpenCode request a refresh, a tick or a wait makes gets this long. */
-const REQUEST_MS = 30_000
-/** A request's own abort gets this much grace before we give up on it locally. */
-const REQUEST_GRACE_MS = 5_000
-/** Directory-scoped calls (create, location, prompt) may need this long in a directory OpenCode has not opened yet. */
-const LONG_REQUEST_MS = 120_000
 /** A gate review of a large diff against many criteria gets this long per answer (the ask default is 5 min). */
 export const GATE_REVIEW_TIMEOUT_MS = 600_000
 /** A whole background tick (all due refreshes) gets this long before the next may start. */
@@ -326,17 +321,6 @@ interface Live {
   activity?: { key: string; write: Promise<void> }
 }
 
-/** The answer of a request, or an error that names what failed. Settles within a local deadline whatever the SDK does. */
-async function req<T>(what: string, p: Promise<T>, ms = REQUEST_MS + REQUEST_GRACE_MS): Promise<T> {
-  try {
-    return await within(p, ms, what)
-  } catch (err) {
-    // A local deadline already names the request; anything else is named once here.
-    if ((err as Error).message === `${what} did not finish within ${Math.round(ms / 1000)}s`) throw err
-    throw new Error(`${what} failed: ${(err as Error).message || String(err)}`, { cause: err })
-  }
-}
-
 /** The client throws the server's tagged errors (e.g. SessionNotFoundError for a missing session). */
 function isNotFound(err: unknown): boolean {
   const e = err as { name?: string; cause?: { status?: number } } | undefined
@@ -350,18 +334,10 @@ function stillChanging(m: SessionMessageInfo): boolean {
   return false
 }
 
-/** Request options that give up after `ms` (the SDK passes them to fetch). */
-function timed(ms = REQUEST_MS): { signal: AbortSignal } {
-  return { signal: AbortSignal.timeout(ms) }
-}
-
-/** Settle with `p`, or reject after `ms` (the work itself is not cancelled). */
-function within<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
-  let timer: NodeJS.Timeout | undefined
-  const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`${what} did not finish within ${Math.round(ms / 1000)}s`)), ms)
-  })
-  return Promise.race([p, timeout]).finally(() => clearTimeout(timer))
+/** Which runtime a model id names: a "codex/" or "cursor/" prefix, else OpenCode's "provider/model". */
+export function modelRuntime(spec: string): { runtime: RuntimeKind; model: string } {
+  const named = /^(codex|cursor)\/(.+)$/.exec(spec)
+  return named ? { runtime: named[1] as RuntimeKind, model: named[2]! } : { runtime: "opencode", model: spec }
 }
 
 export function parseModel(spec: string, variant?: string): ModelRef {
@@ -577,6 +553,8 @@ export class Fleet {
   private closed = false
   /** A landing waits for the previous landing of its repository; a failure does not block the next. */
   private readonly landing = new Map<string, Promise<unknown>>()
+  /** The runtimes this fleet can drive: OpenCode today, Codex and Cursor once they exist. */
+  private readonly runtimes: Map<RuntimeKind, Runtime>
 
   constructor(
     private readonly backend: Backend,
@@ -585,14 +563,17 @@ export class Fleet {
     private readonly hooks: Hooks,
     private readonly news = new News(config.stateDir),
   ) {
+    this.runtimes = new Map([["opencode", new OpenCodeRuntime(backend)]])
     this.syncStore()
-    backend.events.on("event", (e: OpenCodeEvent) => {
-      try {
-        this.onEvent(e)
-      } catch {
-        // Never let a bug here break the event stream.
-      }
-    })
+    for (const runtime of this.runtimes.values()) {
+      runtime.events.on("event", (e: OpenCodeEvent) => {
+        try {
+          this.onEvent(e)
+        } catch {
+          // Never let a bug here break the event stream.
+        }
+      })
+    }
     this.monitor = setInterval(() => {
       this.heartbeat()
       void this.tick()
@@ -681,20 +662,31 @@ export class Fleet {
     return this.backend.info.key
   }
 
-  private get api() {
-    return this.backend.client
+  /**
+   * The runtime an agent runs on. A stored record without one predates the seam and is OpenCode's;
+   * a runtime this fleet does not have yet is refused by the same name spawn uses.
+   */
+  private runtimeFor(target: Live | RuntimeKind = "opencode"): Runtime {
+    const kind = typeof target === "string" ? target : (target.record.runtime ?? "opencode")
+    const runtime = this.runtimes.get(kind)
+    if (!runtime) throw new Error(`the ${kind} runtime is not available yet`)
+    return runtime
   }
 
   // ---------------------------------------------------------------- catalog
 
+  /** OpenCode's model catalog, which opencode_models lists. */
   async models(directory?: string): Promise<ModelInfo[]> {
-    const dir = this.resolveDir(directory)
+    return this.listModels(this.runtimeFor("opencode"), this.resolveDir(directory))
+  }
+
+  private async listModels(runtime: Runtime, dir: string): Promise<ModelInfo[]> {
     const cached = this.modelCache.get(dir)
     if (cached && Date.now() - cached.at < 60_000) return cached.models
     let models: ModelInfo[] = []
     // A directory OpenCode has not opened yet answers with an empty catalog at first.
     for (let i = 0; i < 20; i++) {
-      models = (await req("listing models", this.api.model.list({ location: { directory: dir } }, timed()))).data
+      models = await runtime.models(dir)
       if (models.length) break
       await sleep(250)
     }
@@ -720,8 +712,11 @@ export class Fleet {
   /** Rules saved by "always" answers for the project containing `directory`. */
   async savedPermissions(directory?: string): Promise<{ project: string; rules: PermissionSavedInfo[] }> {
     const dir = this.resolveDir(directory)
-    const loc = await req("locating the project", this.api.location.get({ location: { directory: dir } }, timed(LONG_REQUEST_MS)), LONG_REQUEST_MS)
-    const rules = await req("listing saved permissions", this.api.permission.saved.list({ projectID: loc.project.id }, timed()))
+    const runtime = this.runtimeFor("opencode")
+    if (!runtime.location) throw notSupported(runtime, "listing saved permissions")
+    if (!runtime.permissions) throw notSupported(runtime, "listing saved permissions")
+    const loc = await runtime.location.get(dir)
+    const rules = await runtime.permissions.saved.list(loc.project.id)
     return { project: loc.project.directory, rules }
   }
 
@@ -729,23 +724,27 @@ export class Fleet {
     const { rules } = await this.savedPermissions(directory)
     const rule = rules.find((r) => r.id === id)
     if (!rule) throw new Error(`no saved permission ${id} for this project${rules.length ? `; saved: ${rules.map((r) => r.id).join(", ")}` : ""}`)
-    await req("removing the saved permission", this.api.permission.saved.remove({ id }, timed()))
+    const runtime = this.runtimeFor("opencode")
+    if (!runtime.permissions) throw notSupported(runtime, "removing saved permissions")
+    await runtime.permissions.saved.remove(id)
     return rule
   }
 
   async agents(directory?: string): Promise<AgentInfo[]> {
     const dir = this.resolveDir(directory)
+    const runtime = this.runtimeFor("opencode")
+    if (!runtime.agents) throw notSupported(runtime, "listing agent profiles")
     let agents: AgentInfo[] = []
     for (let i = 0; i < 20; i++) {
-      agents = (await req("listing agents", this.api.agent.list({ location: { directory: dir } }, timed()))).data
+      agents = await runtime.agents(dir)
       if (agents.length) break
       await sleep(250)
     }
     return agents
   }
 
-  private async validateModel(ref: ModelRef, directory: string) {
-    const models = await this.models(directory)
+  private async validateModel(runtime: Runtime, ref: ModelRef, directory: string) {
+    const models = await this.listModels(runtime, this.resolveDir(directory))
     if (!models.length) throw new Error("OpenCode reports no models at all. Configure a provider (opencode auth login, or opencode.json) and retry.")
     const found = models.find((m) => m.providerID === ref.providerID && m.id === ref.id)
     if (!found) {
@@ -1132,7 +1131,7 @@ export class Fleet {
    * (which does not exist yet): the worktree is a checkout of the same repository, carrying its
    * uncommitted changes by default, so OpenCode reads the same project and global config there.
    */
-  private async checkSpawn(input: SpawnInput): Promise<{ directory: string; model?: ModelRef; prepared: Prepared; release: () => void }> {
+  private async checkSpawn(input: SpawnInput): Promise<{ directory: string; runtime: Runtime; model?: ModelRef; prepared: Prepared; release: () => void }> {
     const directory = this.resolveDir(input.directory)
     const stat = await fs.stat(directory).catch(() => undefined)
     if (!stat?.isDirectory()) throw new Error(`directory does not exist: ${directory}`)
@@ -1151,15 +1150,18 @@ export class Fleet {
     }
     try {
       if (input.scope && !input.scope.paths.length) throw new Error("scope.paths needs at least one path or glob")
-      const model = input.model ? parseModel(input.model, input.variant) : undefined
+      // "codex/" and "cursor/" name another runtime; only OpenCode exists after this task.
+      const named = input.model ? modelRuntime(input.model) : { runtime: "opencode" as const, model: undefined }
+      const runtime = this.runtimeFor(named.runtime)
+      const model = named.model ? parseModel(named.model, input.variant) : undefined
       if (!model && input.variant) throw new Error("variant requires model (pick one with opencode_models)")
-      if (model) await this.validateModel(model, directory)
+      if (model) await this.validateModel(runtime, model, directory)
       if (input.agent) await this.validateAgent(input.agent, directory)
       // Profile rules are checked here too, so a bad effect fails before anything is created.
       if (input.profile) profileRules(input.profile)
       // Read attachments before anything is created, so a typo fails cleanly.
       const prepared = await prepareFiles(input.files ?? [], directory)
-      return { directory, model, prepared, release }
+      return { directory, runtime, model, prepared, release }
     } catch (err) {
       release()
       throw err
@@ -1168,10 +1170,10 @@ export class Fleet {
 
   private async startSpawn(
     input: SpawnInput,
-    checked: { directory: string; model?: ModelRef; prepared: Prepared },
+    checked: { directory: string; runtime: Runtime; model?: ModelRef; prepared: Prepared },
   ): Promise<{ snapshot: Snapshot; notes: string[] }> {
     let directory = checked.directory
-    const { model, prepared } = checked
+    const { runtime, model, prepared } = checked
     const notes: string[] = []
     const name = input.name ?? `agent-${Date.now().toString(36)}${randomBytes(2).toString("hex")}`
     let worktree: Worktree | undefined
@@ -1200,20 +1202,14 @@ export class Fleet {
       if (input.signal?.aborted) throw new Error("cancelled")
       // A profile is the session's own permission rules, added after the agent's.
       const profile = input.scope ? withScope(input.profile ?? {}, input.scope) : input.profile
-      const session = await req(
-        "creating session",
-        this.api.session.create(
-          {
-            location: { directory },
-            title: `horde: ${name}`,
-            ...(model ? { model } : {}),
-            ...(input.agent ? { agent: input.agent } : {}),
-            ...(profile ? { permissions: profileRules(profile) } : {}),
-          },
-          timed(LONG_REQUEST_MS),
-        ),
-        LONG_REQUEST_MS,
-      )
+      const session = await runtime.createSession({
+        directory,
+        title: `horde: ${name}`,
+        ...(model ? { model } : {}),
+        ...(input.variant ? { variant: input.variant } : {}),
+        ...(input.agent ? { agent: input.agent } : {}),
+        ...(profile ? { rules: profileRules(profile) } : {}),
+      })
       sessionId = session.id
       const steps = [input.limits?.maxSteps, profile?.steps].filter((n): n is number => !!n)
       const policy = input.permissions ?? this.config.defaultPermissions
@@ -1227,6 +1223,7 @@ export class Fleet {
         id: session.id,
         name: input.name ?? name,
         server: this.serverKey,
+        runtime: runtime.kind,
         directory,
         policy,
         questions: input.questions ?? defaultQuestionPolicy(policy),
@@ -1269,7 +1266,7 @@ export class Fleet {
       if (!prompted) {
         if (sessionId) {
           this.forget(sessionId)
-          await within(this.api.session.remove({ sessionID: sessionId }), REQUEST_MS + REQUEST_GRACE_MS, "removing the session").catch(() => undefined)
+          await runtime.remove(sessionId).catch(() => undefined)
         }
         if (worktree) await removeWorktree(worktree, name, true).catch(() => undefined)
       }
@@ -1309,6 +1306,7 @@ export class Fleet {
     // Waking a settled agent takes a running slot.
     const waking = !!live.state && SETTLED.has(live.state) && live.state !== "needs_input"
     const release = waking ? this.reserve() : () => undefined
+    const runtime = this.runtimeFor(live)
     let delivery = opts.delivery
     try {
       // After an interrupt OpenCode may still be winding the old loop down; a
@@ -1318,20 +1316,27 @@ export class Fleet {
       const session = await this.session(id)
       const directory = session.location.directory
       const prepared = await prepareFiles(opts.files ?? [], directory)
+      const chosen = opts.model ? modelRuntime(opts.model) : undefined
+      if (chosen) {
+        const target = this.runtimeFor(chosen.runtime)
+        if (target !== runtime) throw new Error(`cannot switch an agent from the ${runtime.kind} runtime to the ${chosen.runtime} runtime`)
+      }
       if (opts.model || opts.variant) {
         const current = session.model ?? live.track.model
-        const model = opts.model
-          ? parseModel(opts.model, opts.variant)
+        const model = chosen
+          ? parseModel(chosen.model, opts.variant)
           : current
             ? { providerID: current.providerID, id: current.id, variant: opts.variant }
             : undefined
         if (!model) throw new Error("variant requires model: the agent's model is not known yet; pass model too")
-        await this.validateModel(model, directory)
-        await req("switching model", this.api.session.switchModel({ sessionID: id, model }, timed()))
+        if (!runtime.switchModel) throw notSupported(runtime, "switching model")
+        await this.validateModel(runtime, model, directory)
+        await runtime.switchModel(id, model)
       }
       if (opts.agent) {
+        if (!runtime.switchAgent) throw notSupported(runtime, "switching agent")
         await this.validateAgent(opts.agent, directory)
-        await req("switching agent", this.api.session.switchAgent({ sessionID: id, agent: opts.agent }, timed()))
+        await runtime.switchAgent(id, opts.agent)
       }
       const patch: Partial<AgentRecord> = {}
       if (opts.permissions) {
@@ -1360,19 +1365,10 @@ export class Fleet {
     let sent: { id: string }
     live.sending++
     try {
-      sent = await req(
-        "sending prompt",
-        this.api.session.prompt(
-          {
-            sessionID: live.record.id,
-            text: body,
-            ...(prepared.files.length ? { files: prepared.files } : {}),
-            delivery: delivery ?? "steer",
-          },
-          timed(LONG_REQUEST_MS),
-        ),
-        LONG_REQUEST_MS,
-      )
+      sent = await this.runtimeFor(live).prompt(live.record.id, body, {
+        ...(prepared.files.length ? { files: prepared.files } : {}),
+        delivery: delivery ?? "steer",
+      })
     } finally {
       live.sending--
     }
@@ -1416,11 +1412,8 @@ export class Fleet {
 
   private async interruptNow(live: Live, reason: string) {
     const tree = [live.record.id, ...live.children]
-    await Promise.all(
-      tree.map((sid) =>
-        within(this.api.session.interrupt({ sessionID: sid }, timed()), REQUEST_MS + REQUEST_GRACE_MS, "interrupting the session").catch(() => undefined),
-      ),
-    )
+    const runtime = this.runtimeFor(live)
+    await Promise.all(tree.map((sid) => runtime.interrupt(sid).catch(() => undefined)))
     this.updateRecord(live.record.id, { interruptedSeq: live.track.seq, pauseAfterStep: undefined, stopReason: reason })
     // A prompt we sent that history does not show yet escaped this interrupt: stop its turn when it shows up.
     if (live.sent) live.stopSent = { gen: live.gen, at: Date.now() }
@@ -1454,11 +1447,11 @@ export class Fleet {
     dialog?.abort()
     live.handled.add(requestID)
     try {
-      if (perm) await this.replyPermission(perm, reply.decision ?? "once", reply.message)
+      if (perm) await this.replyPermission(live, perm, reply.decision ?? "once", reply.message)
       else if (question) {
-        if (reply.decision === "reject") await this.rejectQuestion(question)
-        else if (reply.answers) await this.answerQuestion(question, formAnswer(question, reply.answers))
-        else await this.dismissQuestion(question)
+        if (reply.decision === "reject") await this.rejectQuestion(live, question)
+        else if (reply.answers) await this.answerQuestion(live, question, formAnswer(question, reply.answers))
+        else await this.dismissQuestion(live, question)
       }
     } catch (err) {
       live.handled.delete(requestID)
@@ -1467,24 +1460,27 @@ export class Fleet {
     return this.snapshot(id)
   }
 
-  private async replyPermission(p: PermissionRequest, decision: "once" | "always" | "reject", message?: string) {
-    await req(
-      "replying to permission",
-      this.api.permission.reply({ sessionID: p.sessionID, requestID: p.id, decision, ...(message ? { message } : {}) }, timed()),
-    )
+  private async replyPermission(live: Live, p: PermissionRequest, decision: "once" | "always" | "reject", message?: string) {
+    const runtime = this.runtimeFor(live)
+    if (!runtime.permissions) throw notSupported(runtime, "replying to permissions")
+    await runtime.permissions.reply(p.sessionID, p.id, { decision, ...(message ? { message } : {}) })
   }
 
-  private async answerQuestion(q: FormInfo, answer: FormAnswer) {
-    await req("answering question", this.api.session.form.reply({ sessionID: q.sessionID, formID: q.id, answer }, timed()))
+  private async answerQuestion(live: Live, q: FormInfo, answer: FormAnswer) {
+    const runtime = this.runtimeFor(live)
+    if (!runtime.form) throw notSupported(runtime, "answering questions")
+    await runtime.form.reply(q.sessionID, q.id, answer)
   }
 
   /** Cancelling a question halts the agent in OpenCode, so "dismiss" answers it instead. */
-  private async dismissQuestion(q: FormInfo) {
-    await this.answerQuestion(q, dismissAnswer(q))
+  private async dismissQuestion(live: Live, q: FormInfo) {
+    await this.answerQuestion(live, q, dismissAnswer(q))
   }
 
-  private async rejectQuestion(q: FormInfo) {
-    await req("rejecting question", this.api.session.form.cancel({ sessionID: q.sessionID, formID: q.id }, timed()))
+  private async rejectQuestion(live: Live, q: FormInfo) {
+    const runtime = this.runtimeFor(live)
+    if (!runtime.form) throw notSupported(runtime, "rejecting questions")
+    await runtime.form.cancel(q.sessionID, q.id)
   }
 
   async dispose(ref: string, opts: { worktree?: "keep" | "remove" | "discard"; deleteSession?: boolean }): Promise<string> {
@@ -1507,6 +1503,7 @@ export class Fleet {
   private async disposeHeld(live: Live, opts: { worktree?: "keep" | "remove" | "discard"; deleteSession?: boolean }, notes: string[]): Promise<string> {
     const id = live.record.id
     const name = live.record.name ?? id
+    const runtime = this.runtimeFor(live)
     await this.refresh(live).catch(() => undefined)
     if (live.state === "running" || live.state === "needs_input") {
       await this.interruptNow(live, "disposed")
@@ -1521,7 +1518,7 @@ export class Fleet {
     if (opts.deleteSession) {
       // First, while its directory still exists: OpenCode opens the session's
       // directory to serve the request. Deleting removes the session and its children.
-      const err = await within(this.api.session.remove({ sessionID: id }), REQUEST_MS + REQUEST_GRACE_MS, "removing the session").then(
+      const err = await runtime.remove(id).then(
         () => undefined,
         (e: Error) => e,
       )
@@ -1538,10 +1535,7 @@ export class Fleet {
         // Stop tracking first: our own refreshes would make OpenCode reopen the directory.
         this.forget(id)
         // Let OpenCode release the directory (again before each retry) before it disappears.
-        const release = () =>
-          within(this.api.debug.location.evict({ location: { directory: wt.path } }), REQUEST_MS + REQUEST_GRACE_MS, "evicting the location").catch(
-            () => undefined,
-          )
+        const release = () => runtime.location?.evict?.(wt.path) ?? Promise.resolve()
         notes.push(await removeWorktree(wt, name, mode === "discard", release))
         // Its check logs go too: nothing reads them once the worktree is gone.
         for (const dir of new Set([wt.path, wt.root])) await fs.rm(logDirFor(path.join(verifyStateDir(), "logs"), dir), { recursive: true, force: true })
@@ -1962,9 +1956,11 @@ export class Fleet {
     if (moved) throw new Error(moved)
     const id = live.record.id
     const scope: Scope = { paths, outside: live.record.scope?.outside ?? "deny" }
+    const runtime = this.runtimeFor(live)
+    if (!runtime.update) throw notSupported(runtime, "changing an agent's scope")
     const session = await this.session(id)
     const kept = (session.permissions ?? []).filter((r) => r.action !== "edit")
-    await req("updating the agent's rules", this.api.session.update({ sessionID: id, permissions: [...kept, ...profileRules(withScope({}, scope))] }, timed()))
+    await runtime.update(id, { permissions: [...kept, ...profileRules(withScope({}, scope))] })
     this.updateRecord(id, { scope, ...(live.record.gate ? { gate: { ...live.record.gate, allowed: scopeGlobs(paths) } } : {}) })
     const task = live.record.task
     if (task) await (await Board.open(live.record.worktree?.repo ?? live.record.directory)).edit(task.id, { scope: paths })
@@ -2049,7 +2045,8 @@ export class Fleet {
   // --------------------------------------------------------------- reading
 
   async session(id: string): Promise<SessionInfo> {
-    return req(`loading session ${id}`, this.api.session.get({ sessionID: id }, timed()))
+    const live = this.live.get(id) ?? this.live.get(this.childToRoot.get(id) ?? "")
+    return (live ? this.runtimeFor(live) : this.runtimeFor("opencode")).session(id)
   }
 
   /** Wait for the agent's loop to wind down. False when it is still active at the deadline. */
@@ -2065,7 +2062,8 @@ export class Fleet {
   }
 
   private async activeSet(): Promise<Set<string>> {
-    return new Set(Object.keys(await req("listing active sessions", this.api.session.active(timed()))))
+    const sets = await Promise.all([...this.runtimes.values()].map((runtime) => runtime.active()))
+    return new Set(sets.flatMap((set) => [...set]))
   }
 
   /**
@@ -2101,12 +2099,13 @@ export class Fleet {
     // A backend death took this agent's turn with it: nothing on the new server describes it
     // until a prompt restarts it (sendPrompt clears the mark).
     if (live.stranded) return
+    const runtime = this.runtimeFor(live)
     const gen = live.gen
     const token = live.run
     const before = live.state
     let session: SessionInfo
     try {
-      session = await req(`loading session ${id}`, this.api.session.get({ sessionID: id }, timed()))
+      session = await runtime.session(id)
     } catch (err) {
       if (!isNotFound((err as Error).cause)) throw err
       this.forget(id)
@@ -2122,7 +2121,7 @@ export class Fleet {
     const replaying = !live.loaded
     const turnsBefore = live.track.turns.length ? currentTurn(live.track)!.startSeq : -1
     const seqBefore = live.track.seq
-    const track = await this.readHistory(id, live.track, live.session.location.directory, live.resync)
+    const track = await this.readHistory(id, live.track, live.session.location.directory, live.resync, runtime)
     if (live.run !== token || this.closed) return
     live.track = track
     live.resync = false
@@ -2150,14 +2149,14 @@ export class Fleet {
     const hot = [...live.hotChildren.keys()]
     for (const c of hot) {
       const t = live.childTracks.get(c) ?? emptyTrack()
-      const childTrack = await this.readHistory(c, t, live.session.location.directory).catch(() => t)
+      const childTrack = await this.readHistory(c, t, live.session.location.directory, false, runtime).catch(() => t)
       if (live.run !== token || this.closed) return
       live.childTracks.set(c, childTrack)
     }
     const tree = [id, ...hot]
     const [perms, questions] = await Promise.all([
-      Promise.all(tree.map((sid) => req("listing permissions", this.api.permission.list({ sessionID: sid }, timed())))),
-      Promise.all(tree.map((sid) => req("listing questions", this.api.session.form.list({ sessionID: sid }, timed())))),
+      runtime.permissions ? Promise.all(tree.map((sid) => runtime.permissions!.list(sid))) : Promise.resolve([]),
+      runtime.form ? Promise.all(tree.map((sid) => runtime.form!.list(sid))) : Promise.resolve([]),
     ])
     if (live.run !== token || this.closed) return
     live.pending = { permissions: perms.flat(), questions: questions.flat() }
@@ -2192,11 +2191,7 @@ export class Fleet {
     const marker = live.record.interruptedSeq
     const cur = currentTurn(live.track)
     if (marker !== undefined && cur && live.track.inLoop && cur.startSeq > marker && cur.admittedSeq <= marker && live.gen === gen) {
-      await Promise.all(
-        [id, ...live.hotChildren.keys()].map((sid) =>
-          within(this.api.session.interrupt({ sessionID: sid }, timed()), REQUEST_MS + REQUEST_GRACE_MS, "interrupting the session").catch(() => undefined),
-        ),
-      )
+      await Promise.all([id, ...live.hotChildren.keys()].map((sid) => runtime.interrupt(sid).catch(() => undefined)))
     }
     if (live.run !== token || this.closed) return
     live.lastRefresh = Date.now()
@@ -2219,13 +2214,12 @@ export class Fleet {
     this.maybePush(live)
   }
 
-  private async readHistory(sessionID: string, track: Track, directory: string, full = false): Promise<Track> {
+  private async readHistory(sessionID: string, track: Track, directory: string, full = false, runtime?: Runtime): Promise<Track> {
+    const live = this.live.get(sessionID) ?? this.live.get(this.childToRoot.get(sessionID) ?? "")
+    const rt = runtime ?? (live ? this.runtimeFor(live) : this.runtimeFor("opencode"))
     // Pricing comes from the catalog; load it once per directory.
     if (!this.modelCache.has(directory)) await this.models(directory).catch(() => undefined)
-    const [read, inbox] = await Promise.all([
-      this.conversation(sessionID, track, full),
-      req("reading the inbox", this.api.session.inbox.list({ sessionID }, timed())),
-    ])
+    const [read, inbox] = await Promise.all([this.conversation(rt, sessionID, track, full), rt.inbox(sessionID)])
     const built = buildTrack(read.messages, inbox, this.estimator(directory))
     built.cursor = read.cursor
     return built
@@ -2237,26 +2231,26 @@ export class Fleet {
    * again while it can still change. Without one, or after a revert, the whole timeline is.
    * A cursor the server no longer accepts falls back to that full read.
    */
-  private async conversation(sessionID: string, track?: Track, full = false): Promise<{ messages: SessionMessageInfo[]; cursor?: string }> {
-    if (!track?.cursor || !track.messages.length || full) return this.readAll(sessionID)
+  private async conversation(runtime: Runtime, sessionID: string, track?: Track, full = false): Promise<{ messages: SessionMessageInfo[]; cursor?: string }> {
+    if (!track?.cursor || !track.messages.length || full) return this.readAll(runtime, sessionID)
     const fresh: SessionMessageInfo[] = []
     let cursor = track.cursor
     try {
       for (let page = 0; page < 1000; page++) {
-        const res = await req("reading the conversation", this.api.message.list({ sessionID, limit: 100, cursor }, timed()))
+        const res = await runtime.messages(sessionID, { limit: 100, cursor })
         // A cursor that points into history we already have is stale (a reverted timeline): read it all.
-        if (res.data.some((m) => track.ids.has(m.id))) return this.readAll(sessionID)
-        fresh.push(...res.data)
-        if (res.data.length < 100) {
-          cursor = res.cursor.next ?? cursor
+        if (res.messages.some((m) => track.ids.has(m.id))) return this.readAll(runtime, sessionID)
+        fresh.push(...res.messages)
+        if (res.messages.length < 100) {
+          cursor = res.cursor ?? cursor
           break
         }
-        if (!res.cursor.next) break
-        cursor = res.cursor.next
+        if (!res.cursor) break
+        cursor = res.cursor
       }
     } catch (err) {
       if (isNotFound((err as Error).cause)) throw err
-      return this.readAll(sessionID)
+      return this.readAll(runtime, sessionID)
     }
     const knownLast = track.messages[track.messages.length - 1]
     let messages = fresh.length ? [...track.messages, ...fresh] : track.messages
@@ -2264,11 +2258,13 @@ export class Fleet {
     // a compaction completing) would be missed: read that one message again while it is open.
     if (knownLast && stillChanging(knownLast)) {
       try {
-        const updated = await req("reading the newest message", this.api.session.message.get({ sessionID, messageID: knownLast.id }, timed()))
-        messages = messages.slice()
-        messages[track.messages.length - 1] = updated
+        const [updated] = (await runtime.messages(sessionID, { messageID: knownLast.id })).messages
+        if (updated) {
+          messages = messages.slice()
+          messages[track.messages.length - 1] = updated
+        }
       } catch (err) {
-        if (isNotFound((err as Error).cause)) return this.readAll(sessionID)
+        if (isNotFound((err as Error).cause)) return this.readAll(runtime, sessionID)
         throw err
       }
     }
@@ -2276,15 +2272,15 @@ export class Fleet {
   }
 
   /** The whole conversation, oldest first, with a cursor just past its newest message. */
-  private async readAll(sessionID: string): Promise<{ messages: SessionMessageInfo[]; cursor?: string }> {
+  private async readAll(runtime: Runtime, sessionID: string): Promise<{ messages: SessionMessageInfo[]; cursor?: string }> {
     const messages: SessionMessageInfo[] = []
     let cursor: string | undefined
     for (let page = 0; page < 1000; page++) {
-      const res = await req("reading the conversation", this.api.message.list({ sessionID, limit: 100, ...(cursor ? { cursor } : { order: "asc" }) }, timed()))
-      messages.push(...res.data)
-      if (res.data.length < 100) return { messages, cursor: res.cursor.next ?? cursor }
-      cursor = res.cursor.next ?? cursor
-      if (!res.cursor.next) break
+      const res = await runtime.messages(sessionID, { limit: 100, ...(cursor ? { cursor } : { order: "asc" }) })
+      messages.push(...res.messages)
+      if (res.messages.length < 100) return { messages, cursor: res.cursor ?? cursor }
+      cursor = res.cursor ?? cursor
+      if (!res.cursor) break
     }
     return { messages, cursor }
   }
@@ -2712,7 +2708,7 @@ export class Fleet {
     for (const p of asks) {
       if (!p.resources.every((r) => isTrustedCommand(r, { state }))) continue
       live.handled.add(p.id)
-      await this.replyPermission(p, "once").catch(() => live.handled.delete(p.id))
+      await this.replyPermission(live, p, "once").catch(() => live.handled.delete(p.id))
     }
   }
 
@@ -2749,6 +2745,7 @@ export class Fleet {
       if (record.policy === "allow" || record.policy === "deny") {
         live.handled.add(p.id)
         await this.replyPermission(
+          live,
           p,
           record.policy === "allow" ? "once" : "reject",
           record.policy === "deny" ? "Denied by the orchestrator's permission policy. Find another way, or explain what you need and stop." : undefined,
@@ -2758,7 +2755,7 @@ export class Fleet {
           p.id,
           (signal) => this.hooks.askPermission(this.build(live), p, signal),
           async (answer) => {
-            if (answer) await this.replyPermission(p, answer.reply, answer.message)
+            if (answer) await this.replyPermission(live, p, answer.reply, answer.message)
             else this.handToCaller(live, p.id)
           },
         )
@@ -2768,14 +2765,14 @@ export class Fleet {
       if (live.handled.has(q.id) || live.handedToCaller.has(q.id)) continue
       if (record.questions === "dismiss") {
         live.handled.add(q.id)
-        await this.dismissQuestion(q).catch(() => live.handled.delete(q.id))
+        await this.dismissQuestion(live, q).catch(() => live.handled.delete(q.id))
       } else if (record.questions === "user" && this.hooks.canElicit()) {
         ask(
           q.id,
           (signal) => this.hooks.askQuestion(this.build(live), q, signal),
           async (answer) => {
-            if (answer === "dismiss") await this.dismissQuestion(q)
-            else if (answer) await this.answerQuestion(q, answer)
+            if (answer === "dismiss") await this.dismissQuestion(live, q)
+            else if (answer) await this.answerQuestion(live, q, answer)
             else this.handToCaller(live, q.id)
           },
         )
@@ -2825,13 +2822,13 @@ export class Fleet {
   private async scanChildren(live: Live) {
     live.lastChildScan = Date.now()
     const directory = live.session?.location.directory ?? live.record.directory
-    const res = await req("listing sessions", this.api.session.list({ directory, limit: 100, order: "desc" }, timed()))
+    const sessions = await this.runtimeFor(live).sessions(directory, { limit: 100, order: "desc" })
     const tree = new Set([live.record.id, ...live.children])
     // Parents are listed after children in desc order; loop until no new descendants appear.
     let grew = true
     while (grew) {
       grew = false
-      for (const s of res.data) {
+      for (const s of sessions) {
         if (s.parentID && tree.has(s.parentID) && !tree.has(s.id)) {
           tree.add(s.id)
           this.addChild(live, s.id)
@@ -2920,11 +2917,13 @@ export class Fleet {
    */
   async compact(ref: string): Promise<Snapshot> {
     const live = await this.get(ref)
+    const runtime = this.runtimeFor(live)
+    if (!runtime.compact) throw notSupported(runtime, "compacting")
     await this.refresh(live)
     if (live.state === "running" || live.state === "needs_input")
       throw new Error(`${live.record.name ?? live.record.id} is ${live.state}; compact it once it is idle (opencode_wait, or opencode_interrupt first)`)
     return this.withoutGate(live, async () => {
-      const queued = await req("compacting the session", this.api.session.compact({ sessionID: live.record.id }, timed()))
+      const queued = await runtime.compact!(live.record.id)
       // The summary is written by the model; wait for it to land (its message keeps the request's id).
       const deadline = Date.now() + 120_000
       while (Date.now() < deadline) {
@@ -2948,6 +2947,8 @@ export class Fleet {
     opts: { turns?: number; to?: string } = {},
   ): Promise<{ snapshot: Snapshot; files: { path: string; status: string }[]; turns: number }> {
     const live = await this.get(ref)
+    const runtime = this.runtimeFor(live)
+    if (!runtime.revert) throw notSupported(runtime, "reverting")
     await this.refresh(live)
     const name = live.record.name ?? live.record.id
     if (live.state === "running" || live.state === "needs_input")
@@ -2961,7 +2962,8 @@ export class Fleet {
     opts: { turns?: number; to?: string },
   ): Promise<{ snapshot: Snapshot; files: { path: string; status: string }[]; turns: number }> {
     const sessionID = live.record.id
-    const conversation = async () => (await this.conversation(sessionID)).messages
+    const runtime = this.runtimeFor(live)
+    const conversation = async () => (await this.conversation(runtime, sessionID)).messages
     let messages = await conversation()
     const ids = messages.map((m) => m.id)
     // OpenCode undoes the given message and everything after it.
@@ -2996,8 +2998,9 @@ export class Fleet {
       await sleep(250)
       messages = await conversation()
     }
-    const staged = await req("staging the revert", this.api.session.revert.stage({ sessionID, messageID: from, files: true }, timed()))
-    await req("committing the revert", this.api.session.revert.commit({ sessionID }, timed()))
+    if (!runtime.revert) throw notSupported(runtime, "reverting")
+    const staged = await runtime.revert.stage(sessionID, from, true)
+    await runtime.revert.commit(sessionID)
     // Messages are gone: the incremental cursor now points into a different timeline.
     live.resync = true
     await this.refresh(live)
@@ -3036,15 +3039,12 @@ export class Fleet {
       // OpenCode may record the real path (macOS /private/var, Windows long names): ask for both.
       const dir = this.resolveDir(opts.directory)
       const real = await fs.realpath(dir).catch(() => dir)
-      const lists = await Promise.all(
-        [...new Set([dir, real])].map((directory) =>
-          req("listing sessions", this.api.session.list({ directory, limit: opts.limit ?? 20, order: "desc" }, timed())),
-        ),
-      )
+      const runtime = this.runtimeFor("opencode")
+      const lists = await Promise.all([...new Set([dir, real])].map((directory) => runtime.sessions(directory, { limit: opts.limit ?? 20, order: "desc" })))
       const owned = new Set(this.store.agents(this.serverKey).map((r) => r.id))
       const seen = new Set<string>()
       untracked = lists
-        .flatMap((l) => l.data)
+        .flat()
         .filter((s) => !seen.has(s.id) && seen.add(s.id))
         .filter((s) => !s.parentID && !this.live.has(s.id) && !owned.has(s.id) && !this.childToRoot.has(s.id))
         .sort((a, b) => b.time.updated - a.time.updated)
@@ -3057,27 +3057,27 @@ export class Fleet {
     const live = await this.get(ref)
     await this.refresh(live)
     const since = opts.scope === "turn" ? currentTurn(live.track)?.admittedAt : undefined
-    const messages = await this.messages(live.record.id, since)
+    const messages = await this.messages(this.runtimeFor(live), live.record.id, since)
     return renderTranscript(messages, opts.detail)
   }
 
   /** Messages in chronological order, optionally only those created at or after `since`. */
-  private async messages(id: string, since?: number): Promise<SessionMessageInfo[]> {
+  private async messages(runtime: Runtime, id: string, since?: number): Promise<SessionMessageInfo[]> {
     const out: SessionMessageInfo[] = []
     let cursor: string | undefined
     for (let page = 0; page < 200; page++) {
       // The cursor already encodes the order.
-      const res = await req("loading messages", this.api.message.list({ sessionID: id, limit: 100, ...(cursor ? { cursor } : { order: "desc" }) }, timed()))
+      const res = await runtime.messages(id, { limit: 100, ...(cursor ? { cursor } : { order: "desc" }) })
       let done = false
-      for (const m of res.data) {
+      for (const m of res.messages) {
         if (since !== undefined && m.time.created < since) {
           done = true
           break
         }
         out.push(m)
       }
-      if (done || !res.cursor.next || res.data.length < 100) break
-      cursor = res.cursor.next
+      if (done || !res.cursor || res.messages.length < 100) break
+      cursor = res.cursor
     }
     return out.reverse()
   }
@@ -3409,6 +3409,7 @@ export class Fleet {
     const record: AgentRecord = {
       id: session.id,
       server: this.serverKey,
+      runtime: "opencode",
       directory: session.location.directory,
       policy: "ask",
       questions: "ask",
@@ -3518,9 +3519,12 @@ export class Fleet {
     const root = this.childToRoot.get(ref)
     if (root && this.live.has(root)) return this.live.get(root)!
     if (this.gone.has(ref)) throw new Error(`session ${ref} was disposed or deleted; it is no longer tracked`)
-    const session = await within(this.api.session.get({ sessionID: ref }), REQUEST_MS + REQUEST_GRACE_MS, `loading session ${ref}`).catch((err: unknown) => {
-      throw new Error(isNotFound(err) ? `session ${ref} does not exist on this OpenCode server` : `loading session ${ref} failed: ${(err as Error).message}`)
-    })
+    const session = await this.runtimeFor("opencode")
+      .session(ref)
+      .catch((err: unknown) => {
+        const missing = isNotFound(err) || isNotFound((err as Error).cause)
+        throw new Error(missing ? `session ${ref} does not exist on this OpenCode server` : `loading session ${ref} failed: ${(err as Error).message}`)
+      })
     // A subagent's session belongs to its root agent.
     if (session.parentID) {
       const rootLive = await this.get(session.parentID)
