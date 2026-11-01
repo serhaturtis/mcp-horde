@@ -401,11 +401,14 @@ async function changes(root: string, base: string): Promise<Change[]> {
   // hides is audited as untracked. Comparing the two listings leaves only info/global hits.
   const hidden = splitZ(await gitRaw(root, [...Q, "ls-files", "--others", "--exclude-per-directory=.gitignore", "-z"]))
   const listed = new Set(standard)
-  for (const p of hidden) {
-    if (listed.has(p)) continue
-    const source = await gitRaw(root, ["check-ignore", "-v", "--", p]).catch(() => "")
-    if (!/(^|[/\\])\.git[/\\]info[/\\]exclude:\d+:/.test(source)) continue
-    await addUntracked(p)
+  const candidates = hidden.filter((p) => !listed.has(p))
+  // A few hundred paths per call: `-v` prints `source:line:pattern<TAB>path` per matched path.
+  for (let at = 0; at < candidates.length; at += 200) {
+    const out = await gitRaw(root, [...Q, "check-ignore", "-v", "--", ...candidates.slice(at, at + 200)]).catch(() => "")
+    for (const line of out.split("\n")) {
+      const m = /^(.*?):\d+:.*\t(.*)$/.exec(line)
+      if (m && /(^|[/\\])\.git[/\\]info[/\\]exclude$/.test(m[1]!)) await addUntracked(m[2]!)
+    }
   }
   return [...byPath.values()]
 }
@@ -794,8 +797,10 @@ async function checkScriptPaths(root: string, checks: { command: string; cwd: st
             }
         }
         if (!INTERPRETERS.has(program)) continue
-        // sh -c "..." and bash -c '...' run the quoted text: follow it as a command line.
-        const cArg = toks.findIndex((t, i) => i > 0 && (t === "-c" || t === "-e"))
+        // sh -c "..." and bash -c '...' run the quoted text: follow it as a command line (a shell's
+        // -e is errexit, but node -e, perl -e and ruby -e take code too).
+        const shell = /^(sh|bash|zsh|dash|ksh|fish)$/.test(program)
+        const cArg = toks.findIndex((t, i) => i > 0 && (t === "-c" || (t === "-e" && !shell)))
         if (cArg > 0 && toks[cArg + 1]) {
           for (const rel of await refs(dir, toks[cArg + 1]!, depth - 1)) found.add(rel)
           continue
