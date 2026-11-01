@@ -1,6 +1,6 @@
 {
   "name": "@mcp-horde/opencode",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "MCP server that lets any harness delegate work to OpenCode agents on any model: spawn them in parallel, steer, wait, pause, resume, and answer their permission prompts.",
   "license": "MIT",

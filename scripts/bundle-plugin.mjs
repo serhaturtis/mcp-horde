@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { spawnSync } from "node:child_process"
 // Bundles the horde servers into self-contained files inside the Claude Code plugin, so the
 // plugin runs from a plain clone of this repository: no npm install, no build step.
 //
@@ -77,6 +78,24 @@ if (process.argv.includes("--check")) {
   if (pluginVersion !== serverVersion) {
     console.error(`plugins/horde/.claude-plugin/plugin.json says version ${pluginVersion}, packages/opencode/package.json ${serverVersion}: keep them equal`)
     process.exit(1)
+  }
+  // `claude plugin update` compares the pinned version string, nothing else: bundles that changed
+  // since the pushed tip without a new version would leave every install on the old copy, reported
+  // as "already at the latest version". Judged against origin/master when it is known.
+  const git = (...args) => {
+    const r = spawnSync("git", args, { cwd: root, encoding: "utf8" })
+    return r.status === 0 ? r.stdout.trim() : undefined
+  }
+  if (git("rev-parse", "--verify", "-q", "origin/master")) {
+    const bundlesChanged = spawnSync("git", ["diff", "--quiet", "origin/master", "--", "plugins/horde/servers"], { cwd: root }).status !== 0
+    const pushed = git("show", "origin/master:plugins/horde/.claude-plugin/plugin.json")
+    const pushedVersion = pushed ? JSON.parse(pushed).version : undefined
+    if (bundlesChanged && pushedVersion === pluginVersion) {
+      console.error(
+        `plugins/horde/servers changed since origin/master but plugin.json still says ${pluginVersion}: bump the version in plugin.json and packages/opencode/package.json, or every install stays on the old copy`,
+      )
+      process.exit(1)
+    }
   }
   if (orphans.length) {
     console.error(`plugins/horde/servers holds files a fresh build does not produce (${orphans.join(", ")}): delete them`)
