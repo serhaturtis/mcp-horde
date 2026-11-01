@@ -136,6 +136,8 @@ export interface ServerRecord {
   password: string
   pid: number
   startedAt: number
+  /** The process's start time, so a recycled pid is not mistaken for the server. */
+  startTime?: string
   /** Binary and version the server was started with, to warn about upgrades. */
   bin?: string
   version?: string

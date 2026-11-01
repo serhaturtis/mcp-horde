@@ -1,3 +1,4 @@
+import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { defaultWorktreeDir, loadHordeFile, loadUserHordeFile, memoryHigh, scopeEnabled } from "@mcp-horde/core"
@@ -88,6 +89,25 @@ export function defaultMaxRunning(cores: number): number {
   return Math.min(8, Math.max(2, Math.floor(cores / 2)))
 }
 
+/** The CPUs a cgroup v2 quota allows (`cpu.max`: "quota period"), or undefined without a numeric limit. */
+export function cpuQuotaCores(file = "/sys/fs/cgroup/cpu.max"): number | undefined {
+  try {
+    const [quota, period] = fs.readFileSync(file, "utf8").trim().split(/\s+/)
+    if (!quota || quota === "max" || !period) return undefined
+    const q = Number(quota)
+    const p = Number(period)
+    if (!Number.isFinite(q) || !Number.isFinite(p) || q <= 0 || p <= 0) return undefined
+    return Math.ceil(q / p)
+  } catch {
+    return undefined
+  }
+}
+
+/** The host's usable CPUs: its count, capped by a cgroup v2 quota when one is set. */
+export function effectiveCores(cpus = os.cpus().length, cpuMaxFile = "/sys/fs/cgroup/cpu.max"): number {
+  return Math.min(cpus, cpuQuotaCores(cpuMaxFile) ?? cpus)
+}
+
 /**
  * The running-agent limit: HORDE_OPENCODE_MAX_RUNNING, else horde.json `opencode.maxRunning`
  * (found from the default directory), else the user-level horde.json's, else the core count's.
@@ -108,7 +128,7 @@ function maxRunning(env: NodeJS.ProcessEnv, directory: string, cores: number): {
   return { maxRunning: n, maxRunningFrom: project.data.opencode === undefined ? `${file} opencode.maxRunning` : "horde.json opencode.maxRunning" }
 }
 
-export function loadConfig(env: NodeJS.ProcessEnv = process.env, opts: { cores?: number } = {}): Config {
+export function loadConfig(env: NodeJS.ProcessEnv = process.env, opts: { cores?: number; cpuMaxFile?: string } = {}): Config {
   const home = os.homedir()
   const stateHome = env.XDG_STATE_HOME || path.join(home, ".local", "state")
   const directory = path.resolve(env.HORDE_OPENCODE_DIRECTORY || process.cwd())
@@ -123,7 +143,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, opts: { cores?:
     codexBin: env.HORDE_CODEX_BIN || "codex",
     directory,
     defaultPermissions: policy(env.HORDE_OPENCODE_PERMISSIONS),
-    ...maxRunning(env, directory, opts.cores ?? os.cpus().length),
+    ...maxRunning(env, directory, opts.cores ?? effectiveCores(os.cpus().length, opts.cpuMaxFile)),
     stateDir: path.resolve(env.HORDE_OPENCODE_STATE_DIR || path.join(stateHome, "mcp-horde", "opencode")),
     worktreeDir: defaultWorktreeDir(env),
     channel: bool(env.HORDE_OPENCODE_CHANNEL, "HORDE_OPENCODE_CHANNEL"),

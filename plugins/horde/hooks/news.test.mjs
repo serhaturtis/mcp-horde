@@ -4,6 +4,7 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { describe, test } from "node:test"
+import { parentPid } from "./news.mjs"
 
 const hookPath = path.resolve(import.meta.dirname, "news.mjs")
 const SESSION = "session-1"
@@ -134,6 +135,27 @@ describe("another session's news after /clear", () => {
   test("ignores another session's news when the server has a different parent", (t) => {
     const dir = state(t, news({ waiting: twoWaiting }), "session-before-clear")
     assert.equal(run("UserPromptSubmit", dir), undefined)
+  })
+})
+
+describe("parentPid", () => {
+  test("reads the parent through PowerShell on Windows", () => {
+    let seen
+    const exec = (file, args, opts) => {
+      seen = { file, args, opts }
+      return "4321\n"
+    }
+    assert.equal(parentPid(1234, exec, "win32"), 4321)
+    assert.equal(seen.file, "powershell")
+    assert.match(seen.args.join(" "), /Get-CimInstance Win32_Process -Filter "ProcessId=1234"/)
+    assert.match(seen.args.join(" "), /ParentProcessId/)
+  })
+
+  test("returns undefined when Windows cannot read the parent", () => {
+    const exec = () => {
+      throw new Error("no PowerShell")
+    }
+    assert.equal(parentPid(1234, exec, "win32"), undefined)
   })
 })
 

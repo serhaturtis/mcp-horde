@@ -13,6 +13,33 @@ import type { ServerRecord, Store } from "./state.js"
 
 /** The shared-server record; `username` is absent in records written before it was stored. */
 
+/** Note something in the log recordLifecycle writes (same file, private to the user); best effort. */
+function lifecycleNote(what: string): void {
+  try {
+    const dir = path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state"), "mcp-horde")
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+    fs.appendFileSync(path.join(dir, "servers.log"), `${new Date().toISOString()} opencode pid ${process.pid}: ${what}\n`, { mode: 0o600 })
+  } catch {
+    // Logging must never be what breaks a server.
+  }
+}
+
+/** Set an owned subagent session's environment, retrying a transient failure instead of skipping it. */
+export async function retrySessionEnvironment(set: () => Promise<unknown>, note = lifecycleNote, delayMs = 250): Promise<boolean> {
+  for (let retry = 0; ; retry++) {
+    try {
+      await set()
+      return true
+    } catch (err) {
+      if (retry >= 3) {
+        note(`a subagent session's environment could not be set after 3 retries: ${describe(err)}`)
+        return false
+      }
+      await new Promise((r) => setTimeout(r, delayMs))
+    }
+  }
+}
+
 /** OpenCode versions this server was tested against. Others work but get a warning. */
 export const TESTED_OPENCODE = { major: 2, minor: 1 }
 
@@ -81,12 +108,14 @@ export class Backend {
       const { sessionID, parentID } = raw.data ?? {}
       if (typeof sessionID !== "string" || typeof parentID !== "string" || !owned.has(parentID) || owned.has(sessionID)) return
       owned.add(sessionID)
-      void set(sessionID).catch(() => undefined)
+      void retrySessionEnvironment(() => set(sessionID))
     })
   }
 
   static async start(config: Config, store: Store): Promise<Backend> {
     const warnings: string[] = []
+    const dropped = droppedSecretWarning(process.env, config.username, config.passEnv)
+    if (dropped) warnings.push(dropped)
     if (config.url) {
       if (!config.password) {
         if (!isLoopback(new URL(config.url).hostname) && !config.allowInsecure) {
@@ -123,6 +152,9 @@ export class Backend {
 
     if (config.serverMode === "shared") {
       const bin = resolveBinary(config.bin)
+      // Read the configured version before taking the lock: a hanging `opencode --version` must
+      // not freeze the lock (or let another process take it over) for the whole MCP server.
+      const configuredVersion = binaryVersion(bin)
       const { client, info } = await store.lock("server", async (): Promise<{ client: OpenCodeClient; info: ServerInfo }> => {
         const known: ServerRecord | undefined = store.server // read fresh: another process may have started one
         if (known) {
@@ -136,7 +168,7 @@ export class Backend {
             }
             // The record's version is the binary the server was started with; warn once when the
             // configured binary is now a different version (a plugin or OpenCode upgrade).
-            const versionWarning = versionMismatch(known.version, await binaryVersion(bin))
+            const versionWarning = versionMismatch(known.version, configuredVersion)
             const env = serverEnv({ username, password: known.password, passEnv: config.passEnv })
             return {
               client,
@@ -154,20 +186,21 @@ export class Backend {
               },
             }
           }
-          // The record's server answers but not with our password, reset the connection, or hung.
-          // If its pid is still our `opencode serve` on the recorded port, stop it before starting
-          // a new one, so it does not linger as an orphan nothing can stop or attach to.
+          // A probe that timed out says nothing about identity: a busy server keeps its agents.
+          if (probe.timedOut) {
+            throw new Error(
+              `The recorded shared OpenCode server at ${known.url} (pid ${known.pid}) is not responding. Stop it with opencode_server stop, then retry.`,
+            )
+          }
+          // A server whose port refuses, or which answers but not with our password, is replaced
+          // only when its pid is proven ours; an unrelated process is never killed.
           if (isOurSharedServer(known)) {
             await stopPid(known.pid, known.url)
             forgetShared(store, known)
           } else if (probe.reachable) {
             throw new Error(
               `The recorded shared OpenCode server at ${known.url} (pid ${known.pid}) answers but is not usable: ${probe.reason}. ` +
-                "Check OPENCODE_SERVER_USERNAME/PASSWORD, or stop it with opencode_server stop.",
-            )
-          } else if (probe.timedOut && pidAlive(known.pid)) {
-            throw new Error(
-              `The recorded shared OpenCode server at ${known.url} (pid ${known.pid}) is not responding. Stop it with opencode_server stop, then retry.`,
+                `pid ${known.pid} could not be verified as our server and must be stopped by hand.`,
             )
           } else {
             forgetShared(store, known) // gone: start a new one
@@ -177,10 +210,16 @@ export class Backend {
         // OPENCODE_SERVER_PASSWORD is a secret, and reusing it would hand it to every worker shell.
         const password = randomBytes(24).toString("hex")
         const env = serverEnv({ username: config.username, password, passEnv: config.passEnv })
-        const { url, pid } = await spawnShared(config, store.dir, password, env)
+        const { url, pid, startTime } = await spawnShared(config, store.dir, password, env)
         const client = connect(url, config.username, password)
-        const version = await health(client, url)
-        const record: ServerRecord = { url, password, pid, startedAt: Date.now(), bin: bin.command, version, username: config.username }
+        let version: string
+        try {
+          version = await health(client, url)
+        } catch (err) {
+          await stopPid(pid, url)
+          throw err
+        }
+        const record: ServerRecord = { url, password, pid, startedAt: Date.now(), startTime, bin: bin.command, version, username: config.username }
         store.setServer(record)
         return {
           client,
@@ -319,7 +358,7 @@ export async function stopServer(config: Config, store: Store, backend?: Backend
     const ours = !probe.ok && isOurSharedServer(known)
     if (!probe.ok && !hung && !ours) {
       forgetShared(store, known)
-      return `The recorded shared server (${known.url}, pid ${known.pid}) is not answering with its password (${probe.reason || "no answer"}), so nothing was killed (the pid may belong to another process now). The record was cleared.`
+      return `The recorded shared server (${known.url}, pid ${known.pid}) is not answering with its password (${probe.reason || "no answer"}), so nothing was killed: pid ${known.pid} could not be verified as our server and must be stopped by hand. The record was cleared.`
     }
     // Stop the process before dropping the record, so the password file survives until it is dead.
     await stopPid(known.pid, known.url)
@@ -351,11 +390,48 @@ function processArgs(pid: number): string[] | undefined {
   }
 }
 
+/** The pid's start time (/proc field 22, `ps` on macOS, PowerShell on Windows), or undefined when it cannot be read. */
+export function processStartTime(pid: number): string | undefined {
+  if (isWindows) {
+    try {
+      const res = spawnSync("powershell", ["-NoProfile", "-NonInteractive", "-Command", `(Get-Process -Id ${pid}).StartTime`], {
+        encoding: "utf8",
+        timeout: 5_000,
+        windowsHide: true,
+      })
+      const out = res.stdout?.trim()
+      return res.status === 0 && out ? out : undefined
+    } catch {
+      return undefined
+    }
+  }
+  if (process.platform === "darwin") {
+    try {
+      const res = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8", timeout: 5_000, windowsHide: true })
+      const out = res.stdout?.trim()
+      return res.status === 0 && out ? out : undefined
+    } catch {
+      return undefined
+    }
+  }
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8")
+    // After the command name (which may contain spaces): state is field 3, starttime is field 22.
+    return stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19] || undefined
+  } catch {
+    return undefined
+  }
+}
+
 /** Whether the recorded pid is still our `opencode serve` on the recorded port. */
-function isOurSharedServer(known: ServerRecord): boolean {
+export function isOurSharedServer(known: ServerRecord): boolean {
   if (!pidAlive(known.pid)) return false
+  // An old record has no start time, so a recycled pid cannot be ruled out: never kill it.
+  if (!known.startTime) return false
+  const start = processStartTime(known.pid)
+  if (!start || start !== known.startTime) return false
   const args = processArgs(known.pid)
-  if (args === undefined) return true // cannot read the command line (macOS): the pid check is all we have
+  if (args === undefined) return true // no readable command line (macOS, Windows): the start time is the proof
   const port = String(new URL(known.url).port)
   return args.includes("serve") && args.includes("--port") && args.includes(port)
 }
@@ -377,7 +453,7 @@ function stopScope(url: string | undefined) {
 }
 
 /** Stop a pid (SIGTERM, then SIGKILL after a grace period), and its scope, waiting for it to exit. */
-async function stopPid(pid: number, url?: string): Promise<void> {
+export async function stopPid(pid: number, url?: string): Promise<void> {
   killTree(pid, true)
   stopScope(url)
   const deadline = Date.now() + 5_000
@@ -558,9 +634,20 @@ export function serverEnv(
   platform: string = process.platform,
 ): Record<string, string | undefined> {
   const kept: Record<string, string | undefined> = {}
-  const always = /^(PATH|HOME|USER|LOGNAME|SHELL|LANG|TZ|TMPDIR|TEMP|TMP)$/
-  const proxyAndTls = /^(HTTPS?_PROXY|NO_PROXY|SSL_CERT_FILE|SSL_CERT_DIR|NODE_EXTRA_CA_CERTS)$/i
-  const windows = /^(SystemRoot|ComSpec|APPDATA|LOCALAPPDATA|USERPROFILE)$/
+  const win = platform === "win32"
+  // Windows environment names are case-insensitive, and PATH is often spelled `Path`.
+  const flags = win ? "i" : ""
+  const always = new RegExp("^(PATH|HOME|USER|LOGNAME|SHELL|LANG|TZ|TMPDIR|TEMP|TMP)$", flags)
+  const proxyAndTls = /^(HTTPS?_PROXY|ALL_PROXY|NO_PROXY|SSL_CERT_FILE|SSL_CERT_DIR|NODE_EXTRA_CA_CERTS|CURL_CA_BUNDLE|REQUESTS_CA_BUNDLE|GIT_SSL_CAINFO)$/i
+  // Toolchain roots: version managers and caches a worker's build needs without its secrets.
+  const extra = new RegExp(
+    "^(TERM|COLORTERM|SSH_AUTH_SOCK|NVM_DIR|VOLTA_HOME|FNM_DIR|N_PREFIX|PNPM_HOME|BUN_INSTALL|DENO_DIR|MISE_DATA_DIR|MISE_CONFIG_DIR|ASDF_DIR|ASDF_DATA_DIR|PYENV_ROOT|RBENV_ROOT|CARGO_HOME|RUSTUP_HOME|GOPATH|GOROOT|GOMODCACHE|GOFLAGS|JAVA_HOME|SDKMAN_DIR|ANDROID_HOME|ANDROID_SDK_ROOT|DOTNET_ROOT|UV_CACHE_DIR|PIP_CACHE_DIR)$",
+    flags,
+  )
+  const windows = new RegExp(
+    "^(SystemRoot|ComSpec|APPDATA|LOCALAPPDATA|USERPROFILE|USERNAME|HOMEDRIVE|HOMEPATH|PATHEXT|SystemDrive|ProgramFiles|ProgramFiles\\(x86\\)|ProgramData|PROCESSOR_ARCHITECTURE|NUMBER_OF_PROCESSORS|OS|windir)$",
+    flags,
+  )
   const pass = (opts.passEnv ?? []).map(
     (p) =>
       new RegExp(
@@ -577,6 +664,7 @@ export function serverEnv(
     if (
       always.test(name) ||
       proxyAndTls.test(name) ||
+      extra.test(name) ||
       name.startsWith("LC_") ||
       name.startsWith("XDG_") ||
       name.startsWith("OPENCODE_") ||
@@ -591,6 +679,19 @@ export function serverEnv(
   kept.OPENCODE_SERVER_USERNAME = opts.username
   kept.OPENCODE_SERVER_PASSWORD = opts.password
   return kept
+}
+
+/**
+ * The one-line warning for provider keys the allowlist drops; at most five are named. A key the
+ * user relies on must not vanish without pointing at HORDE_OPENCODE_PASS_ENV.
+ */
+export function droppedSecretWarning(env: NodeJS.ProcessEnv, username: string, passEnv: string[] = []): string | undefined {
+  const kept = serverEnv({ username, passEnv }, env)
+  const names = Object.keys(env).filter((name) => /(_API_KEY|_TOKEN)$/i.test(name) && env[name] !== undefined && !(name in kept))
+  if (!names.length) return undefined
+  const shown = names.slice(0, 5).join(", ")
+  const more = names.length > 5 ? ` and ${names.length - 5} more` : ""
+  return `Dropped ${shown}${more} from the worker environment; name them in HORDE_OPENCODE_PASS_ENV if a worker needs them.`
 }
 
 /** The shell environment a session gets: the allowlist without the server's auth. */
@@ -616,14 +717,22 @@ function parseVersion(output: string | undefined): string | undefined {
   return /(\d+\.\d+(?:\.\d+)?)/.exec(output ?? "")?.[1]
 }
 
-/** The configured binary's version, read once per reconnect (cheap: `opencode --version`). */
-function binaryVersion(bin: { command: string; shell: boolean }): string | undefined {
+/** Versions read this process, by binary path: a reconnect must not run `opencode --version` again. */
+const binaryVersions = new Map<string, string | undefined>()
+
+/** The configured binary's version, cached per path and bounded so a hanging binary cannot freeze us. */
+export function binaryVersion(bin: { command: string; shell: boolean }): string | undefined {
+  const key = bin.command
+  if (binaryVersions.has(key)) return binaryVersions.get(key)
+  let version: string | undefined
   try {
-    const res = spawnSync(bin.command, ["--version"], { shell: bin.shell, encoding: "utf8" })
-    return parseVersion(res.stdout)
+    const res = spawnSync(bin.command, ["--version"], { shell: bin.shell, encoding: "utf8", timeout: 5_000, windowsHide: true })
+    version = parseVersion(res.stdout)
   } catch {
-    return undefined
+    version = undefined
   }
+  binaryVersions.set(key, version)
+  return version
 }
 
 function serveArgs(port: number) {
@@ -660,13 +769,27 @@ async function scopedPid(proc: ChildProcess, pidFile: string): Promise<number> {
   return proc.pid!
 }
 
+/** Open the shared server's log, making an older 0644 file private as well as a new one. */
+export function openSharedLog(stateDir: string): { fd: number; path: string } {
+  const logPath = path.join(stateDir, "opencode-server.log")
+  const fd = fs.openSync(logPath, "w", 0o600)
+  // openSync's mode only applies when it creates the file.
+  fs.chmodSync(logPath, 0o600)
+  return { fd, path: logPath }
+}
+
 /** A detached server that outlives this process; its output goes to a log file. */
-async function spawnShared(config: Config, stateDir: string, password: string, env: Record<string, string | undefined>): Promise<{ url: string; pid: number }> {
+async function spawnShared(
+  config: Config,
+  stateDir: string,
+  password: string,
+  env: Record<string, string | undefined>,
+): Promise<{ url: string; pid: number; startTime?: string }> {
   const logPath = path.join(stateDir, "opencode-server.log")
   let lastError: Error | undefined
   for (let attempt = 0; attempt < 3; attempt++) {
     const port = await freePort()
-    const log = fs.openSync(logPath, "w", 0o600)
+    const log = openSharedLog(stateDir)
     const bin = resolveBinary(config.bin)
     // The Claude Code session must not be the scope that owns the horde's builds: a systemd user
     // scope keeps the server and its memory out of the terminal scope systemd-oomd would kill.
@@ -680,14 +803,15 @@ async function spawnShared(config: Config, stateDir: string, password: string, e
     const proc = spawn(launch.command, launch.args, {
       cwd: workingDir(config),
       env,
-      stdio: ["ignore", log, log],
+      stdio: ["ignore", log.fd, log.fd],
       detached: true,
       windowsHide: true,
       shell: scoped ? false : bin.shell,
     })
-    fs.closeSync(log)
+    fs.closeSync(log.fd)
     proc.unref()
     const pid = scoped ? await scopedPid(proc, pidFile) : proc.pid!
+    const startTime = processStartTime(pid)
     const url = `http://127.0.0.1:${port}`
     const client = connect(url, config.username, password)
     try {
@@ -705,11 +829,12 @@ async function spawnShared(config: Config, stateDir: string, password: string, e
             if (probe.ok && proc.exitCode === null) return resolve()
             await new Promise((r) => setTimeout(r, 200))
           }
-          killTree(pid, true)
+          // The same stop sequence as stopPid: SIGTERM and its scope, then SIGKILL after 5 s.
+          await stopPid(pid, url)
           reject(new Error(`Timed out waiting for \`${config.bin} serve\`; see ${logPath}`))
         })()
       })
-      return { url, pid }
+      return { url, pid, startTime }
     } catch (err) {
       lastError = err as Error
       if (/Failed to launch/.test(lastError.message)) break

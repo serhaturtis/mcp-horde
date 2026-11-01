@@ -11,19 +11,23 @@ import { execFileSync } from "node:child_process"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
+import { fileURLToPath } from "node:url"
 
 const MAX_NAMED = 6
 const TITLE_CHARS = 60
 const STALE_MS = 24 * 60 * 60 * 1000
 const COLLECT = " Collect them with horde_wait before stopping (horde_drop what you no longer need)."
 
-try {
-  const event = process.argv[2]
-  const input = readInput()
-  const news = readNews(input)
-  if (news && event === "UserPromptSubmit") prompt(news)
-  if (news && event === "Stop") stop(news, input)
-} catch {}
+// Imported by the tests for parentPid; only a direct run reads stdin and writes the hook output.
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  try {
+    const event = process.argv[2]
+    const input = readInput()
+    const news = readNews(input)
+    if (news && event === "UserPromptSubmit") prompt(news)
+    if (news && event === "Stop") stop(news, input)
+  } catch {}
+}
 
 function readInput() {
   try {
@@ -83,7 +87,21 @@ function fallback() {
 }
 
 /** A process's parent pid, or undefined where this platform gives no way to read it. */
-function parentPid(pid) {
+export function parentPid(pid, exec = execFileSync, platform = process.platform) {
+  if (platform === "win32") {
+    try {
+      const out = exec(
+        "powershell",
+        ["-NoProfile", "-NonInteractive", "-Command", `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}").ParentProcessId`],
+        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+      ).trim()
+      const ppid = Number(out)
+      if (out && Number.isInteger(ppid) && ppid > 0) return ppid
+    } catch {
+      // No PowerShell: the parent cannot be read.
+    }
+    return undefined
+  }
   try {
     // /proc/<pid>/stat: the command may contain spaces and parentheses, so split after the last ')'.
     const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8")
@@ -93,7 +111,7 @@ function parentPid(pid) {
     // No /proc here, so try ps below.
   }
   try {
-    const out = execFileSync("ps", ["-o", "ppid=", "-p", String(pid)], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim()
+    const out = exec("ps", ["-o", "ppid=", "-p", String(pid)], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim()
     const ppid = Number(out)
     if (out && Number.isInteger(ppid) && ppid > 0) return ppid
   } catch {

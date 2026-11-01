@@ -5,6 +5,26 @@ import path from "node:path"
 
 const isWindows = process.platform === "win32"
 
+function lifecycleFile(): string {
+  return path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state"), "mcp-horde", "servers.log")
+}
+
+/** Append one line to the lifecycle log; never throws. */
+function noteLifecycle(name: string, what: string): void {
+  try {
+    const file = lifecycleFile()
+    const dir = path.dirname(file)
+    // Private to the user: the log names sessions and pids, and Node's fatal-error reports land beside it.
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+    // An install created before this mode was set can be 0755: tighten it for the log and the reports.
+    if (!isWindows && (fs.statSync(dir).mode & 0o077) !== 0) fs.chmodSync(dir, 0o700)
+    fs.appendFileSync(file, `${new Date().toISOString()} ${name} pid ${process.pid}: ${what}\n`, { mode: 0o600 })
+    if (!isWindows && (fs.statSync(file).mode & 0o077) !== 0) fs.chmodSync(file, 0o600)
+  } catch {
+    // Logging must never be what breaks a server.
+  }
+}
+
 /**
  * Note a server's start, and how it ends, in one log the horde's servers share
  * ($XDG_STATE_HOME/mcp-horde/servers.log): the signal it got, its stdin closing, an uncaught
@@ -15,21 +35,14 @@ const isWindows = process.platform === "win32"
  * ponytail: the log only grows (a few lines per server start); rotate it if that ever matters.
  */
 export function recordLifecycle(name: string, version: string): void {
-  const file = path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state"), "mcp-horde", "servers.log")
-  const note = (what: string) => {
-    try {
-      // Private to the user: the log names sessions and pids, and Node's fatal-error reports land beside it.
-      fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
-      fs.appendFileSync(file, `${new Date().toISOString()} ${name} pid ${process.pid}: ${what}\n`, { mode: 0o600 })
-      if (!isWindows && (fs.statSync(file).mode & 0o077) !== 0) fs.chmodSync(file, 0o600)
-    } catch {
-      // Logging must never be what breaks a server.
-    }
-  }
+  const note = (what: string) => noteLifecycle(name, what)
   note(`started (version ${version}, parent ${process.ppid})`)
   try {
-    process.report.directory = path.dirname(file)
+    process.report.directory = path.dirname(lifecycleFile())
     process.report.reportOnFatalError = true
+    // The report is next to the log, not necessarily private on every platform: keep the environment
+    // (server password, provider keys) out of it where Node allows (22.13+).
+    if ("excludeEnv" in process.report) process.report.excludeEnv = true
   } catch {
     // No report support: the log still says the rest.
   }
@@ -74,10 +87,25 @@ export function killTree(pid: number, group: boolean, signal: NodeJS.Signals = "
   }
 }
 
-/** Whether HORDE_SCOPE asks for transient systemd user scopes (anything except off/0/false/no). */
+const SCOPE_ON = ["on", "1", "true", "yes", "auto"]
+const SCOPE_OFF = ["off", "0", "false", "no"]
+let scopeUnknownNoted = false
+
+/**
+ * Whether HORDE_SCOPE asks for transient systemd user scopes. on/1/true/yes/auto enable,
+ * off/0/false/no disable; an unknown value counts as unset (on) and is noted once.
+ */
 export function scopeEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  const value = env.HORDE_SCOPE?.trim().toLowerCase()
-  return !(value === "off" || value === "0" || value === "false" || value === "no")
+  const raw = env.HORDE_SCOPE?.trim()
+  if (!raw) return true
+  const value = raw.toLowerCase()
+  if (SCOPE_ON.includes(value)) return true
+  if (SCOPE_OFF.includes(value)) return false
+  if (!scopeUnknownNoted) {
+    scopeUnknownNoted = true
+    noteLifecycle("core", `HORDE_SCOPE="${raw}" is not a boolean; treating it as unset (scopes on)`)
+  }
+  return true
 }
 
 /** The validated HORDE_MEMORY_HIGH value, or undefined when it is unset. */
@@ -90,8 +118,8 @@ export function memoryHigh(env: NodeJS.ProcessEnv = process.env): string | undef
   return value
 }
 
-/** Probe once per process: the answer cannot change for the life of a server. */
-let scopeProbe: boolean | undefined
+/** Probe once per runtime directory and session bus, not once per process. */
+const scopeProbes = new Map<string, boolean>()
 type ScopeProbe = (env: NodeJS.ProcessEnv) => boolean
 
 function probeSystemd(env: NodeJS.ProcessEnv): boolean {
@@ -111,8 +139,13 @@ export function scopeAvailable(env: NodeJS.ProcessEnv = process.env, platform = 
   if (platform !== "linux" || !scopeEnabled(env) || !env.XDG_RUNTIME_DIR) return false
   // A supplied probe is a test override and must not decide the cached answer for this process.
   if (probe) return probe(env)
-  if (scopeProbe === undefined) scopeProbe = probeSystemd(env)
-  return scopeProbe
+  const key = `${env.XDG_RUNTIME_DIR}\0${env.DBUS_SESSION_BUS_ADDRESS ?? ""}`
+  let available = scopeProbes.get(key)
+  if (available === undefined) {
+    available = probeSystemd(env)
+    scopeProbes.set(key, available)
+  }
+  return available
 }
 
 export interface ScopeOptions {
@@ -197,8 +230,9 @@ export function runCommand(command: string, opts: RunOptions): Promise<RunResult
   const started = Date.now()
   // The Claude Code session must not be the scope that owns the horde's builds: their page cache
   // (cargo target/, node_modules) otherwise makes its cgroup the one systemd-oomd kills.
+  const unit = `horde-check-${process.pid}-${++checkSequence}`
   const scope = scopeCommand(["/bin/sh", "-c", command], {
-    unit: `horde-check-${process.pid}-${++checkSequence}`,
+    unit,
     env: { ...process.env, ...opts.env },
   })
   return new Promise((resolve, reject) => {
@@ -231,6 +265,15 @@ export function runCommand(command: string, opts: RunOptions): Promise<RunResult
     const killAll = () => {
       if (child.pid !== undefined) killTree(child.pid, !isWindows, "SIGKILL")
     }
+    // A daemonized child (setsid) leaves the process group: stopping the scope reaches it too.
+    const stopScope = () => {
+      if (!scope.scoped) return
+      try {
+        spawnSync("systemctl", ["--user", "stop", `${unit}.scope`], { stdio: "ignore", timeout: 5_000 })
+      } catch {
+        // No user manager, or the scope is already gone.
+      }
+    }
     // After a timeout or abort, give up on output a process outside the group still holds.
     const stopReading = () => {
       const t = setTimeout(() => {
@@ -243,6 +286,7 @@ export function runCommand(command: string, opts: RunOptions): Promise<RunResult
       () => {
         stopped = "timeout"
         killAll()
+        stopScope()
         stopReading()
       },
       opts.timeoutMs ?? 10 * 60_000,
@@ -250,6 +294,7 @@ export function runCommand(command: string, opts: RunOptions): Promise<RunResult
     const onAbort = () => {
       stopped = "cancelled"
       killAll()
+      stopScope()
       stopReading()
     }
     if (opts.signal?.aborted) onAbort()
