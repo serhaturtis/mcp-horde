@@ -34,6 +34,7 @@ The project's checks judge every task, so `horde_do` refuses in a repository whe
 ## When to step in
 
 - Two failed rounds on one tier: escalate (`horde_tell` with the `model` the outcome names) instead of another hint.
+- A `horde_tell` reaches a Codex or Cursor worker only after its current turn: those runtimes cannot steer mid-turn, so wait for the turn to end before expecting the change.
 - Failing on the strongest tier: do it yourself, starting from the FAILED outcome (usually most of the diagnosis).
 - Several workers rediscovering the same fact: `board_remember` it; later briefs include it.
 

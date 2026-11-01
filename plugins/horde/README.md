@@ -41,6 +41,8 @@ Optional, in the repository's `horde.json`: the worker models per tier, cheapest
 }
 ```
 
+A tier is `"provider/model"` for OpenCode (e.g. `"deepseek/deepseek-flash"`), `"codex/<model>"` for the Codex CLI (e.g. `"codex/gpt-5.3-codex"`) and `"cursor/<model>"` for Cursor's agent (e.g. `"cursor/gpt-5.3-codex"`). The horde.json `prices` table gives USD per million tokens (`input`, `output`, optional `cachedInput`) for runtimes that report tokens only, e.g. `{ "codex/gpt-5.3-codex": { "input": 1.25, "output": 10, "cachedInput": 0.125 } }`; without a matching price the cost is 0. On the Codex and Cursor runtimes, edits outside the scope are caught by the audit rather than refused up front, a `horde_tell` reaches the worker after its current turn, and permission prompts never come to the orchestrator (the worker runs auto-approved inside the CLI's sandbox).
+
 Checks take `cwd`, `env`, `"when": "land"` (only before landing), `slots` and `exclusive`, and see `HORDE_TASK` and `HORDE_WORKTREE` when they run for a task; the setup skill (`/horde:setup`) writes `horde.json` for a repository and has a full example. `workers.brief` lists repository-relative files (house rules) that every worker brief includes in full under `## House rules (<path>)`, right after its scope; each file is capped at 300 lines, and a listed file that does not exist is named in the brief rather than failing it. `workers.land` is a command run while a task lands, after its commits are rebased onto your branch and before the checks, for files that must be regenerated on the new base; its changes are committed on top and land with the task.
 
 To use the same worker defaults in every repository, put `tiers` and `opencode` in `$XDG_CONFIG_HOME/mcp-horde/horde.json` (`~/.config/mcp-horde/horde.json` when `XDG_CONFIG_HOME` is unset). They apply only where the repository's `horde.json` does not set that key, and every other key is ignored. This makes `deepseek/deepseek-flash` the default worker model everywhere:
@@ -59,6 +61,8 @@ Set these in the shell before starting Claude Code; the plugin's MCP servers inh
 | --- | --- | --- |
 | `HORDE_OPENCODE_SERVER` | `shared` | `shared`: one detached `opencode serve` that outlives MCP restarts. `private`: one server per MCP process, stopped with it. |
 | `HORDE_OPENCODE_BIN` | `opencode` | Binary used to start `opencode serve`. |
+| `HORDE_CODEX_BIN` | `codex` | Binary run for a `codex/<model>` tier (OpenAI's Codex CLI). |
+| `HORDE_CURSOR_BIN` | `cursor-agent` | Binary run for a `cursor/<model>` tier (Cursor's agent CLI, version 2026.10 or later). |
 | `HORDE_OPENCODE_URL` | none | Attach to a server you run yourself instead of starting one. |
 | `HORDE_OPENCODE_PERMISSIONS` | `user` | What a permission request does: `user` asks you, `ask` gives it to the calling model, `allow` and `deny` decide automatically. |
 | `HORDE_OPENCODE_MAX_RUNNING` | `horde.json` `opencode.maxRunning`, else 8 | Maximum number of workers running at once (`0` = unlimited). |
