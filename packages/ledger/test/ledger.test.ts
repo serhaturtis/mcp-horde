@@ -7,7 +7,7 @@ import { describe, test } from "node:test"
 import { Board } from "@mcp-horde/board"
 import { Client } from "@modelcontextprotocol/client"
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio"
-import { areasOf, kindOf, outcomesOf, renderStats, stats, suggest, suggestTiers } from "../src/lib.js"
+import { areasOf, kindOf, type Outcome, outcomesOf, renderStats, stats, suggest, suggestTiers } from "../src/lib.js"
 
 const tmp = () => fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "horde-ledger-")))
 const pkg = path.join(import.meta.dirname, "..")
@@ -25,11 +25,42 @@ async function history(board: Board, title: string, scope: string[], model: stri
 describe("ledger", () => {
   test("kinds and areas of work", () => {
     assert.equal(kindOf("Add tests for the parser"), "test")
+    assert.equal(kindOf("Document how to run the tests"), "docs")
+    assert.equal(kindOf("Fix the failing test"), "fix")
+    assert.equal(kindOf("Upgrade the test runner"), "build")
+    assert.equal(kindOf("Rename the test helper"), "refactor")
     assert.equal(kindOf("Fix crash on empty input"), "fix")
     assert.equal(kindOf("Rename Foo to Bar"), "refactor")
     assert.equal(kindOf("Login rate limit", "Write the README section"), "docs")
     assert.equal(kindOf("Rate limiting for login"), "feature")
     assert.deepEqual(areasOf(["src/api/**", "src/api/login.ts", "test/api/deep/x/**", "README.md", "**"]), ["src/api", "test/api"])
+  })
+
+  test("an attempt over several areas splits its cost across them", () => {
+    const at = (areas: string[], cost: number): Outcome => ({
+      repo: "r",
+      task: "t",
+      title: "x",
+      kind: "feature",
+      areas,
+      tier: 0,
+      accepted: true,
+      cost,
+      at: 1,
+    })
+    const rows = stats([at(["src/a", "src/b"], 1)], "area")
+    assert.deepEqual(
+      rows.map((r) => [r.key, r.costPerAccepted]),
+      [
+        ["src/a", 0.5],
+        ["src/b", 0.5],
+      ],
+    )
+    assert.deepEqual(
+      stats([at(["src/a", "src/a"], 1)], "area").map((r) => [r.key, r.accepted, r.costPerAccepted]),
+      [["src/a", 1, 1]],
+      "a repeated area is one group",
+    )
   })
 
   test("statistics by model, with cost per accepted task and drift", async () => {

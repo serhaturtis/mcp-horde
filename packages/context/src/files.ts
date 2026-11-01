@@ -140,19 +140,19 @@ export function unreadable(project: Project, rel: string): string | undefined {
   return access(project, rel).error
 }
 
-function access(project: Project, rel: string): { abs: string; st: fs.Stats; error?: undefined } | { error: string } {
+function access(project: Project, rel: string): { abs: string; st: fs.BigIntStats; error?: undefined } | { error: string } {
   const norm = path.posix.normalize(rel.replace(/\\/g, "/"))
   if (path.isAbsolute(rel) || path.posix.isAbsolute(norm) || norm === ".." || norm.startsWith("../")) return { error: `${rel} is outside ${project.root}` }
   if (!isProjectFile(project, rel)) return { error: `no file ${rel} in ${project.root}` }
   const abs = path.join(project.root, rel)
-  let st: fs.Stats
+  let st: fs.BigIntStats
   try {
-    st = fs.lstatSync(abs)
+    st = fs.lstatSync(abs, { bigint: true })
     if (st.isSymbolicLink()) {
       const real = fs.realpathSync.native(abs)
       const r = path.relative(realRoot(project.root), real)
       if (!r || r.startsWith("..") || path.isAbsolute(r)) return { error: `${rel} links outside ${project.root}` }
-      st = fs.statSync(abs)
+      st = fs.statSync(abs, { bigint: true })
     }
   } catch {
     return { error: `${rel} cannot be read` }
@@ -165,7 +165,9 @@ function access(project: Project, rel: string): { abs: string; st: fs.Stats; err
 const MAX_TEXT_BYTES = 64 * 1024 * 1024
 /** …and at most this many files (binaries and oversized files hold no text but an entry). */
 const MAX_TEXTS = 100_000
-const texts = new Map<string, { mtime: number; size: number; text: string | undefined }>()
+/** A file modified this recently is re-read even when its stats look unchanged (git's racy-file rule). */
+const RACY_MS = 2000
+const texts = new Map<string, { mtime: bigint; ctime: bigint; ino: bigint; size: bigint; text: string | undefined }>()
 let textBytes = 0
 const evictions: ((abs: string) => void)[] = []
 
@@ -187,14 +189,16 @@ function dropText(abs: string) {
 /**
  * A project file's text, or undefined for binaries, oversized files, anything that is not a
  * regular file, and paths outside the project's file list or root (see `unreadable`).
- * Cached by mtime and size.
+ * Cached by inode, mtime, ctime and size; a file modified in the last two seconds is re-read.
  */
 export function readText(project: Project, rel: string): string | undefined {
   const a = access(project, rel)
   if (a.error !== undefined) return undefined
   const { abs, st } = a
   const hit = texts.get(abs)
-  if (hit && hit.mtime === st.mtimeMs && hit.size === st.size) {
+  const sameStats = !!hit && hit.mtime === st.mtimeMs && hit.ctime === st.ctimeMs && hit.ino === st.ino && hit.size === st.size
+  const racy = Number(st.mtimeMs) > Date.now() - RACY_MS
+  if (!racy && sameStats) {
     // Most recently used last.
     texts.delete(abs)
     texts.set(abs, hit)
@@ -209,8 +213,9 @@ export function readText(project: Project, rel: string): string | undefined {
       text = undefined
     }
   }
-  dropText(abs)
-  texts.set(abs, { mtime: st.mtimeMs, size: st.size, text })
+  // A racy re-read that found the same text leaves derived caches (definitions, spans) valid.
+  if (!(sameStats && hit.text === text)) dropText(abs)
+  texts.set(abs, { mtime: st.mtimeMs, ctime: st.ctimeMs, ino: st.ino, size: st.size, text })
   textBytes += bytesOf(text)
   while ((textBytes > MAX_TEXT_BYTES || texts.size > MAX_TEXTS) && texts.size > 1) dropText(texts.keys().next().value as string)
   return text

@@ -37,10 +37,30 @@ export function fileInfo(project: Project, rel: string): FileInfo | undefined {
   // Computed before the grammars finished loading: compute again.
   const generation = syntaxGeneration()
   if (hit && hit.text === text && hit.generation === generation) return hit.info
-  // Components mix <template> markup with <script>: read their imports but no definitions,
-  // which the line/grammar rules would otherwise scatter across the markup.
+  // Components mix <template> markup with <script>: read their imports but no definitions, and
+  // mark the markup (and comments/strings inside the script) non-code so references skip both.
   const component = /\.(vue|svelte|astro)$/.test(rel)
-  const parsed = component ? undefined : parse(text, lang, rel)
+  let parsed: Parsed | undefined
+  if (component) {
+    const scripts: { start: number; body: string }[] = []
+    for (const m of text.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)) scripts.push({ start: (m.index ?? 0) + m[0].indexOf(">") + 1, body: m[1] ?? "" })
+    // Astro's frontmatter is its script block.
+    if (/\.astro$/.test(rel)) {
+      const fm = /^---\r?\n([\s\S]*?)\r?\n---/.exec(text)
+      if (fm) scripts.push({ start: (fm.index ?? 0) + fm[0].indexOf("\n") + 1, body: fm[1] ?? "" })
+    }
+    scripts.sort((a, b) => a.start - b.start)
+    const spans: Parsed["spans"] = []
+    let last = 0
+    for (const s of scripts) {
+      if (s.start > last) spans.push({ start: last, end: s.start, code: false })
+      const p = parse(s.body, lang, rel)
+      for (const span of p?.spans ?? []) spans.push({ start: s.start + span.start, end: s.start + span.end, code: span.code })
+      last = s.start + s.body.length
+    }
+    if (last < text.length) spans.push({ start: last, end: text.length, code: false })
+    parsed = { defs: [], spans }
+  } else parsed = parse(text, lang, rel)
   const info = {
     lang,
     defs: component ? [] : (parsed?.defs ?? patternDefinitions(text, lang)),
@@ -63,6 +83,13 @@ interface TsConfig {
   paths: { prefix: string; suffix: string; star: boolean; targets: string[] }[]
 }
 
+interface WorkspacePackage {
+  dir: string
+  entry?: string
+  /** Exports subpaths ("./widget") mapped to their source files. */
+  subpaths: Map<string, string[]>
+}
+
 /**
  * What one import-graph build knows about the project, computed once per build: the file
  * set, files by directory and by name, workspace packages, go.mod, Python project roots and
@@ -77,7 +104,7 @@ class Resolver {
   readonly dirsByName = new Map<string, string[]>()
   /** Non-source files read while resolving, with the text seen. */
   readonly deps = new Map<string, string | undefined>()
-  private packages?: Map<string, { dir: string; entry?: string }>
+  private packages?: Map<string, WorkspacePackage>
   private goModsAll?: { dir: string; mod: string }[]
   private readonly pyRoots = new Map<string, string | null>()
   private pyPkgs?: Map<string, string[]>
@@ -100,9 +127,9 @@ class Resolver {
   }
 
   /** Files of package `pkg` (path below `dir`), on whatever directory it maps to. */
-  workspacePackages(): Map<string, { dir: string; entry?: string }> {
+  workspacePackages(): Map<string, WorkspacePackage> {
     if (this.packages) return this.packages
-    const packages = new Map<string, { dir: string; entry?: string }>()
+    const packages = new Map<string, WorkspacePackage>()
     for (const pj of this.byName.get("package.json") ?? []) {
       let data: { name?: string; main?: string; types?: string; exports?: unknown }
       try {
@@ -113,6 +140,7 @@ class Resolver {
       if (!data.name) continue
       const dir = path.posix.dirname(pj)
       const root = (p: string) => path.posix.normalize(path.posix.join(dir, p))
+      const sourceFile = (p: string) => jsFile(p.replace(/^(.*?)(dist|build|lib)\//, "$1src/").replace(/\.d\.ts$/, ".ts"), this.files) ?? jsFile(p, this.files)
       const dot = (
         data.exports && typeof data.exports === "object" && !Array.isArray(data.exports)
           ? ((data.exports as Record<string, unknown>)["."] ?? data.exports)
@@ -122,11 +150,36 @@ class Resolver {
       const candidates = [...conds, data.main, data.types].filter((x): x is string => typeof x === "string")
       let entry: string | undefined
       for (const c of candidates) {
-        const p = root(c)
-        entry = jsFile(p.replace(/^(.*?)(dist|build|lib)\//, "$1src/").replace(/\.d\.ts$/, ".ts"), this.files) ?? jsFile(p, this.files)
+        entry = sourceFile(root(c))
         if (entry) break
       }
-      packages.set(data.name, { dir: dir === "." ? "" : dir, entry: entry ?? jsFile(root("src/index"), this.files) ?? jsFile(root("index"), this.files) })
+      const subpaths = new Map<string, string[]>()
+      if (data.exports && typeof data.exports === "object" && !Array.isArray(data.exports))
+        for (const [key, value] of Object.entries(data.exports as Record<string, unknown>)) {
+          if (!key.startsWith("./") || key === "./") continue
+          const targets =
+            typeof value === "string"
+              ? [value]
+              : value && typeof value === "object"
+                ? [
+                    (value as Record<string, unknown>).source,
+                    (value as Record<string, unknown>).import,
+                    (value as Record<string, unknown>).default,
+                    (value as Record<string, unknown>).require,
+                    (value as Record<string, unknown>).types,
+                  ]
+                : []
+          const files = targets
+            .filter((x): x is string => typeof x === "string")
+            .map((t) => sourceFile(root(t)))
+            .filter((x): x is string => !!x)
+          if (files.length) subpaths.set(key, files)
+        }
+      packages.set(data.name, {
+        dir: dir === "." ? "" : dir,
+        entry: entry ?? jsFile(root("src/index"), this.files) ?? jsFile(root("index"), this.files),
+        subpaths,
+      })
     }
     this.packages = packages
     return packages
@@ -406,6 +459,9 @@ function workspaceImport(r: Resolver, spec: string): string[] {
   const pkg = m && r.workspacePackages().get(m[1]!)
   if (!pkg) return []
   if (!m![2]) return pkg.entry ? [pkg.entry] : []
+  // An exports subpath ("@x/lib/sub" -> "./sub") names its source directly.
+  const exported = pkg.subpaths.get(`./${m![2]}`)
+  if (exported?.length) return exported
   const sub = path.posix.join(pkg.dir, m![2])
   const hit = jsFile(sub, r.files) ?? jsFile(path.posix.join(pkg.dir, "src", m![2]), r.files)
   return hit ? [hit] : []
@@ -499,6 +555,18 @@ const isRunnableTest = (p: string) =>
  * package's tests; for Rust, the file's own `#[cfg(test)]` module.
  */
 export function testsFor(project: Project, files: string[], opts: { transitive?: boolean } = {}): Map<string, TestLink[]> {
+  // A directory argument covers the files under it.
+  const wanted: string[] = []
+  for (const file of files) {
+    if (project.files.includes(file)) {
+      wanted.push(file)
+      continue
+    }
+    const dir = file === "." ? "" : file.replace(/\/+$/, "")
+    const under = project.files.filter((f) => (dir ? f.startsWith(`${dir}/`) : true))
+    if (under.length) wanted.push(...under)
+    else wanted.push(file)
+  }
   const tests = project.files.filter((f) => isTestPath(f) && langOf(f))
   const graph = importGraph(project)
   // Non-test source files by stem, so a flat test name mirrors only an unambiguous file.
@@ -509,7 +577,7 @@ export function testsFor(project: Project, files: string[], opts: { transitive?:
     stemCount.set(s, (stemCount.get(s) ?? 0) + 1)
   }
   const result = new Map<string, TestLink[]>()
-  for (const file of files) {
+  for (const file of wanted) {
     const links = new Map<string, string>()
     const add = (t: string, why: string) => {
       if (!links.has(t)) links.set(t, why)

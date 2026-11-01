@@ -897,6 +897,87 @@ describe("import resolution details", () => {
   })
 })
 
+describe("bug hunt fixes", () => {
+  test("excerpt keeps its cut marker inside budget_chars", () => {
+    const dir = fixture({ "long.ts": `export const text = "${"a".repeat(50_000)}"\n` })
+    const p = openProject(dir)
+    const out = excerpt(p, "long.ts", { budgetChars: 500 })
+    assert.ok(out.length <= 500, `${out.length} chars`)
+    assert.match(out, /cut at 500 chars/)
+  })
+
+  test("a shadowing local inside a definition body is not a reference", () => {
+    const dir = fixture({
+      "render.ts": "export function render(items: string[]) {\n  for (const render of items) use(render)\n  return render\n}\nrender(['x'])\n",
+    })
+    const p = openProject(dir)
+    assert.deepEqual(
+      find(p, "render", { kind: "reference" }).hits.map((h) => h.line),
+      [5],
+    )
+    assert.equal(symbol(p, "render")[0]!.callCount, 1)
+  })
+
+  test("a Vue component's markup and script comment are not references", () => {
+    const dir = fixture({
+      "src/lib.ts": "export function slug(s: string) {\n  return s\n}\n",
+      "src/Price.vue":
+        "<template>\n  <p>slug</p>\n</template>\n<script setup lang=\"ts\">\nimport { slug } from './lib.js'\n// slug is computed below\nconst label = slug('x')\n</script>\n",
+    })
+    const p = openProject(dir)
+    assert.deepEqual(
+      find(p, "slug", { kind: "reference", paths: ["src/Price.vue"] }).hits.map((h) => h.line),
+      [5, 7],
+    )
+  })
+
+  test("workspace exports subpaths resolve, so tests_for sees the test", () => {
+    const dir = fixture({
+      "packages/lib/package.json": JSON.stringify({ name: "@x/lib", exports: { "./widget": { source: "./src/deep/widget.ts" } } }),
+      "packages/lib/src/deep/widget.ts": "export const widget = 1\n",
+      "packages/app/checks/one.test.ts": "import { widget } from '@x/lib/widget'\n",
+    })
+    const p = openProject(dir)
+    assert.deepEqual(importGraph(p).out.get("packages/app/checks/one.test.ts"), ["packages/lib/src/deep/widget.ts"])
+    assert.deepEqual(
+      testsFor(p, ["packages/lib/src/deep/widget.ts"])
+        .get("packages/lib/src/deep/widget.ts")!
+        .map((t) => `${t.test} (${t.why})`),
+      ["packages/app/checks/one.test.ts (imports it)"],
+    )
+  })
+
+  test("a same-size rewrite in the same timestamp tick is re-read", () => {
+    const dir = fixture({ "a.ts": "AAAA\n" })
+    const p = openProject(dir)
+    const file = path.join(dir, "a.ts")
+    assert.equal(readText(p, "a.ts"), "AAAA\n")
+    const before = fs.statSync(file, { bigint: true })
+    fs.writeFileSync(file, "BBBB\n")
+    fs.utimesSync(file, Number(before.atimeMs) / 1000, Number(before.mtimeMs) / 1000)
+    assert.equal(fs.statSync(file).size, Number(before.size))
+    assert.equal(readText(p, "a.ts"), "BBBB\n")
+  })
+
+  test("tests_for expands a directory to the files under it", () => {
+    const dir = fixture({
+      "src/a.ts": "export const a = 1\n",
+      "src/a.test.ts": "import { a } from './a.js'\n",
+      "other/b.ts": "export const b = 1\n",
+    })
+    const p = openProject(dir)
+    for (const arg of ["src", "src/"]) {
+      const r = testsFor(p, [arg])
+      assert.deepEqual([...r.keys()].sort(), ["src/a.test.ts", "src/a.ts"], arg)
+      assert.deepEqual(
+        r.get("src/a.ts")!.map((t) => `${t.test} (${t.why})`),
+        ["src/a.test.ts (naming)"],
+        arg,
+      )
+    }
+  })
+})
+
 describe("MCP server", () => {
   test("tools over stdio", async () => {
     const client = new Client({ name: "test", version: "0" })

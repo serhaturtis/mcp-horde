@@ -32,11 +32,11 @@ export interface Outcome {
 }
 
 const KINDS: [Kind, RegExp][] = [
-  ["test", /\b(tests?|spec|coverage|e2e)\b/i],
-  ["fix", /\b(fix|bug|crash|regression|broken|error|fails?)\b/i],
-  ["refactor", /\b(refactor|rename|extract|move|split|clean ?up|simplify|restructure)\b/i],
   ["docs", /\b(docs?|readme|document(ation)?|comments?|changelog)\b/i],
   ["build", /\b(build|ci|config(ure|uration)?|deps?|dependenc(y|ies)|upgrade|bump|lint)\b/i],
+  ["refactor", /\b(refactor|rename|extract|move|split|clean ?up|simplify|restructure)\b/i],
+  ["fix", /\b(fix|bug|crash|regression|broken|error|fails?)\b/i],
+  ["test", /\b(tests?|spec|coverage|e2e)\b/i],
 ]
 
 /** What kind of work a task is, from its title (and goal when the title says nothing). */
@@ -135,21 +135,27 @@ const keysOf = (o: Outcome, by: GroupBy): string[] => {
     case "kind":
       return [o.kind]
     case "area":
-      return o.areas.length ? o.areas : ["(no scope)"]
+      return [...new Set(o.areas.length ? o.areas : ["(no scope)"])]
     case "repo":
       return [o.repo]
   }
 }
 
 export function stats(outcomes: Outcome[], by: GroupBy): Row[] {
-  const groups = new Map<string, Outcome[]>()
-  for (const o of outcomes) for (const k of keysOf(o, by)) groups.set(k, [...(groups.get(k) ?? []), o])
+  // An attempt that spans several areas spreads its cost over them instead of counting it in each.
+  const groups = new Map<string, { o: Outcome; share: number }[]>()
+  for (const o of outcomes) {
+    const keys = keysOf(o, by)
+    const share = by === "area" && keys.length > 1 ? 1 / keys.length : 1
+    for (const k of keys) groups.set(k, [...(groups.get(k) ?? []), { o, share }])
+  }
   return [...groups]
-    .map(([key, os]) => {
+    .map(([key, members]) => {
+      const os = members.map((m) => m.o)
       os.sort((a, b) => a.at - b.at)
       const accepted = os.filter((o) => o.accepted)
       const gated = accepted.filter((o) => o.rounds !== undefined)
-      const cost = os.reduce((n, o) => n + o.cost, 0)
+      const cost = members.reduce((n, m) => n + m.o.cost * m.share, 0)
       const recent = os.slice(-RECENT)
       return {
         key,

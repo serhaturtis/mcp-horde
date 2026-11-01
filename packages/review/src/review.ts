@@ -108,7 +108,8 @@ export async function collectReview(
   const skipped: string[] = []
   for (const f of untracked) {
     const abs = path.join(root, f)
-    const st = fs.statSync(abs, { throwIfNoEntry: false })
+    // lstat: an untracked symlink is skipped rather than following it out of the workspace.
+    const st = fs.lstatSync(abs, { throwIfNoEntry: false })
     if (!st?.isFile() || st.size > MAX_UNTRACKED) {
       skipped.push(f)
       continue
@@ -147,6 +148,59 @@ export async function collectReview(
   }
 }
 
+/** A git header path: C-quoted when it holds control characters, otherwise as written with a trailing tab. */
+function gitPath(s: string): string {
+  if (!s.startsWith('"')) return s.replace(/\t$/, "")
+  let out = ""
+  for (let i = 1; i < s.length; i++) {
+    const c = s[i]!
+    if (c === '"') break
+    if (c !== "\\") {
+      out += c
+      continue
+    }
+    const e = s[++i]
+    if (e === "n") out += "\n"
+    else if (e === "t") out += "\t"
+    else if (e === "r") out += "\r"
+    else if (e === "b") out += "\b"
+    else if (e === "f") out += "\f"
+    else if (e === "v") out += "\v"
+    else if (e === '"' || e === "\\") out += e
+    else if (/[0-7]/.test(e ?? "")) {
+      let oct = e!
+      while (oct.length < 3 && /[0-7]/.test(s[i + 1] ?? "")) oct += s[++i]
+      out += String.fromCharCode(Number.parseInt(oct, 8))
+    } else out += e ?? ""
+  }
+  return out
+}
+
+/** The two paths of a `diff --git` line (still carrying their a/ and b/ prefixes). */
+function diffHeader(line: string): [string, string] | undefined {
+  const rest = line.slice("diff --git ".length)
+  if (rest.startsWith('"')) {
+    const tokens: string[] = []
+    for (let i = 0; i < rest.length; ) {
+      while (rest[i] === " ") i++
+      if (i >= rest.length) break
+      if (rest[i] === '"') {
+        let j = i + 1
+        while (j < rest.length && rest[j] !== '"') j += rest[j] === "\\" ? 2 : 1
+        tokens.push(gitPath(rest.slice(i, j + 1)))
+        i = j + 1
+      } else {
+        const start = i
+        while (i < rest.length && rest[i] !== " ") i++
+        tokens.push(gitPath(rest.slice(start, i)))
+      }
+    }
+    return tokens.length >= 2 ? [tokens[0]!, tokens[1]!] : undefined
+  }
+  const m = /^a\/(.*) b\/(.*)$/.exec(rest)
+  return m ? [`a/${m[1]}`, `b/${m[2]}`] : undefined
+}
+
 /** The diff with new-file line numbers, within a budget; which lines it shows, which it changes, and which files and hunks it touches. */
 export function renderDiff(raw: string, maxChars: number) {
   const shown = new Map<string, Set<number>>()
@@ -156,13 +210,18 @@ export function renderDiff(raw: string, maxChars: number) {
   const hunks = new Map<string, [number, number][]>()
   const deleted = new Set<string>()
   const files: { file: string; text: string }[] = []
+  const unshown: string[] = []
   let file: string | undefined
   let oldFile: string | undefined
   let out: string[] = []
   let newLine = 0
   let inHunk = false
   const flush = () => {
-    if (file && out.length) files.push({ file, text: out.join("\n") })
+    if (file) {
+      if (out.length) files.push({ file, text: out.join("\n") })
+      // Binary and mode-only changes have a header but no hunk to show.
+      else unshown.push(file)
+    }
     out = []
   }
   for (const line of raw.split("\n")) {
@@ -172,16 +231,17 @@ export function renderDiff(raw: string, maxChars: number) {
       oldFile = undefined
       inHunk = false
       // The header names every file, even binary or deleted ones that have no +++ line.
-      const m = /^diff --git a\/(.*) b\/(.*)$/.exec(line)
-      if (m) {
-        file = m[2]!
+      const h = diffHeader(line)
+      if (h) {
+        file = h[1].replace(/^b\//, "")
         diffFiles.add(file)
       }
       continue
     }
     // Headers only before a file's first hunk: a removed "-- x" line is not a header.
     if (!inHunk && line.startsWith("+++ ")) {
-      if (line === "+++ /dev/null") {
+      const path = gitPath(line.slice(4))
+      if (path === "/dev/null") {
         // A deleted file has no new side to cite; show it by name instead of dropping it.
         file = oldFile
         if (file) {
@@ -190,7 +250,7 @@ export function renderDiff(raw: string, maxChars: number) {
           out.push(`=== ${file} (deleted)`)
         }
       } else {
-        file = line.slice(4).replace(/^b\//, "")
+        file = path.replace(/^b\//, "")
         if (file) {
           diffFiles.add(file)
           out.push(`=== ${file}`)
@@ -199,7 +259,8 @@ export function renderDiff(raw: string, maxChars: number) {
       continue
     }
     if (!inHunk && line.startsWith("--- ")) {
-      if (line !== "--- /dev/null") oldFile = line.slice(4).replace(/^a\//, "")
+      const path = gitPath(line.slice(4))
+      if (path !== "/dev/null") oldFile = path.replace(/^a\//, "")
       continue
     }
     const h = /^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$/.exec(line)
@@ -243,16 +304,17 @@ export function renderDiff(raw: string, maxChars: number) {
   flush()
   // Smaller files first, so the budget shows as many whole files as it can.
   const kept: string[] = []
-  const omitted: string[] = []
+  const omitted: string[] = [...unshown]
   let used = 0
   for (const f of [...files].sort((a, b) => a.text.length - b.text.length)) {
-    if (used + f.text.length > maxChars) {
+    const sep = kept.length ? 2 : 0
+    if (used + sep + f.text.length > maxChars) {
       omitted.push(f.file)
       shown.delete(f.file)
       continue
     }
     kept.push(f.text)
-    used += f.text.length
+    used += sep + f.text.length
   }
   return { diff: kept.join("\n\n"), shown, omitted, changed, removedAt, diffFiles, hunks, deleted }
 }
@@ -290,55 +352,153 @@ export function reviewPrompt(r: ReviewInput, checks?: GateCheck[]): string {
     .join("\n")
 }
 
-/** Whether a criterion is about a check or test passing, or about something staying unchanged. */
-function checksOrUnchanged(text: string): boolean {
+/** Whether a criterion is about the tests, checks, lint or typecheck passing. */
+function checkCriterion(text: string): boolean {
+  return /\b(tests?|testing|checks?|checked|lint|typecheck|type-check)\b/i.test(text) && /\b(pass(es|ing|ed)?|green|succeed(s|ed)?|ok|clean)\b/i.test(text)
+}
+
+/** Whether a criterion is about something staying unchanged, kept, preserved or not modified. */
+function unchangedCriterion(text: string): boolean {
   return (
-    /\b(tests?|testing|checks?|checked|lint|typecheck|type-check|pass(es|ing|ed)?|unchanged|untouched|keep|keeps|kept|still|remains?|preserve[ds]?)\b/i.test(
-      text,
-    ) || /\b(not|never|no|without|isn't|aren't|doesn't|don't)\s+(change[ds]?|changing|modif(y|ied|ies)|touch(ed|es)?)\b/i.test(text)
+    /\b(unchanged|untouched|unmodified|unaffected|kept)\b/i.test(text) ||
+    /\b(keeps?|preserv(e|es|ed|ing))\b/i.test(text) ||
+    /\b(not|never|no|without|isn't|aren't|doesn't|don't)\s+(change[ds]?|changing|modif(y|ied|ies)|touch(ed|es)?)\b/i.test(text)
   )
 }
 
-const BLOCK_COMMENTS: [string, string][] = [
-  ["/*", "*/"],
-  ["<!--", "-->"],
-  ['"""', '"""'],
-  ["'''", "'''"],
-]
+/** Extensions whose `#` starts a line comment. */
+const HASH_COMMENT = new Set(["py", "rb", "sh", "bash", "zsh", "fish", "yaml", "yml", "toml", "pl", "pm", "r"])
+/** Extensions whose `--` starts a line comment. */
+const DASH_COMMENT = new Set(["sql", "lua", "hs", "lhs", "ada", "adb", "ads"])
+/** C-like extensions with `//` and `/* … *\/` comments. */
+const SLASH_COMMENT = new Set([
+  "ts",
+  "tsx",
+  "js",
+  "jsx",
+  "mts",
+  "cts",
+  "mjs",
+  "cjs",
+  "go",
+  "rs",
+  "java",
+  "kt",
+  "kts",
+  "cs",
+  "c",
+  "h",
+  "cc",
+  "cpp",
+  "cxx",
+  "hpp",
+  "hh",
+  "swift",
+  "scala",
+  "dart",
+  "php",
+  "proto",
+])
+/** Extensions with HTML comments. */
+const HTML_COMMENT = new Set(["html", "htm", "xml", "vue", "svelte", "astro", "md", "markdown"])
 
-/** Whether a new-file line (1-based) sits inside a block comment or docstring opened on an earlier line. */
-function insideBlockComment(lines: string[], line: number): boolean {
-  let open: string | undefined
-  for (let i = 0; i < line - 1; i++) {
-    let text = lines[i] ?? ""
-    for (;;) {
-      if (open) {
-        const end = text.indexOf(open)
-        if (end < 0) break
-        text = text.slice(end + open.length)
-        open = undefined
-        continue
-      }
-      let at = -1
-      let pair: [string, string] | undefined
-      for (const p of BLOCK_COMMENTS) {
-        const found = text.indexOf(p[0])
-        if (found >= 0 && (at < 0 || found < at)) {
-          at = found
-          pair = p
-        }
-      }
-      if (!pair) break
-      const rest = text.slice(at + pair[0].length)
-      const end = rest.indexOf(pair[1])
-      text = end < 0 ? "" : rest.slice(end + pair[1].length)
-      if (end < 0) open = pair[1]
-    }
-  }
-  return open !== undefined
+interface CommentStyle {
+  line: string[]
+  block: [string, string][]
 }
 
-/** Whether a cited line is a comment, or names the reviewer or the criteria, so it cannot be evidence. */
+function commentStyle(file: string): CommentStyle {
+  const ext = (/\.([A-Za-z0-9]+)$/.exec(file)?.[1] ?? "").toLowerCase()
+  const line: string[] = []
+  const block: [string, string][] = []
+  if (HASH_COMMENT.has(ext)) line.push("#")
+  if (DASH_COMMENT.has(ext)) line.push("--")
+  if (SLASH_COMMENT.has(ext)) {
+    line.push("//")
+    block.push(["/*", "*/"])
+  }
+  if (ext === "py") block.push(['"""', '"""'], ["'''", "'''"])
+  if (HTML_COMMENT.has(ext)) block.push(["<!--", "-->"])
+  return { line, block }
+}
+
+/** The comment text on `line` (1-based), and whether the line is only a comment. */
+function commentOf(lines: string[], line: number, style: CommentStyle): { text: string; whole: boolean } {
+  let block: [string, string] | undefined
+  for (let n = 0; n < line; n++) {
+    const src = lines[n] ?? ""
+    const startedInBlock = block !== undefined
+    let code = ""
+    let comment = ""
+    let quote: string | undefined
+    for (let i = 0; i < src.length; ) {
+      if (block) {
+        const end = src.indexOf(block[1], i)
+        if (end < 0) {
+          comment += src.slice(i)
+          break
+        }
+        comment += src.slice(i, end + block[1].length)
+        i = end + block[1].length
+        block = undefined
+        continue
+      }
+      const c = src[i]!
+      if (quote) {
+        if (c === "\\") {
+          code += src.slice(i, i + 2)
+          i += 2
+          continue
+        }
+        code += c
+        i++
+        if (c === quote) quote = undefined
+        continue
+      }
+      let found: [string, string] | undefined
+      let at = -1
+      for (const p of style.block) {
+        const idx = src.indexOf(p[0], i)
+        if (idx >= 0 && (at < 0 || idx < at)) {
+          at = idx
+          found = p
+        }
+      }
+      let lineAt = -1
+      for (const m of style.line) {
+        const idx = src.indexOf(m, i)
+        if (idx >= 0 && (lineAt < 0 || idx < lineAt)) lineAt = idx
+      }
+      if (lineAt >= 0 && (at < 0 || lineAt < at)) {
+        code += src.slice(i, lineAt)
+        comment += src.slice(lineAt)
+        break
+      }
+      if (found && at >= 0) {
+        code += src.slice(i, at)
+        const end = src.indexOf(found[1], at + found[0].length)
+        if (end < 0) {
+          comment += src.slice(at)
+          block = found
+          break
+        }
+        comment += src.slice(at, end + found[1].length)
+        i = end + found[1].length
+        continue
+      }
+      if (c === '"' || c === "'" || c === "`") quote = c
+      code += c
+      i++
+    }
+    if (n === line - 1) return { text: comment, whole: code.trim() === "" && (comment.length > 0 || startedInBlock) }
+  }
+  return { text: "", whole: false }
+}
+
+/** Words that tell the reviewer how to answer, which only count inside a comment. */
+const TAINT = /\b(reviewer|criteria?|acceptance|verdict)\b|\b(?:mark|consider)\b[^.]*\bmet\b/i
+
+/** Whether a cited line is a comment, or has a comment that names the reviewer or the criteria, so it cannot be evidence. */
 function tainted(r: ReviewInput, file: string, line: number, texts: Map<string, string>, files: Map<string, string[]>): boolean {
   let lines = files.get(file)
   if (lines === undefined) {
@@ -351,7 +511,45 @@ function tainted(r: ReviewInput, file: string, line: number, texts: Map<string, 
   }
   const text = texts.get(`${file}:${line}`) ?? lines[line - 1]
   if (text === undefined) return false
-  return /^(\/\/|#|--|\/\*|<!--|'''|""")/.test(text.trim()) || /\b(reviewer|criteria?|acceptance)\b/i.test(text) || insideBlockComment(lines, line)
+  // The diff's line is the evidence; earlier lines give the block comment state.
+  const source = lines.length >= line ? [...lines.slice(0, line - 1), text] : [text]
+  const comment = commentOf(source, source.length, commentStyle(file))
+  if (!comment.text) return false
+  return comment.whole || TAINT.test(comment.text)
+}
+
+/** The absolute path of a workspace-relative file that resolves inside the workspace, or undefined. */
+function workspaceFile(root: string, rel: string): string | undefined {
+  if (!rel || path.isAbsolute(rel)) return undefined
+  const parts = rel.replace(/\\/g, "/").split("/")
+  if (parts.includes("..")) return undefined
+  const norm = path.posix.normalize(rel.replace(/\\/g, "/"))
+  if (norm === ".." || norm.startsWith("../") || path.posix.isAbsolute(norm)) return undefined
+  const abs = path.join(root, norm)
+  try {
+    const real = fs.realpathSync.native(abs)
+    const back = path.relative(fs.realpathSync.native(root), real)
+    if (!back || back.startsWith("..") || path.isAbsolute(back)) return undefined
+  } catch {
+    return undefined
+  }
+  return abs
+}
+
+/** Whether a file is binary, by the same NUL test as context's readText. */
+function binaryFile(abs: string): boolean {
+  try {
+    const fd = fs.openSync(abs, "r")
+    try {
+      const buf = Buffer.alloc(8000)
+      const n = fs.readSync(fd, buf, 0, buf.length, 0)
+      return buf.subarray(0, n).includes(0)
+    } finally {
+      fs.closeSync(fd)
+    }
+  } catch {
+    return true
+  }
 }
 
 /** The model's answer, with every citation checked against the diff and the gate's passed checks, and a verdict for every criterion. */
@@ -364,6 +562,8 @@ export function checkVerdicts(r: ReviewInput, json: unknown, checks: GateCheck[]
     evidence?: Evidence[]
     note?: string
   }[]
+  if (!given.some((g) => Number.isInteger(g.criterion) && g.criterion >= 1 && g.criterion <= r.criteria.length))
+    throw new Error("the reviewer gave no verdicts for the acceptance criteria")
   const texts = new Map<string, string>()
   let current: string | undefined
   for (const l of r.diff.split("\n")) {
@@ -387,13 +587,17 @@ export function checkVerdicts(r: ReviewInput, json: unknown, checks: GateCheck[]
         untouched: [],
         note: "the reviewer gave no verdict for this criterion",
       }
-    const norm = (f: string) => f.replace(/\\/g, "/").replace(/^(\.\/|b\/)/, "")
+    const norm = (f: string) => {
+      const p = f.replace(/\\/g, "/").replace(/^\.\//, "")
+      return r.diffFiles.has(p) ? p : p.replace(/^b\//, "")
+    }
     const isCheck = (e: Evidence): e is { check: string } => "check" in e
     const isUntouched = (e: Evidence): e is { untouched: string } => "untouched" in e
     const cited = (v.evidence ?? [])
       .filter((e): e is { file: string; line: number } => !isCheck(e) && !isUntouched(e))
       .map((e) => ({ file: norm(e.file), line: e.line }))
-    const inChange = cited.filter((e) => r.changed.get(e.file)?.has(e.line) || r.removedAt.get(e.file)?.has(e.line))
+    // Only a line the reviewer was shown can be evidence; a file the budget omitted did not show one.
+    const inChange = cited.filter((e) => r.shown.get(e.file)?.has(e.line) && (r.changed.get(e.file)?.has(e.line) || r.removedAt.get(e.file)?.has(e.line)))
     const evidence = inChange.filter((e) => !tainted(r, e.file, e.line, texts, files))
     const kept = (v.evidence ?? [])
       .filter(isCheck)
@@ -406,9 +610,10 @@ export function checkVerdicts(r: ReviewInput, json: unknown, checks: GateCheck[]
         return { file: norm(m ? m[1]! : e.untouched), line: m ? Number(m[2]) : undefined }
       })
       .filter((u) => {
-        if (u.file.includes("\0")) return false
-        const abs = path.join(r.workspace.path, u.file)
-        if (!fs.statSync(abs, { throwIfNoEntry: false })?.isFile() || r.deleted.has(u.file)) return false
+        if (u.line !== undefined && u.line < 1) return false
+        const abs = workspaceFile(r.workspace.path, u.file)
+        if (!abs || r.deleted.has(u.file)) return false
+        if (!fs.statSync(abs, { throwIfNoEntry: false })?.isFile() || binaryFile(abs)) return false
         if (u.line === undefined) return !r.diffFiles.has(u.file)
         if (r.hunks.get(u.file)?.some(([start, end]) => u.line! >= start && u.line! <= end)) return false
         const body = fs.readFileSync(abs, "utf8")
@@ -419,7 +624,7 @@ export function checkVerdicts(r: ReviewInput, json: unknown, checks: GateCheck[]
     const dropped = (v.evidence ?? []).length - inChange.length - kept.length - untouched.length
     let status = v.status
     let note = truncate(v.note ?? "", 300)
-    const supported = evidence.length > 0 || ((kept.length > 0 || untouched.length > 0) && checksOrUnchanged(text))
+    const supported = evidence.length > 0 || (kept.length > 0 && checkCriterion(text)) || (untouched.length > 0 && unchangedCriterion(text))
     if (status === "met" && !supported) {
       status = "unclear"
       note =

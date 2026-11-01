@@ -69,12 +69,13 @@ function scan(project: Project, files: string[], re: RegExp, reference: string |
     const text = readText(project, f)
     if (text === undefined || (pre && !pre.test(text))) continue
     const info = reference !== undefined ? fileInfo(project, f) : undefined
-    const defLines = info ? new Set(info.defs.filter((d) => d.name === reference).map((d) => d.line)) : undefined
+    const defRanges = info ? info.defs.filter((d) => d.name === reference) : []
+    const inDefinition = (n: number) => defRanges.some((d) => n >= d.line && n <= d.end)
     const all = info?.spans ? new RegExp(re.source, `${re.flags}g`) : undefined
     const lines = text.split(/\n/)
     let offset = 0
     for (let i = 0; i < lines.length; offset += lines[i]!.length + 1, i++) {
-      if (!re.test(lines[i]!) || defLines?.has(i + 1)) continue
+      if (!re.test(lines[i]!) || inDefinition(i + 1)) continue
       // A parsed file knows its comments and strings: a mention there is no reference.
       if (all && info?.spans && ![...lines[i]!.matchAll(all)].some((m) => isCode(info.spans!, offset + m.index))) continue
       total++
@@ -148,7 +149,11 @@ export function excerpt(project: Project, file: string, opts: ExcerptOptions = {
   if (text === undefined) throw new Error(`${rel} is binary or too large to read`)
   const budget = opts.budgetChars ?? 12_000
   const total = linesOf(text).length
-  const fit = (s: string) => (s.length > budget ? `${s.slice(0, budget)}\n… (cut at ${budget} chars; ask for a line range)` : s)
+  const fit = (s: string) => {
+    if (s.length <= budget) return s
+    const marker = `\n… (cut at ${budget} chars; ask for a line range)`
+    return marker.length >= budget ? s.slice(0, budget) : `${s.slice(0, budget - marker.length)}${marker}`
+  }
   if (opts.lines) {
     const m = /^(\d+)(?:\s*-\s*(\d+))?$/.exec(opts.lines.trim())
     if (!m) throw new Error(`lines must look like "10-40", not "${opts.lines}"`)
