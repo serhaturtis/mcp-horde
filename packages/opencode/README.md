@@ -31,6 +31,19 @@ horde_land { id: "t-4f1a" }
   landed t-4f1a on main: 2 commit(s) · checks ✓ typecheck, lint, test (215 passed) on main's tip before updating it · task done, worktree and branch removed
 ```
 
+### Workers on the Codex CLI
+
+A tier or `model` written `codex/<model>` runs the worker on OpenAI's `codex` CLI instead of OpenCode. Its first turn is `codex exec --json -C <worktree> -s workspace-write --skip-git-repo-check [-m <model>] "<prompt>"`; later turns are `codex exec resume <thread> --json …`, so `horde_tell` continues the same Codex thread. The process gets the same allowlisted environment as an OpenCode worker, plus `CODEX_HOME` and `OPENAI_API_KEY` when they are set, and its stdin is closed. Codex cannot ask for permissions, steer mid-turn, revert or compact; a session created with the `deny` policy (reviews and investigations) runs with `-s read-only`. `horde_drop` stops the process, but the thread stays in your Codex history. Cost comes from the usage Codex reports, priced by `horde.json`:
+
+```json
+{
+  "tiers": ["codex/gpt-5.3-codex"],
+  "prices": { "codex/gpt-5.3-codex": { "input": 1.25, "output": 10, "cachedInput": 0.125 } }
+}
+```
+
+`input`, `output` and the optional `cachedInput` are USD per million tokens; reasoning tokens are billed as output and cache writes at the input price. Without a matching price the cost is 0.
+
 Everything below is the finer control underneath: agents without a task, worktree or checks, steering mid-step, multi-task plans on the board, transcripts and the rest.
 
 ## What the calling agent can do
@@ -172,6 +185,7 @@ The model, effort, profile, directory, policies and limits are chosen by the cal
 | `OPENCODE_SERVER_PASSWORD` / `OPENCODE_SERVER_USERNAME` | random / `opencode` | Basic auth. OpenCode 2 serves its API only with a password: to attach, use the one your server was started with. Required for non-loopback URLs unless `HORDE_OPENCODE_ALLOW_INSECURE=1`. |
 | `HORDE_OPENCODE_BIN` | `opencode` | Binary used to start `opencode serve`. |
 | `HORDE_CURSOR_BIN` | `cursor-agent` | Binary used for tasks whose model id starts with `cursor/` (Cursor's agent CLI, version 2026.10 or later). |
+| `HORDE_CODEX_BIN` | `codex` | Binary run for a `codex/<model>` tier (or `model`); `codex` on `PATH` is used when unset. |
 | `HORDE_OPENCODE_DIRECTORY` | current directory | Default working directory for agents; relative `directory` arguments resolve against it. |
 | `HORDE_OPENCODE_PERMISSIONS` | `user` | Default permission policy. |
 | `HORDE_OPENCODE_MAX_RUNNING` | `horde.json` `opencode.maxRunning`, else `8` | Maximum number of agents working at once (`0` = unlimited). |

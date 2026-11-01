@@ -379,6 +379,25 @@ describe("horde.json", () => {
     assert.throws(() => loadTiers(repo), /"tiers"\[0\] needs "model": "provider\/model" \(or "codex\/…" \/ "cursor\/…"\)/)
   })
 
+  test("model prices are USD per million tokens, with input and output required", () => {
+    const repo = tmp()
+    fs.mkdirSync(path.join(repo, ".git"))
+    const load = (prices: unknown) => {
+      fs.writeFileSync(path.join(repo, "horde.json"), JSON.stringify({ prices }))
+      return loadHordeFile(repo)
+    }
+    assert.deepEqual(load({ "codex/gpt-5.3-codex": { input: 1, output: 2, cachedInput: 0.1 } }).data.prices, {
+      "codex/gpt-5.3-codex": { input: 1, output: 2, cachedInput: 0.1 },
+    })
+    assert.throws(() => load({ "codex/gpt-5.3-codex": { input: 1 } }), /"prices\.codex\/gpt-5\.3-codex" needs "input" and "output"/)
+    assert.throws(() => load({ "codex/gpt-5.3-codex": { input: 1, output: -2 } }), /"prices\.codex\/gpt-5\.3-codex\.output" must be a non-negative number/)
+    assert.throws(
+      () => load({ "codex/gpt-5.3-codex": { input: 1, output: 2, cachedInput: 0, cacheRead: 3 } }),
+      /unknown key "prices\.codex\/gpt-5\.3-codex\.cacheRead"/,
+    )
+    assert.throws(() => load({ "not-a-model": { input: 1, output: 2 } }), /"prices\.not-a-model" id must be a model id/)
+  })
+
   test("user-level horde.json supplies tiers unless the repository sets them", () => {
     const repo = tmp()
     fs.mkdirSync(path.join(repo, ".git"))

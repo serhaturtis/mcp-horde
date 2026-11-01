@@ -57,6 +57,8 @@ export interface CreateSessionInput {
   variant?: string
   /** A runtime-specific agent profile (OpenCode's "build", "plan", …). */
   agent?: string
+  /** The session's permission policy; a runtime without prompts uses "deny" to run read-only. */
+  permissions?: "user" | "ask" | "allow" | "deny"
   /** The session's own permission rules, applied before any turn. */
   rules?: SessionRule[]
   /** Environment variables the session's tools should see. */

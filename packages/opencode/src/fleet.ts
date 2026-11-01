@@ -34,6 +34,7 @@ import { type Config, inProject, type PermissionPolicy } from "./config.js"
 import { News, type NewsWait, type NewsWork } from "./news.js"
 import { type Detail, inputSummary, renderTranscript } from "./render.js"
 import { notSupported, OpenCodeRuntime, type Runtime, type RuntimeKind, within } from "./runtime.js"
+import { CodexRuntime } from "./runtime-codex.js"
 import { CursorRuntime } from "./runtime-cursor.js"
 import { type AgentRecord, type GateConfig, type Limits, ownerAlive, type ReviewSummary, SELF, type Store } from "./state.js"
 import { buildTrack, type CostEstimator, costSince, currentTurn, emptyTrack, latestTool, type Track, type Turn, turnsSince } from "./tracker.js"
@@ -554,7 +555,7 @@ export class Fleet {
   private closed = false
   /** A landing waits for the previous landing of its repository; a failure does not block the next. */
   private readonly landing = new Map<string, Promise<unknown>>()
-  /** The runtimes this fleet can drive. */
+  /** The runtimes this fleet can drive: OpenCode always, Codex when a binary is configured, Cursor always. */
   private readonly runtimes: Map<RuntimeKind, Runtime>
 
   constructor(
@@ -564,10 +565,11 @@ export class Fleet {
     private readonly hooks: Hooks,
     private readonly news = new News(config.stateDir),
   ) {
-    this.runtimes = new Map<RuntimeKind, Runtime>([
-      ["opencode", new OpenCodeRuntime(backend)],
-      ["cursor", new CursorRuntime(backend, config)],
-    ])
+    const runtimes: [RuntimeKind, Runtime][] = [["opencode", new OpenCodeRuntime(backend)]]
+    // loadConfig always names a binary; a Config built without one (a test harness) has no Codex runtime.
+    if (config.codexBin) runtimes.push(["codex", new CodexRuntime(backend, config.codexBin)])
+    runtimes.push(["cursor", new CursorRuntime(backend, config)])
+    this.runtimes = new Map(runtimes)
     this.syncStore()
     for (const runtime of this.runtimes.values()) {
       runtime.events.on("event", (e: OpenCodeEvent) => {
@@ -751,6 +753,8 @@ export class Fleet {
   }
 
   private async validateModel(runtime: Runtime, ref: ModelRef, directory: string) {
+    // Codex has no catalog to check against: the CLI accepts the model id and reports a bad one itself.
+    if (runtime.kind === "codex") return
     const models = await this.listModels(runtime, this.resolveDir(directory))
     if (!models.length) throw new Error("OpenCode reports no models at all. Configure a provider (opencode auth login, or opencode.json) and retry.")
     const found = models.find((m) => m.providerID === ref.providerID && m.id === ref.id)
@@ -1160,6 +1164,7 @@ export class Fleet {
       // "codex/" and "cursor/" name another runtime; anything else is OpenCode's "provider/model".
       const named = input.model ? modelRuntime(input.model) : { runtime: "opencode" as const, model: undefined }
       const runtime = this.runtimeFor(named.runtime)
+      // A runtime-prefixed id is parsed whole, so a codex session's model is {providerID: "codex", id}.
       const model = input.model ? parseModel(input.model, input.variant) : undefined
       if (!model && input.variant) throw new Error("variant requires model (pick one with opencode_models)")
       if (model) await this.validateModel(runtime, model, directory)
@@ -1209,17 +1214,18 @@ export class Fleet {
       if (input.signal?.aborted) throw new Error("cancelled")
       // A profile is the session's own permission rules, added after the agent's.
       const profile = input.scope ? withScope(input.profile ?? {}, input.scope) : input.profile
+      const policy = input.permissions ?? this.config.defaultPermissions
       const session = await runtime.createSession({
         directory,
         title: `horde: ${name}`,
         ...(model ? { model } : {}),
         ...(input.variant ? { variant: input.variant } : {}),
         ...(input.agent ? { agent: input.agent } : {}),
+        permissions: policy,
         ...(profile ? { rules: profileRules(profile) } : {}),
       })
       sessionId = session.id
       const steps = [input.limits?.maxSteps, profile?.steps].filter((n): n is number => !!n)
-      const policy = input.permissions ?? this.config.defaultPermissions
       // A gate on a scoped agent audits against the scope unless told otherwise.
       let gate = input.gate
       if (input.scope && gate !== undefined && gate !== false) {
@@ -1330,12 +1336,11 @@ export class Fleet {
       }
       if (opts.model || opts.variant) {
         const current = session.model ?? live.track.model
-        const model =
-          chosen && opts.model
-            ? parseModel(opts.model, opts.variant)
-            : current
-              ? { providerID: current.providerID, id: current.id, variant: opts.variant }
-              : undefined
+        const model = opts.model
+          ? parseModel(opts.model, opts.variant)
+          : current
+            ? { providerID: current.providerID, id: current.id, variant: opts.variant }
+            : undefined
         if (!model) throw new Error("variant requires model: the agent's model is not known yet; pass model too")
         if (!runtime.switchModel) throw notSupported(runtime, "switching model")
         await this.validateModel(runtime, model, directory)

@@ -4,8 +4,9 @@ import path from "node:path"
 
 /** The keys every horde.json section knows; anything else is a typo, not a setting. */
 const KNOWN = {
-  top: ["context", "opencode", "tiers", "verify", "workers"],
+  top: ["context", "opencode", "prices", "tiers", "verify", "workers"],
   verify: ["checks", "audit", "timeoutSeconds"],
+  price: ["input", "output", "cachedInput"],
   check: ["command", "kind", "cwd", "env", "when", "slots", "exclusive"],
   audit: ["block", "warn", "off", "allowed", "generated"],
   workers: ["link", "setup", "brief", "land"],
@@ -65,6 +66,21 @@ export function validateHordeFile(data: Record<string, unknown>, file?: string):
   }
   rejectUnknown(data.opencode, KNOWN.opencode, "opencode", file)
   rejectUnknown(data.context, KNOWN.context, "context", file)
+  if (data.prices !== undefined) {
+    if (!isObject(data.prices)) throw new Error(`${file ? `${file}: ` : ""}"prices" must be an object of model id -> { "input", "output", "cachedInput"? }`)
+    for (const [id, price] of Object.entries(data.prices)) {
+      rejectUnknown(price, KNOWN.price, `prices.${id}`, file)
+      if (!MODEL_ID.test(id)) throw new Error(`${file ? `${file}: ` : ""}"prices.${id}" id must be a model id ("provider/model" or "codex/model")`)
+      if (!isObject(price)) throw new Error(`${file ? `${file}: ` : ""}"prices.${id}" must be an object { "input", "output", "cachedInput"? }`)
+      for (const key of ["input", "output", "cachedInput"] as const) {
+        const value = price[key]
+        if (value !== undefined && (typeof value !== "number" || !Number.isFinite(value) || value < 0))
+          throw new Error(`${file ? `${file}: ` : ""}"prices.${id}.${key}" must be a non-negative number (USD per million tokens)`)
+      }
+      if (typeof price.input !== "number" || typeof price.output !== "number")
+        throw new Error(`${file ? `${file}: ` : ""}"prices.${id}" needs "input" and "output" (USD per million tokens)`)
+    }
+  }
   if (Array.isArray(data.tiers))
     data.tiers.forEach((tier, i) => {
       rejectUnknown(tier, KNOWN.tier, `tiers[${i}]`, file)

@@ -28,6 +28,8 @@ export interface Config {
   bin: string
   /** Binary used for tasks whose model id starts with `cursor/` (HORDE_CURSOR_BIN, else cursor-agent). */
   cursorBin?: string
+  /** Binary used for `codex exec` turns (HORDE_CODEX_BIN). */
+  codexBin?: string
   /** Default working directory for spawned agents. */
   directory: string
   defaultPermissions: PermissionPolicy
@@ -118,6 +120,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, opts: { cores?:
     serverMode: mode(env.HORDE_OPENCODE_SERVER),
     bin: env.HORDE_OPENCODE_BIN || "opencode",
     cursorBin: env.HORDE_CURSOR_BIN || "cursor-agent",
+    codexBin: env.HORDE_CODEX_BIN || "codex",
     directory,
     defaultPermissions: policy(env.HORDE_OPENCODE_PERMISSIONS),
     ...maxRunning(env, directory, opts.cores ?? os.cpus().length),
@@ -136,6 +139,24 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, opts: { cores?:
     scope: scopeEnabled(env),
     memoryHigh: memoryHigh(env),
   }
+}
+
+/** A model's prices in USD per million tokens, from horde.json "prices". */
+export interface Price {
+  input: number
+  output: number
+  cachedInput?: number
+}
+
+/**
+ * `horde.json` → `prices`, keyed by model id (e.g. "codex/gpt-5.3-codex"). The shape and values
+ * are validated by @mcp-horde/core when the file is read; this reads the section for a directory.
+ */
+export function loadPrices(directory: string): Record<string, Price> {
+  const { data } = loadHordeFile(directory)
+  const raw = data.prices
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {}
+  return Object.fromEntries(Object.entries(raw as Record<string, Price>).map(([id, price]) => [id, { ...price }]))
 }
 
 /**
