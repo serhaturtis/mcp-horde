@@ -490,13 +490,31 @@ export class CodexRuntime implements Runtime {
       // A spawn failure may not emit "exit" (e.g. ENOENT): close the turn here; finish is idempotent.
       this.finish(session, turn, undefined)
     })
-    proc.once("exit", (code, signal) => {
-      if (out.trim()) this.record(session, turn, out.trim())
+    // Finish when the pipes close (every line has been read), or two seconds after exit when a
+    // grandchild that inherited stdout keeps them open: the turn must not wait for it.
+    let ended = false
+    const end = (code: number | null, signal: NodeJS.Signals | null) => {
+      if (ended) return
+      ended = true
+      if (out.trim()) {
+        try {
+          this.record(session, turn, out.trim())
+        } catch (e) {
+          this.fail(session, turn, `codex sent a malformed event: ${(e as Error).message}`)
+        }
+      }
       if (!turn.interrupted && !turn.failure && code !== 0) {
         const reason = err.trim() || (signal ? `codex was killed by ${signal}` : `codex exited with code ${code}`)
         this.fail(session, turn, reason)
       }
       this.finish(session, turn, code)
+      proc.stdout?.destroy()
+      proc.stderr?.destroy()
+    }
+    proc.once("close", (code, signal) => end(code, signal))
+    proc.once("exit", (code, signal) => {
+      const grace = setTimeout(() => end(code, signal), 2_000)
+      grace.unref()
     })
   }
 

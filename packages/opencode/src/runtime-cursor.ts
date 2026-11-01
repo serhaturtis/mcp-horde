@@ -342,13 +342,21 @@ export class CursorRuntime implements Runtime {
       turn.spawnError = err.message
       this.finish(session, turn, undefined, stderr.text)
     })
-    // Finish on exit, not close: a grandchild that inherits stdout can keep the pipes open long
-    // after cursor-agent is gone, and the turn must not wait for it.
-    proc.once("exit", (code, signal) => {
+    // Finish when the pipes close (every line has been read), or two seconds after exit when a
+    // grandchild that inherited stdout keeps them open: the turn must not wait for it.
+    let ended = false
+    const end = (code: number | null, signal: NodeJS.Signals | null) => {
+      if (ended) return
+      ended = true
       if (pending) this.ingest(session, turn, pending)
       this.finish(session, turn, code, stderr.text, signal ?? undefined)
       proc.stdout?.destroy()
       proc.stderr?.destroy()
+    }
+    proc.once("close", (code, signal) => end(code, signal))
+    proc.once("exit", (code, signal) => {
+      const grace = setTimeout(() => end(code, signal), 2_000)
+      grace.unref()
     })
   }
 
