@@ -17,8 +17,9 @@ export interface Narrowing {
   full?: string
 }
 
-/** A path as one shell word: single quotes on POSIX shells (nothing expands inside), double quotes for cmd.exe. */
-const quote = (p: string) => (/^[\w./@-]+$/.test(p) ? p : process.platform === "win32" ? `"${p.replace(/"/g, '\\"')}"` : `'${p.replace(/'/g, "'\\''")}'`)
+/** A path as one shell word: single quotes on POSIX shells (nothing expands inside), double quotes for
+ *  cmd.exe, which escapes a quote by doubling it and cannot escape %NAME% inside the quotes. */
+const quote = (p: string) => (/^[\w./@-]+$/.test(p) ? p : process.platform === "win32" ? `"${p.replace(/"/g, '""')}"` : `'${p.replace(/'/g, "'\\''")}'`)
 
 const PYTEST = /(^|[\s/])(pytest|py\.test)(\s|$)|-m\s+pytest\b/
 /** Pytest options that take no value; any other option's value is the next word unless it is written with `=`. */
@@ -70,6 +71,12 @@ const PYTEST_FLAGS = new Set([
   "-h",
   "--help",
 ])
+/** Pytest selectors that name their own tests: appending paths keeps the filter and can run nothing. */
+const PYTEST_SELECTS = new Set(["-m", "-k", "--lf", "--ff", "--co"])
+/** The same for the plan, where --ignore and --deselect also make a narrowed run wrong. */
+const PYTEST_SELECTS_ALL = new Set([...PYTEST_SELECTS, "--ignore", "--deselect"])
+/** jest/vitest options that select tests: an appended file is still filtered by them. */
+const JS_SELECTS = /(?:^|\s)(?:-t|--testNamePattern|--testPathPattern|--testPathIgnorePatterns|--changed|--onlyChanged)(?:\s|=|$)/
 /** Shell syntax: the words around an operator belong to other commands, not to the runner. */
 const SHELL = /['"$;&|<>`\n\r]/
 /** A `cd` at the start of the command: the runner's paths are relative to another directory. */
@@ -93,7 +100,10 @@ export function narrowCommand(check: Check, tests: string[]): string | undefined
   // jest takes its arguments as regular expressions unless told they are paths.
   const runner = cmd.match(/(?:^|\s)(?:npx\s+)?(vitest|jest)(?:\s|$)/)?.[1]
   const byPath = (r: string | undefined) => (r === "jest" ? "--runTestsByPath " : "")
-  if (runner && !/[;&|]/.test(cmd)) return js.length ? `${cmd} ${byPath(runner)}${js.map(quote).join(" ")}` : undefined
+  if (runner && !/[;&|]/.test(cmd)) {
+    if (JS_SELECTS.test(cmd)) return undefined
+    return js.length ? `${cmd} ${byPath(runner)}${js.map(quote).join(" ")}` : undefined
+  }
   if (/^go\s+test\b/.test(cmd) && /\s\.\/\.\.\.(\s|$)/.test(cmd)) return go.length ? cmd.replace(/\s\.\/\.\.\.(?=\s|$)/, ` ${go.join(" ")}`) : undefined
   // `node --test` with an explicit file list (how this repository's packages run theirs): the
   // listed test files are replaced by the related ones; flags and loaders stay as they are.
@@ -104,11 +114,11 @@ export function narrowCommand(check: Check, tests: string[]): string | undefined
     return undefined
   }
   if (/^npm\s+(test|run\s+test)$/.test(cmd) && js.length) {
-    const script = npmScript(check.cwd, "test")
+    const script = npmScript(check.cwd, "test")?.trim()
     // Only a single vitest/jest call with flags: anything else (chained commands, node --test
     // with its own file list, wrappers) cannot take extra paths safely.
-    const m = script?.trim().match(/^(?:npx\s+)?(vitest(?:\s+run)?|jest)(?:\s+--?[\w-]+(?:=\S+)?)*$/)
-    if (m) return `${cmd} -- ${byPath(m[1])}${js.map(quote).join(" ")}`
+    const m = script?.match(/^(?:npx\s+)?(vitest(?:\s+run)?|jest)(?:\s+--?[\w-]+(?:=\S+)?)*$/)
+    if (m && script && !JS_SELECTS.test(script)) return `${cmd} -- ${byPath(m[1])}${js.map(quote).join(" ")}`
   }
   return undefined
 }
@@ -123,6 +133,8 @@ function narrowPytest(check: Check, cmd: string, py: string[]): string | undefin
   const tokens = cmd.split(/\s+/).filter(Boolean)
   const at = tokens.findIndex((t) => /(?:^|[\\/])(pytest|py\.test)$/.test(t))
   if (at < 0) return undefined
+  // A selector the runner applies itself would also filter the paths appended here.
+  if (tokens.slice(at + 1).some((t) => PYTEST_SELECTS.has(t.split("=")[0]!))) return undefined
   const exists = (t: string) => fs.existsSync(path.resolve(check.cwd, t))
   const named = new Set<number>()
   for (let i = at + 1; i < tokens.length; i++) {
@@ -153,6 +165,21 @@ function npmScript(dir: string, name: string): string | undefined {
   } catch {
     return undefined
   }
+}
+
+/** Why the check's own selectors make narrowing unsafe: the runner keeps them and may run nothing. */
+function selectsOwnTests(check: Check): string | undefined {
+  const cmd = check.command
+  if (PYTEST.test(cmd)) {
+    const tokens = cmd.split(/\s+/)
+    const at = tokens.findIndex((t) => /(?:^|[\\/])(pytest|py\.test)$/.test(t))
+    if (at >= 0 && tokens.slice(at + 1).some((t) => PYTEST_SELECTS_ALL.has(t.split("=")[0]!)))
+      return "it selects its own tests (-m, -k, --ignore, --deselect, --lf, --ff or --co)"
+  }
+  const js = "-t, --testNamePattern, --testPathPattern, --changed or --onlyChanged"
+  if (JS_SELECTS.test(cmd)) return `it selects its own tests (${js})`
+  if (/^npm\s+(test|run\s+test)$/.test(cmd.trim()) && JS_SELECTS.test(npmScript(check.cwd, "test") ?? "")) return `it selects its own tests (${js})`
+  return undefined
 }
 
 /**
@@ -231,6 +258,19 @@ export function planRelated(root: string, changed: string[], checks: Check[]): {
     const r = rel(cwd, f)
     return !r.startsWith("../") && r !== ".." && !path.isAbsolute(r)
   }
+  /** Does the command name a path outside its own directory (a `../` token or an absolute one)? */
+  const namesOutside = (cwd: string, command: string) => {
+    for (const raw of command.split(/[\s;&|()]+/)) {
+      const t = raw.replace(/^['"]|['"]$/g, "")
+      if (!t || t.startsWith("-")) continue
+      const norm = t.replace(/\\/g, "/")
+      if (!path.isAbsolute(t) && !norm.startsWith("..") && !norm.includes("../")) continue
+      const abs = path.resolve(cwd, t)
+      if (!withinRoot(abs)) continue
+      if (!inside(cwd, path.relative(realRoot, abs).replace(/\\/g, "/"))) return true
+    }
+    return false
+  }
   for (const check of tests) {
     const aliases = jsRunner(check) ? aliasUnsafe(root, check) : undefined
     if (aliases) {
@@ -250,8 +290,15 @@ export function planRelated(root: string, changed: string[], checks: Check[]): {
       })
       continue
     }
+    const selection = selectsOwnTests(check)
+    if (selection) {
+      plans.set(check, { tests: mine, full: selection })
+      continue
+    }
     if (!mine.length) {
-      if (changed.some((f) => inside(check.cwd, f))) plans.set(check, { tests: [], full: "no related tests in this check's directory" })
+      // A command that reaches outside its own directory runs tests this plan cannot see: run it whole.
+      if (namesOutside(check.cwd, check.command)) plans.set(check, { tests: [], full: "its command names paths outside its directory" })
+      else if (changed.some((f) => inside(check.cwd, f))) plans.set(check, { tests: [], full: "no related tests in this check's directory" })
       else plans.set(check, { tests: [], skipped: "no changes and no related tests under its directory" })
       continue
     }

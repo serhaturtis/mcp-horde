@@ -224,12 +224,17 @@ export async function detectChecks(directory: string, settings = loadSettings(di
 /** The repository root (or a nested repository's, which has its own `.git`), or the filesystem root. */
 const isTop = (dir: string, stop: string | undefined) => dir === stop || fs.existsSync(path.join(dir, ".git")) || path.dirname(dir) === dir
 
-/** package.json script names a check runs (`npm test`, `pnpm run lint`, …), so the audit can tell when they change. */
+/**
+ * package.json script names a check runs (`npm test`, `pnpm run lint`, `cd pkg && yarn run unit`),
+ * so the audit can tell when they change. A manager anywhere in a shell segment counts; when a
+ * `cd` precedes it, the script is the one in that directory's package.json.
+ */
 export function checkScripts(checks: Check[]): string[] {
-  return checks.flatMap((c) => {
-    const m = c.command.match(/^(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?([\w:.-]+)/)
-    return m ? [m[1]!] : []
-  })
+  const out = new Set<string>()
+  for (const c of checks)
+    for (const segment of c.command.split(/&&|\|\||;|\|/))
+      for (const m of segment.matchAll(/(?:^|\s)(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?([\w:.-]+)/g)) out.add(m[1]!)
+  return [...out]
 }
 
 const PLACEHOLDER_TEST = /no test specified/
@@ -381,8 +386,10 @@ async function detectIn(dir: string, stop: string | undefined, ctx: DetectCtx): 
   // Python
   const pyproject = await read("pyproject.toml")
   if (pyproject || (await has("setup.py")) || (await has("setup.cfg")) || (await has("pytest.ini")) || (await has("tox.ini"))) {
+    // A venv and a src/ layout are local, ignored inputs rather than rules: read them from the
+    // working tree even when the manifests and configs come from the commit.
     let venv: string | undefined
-    for (const v of [".venv/bin/python", "venv/bin/python", ".venv/Scripts/python.exe"]) if (await has(v)) venv = v
+    for (const v of [".venv/bin/python", "venv/bin/python", ".venv/Scripts/python.exe"]) if (fs.existsSync(path.join(dir, v))) venv = v
     // The project's own environment manager when it has a lockfile for one (and it is installed).
     const py =
       (await has("uv.lock")) && onPath("uv")
@@ -395,7 +402,7 @@ async function detectIn(dir: string, stop: string | undefined, ctx: DetectCtx): 
               ? "python"
               : "python3"
     // The project's code, not whatever an inherited PYTHONPATH or activated virtualenv points at.
-    const env = { PYTHONPATH: [...((await has("src")) ? [path.join(dir, "src")] : []), dir].join(path.delimiter) }
+    const env = { PYTHONPATH: [...(fs.existsSync(path.join(dir, "src")) ? [path.join(dir, "src")] : []), dir].join(path.delimiter) }
     const pyCheck = { env, stripEnv: ["VIRTUAL_ENV"] }
     if (/\[tool\.mypy\]/.test(pyproject) || (await has("mypy.ini"))) add("typecheck", `${py} -m mypy .`, "typecheck", "mypy config", pyCheck)
     if (/\[tool\.ruff/.test(pyproject) || (await has("ruff.toml")) || (await has(".ruff.toml")))

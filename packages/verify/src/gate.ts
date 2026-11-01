@@ -84,15 +84,17 @@ const VERDICT_TTL_MS = 10 * 60_000
 
 /** Directories whose contents are installed or generated, not inputs a check's key can afford to stat. */
 const KEY_SKIP_DIRS = new Set(["node_modules", ".venv", "venv", "vendor", "target", "dist", "build", ".git"])
-/** How many ignored files the key looks at: enough for the usual .env/.cache at the root, bounded. */
-const KEY_IGNORED_LIMIT = 200
+/** How many ignored files the key stats: past this there is no key at all, never a silent subset. */
+const KEY_IGNORED_LIMIT = 5000
+/** Untracked files up to this size are keyed by content, not by metadata a write can preserve. */
+const KEY_HASH_LIMIT = 1024 * 1024
 
 /**
- * A key that changes when HEAD, the diff, an untracked file, or an ignored file at the root or
- * one level below changes. Deeper ignored files and the contents of dependency directories are
- * not part of the key (the verdict names the former), and a pass also expires after
- * VERDICT_TTL_MS. Any git error means no key (never cached): an empty diff standing in for one
- * that failed would match a different tree.
+ * A key that changes when HEAD, the diff, an untracked file, or a git-ignored file changes.
+ * Ignored files count at any depth (dependency directories aside) up to KEY_IGNORED_LIMIT; past
+ * that the key is undefined, so a verdict is never reused for a tree the key only partly saw, and
+ * a pass also expires after VERDICT_TTL_MS. Any git error means no key (never cached): an empty
+ * diff standing in for one that failed would match a different tree.
  */
 async function treeKey(directory: string, extra: unknown): Promise<string | undefined> {
   try {
@@ -104,16 +106,27 @@ async function treeKey(directory: string, extra: unknown): Promise<string | unde
       const st = await fs.stat(path.join(root, p)).catch(() => undefined)
       h.update(`\0${p}\0${st?.size ?? -1}\0${st?.mtimeMs ?? -1}`)
     }
-    for (const p of splitZ(await gitRaw(root, ["-c", "core.quotePath=false", "ls-files", "--others", "--exclude-standard", "-z"]))) await stat(p)
-    // Git-ignored files are inputs too (.env, a local config, a linked checkout); their names and
-    // metadata stand in for contents the key cannot hash cheaply.
+    // An untracked input is a small file the work wrote: hash it, so a same-size rewrite with the
+    // old mtime restored still changes the key. Metadata stands in for what is too big to read.
+    const hashed = async (p: string) => {
+      const full = path.join(root, p)
+      const st = await fs.stat(full).catch(() => undefined)
+      if (st?.isFile() && st.size <= KEY_HASH_LIMIT) {
+        const body = await fs.readFile(full).catch(() => undefined)
+        if (body) {
+          h.update(`\0${p}\0#\0`).update(createHash("sha256").update(body).digest())
+          return
+        }
+      }
+      h.update(`\0${p}\0${st?.size ?? -1}\0${st?.mtimeMs ?? -1}`)
+    }
+    for (const p of splitZ(await gitRaw(root, ["-c", "core.quotePath=false", "ls-files", "--others", "--exclude-standard", "-z"]))) await hashed(p)
+    // Git-ignored files are inputs too (.env, a local config, a linked checkout): every one outside
+    // a dependency directory counts, whatever its depth.
     const ignored = splitZ(await gitRaw(root, ["-c", "core.quotePath=false", "ls-files", "--others", "--ignored", "--exclude-standard", "-z"]))
-      .filter((p) => {
-        const parts = p.split("/")
-        return parts.length <= 2 && !parts.some((part) => KEY_SKIP_DIRS.has(part))
-      })
+      .filter((p) => !p.split("/").some((part) => KEY_SKIP_DIRS.has(part)))
       .sort()
-      .slice(0, KEY_IGNORED_LIMIT)
+    if (ignored.length > KEY_IGNORED_LIMIT) return undefined
     for (const p of ignored) await stat(p)
     return h.update("\0").update(JSON.stringify(extra)).digest("hex")
   } catch {
@@ -172,10 +185,14 @@ async function baselineKey(directory: string, commit: string, checks: Check[], e
 
 /** What makes two failures the same one: test and file, or the first message line. Digits matter in
  *  test names and paths (test_limit_20 is not test_limit_10); they are masked only in free-text
- *  messages, where line numbers and timings vary. */
+ *  messages, where line numbers and timings vary. A code-like `test` (TS2322, a lint rule id) is a
+ *  diagnostic, not a name: the message tells two errors in one file apart. */
 function failureKey(f: Failure): string {
-  if (f.test || f.file) return `${f.test ?? ""}\0${f.file ?? ""}`
   const first = (f.message.split("\n").find((l) => l.trim()) ?? "").trim()
+  if (f.test || f.file) {
+    const diagnostic = !!f.test && (/^\S*\d\S*$/.test(f.test) || f.test.includes("/"))
+    return `${f.test ?? ""}\0${f.file ?? ""}${diagnostic ? `\0${first.replace(/\d+/g, "#")}` : ""}`
+  }
   return first.replace(/\d+/g, "#")
 }
 
@@ -220,6 +237,7 @@ async function baselineOutcomes(opts: GateOptions, run: BaselineRun, checks: Che
         checks.map((c) => ({ ...c, cwd: path.resolve(co.root, path.relative(run.root, c.cwd)) })),
         {
           timeoutMs: run.timeoutMs,
+          signal: opts.signal,
           logDir,
           onProgress: opts.onProgress,
           env: { ...env, HORDE_TASK: `base-${spec.commit.slice(0, 8)}`, HORDE_WORKTREE: co.root },
@@ -308,15 +326,19 @@ async function compareBaseline(
 
 export async function gate(directory: string, opts: GateOptions = {}): Promise<Verdict> {
   const dir = path.resolve(directory)
+  const root = await git(dir, "rev-parse", "--show-toplevel").catch(() => dir)
   // The diff starts where HEAD meets base; the rules come from rulesAt (base by default), a
   // commit on the target branch, so the work cannot rewrite them.
-  const base = opts.base ? await diffBase(await git(dir, "rev-parse", "--show-toplevel"), opts.base) : undefined
+  const base = opts.base ? await diffBase(root, opts.base) : undefined
   // The rules come from rulesAt when the caller names the commit the work will land on (a land
   // gate has no base), else from base (a worktree gate); in a shared directory the human's working
   // horde.json is the configuration, and the caller says so with settingsFrom "working".
   const rulesCommit = opts.rulesAt ?? (base && opts.settingsFrom !== "working" ? base : undefined)
   const settings = rulesCommit ? await loadSettingsAt(dir, rulesCommit) : loadSettings(dir)
-  const all = await detectChecks(dir, settings, rulesCommit)
+  const detected = await detectChecks(dir, settings, rulesCommit)
+  // The base's checks are the rules, but a manifest the work added is still the work's: run the
+  // checks only the working tree has (a new package's tests) alongside them.
+  const all = rulesCommit ? addedChecks(detected, await detectChecks(dir, settings), root) : detected
   const selected = opts.checks?.length ? pick(all, opts.checks) : all
   const doAudit = opts.audit !== false && !!base
   const budget = opts.budgetChars ?? 1500
@@ -350,7 +372,6 @@ export async function gate(directory: string, opts: GateOptions = {}): Promise<V
   const toRun = selected.filter((c) => !plans.get(c)?.skipped).map((c) => ({ ...c, command: plans.get(c)?.command ?? c.command }))
   const stateDir = opts.stateDir ?? defaultStateDir()
   const logBase = path.join(stateDir, "logs")
-  const root = await git(dir, "rev-parse", "--show-toplevel").catch(() => dir)
   const lockDir = toRun.some((c) => c.slots || c.exclusive) ? await lockDirFor(dir, stateDir) : undefined
   // The work is the files that existed before the checks ran: a check's own files (reports,
   // __pycache__, coverage) first appear as untracked during the run and are not the worker's.
@@ -387,15 +408,17 @@ export async function gate(directory: string, opts: GateOptions = {}): Promise<V
         generated: settings.audit.generated,
       })
     : undefined
-  // Files the checks wrote are not the work: drop them from the audit's account. Runner caches
-  // count as check output even when they were already there before this run (a worker's own
-  // earlier test run leaves __pycache__ and friends behind).
+  // Files the checks wrote are not the work: drop them from the audit's account. A runner cache
+  // that was already there is check output too (a worker's earlier test run leaves __pycache__
+  // and friends behind), but only for binaries and scope noise: a secret in one is still a secret.
   if (auditResult && preUntracked) {
     const postUntracked = await untracked(dir)
-    const output = new Set([...[...postUntracked].filter((p) => !preUntracked.has(p)), ...[...postUntracked].filter((p) => isRunnerCachePath(p))])
-    if (output.size) {
-      auditResult.files = auditResult.files.filter((p) => !output.has(p))
-      auditResult.findings = auditResult.findings.filter((f) => !f.file || !output.has(f.file))
+    const created = new Set([...postUntracked].filter((p) => !preUntracked.has(p)))
+    const caches = new Set([...postUntracked].filter((p) => isRunnerCachePath(p)))
+    const cacheNoise = (f: Finding) => f.category === "binaries" || f.category === "scope"
+    if (created.size || caches.size) {
+      auditResult.files = auditResult.files.filter((p) => !created.has(p) && !caches.has(p))
+      auditResult.findings = auditResult.findings.filter((f) => !f.file || !(created.has(f.file) || (caches.has(f.file) && cacheNoise(f))))
     }
   }
   const blockers = [
@@ -447,6 +470,21 @@ export async function lockDirFor(dir: string, stateDir: string): Promise<string>
   const common = await git(dir, "rev-parse", "--path-format=absolute", "--git-common-dir").catch(() => dir)
   const real = await fs.realpath(common).catch(() => common)
   return path.join(stateDir, "locks", createHash("sha256").update(real).digest("hex").slice(0, 16))
+}
+
+/**
+ * The base's checks plus those only the working tree has. A manifest the work added is not a
+ * rule the gate may read, but the tests it declares are the work's; a name the base already uses
+ * is qualified by the check's directory so both results stay apart.
+ */
+function addedChecks(base: Check[], work: Check[], root: string): Check[] {
+  const out = [...base]
+  for (const c of work) {
+    if (out.some((x) => x.cwd === c.cwd && x.command === c.command)) continue
+    const rel = path.relative(root, c.cwd).replace(/\\/g, "/") || "."
+    out.push({ ...c, name: out.some((x) => x.name === c.name) ? `${c.name}:${rel}` : c.name })
+  }
+  return out
 }
 
 function pick(all: Check[], names: string[]): Check[] {
@@ -516,6 +554,22 @@ export function render(v: Omit<Verdict, "cached" | "text">, budget: number, cach
       required: !c.pass || atBaseline,
     })
   }
+  // Warnings and the audit come before the check output: a warning (a baseline that could not be
+  // compared, untested code) and a blocking finding cannot be read anywhere else, while the
+  // failures stay available through verify_logs.
+  for (const w of v.warnings) sections.push({ text: `! ${w}` })
+  if (v.audit) {
+    const n = v.audit.files.length
+    sections.push({
+      text: `audit: ${n} file${n === 1 ? "" : "s"} changed, ${v.audit.commits} commit${v.audit.commits === 1 ? "" : "s"} since ${v.audit.base.slice(0, 8)}`,
+    })
+    for (const f of v.audit.findings.filter((x) => x.severity === "block")) {
+      sections.push({ text: `  ✗ ${findingLine(f)}`, group: "audit:block", omitted: (k) => `  … ${k} more blocking finding${k > 1 ? "s" : ""}` })
+    }
+    for (const f of v.audit.findings.filter((x) => x.severity === "warn")) {
+      sections.push({ text: `  ! ${findingLine(f)}`, group: "audit:warn", omitted: (k) => `  … ${k} more warning${k > 1 ? "s" : ""}` })
+    }
+  }
   for (const c of failed) {
     for (const f of c.extracted.failures) {
       const where = f.file ? `${f.file}${f.line ? `:${f.line}` : ""}` : (f.frame ?? "")
@@ -532,19 +586,6 @@ export function render(v: Omit<Verdict, "cached" | "text">, budget: number, cach
     }
     if (c.baseline && !c.baseline.pass && c.baseline.known > 0)
       sections.push({ text: `  (${c.baseline.known} more also fail at ${c.baseline.label})`, required: true })
-  }
-  for (const w of v.warnings.filter((x) => x.startsWith("tests: no test covers"))) sections.push({ text: `! ${w}` })
-  if (v.audit) {
-    const n = v.audit.files.length
-    sections.push({
-      text: `audit: ${n} file${n === 1 ? "" : "s"} changed, ${v.audit.commits} commit${v.audit.commits === 1 ? "" : "s"} since ${v.audit.base.slice(0, 8)}`,
-    })
-    for (const f of v.audit.findings.filter((x) => x.severity === "block")) {
-      sections.push({ text: `  ✗ ${findingLine(f)}`, group: "audit:block", omitted: (k) => `  … ${k} more blocking finding${k > 1 ? "s" : ""}` })
-    }
-    for (const f of v.audit.findings.filter((x) => x.severity === "warn")) {
-      sections.push({ text: `  ! ${findingLine(f)}`, group: "audit:warn", omitted: (k) => `  … ${k} more warning${k > 1 ? "s" : ""}` })
-    }
   }
   return fitSections(sections, budget)
 }

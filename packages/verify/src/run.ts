@@ -77,12 +77,16 @@ const CI_ENV = { CI: "1", NO_COLOR: "1", TERM: "dumb", PY_COLORS: "0", CARGO_TER
 const STRIP_ENV = ["FORCE_COLOR", "CLICOLOR_FORCE", "NODE_TEST_CONTEXT", "OPENCODE_SERVER_", "HORDE_"]
 
 /**
- * Inherited credentials a check must not see: the caller's keys are not the project's. Suffix
- * matching covers the many *_API_KEY/*_TOKEN/*_SECRET/*_PASSWORD names; the list covers keys
- * whose names do not end that way (AWS_SECRET_ACCESS_KEY). A check that needs one names it in
- * its horde.json `env`, which is applied after the strip.
+ * Inherited credentials a check must not see: the caller's keys are not the project's. A name
+ * holding KEY, TOKEN, SECRET, PASSW, PWD or CREDENTIAL (AWS_ACCESS_KEY_ID, PGPASSWORD, MYSQL_PWD)
+ * or a value that is a URL with a user:password@ part is a credential. A check that needs one
+ * names it in its horde.json `env`, which is applied after the strip.
  */
-const SECRET_ENV = /_(?:API_KEY|TOKEN|SECRET|PASSWORD)$/
+const SECRET_ENV = /KEY|TOKEN|SECRET|PASSW|PWD|CREDENTIAL/i
+/** Names that look like credentials but are local settings (a keyboard layout, a keymap). */
+const NOT_SECRET_ENV = /KEYBOARD|KEYMAP|KEY_BINDING|HOTKEY|TOKENIZER/i
+/** driver://user:password@host/db */
+const URL_CREDENTIALS = /^[a-z][a-z0-9+.-]*:\/\/[^/\s@]+:[^/\s@]+@/i
 const KNOWN_SECRET_ENV = [
   "ANTHROPIC_API_KEY",
   "OPENAI_API_KEY",
@@ -98,10 +102,16 @@ const KNOWN_SECRET_ENV = [
   "NPM_TOKEN",
 ]
 
+/** Is this variable a credential, by name or by a URL password in its value? */
+function isSecret(name: string, value: string | undefined): boolean {
+  if (NOT_SECRET_ENV.test(name)) return false
+  return SECRET_ENV.test(name) || (!!value && URL_CREDENTIALS.test(value))
+}
+
 /** The inherited credential names to strip, both the known ones and whatever this process has. */
 function secretEnvNames(): string[] {
   const names = new Set(KNOWN_SECRET_ENV)
-  for (const name of Object.keys(process.env)) if (SECRET_ENV.test(name)) names.add(name)
+  for (const name of Object.keys(process.env)) if (isSecret(name, process.env[name])) names.add(name)
   return [...names]
 }
 
@@ -124,7 +134,7 @@ export async function runChecks(checks: Check[], opts: RunChecksOptions): Promis
   // Task variables (HORDE_TASK, HORDE_WORKTREE, …) reach checks on purpose, but no inherited
   // credential does: only the check's own env may set one.
   const sharedEnv: Record<string, string> = {}
-  for (const [k, v] of Object.entries(opts.env ?? {})) if (!secrets.includes(k) && !SECRET_ENV.test(k)) sharedEnv[k] = v
+  for (const [k, v] of Object.entries(opts.env ?? {})) if (!secrets.includes(k) && !isSecret(k, v)) sharedEnv[k] = v
   for (const check of checks) {
     if (opts.signal?.aborted) break
     opts.onProgress?.(`${check.name}: ${check.command}`)
