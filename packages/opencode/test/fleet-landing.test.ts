@@ -138,7 +138,7 @@ describe("fleet landing: moved tips and lifecycle fixes (real opencode, mock LLM
     assert.match(record.gateState?.verdict?.text ?? "", /the worker's branch contains the target's new tip: the worker may have moved the branch itself/)
 
     const refused = await h.call("horde_land", { id })
-    assert.match(refused, /^not landed: the target branch's tip is on the worker's branch; the worker moved it/, refused)
+    assert.match(refused, /^not landed: the worker's branch contains the target's new tip/, refused)
     assert.match(refused, /the worker's branch contains the target's new tip: the worker may have moved the branch itself/, refused)
     assert.match(refused, /call again to go on from/, refused)
     assert.equal(agentRecord(id)?.pendingTip, git(r, "rev-parse", "HEAD"))

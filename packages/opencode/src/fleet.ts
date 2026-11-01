@@ -99,6 +99,9 @@ type TipMove = {
   head: string
   /** branch: the new tip is on the worker's branch; rewrite: it is not a descendant of the recorded tip. */
   shape: "branch" | "rewrite"
+  /** What moved, for a note. */
+  what: string
+  /** The refusal: what moved and how the caller confirms it. */
   text: string
 }
 
@@ -110,8 +113,10 @@ function goneMessage(at: number): string {
 
 /** What a worker of a child-process runtime (codex, cursor) says after a restart: its session lived in this process only. */
 const RESTART_PREFIX = "the horde restarted while this worker ran"
-function restartMessage(): string {
-  return `${RESTART_PREFIX}; its process was stopped, and its conversation cannot be resumed here: horde_drop the task and horde_do it again`
+function restartMessage(inFlight: boolean): string {
+  return inFlight
+    ? `${RESTART_PREFIX}; its process was stopped, and its conversation cannot be resumed here: horde_drop the task and horde_do it again`
+    : `${RESTART_PREFIX}; its conversation cannot be resumed here: horde_land finished work, or horde_drop the task`
 }
 
 export interface Pending {
@@ -644,7 +649,8 @@ export class Fleet {
       // A backend that died took the turns in flight with it: record that, so the next fleet
       // settles those agents instead of showing them RUNNING (LIVE-02).
       const inFlight = l.state === undefined || l.state === "running" || l.state === "needs_input"
-      const stranded = goneAt !== undefined && (child || inFlight) ? { stopReason: child ? restartMessage() : goneMessage(goneAt) } : {}
+      // A child-process worker's session dies with this process, however it ends: no later fleet can drive it.
+      const stranded = child ? { stopReason: restartMessage(inFlight) } : goneAt !== undefined && inFlight ? { stopReason: goneMessage(goneAt) } : {}
       // A child process is ours: stop it instead of leaving it running after this process goes.
       if (child && runtime) stopping.push(runtime.remove(l.record.id).catch(() => undefined))
       try {
@@ -1706,25 +1712,18 @@ export class Fleet {
       () => true,
       () => false,
     )
+    const confirm = `if that was you, call again to go on from ${current}; otherwise horde_drop`
     if (!forward) {
-      return {
-        tip: current,
-        head,
-        shape: "rewrite",
-        text: `the target branch moved backwards or was rewritten (recorded ${recorded.slice(0, 10)}, now ${current.slice(0, 10)}); if that was you, call again to go on from ${current}; otherwise horde_drop`,
-      }
+      const what = `the target branch moved backwards or was rewritten (recorded ${recorded.slice(0, 10)}, now ${current.slice(0, 10)})`
+      return { tip: current, head, shape: "rewrite", what, text: `${what}; ${confirm}` }
     }
     const onBranch = await git(wt.repo, "merge-base", "--is-ancestor", current, head).then(
       () => true,
       () => false,
     )
     if (!onBranch) return undefined
-    return {
-      tip: current,
-      head,
-      shape: "branch",
-      text: `the target branch's tip is on the worker's branch; the worker moved it (recorded ${recorded.slice(0, 10)}, now ${current.slice(0, 10)}): the worker's branch contains the target's new tip: the worker may have moved the branch itself. if that was you, call again to go on from ${current}; otherwise horde_drop`,
-    }
+    const what = `the worker's branch contains the target's new tip: the worker may have moved the branch itself, or rebased onto commits you added (recorded ${recorded.slice(0, 10)}, now ${current.slice(0, 10)})`
+    return { tip: current, head, shape: "branch", what, text: `${what}; ${confirm}` }
   }
 
   /**
@@ -2596,7 +2595,7 @@ export class Fleet {
       }
     }
     // The move is noted, not judged: only a later caller call can confirm it (pendingTip).
-    if (moved) text = `${text}\n(the target's tip moved: ${moved.text})`
+    if (moved) text = `${text}\n(${moved.what}; the next horde_land asks you to confirm it)`
     // A new instruction (or dispose, or shutdown) superseded this run: its verdict is about an old task.
     if (this.closed || abort.signal.aborted || this.live.get(id) !== live) return
     if (live.sent || live.sending || live.track.lastPromptedSeq > promptBefore || currentTurn(live.track)?.startSeq !== turn) return

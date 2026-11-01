@@ -552,11 +552,12 @@ setTimeout(() => process.exit(0), 60000)`,
     })
     const id = idOf(started)
     const out = await settle(id)
+    // The audit still judges from the recorded tip, so the loosened horde.json is caught, and the move is noted.
     assert.match(out, new RegExp(`^${id} FAILED`), out)
-    assert.match(out, /the target branch's tip is on the worker's branch; the worker moved it/, out)
-    // The landing refuses too, rather than "not ready to land".
+    assert.match(out, /the worker's branch contains the target's new tip: the worker may have moved the branch itself/, out)
+    // The landing refuses too, rather than "not ready to land", until the orchestrator confirms the tip.
     const refused = await h.call("horde_land", { id })
-    assert.match(refused, /^not landed: the target branch's tip is on the worker's branch; the worker moved it/, refused)
+    assert.match(refused, /^not landed: the worker's branch contains the target's new tip: the worker may have moved the branch itself/, refused)
     await h.call("opencode_dispose", { id, worktree: "discard" })
   })
 
