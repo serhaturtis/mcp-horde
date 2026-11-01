@@ -564,12 +564,9 @@ export function trustChange(before: string[], after: string[]): string {
   const parts: string[] = []
   for (const [label, line] of now) {
     if (!old.has(label)) parts.push(`+ ${label} added`)
-    else if (old.get(label) !== line) parts.push(`+ ${label} changed`)
+    else if (old.get(label) !== line) parts.push(`${label} changed`)
   }
-  for (const [label, line] of old) {
-    if (!now.has(label)) parts.push(`− ${label} removed`)
-    else if (now.get(label) !== line) parts.push(`− ${label} changed`)
-  }
+  for (const label of old.keys()) if (!now.has(label)) parts.push(`− ${label} removed`)
   return parts.join(" · ")
 }
 
@@ -973,7 +970,12 @@ export async function reportPath(fleet: Fleet, id: string, repo: string): Promis
 function resolveCitation(wt: Worktree, file: string): { abs?: string; outside?: boolean } {
   // Absolute paths and ".." segments leave the worktree by definition, even if they land inside it.
   if (path.isAbsolute(file) || file.split(/[\\/]/).includes("..")) return { outside: true }
-  const root = fs.realpathSync(wt.root)
+  let root = wt.root
+  try {
+    root = fs.realpathSync(wt.root)
+  } catch {
+    // A root that is already gone: every citation below fails as not found.
+  }
   for (const base of [wt.path, wt.root]) {
     const abs = path.resolve(base, file)
     try {

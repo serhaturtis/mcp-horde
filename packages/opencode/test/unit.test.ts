@@ -1064,7 +1064,7 @@ describe("horde outcome rendering helpers", () => {
     const before = ["check opencode (old script\nline two · cwd: . · env: none)", "check old (go test · cwd: . · env: none)"]
     const after = ["check opencode (new script\nline two · cwd: . · env: none)", "check lint (npm run lint · cwd: . · env: none)"]
     const change = trustChange(before, after)
-    assert.equal(change, "+ check opencode changed · + check lint added · − check opencode changed · − check old removed")
+    assert.equal(change, "check opencode changed · + check lint added · − check old removed")
     assert.doesNotMatch(change, /script|npm run lint|go test/)
   })
 
