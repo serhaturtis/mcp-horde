@@ -83,8 +83,8 @@ const STRIP_ENV = ["FORCE_COLOR", "CLICOLOR_FORCE", "NODE_TEST_CONTEXT", "OPENCO
  * names it in its horde.json `env`, which is applied after the strip.
  */
 const SECRET_ENV = /KEY|TOKEN|SECRET|PASSW|PWD|CREDENTIAL/i
-/** Names that look like credentials but are local settings (a keyboard layout, a keymap). */
-const NOT_SECRET_ENV = /KEYBOARD|KEYMAP|KEY_BINDING|HOTKEY|TOKENIZER/i
+/** Names that look like credentials but are local settings (the shell's directory, a keyboard layout, a keymap). */
+const NOT_SECRET_ENV = /^(?:OLD)?PWD$|KEYBOARD|KEYMAP|KEY_BINDING|HOTKEY|TOKENIZER/i
 /** driver://user:password@host/db */
 const URL_CREDENTIALS = /^[a-z][a-z0-9+.-]*:\/\/[^/\s@]+:[^/\s@]+@/i
 const KNOWN_SECRET_ENV = [

@@ -122,9 +122,9 @@ async function treeKey(directory: string, extra: unknown): Promise<string | unde
     }
     for (const p of splitZ(await gitRaw(root, ["-c", "core.quotePath=false", "ls-files", "--others", "--exclude-standard", "-z"]))) await hashed(p)
     // Git-ignored files are inputs too (.env, a local config, a linked checkout): every one outside
-    // a dependency directory counts, whatever its depth.
+    // a dependency directory or a runner cache counts, whatever its depth.
     const ignored = splitZ(await gitRaw(root, ["-c", "core.quotePath=false", "ls-files", "--others", "--ignored", "--exclude-standard", "-z"]))
-      .filter((p) => !p.split("/").some((part) => KEY_SKIP_DIRS.has(part)))
+      .filter((p) => !p.split("/").some((part) => KEY_SKIP_DIRS.has(part)) && !isRunnerCachePath(p))
       .sort()
     if (ignored.length > KEY_IGNORED_LIMIT) return undefined
     for (const p of ignored) await stat(p)
