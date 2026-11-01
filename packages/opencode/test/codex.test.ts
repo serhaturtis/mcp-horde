@@ -23,7 +23,7 @@ const CHECK = `const fs = require("fs")
 const bad = fs.readdirSync(".").filter((f) => f.endsWith(".txt") && fs.readFileSync(f, "utf8").trim() !== "ok")
 if (bad.length) {
   console.error("txt files must say ok: " + bad.join(", "))
-  process.exit(1)
+  process.exitCode = 1
 }
 `
 
@@ -73,6 +73,8 @@ describe("the Codex runtime: codex exec --json and exec resume (fake CLI)", { ti
         verify: { checks: { test: "node check.js" } },
         tiers: ["codex/fake"],
         prices: { "codex/fake": { input: 1, output: 2, cachedInput: 0.1 } },
+        // A chosen running limit also skips horde_do's load-average refusal on a busy test host.
+        opencode: { maxRunning: 4 },
       }),
     )
     git(repo, "add", ".")

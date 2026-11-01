@@ -17,10 +17,7 @@ const invocations = path.join(stateRoot, "invocations.jsonl")
 fs.mkdirSync(threadsDir, { recursive: true })
 
 let i = 0
-if (argv[i] !== "exec") {
-  process.stderr.write("fake-codex: expected `exec`\n")
-  process.exit(2)
-}
+if (argv[i] !== "exec") throw new Error("fake-codex: expected `exec`")
 i++
 let resume
 if (argv[i] === "resume") {
@@ -149,4 +146,3 @@ if (prompt.includes("# Acceptance criteria") && prompt.includes("# The change"))
 }
 
 emit({ type: "turn.completed", usage })
-process.exit(0)

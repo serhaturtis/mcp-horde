@@ -3,14 +3,15 @@ import { randomBytes } from "node:crypto"
 import { EventEmitter } from "node:events"
 import { loadTiers } from "@mcp-horde/core"
 import type {
+  JsonValue,
   ModelInfo,
   ModelRef,
-  OpenCodeEvent,
   SessionInboxInfo,
   SessionInfo,
   SessionMessageAssistant,
   SessionMessageAssistantTool,
   SessionMessageInfo,
+  ToolContent,
 } from "@opencode/client"
 import type { Backend } from "./backend.js"
 import { loadPrices, type Price } from "./config.js"
@@ -474,40 +475,35 @@ export class CodexRuntime implements Runtime {
         const output = typeof item.aggregated_output === "string" ? item.aggregated_output : ""
         const exit = typeof item.exit_code === "number" ? item.exit_code : undefined
         const failed = completed && (item.status === "failed" || (exit !== undefined && exit !== 0))
-        const state = completed
+        const content: [ToolContent, ...ToolContent[]] = [{ type: "text", text: output }]
+        const state: SessionMessageAssistantTool["state"] = completed
           ? failed
-            ? {
-                status: "error" as const,
-                input: { command },
-                error: { type: "codex", message: output || `exit code ${exit ?? "unknown"}` },
-                content: [{ type: "text" as const, text: output }],
-              }
-            : { status: "completed" as const, input: { command }, content: [{ type: "text" as const, text: output }], metadata: { exitCode: exit ?? 0 } }
-          : { status: "running" as const, input: { command } }
-        this.toolPart(session, turn, id, "bash", state as unknown as SessionMessageAssistantTool["state"], completed)
+            ? { status: "error", input: { command }, error: { type: "codex", message: output || `exit code ${exit ?? "unknown"}` }, content }
+            : { status: "completed", input: { command }, content, metadata: { exitCode: exit ?? 0 } }
+          : { status: "running", input: { command }, metadata: {} }
+        this.toolPart(session, turn, id, "bash", state, completed)
         break
       }
       case "file_change": {
         const changes = Array.isArray(item.changes) ? item.changes : []
         const paths = changes.map((c) => (typeof c.path === "string" ? c.path : "")).filter(Boolean)
-        const state = completed
-          ? {
-              status: "completed" as const,
-              input: { path: paths[0] ?? "", changes },
-              content: [{ type: "text" as const, text: paths.map((p) => `${p}`).join("\n") }],
-            }
-          : { status: "running" as const, input: { path: paths[0] ?? "", changes } }
-        this.toolPart(session, turn, id, "edit", state as unknown as SessionMessageAssistantTool["state"], completed)
+        const input: Record<string, JsonValue> = {
+          path: paths[0] ?? "",
+          changes: changes.map((c) => ({ path: typeof c.path === "string" ? c.path : "", kind: typeof c.kind === "string" ? c.kind : "update" })),
+        }
+        const content: [ToolContent, ...ToolContent[]] = [{ type: "text", text: paths.join("\n") }]
+        const state: SessionMessageAssistantTool["state"] = completed ? { status: "completed", input, content } : { status: "running", input, metadata: {} }
+        this.toolPart(session, turn, id, "edit", state, completed)
         break
       }
       case "mcp_tool_call": {
         const name = typeof item.name === "string" ? item.name : "mcp"
-        const input = item.arguments && typeof item.arguments === "object" ? (item.arguments as Record<string, unknown>) : {}
+        const input: Record<string, JsonValue> =
+          item.arguments && typeof item.arguments === "object" && !Array.isArray(item.arguments) ? (item.arguments as Record<string, JsonValue>) : {}
         const output = typeof item.result === "string" ? item.result : item.result === undefined ? "" : JSON.stringify(item.result)
-        const state = completed
-          ? { status: "completed" as const, input, content: [{ type: "text" as const, text: output }] }
-          : { status: "running" as const, input }
-        this.toolPart(session, turn, id, name, state as unknown as SessionMessageAssistantTool["state"], completed)
+        const content: [ToolContent, ...ToolContent[]] = [{ type: "text", text: output }]
+        const state: SessionMessageAssistantTool["state"] = completed ? { status: "completed", input, content } : { status: "running", input, metadata: {} }
+        this.toolPart(session, turn, id, name, state, completed)
         break
       }
       default: {
@@ -639,6 +635,6 @@ export class CodexRuntime implements Runtime {
   }
 
   private emit(type: string, data: Record<string, unknown>) {
-    this.events.emit("event", { type, data } as unknown as OpenCodeEvent)
+    this.events.emit("event", { type, data })
   }
 }
