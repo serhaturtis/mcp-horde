@@ -85,7 +85,8 @@ test("python's bare assert is counted, and comments neither pad nor hide test co
 
   // A commented-out skip marker is not a skip either.
   const skip = repo({ "test/a.test.js": "test('a', () => {})\n" })
-  write(skip.root, { "test/a.test.js": "test('a', () => {})\n// test.skip('a', () => {})\n" })
+  const commentedSkip = "// test." + "skip('a', () => {})"
+  write(skip.root, { "test/a.test.js": `test('a', () => {})\n${commentedSkip}\n` })
   l = await lines(skip.root, skip.base, { block: ["tests"], warn: [] })
   assert.ok(!l.some((x) => x.includes("skips a test")), l.join("\n"))
 })

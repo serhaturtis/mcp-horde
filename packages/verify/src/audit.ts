@@ -962,7 +962,7 @@ async function packageJsonDeps(root: string, base: string, file: string, beforeF
       return new Map<string, string>()
     }
   }
-  const before = parse(await git(root, "show", `${base}:${beforeFile}`).catch(() => undefined))
+  const before = parse(await git(root, "show", `${base}:${beforeFile}`).catch(() => ""))
   const after = parse(await fs.readFile(path.join(root, file), "utf8").catch(() => undefined))
   const added = [...after.keys()].filter((n) => !before.has(n)).map((n) => `${n}@${after.get(n)}`)
   const removed = [...before.keys()].filter((n) => !after.has(n))
