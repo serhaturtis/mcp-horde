@@ -118,6 +118,11 @@ export interface AgentRecord {
    * the checkout).
    */
   observedTip?: string
+  /**
+   * A target tip move the caller was shown and did not confirm yet: the next caller call that finds
+   * the branch still on this commit accepts it (observedTip = pendingTip) and proceeds.
+   */
+  pendingTip?: string
   /** Paths its edits are confined to (enforced by its profile). */
   scope?: { paths: string[]; outside?: "deny" | "ask" }
   /** The board task this agent works (opencode_spawn task). */

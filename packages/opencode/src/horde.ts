@@ -459,9 +459,11 @@ export function registerHorde(tool: Tool, opts: HordeOptions) {
     },
     async (a, fleet) => {
       const found = await fleet.inspect(a.id).catch(async (err: Error) => {
-        // A task whose worker never started (a stale claim) has no agent to stop: close it on the board.
-        const board = await Board.open(fleet.resolveDir())
-        if (!/^t-/.test(a.id) || !board.tasks().some((t) => t.id === a.id)) throw err
+        // Only a genuinely missing claim is a task whose worker never started: close it on the board.
+        // Any other failure (a runtime session that cannot be read, a disposed agent) must surface.
+        if (!/^unknown agent /.test(err.message)) throw err
+        const board = await Board.open(fleet.resolveDir()).catch(() => undefined)
+        if (!board || !/^t-/.test(a.id) || !board.tasks().some((t) => t.id === a.id)) throw err
         await board.fail(a.id, { reason: a.reason ?? "dropped by the orchestrator", retry: false })
         return undefined
       })
@@ -628,7 +630,8 @@ export async function outcome(fleet: Fleet, ref: string, opts: { live?: boolean 
   const changes = wt ? await changeSummary(wt.root, workStart(wt), wt.base) : undefined
   const workerSaid = oneLine(task?.reports.at(-1)?.summary ?? s.lastTurn?.finalText ?? "")
 
-  const passed = s.gate?.state === "pass" || (verdict?.pass && verdict.final)
+  const turn = s.lastTurn?.startSeq
+  const passed = s.gate?.state === "pass" || (verdict?.pass && verdict.final && verdict.turn === turn && record.gateState?.superseded !== turn)
   if (s.state === "idle" && passed) {
     const review = verdict?.review
     const report = task && board ? await board.checkReport(task.id).catch(() => undefined) : undefined
@@ -777,6 +780,15 @@ function renderLanding(id: string, r: LandResult): string {
       `→ resolve it yourself: git -C ${r.root} rebase ${r.target}, fix${files.length ? ` ${files.join(", ")}` : " the named files"}, git -C ${r.root} rebase --continue, then horde_land {id: "${id}"} again (the land's checks run on the result).${r.baseline ? ` The first commit, "${BASELINE_MESSAGE}", is the carried-over baseline; leave it as it is, it never lands.` : ""}`,
       `→ horde_drop {id: "${id}"}`,
     ].join("\n")
+  }
+  if (r.why === "uncommitted") {
+    if (!r.blocked)
+      return [
+        `not landed: ${id}'s branch could not be fast-forwarded onto ${r.target}:`,
+        indent(truncate(r.text, 1200), "  "),
+        `${r.target} is unchanged; horde_land {id: "${id}"} again when the cause is gone.`,
+      ].join("\n")
+    return `not landed: ${id}'s commits collide with your uncommitted changes:\n${indent(truncate(r.text, 800), "  ")}\nCommit or stash them, then horde_land {id: "${id}"} again.`
   }
   return `not landed: ${id}'s commits collide with your uncommitted changes:\n${indent(truncate(r.text, 800), "  ")}\nCommit or stash them, then horde_land {id: "${id}"} again.`
 }

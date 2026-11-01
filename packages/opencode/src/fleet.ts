@@ -93,10 +93,25 @@ const HEARTBEAT_MS = 30_000
 /** What a wait, a status read or a call on a dead backend answers: the next call reconnects. */
 const SERVER_GONE = "the OpenCode server went away; calling again reconnects"
 
+/** A target tip that moved away from the one the orchestrator recorded. */
+type TipMove = {
+  tip: string
+  head: string
+  /** branch: the new tip is on the worker's branch; rewrite: it is not a descendant of the recorded tip. */
+  shape: "branch" | "rewrite"
+  text: string
+}
+
 /** What a stranded agent (its backend died mid-turn) says, and what to do instead of waiting. */
 const GONE_PREFIX = "its OpenCode session is gone"
 function goneMessage(at: number): string {
   return `${GONE_PREFIX}: the backend restarted at ${new Date(at).toISOString()}; horde_tell restarts the work from its worktree, horde_drop gives it up`
+}
+
+/** What a worker of a child-process runtime (codex, cursor) says after a restart: its session lived in this process only. */
+const RESTART_PREFIX = "the horde restarted while this worker ran"
+function restartMessage(): string {
+  return `${RESTART_PREFIX}; its process was stopped, and its conversation cannot be resumed here: horde_drop the task and horde_do it again`
 }
 
 export interface Pending {
@@ -572,6 +587,10 @@ export class Fleet {
   private closed = false
   /** A landing waits for the previous landing of its repository; a failure does not block the next. */
   private readonly landing = new Map<string, Promise<unknown>>()
+  /** Agents whose landing is running now: no prompt may start a turn the land's dispose would discard. */
+  private readonly landingTasks = new Set<string>()
+  /** Agents whose landing finished: a second horde_land on the disposed record is refused cleanly. */
+  private readonly landedTasks = new Set<string>()
   /** The runtimes this fleet can drive: OpenCode always, Codex when a binary is configured, Cursor always. */
   private readonly runtimes: Map<RuntimeKind, Runtime>
 
@@ -607,30 +626,38 @@ export class Fleet {
   /**
    * Stop monitoring and hand our agents over: another MCP process may claim them at once.
    * A restart keeps the news file (outcomes still wait to be reported) and, with `goneAt`, marks
-   * the turns in flight as taken by the dead backend; an exit removes the news file.
+   * the turns in flight as taken by the dead backend; an exit removes the news file. A child-process
+   * runtime's session lives only in this process: stop its process and say the task must restart.
    */
-  close(opts: { keepNews?: boolean; goneAt?: number } = {}) {
+  async close(opts: { keepNews?: boolean; goneAt?: number } = {}) {
     const goneAt = opts.goneAt
     this.closed = true
     if (this.monitor) clearInterval(this.monitor)
+    const stopping: Promise<unknown>[] = []
     for (const l of this.live.values()) {
       l.gating?.abort.abort()
       l.gating = undefined
       l.fix = undefined
       for (const d of l.dialogs.values()) d.abort()
+      const runtime = this.runtimes.get(l.record.runtime ?? "opencode")
+      const child = runtime?.kind === "codex" || runtime?.kind === "cursor"
       // A backend that died took the turns in flight with it: record that, so the next fleet
       // settles those agents instead of showing them RUNNING (LIVE-02).
-      const stranded = goneAt !== undefined && (l.state === undefined || l.state === "running") ? { stopReason: goneMessage(goneAt) } : {}
+      const inFlight = l.state === undefined || l.state === "running" || l.state === "needs_input"
+      const stranded = goneAt !== undefined && (child || inFlight) ? { stopReason: child ? restartMessage() : goneMessage(goneAt) } : {}
+      // A child process is ours: stop it instead of leaving it running after this process goes.
+      if (child && runtime) stopping.push(runtime.remove(l.record.id).catch(() => undefined))
       try {
         this.store.update(l.record.id, { owner: undefined, ownerSeen: undefined, ...stranded })
       } catch {
         // best effort
       }
     }
+    await Promise.allSettled(stopping)
     this.live.clear()
     this.childToRoot.clear()
     this.wake()
-    return opts.keepNews ? Promise.resolve() : this.news.remove()
+    return opts.keepNews ? undefined : this.news.remove()
   }
 
   /**
@@ -1331,6 +1358,7 @@ export class Fleet {
   ): Promise<Snapshot> {
     const live = await this.get(ref)
     const id = live.record.id
+    if (this.landingTasks.has(id)) throw new Error("the task is landing; wait for horde_land's answer")
     await this.refresh(live)
     const moved = await this.observeTip(live)
     if (moved) throw new Error(moved)
@@ -1463,6 +1491,7 @@ export class Fleet {
   async respond(ref: string, requestID: string, reply: { decision?: "once" | "always" | "reject"; message?: string; answers?: string[][] }): Promise<Snapshot> {
     const live = await this.get(ref)
     const id = live.record.id
+    if (this.landingTasks.has(id)) throw new Error("the task is landing; wait for horde_land's answer")
     await this.refresh(live)
     const moved = await this.observeTip(live)
     if (moved) throw new Error(moved)
@@ -1662,46 +1691,68 @@ export class Fleet {
   }
 
   /**
-   * Refuse when the target branch's tip moved onto the worker's branch: the current tip is a strict
-   * descendant of the recorded one and reachable from the worker's branch. The worker cannot rewrite
-   * a commit, so a tip it moved to its own commit (the only way to make its own horde.json the
-   * rules) is a descendant of the recorded tip and reachable from its branch; a backward reset or a
-   * forward move the orchestrator made is not the worker's, and is not refused here.
+   * Classify a target-tip change from the recorded one. A forward move the orchestrator made (the
+   * new tip is not on the worker's branch) is accepted silently. A forward move whose tip the
+   * worker's branch contains is ambiguous: the worker moved the target onto its own commit, or it
+   * rebased onto commits the orchestrator added. A tip that is not a descendant of the recorded one
+   * is ambiguous too: the orchestrator reset the branch, or the worker rewound or rewrote it.
    */
-  private async movedTip(wt: Worktree, recorded: string): Promise<string | undefined> {
+  private async movedTip(wt: Worktree, recorded: string): Promise<TipMove | undefined> {
     const current = await git(wt.repo, "rev-parse", "HEAD")
     if (current === recorded) return undefined
     const head = await git(wt.root, "rev-parse", "HEAD").catch(() => "")
     if (!head) return undefined
-    const ahead = await git(wt.repo, "merge-base", "--is-ancestor", recorded, current).then(
+    const forward = await git(wt.repo, "merge-base", "--is-ancestor", recorded, current).then(
       () => true,
       () => false,
     )
-    if (!ahead) return undefined
+    if (!forward) {
+      return {
+        tip: current,
+        head,
+        shape: "rewrite",
+        text: `the target branch moved backwards or was rewritten (recorded ${recorded.slice(0, 10)}, now ${current.slice(0, 10)}); if that was you, call again to go on from ${current}; otherwise horde_drop`,
+      }
+    }
     const onBranch = await git(wt.repo, "merge-base", "--is-ancestor", current, head).then(
       () => true,
       () => false,
     )
     if (!onBranch) return undefined
-    return `the target branch's tip is on the worker's branch; the worker moved it (recorded ${recorded.slice(0, 10)}, now ${current.slice(0, 10)})`
+    return {
+      tip: current,
+      head,
+      shape: "branch",
+      text: `the target branch's tip is on the worker's branch; the worker moved it (recorded ${recorded.slice(0, 10)}, now ${current.slice(0, 10)}): the worker's branch contains the target's new tip: the worker may have moved the branch itself. if that was you, call again to go on from ${current}; otherwise horde_drop`,
+    }
   }
 
   /**
    * Re-read the target branch's tip on a caller call (horde_tell, horde_land, a sync) and record it
    * as observed. Returns the explanation when the worker moved the tip, so the caller can refuse;
-   * otherwise the tip is recorded and the caller proceeds. Only caller calls re-observe: the refresh
-   * loop never updates observedTip, so a ref the worker moved between calls is never taken as its own.
+   * the next call from the same tip confirms it (the caller was shown the move and called again).
+   * Only caller calls re-observe: the refresh loop never updates observedTip, so a ref the worker
+   * moved between calls is never taken as its own.
    */
   private async observeTip(live: Live): Promise<string | undefined> {
     const wt = live.record.worktree
     if (!wt) return undefined
     const recorded = live.record.observedTip
-    if (recorded) {
-      const moved = await this.movedTip(wt, recorded)
-      if (moved) return moved
-    }
     const current = await git(wt.repo, "rev-parse", "HEAD")
-    if (current !== recorded) this.updateRecord(live.record.id, { observedTip: current })
+    if (recorded && recorded !== current) {
+      if (live.record.pendingTip && current === live.record.pendingTip) {
+        // The caller called again from the tip it was shown: that is the confirmation.
+        this.updateRecord(live.record.id, { observedTip: current, pendingTip: undefined })
+        return undefined
+      }
+      const moved = await this.movedTip(wt, recorded)
+      if (moved) {
+        if (live.record.pendingTip !== moved.tip) this.updateRecord(live.record.id, { pendingTip: moved.tip })
+        return moved.text
+      }
+    }
+    if (current !== recorded || live.record.pendingTip)
+      this.updateRecord(live.record.id, { observedTip: current, ...(live.record.pendingTip ? { pendingTip: undefined } : {}) })
     return undefined
   }
 
@@ -1719,40 +1770,57 @@ export class Fleet {
    * committed: leftover changes are refused rather than committed with --no-verify.
    */
   async land(ref: string, signal?: AbortSignal, message?: string): Promise<LandResult> {
-    const live = await this.get(ref)
+    const alreadyLanded = () => new Error(`this task already landed; its worktree and branch are gone`)
+    if (this.landedTasks.has(ref)) throw alreadyLanded()
+    const live = await this.get(ref).catch((err: Error) => {
+      if (this.landedTasks.has(ref)) throw alreadyLanded()
+      throw err
+    })
     const id = live.record.id
     const name = live.record.name ?? id
     const task = live.record.task
+    if (this.landingTasks.has(id)) throw new Error("the task is landing; wait for horde_land's answer")
+    if (this.landedTasks.has(id)) throw alreadyLanded()
     if (live.record.investigate)
       throw new Error(`${name} is an investigation (horde_investigate): it produces a report, never changes, so there is nothing to land.`)
     if (!task || !live.record.worktree) throw new Error(`${name} is not a task in a worktree (horde_do starts one); merge it with opencode_worktree`)
-    await this.refresh(live)
-    if (this.working(live))
-      throw new Error(`${name} is still ${live.state === "needs_input" ? "waiting for an answer" : "working"}; horde_wait for its outcome first`)
-    // The tip the landing judges by is the one the orchestrator observed; a move onto the worker's
-    // branch refuses, whatever the gate decided.
-    const moved = await this.observeTip(live)
-    if (moved) {
-      const target = await git(live.record.worktree!.repo, "symbolic-ref", "-q", "--short", "HEAD").catch(() => "")
-      return { landed: false, target, why: "moved", text: moved }
-    }
-    if (!this.readyToLand(live)) {
-      const g = this.gateView(live)
-      throw new Error(
-        `${name} is not ready to land: ${g ? `its checks ${g.state === "fail" ? "failed" : "have not passed yet"}` : `it is ${live.state}`}. horde_tell it to finish, or horde_drop it.`,
-      )
-    }
-    return this.withoutGate(live, async () => {
-      const repo = live.record.worktree!.repo
-      const previous = this.landing.get(repo) ?? Promise.resolve()
-      const run = previous.then(() => this.landLoop(live, id, name, task, signal, message))
-      const tail = run.catch(() => undefined)
-      this.landing.set(repo, tail)
-      void tail.then(() => {
-        if (this.landing.get(repo) === tail) this.landing.delete(repo)
+    this.landingTasks.add(id)
+    try {
+      await this.refresh(live)
+      if (this.working(live))
+        throw new Error(`${name} is still ${live.state === "needs_input" ? "waiting for an answer" : "working"}; horde_wait for its outcome first`)
+      // The tip the landing judges by is the one the orchestrator observed; a move onto the worker's
+      // branch refuses, whatever the gate decided.
+      const moved = await this.observeTip(live)
+      if (moved) {
+        const target = await git(live.record.worktree!.repo, "symbolic-ref", "-q", "--short", "HEAD").catch(() => "")
+        return { landed: false, target, why: "moved", text: moved }
+      }
+      if (!this.readyToLand(live)) {
+        const g = this.gateView(live)
+        throw new Error(
+          `${name} is not ready to land: ${g ? `its checks ${g.state === "fail" ? "failed" : "have not passed yet"}` : `it is ${live.state}`}. horde_tell it to finish, or horde_drop it.`,
+        )
+      }
+      const result = await this.withoutGate(live, async () => {
+        const repo = live.record.worktree!.repo
+        const previous = this.landing.get(repo) ?? Promise.resolve()
+        const run = previous.then(() => this.landLoop(live, id, name, task, signal, message))
+        const tail = run.catch(() => undefined)
+        this.landing.set(repo, tail)
+        void tail.then(() => {
+          if (this.landing.get(repo) === tail) this.landing.delete(repo)
+        })
+        return run
       })
-      return run
-    })
+      if (result.landed) {
+        this.landedTasks.add(id)
+        if (name !== id) this.landedTasks.add(name)
+      }
+      return result
+    } finally {
+      this.landingTasks.delete(id)
+    }
   }
 
   /**
@@ -1887,10 +1955,12 @@ export class Fleet {
       }
       const commits = (await git(wt.repo, "rev-list", "--count", `${tip}..${judged}`).catch(() => "0")).trim()
       // A husky v9 hook lives in a core.hooksPath directory git ignores, so it is absent from the
-      // worktree and the worker's `git commit` there never ran it. Judge every commit that will
-      // land (the task's own, from workStart); a workers.land commit is judged by commitLandStep.
-      if (hook && !message) {
-        const refused = await judgeCommits(wt, hook, workStart(wt), land ? beforeLand! : judged)
+      // worktree: neither the worker's `git commit` there nor the land step's plain commit ran it.
+      // Judge every commit that will land, the land step's own included (a squashed message was
+      // already judged by squashWorktree, so only the land commit is left when there is one).
+      if (hook && (!message || beforeLand)) {
+        const from = message && beforeLand ? beforeLand : workStart(wt)
+        const refused = await judgeCommits(wt, hook, from, judged)
         if (refused !== undefined) {
           if (beforeLand) await restoreWorktree(wt, beforeLand).catch(() => undefined)
           return { landed: false, target, why: "message", text: refused, hook }
@@ -1938,15 +2008,17 @@ export class Fleet {
         })
       } catch (err) {
         if (beforeLand) await restoreWorktree(wt, beforeLand).catch(() => undefined)
-        // The tip was still where the checks saw it, so only the user's uncommitted changes can
-        // refuse the fast-forward; the refusal names them.
         const changed = await git(wt.repo, "status", "--porcelain").catch(() => "")
         const detail = err instanceof Error ? err.message : String(err)
+        const blocked = /local changes|would be overwritten|please commit/i.test(detail)
         return {
           landed: false,
           target,
           why: "uncommitted",
-          text: `${detail}${changed ? `\nuncommitted changes:\n${changed}` : ""}`,
+          text: blocked
+            ? `${detail}${changed ? `\nuncommitted changes:\n${changed}` : ""}`
+            : `the fast-forward failed: ${detail}${changed ? `\nuncommitted changes:\n${changed}` : ""}`,
+          blocked,
         }
       }
       if (!advanced) {
@@ -1984,6 +2056,7 @@ export class Fleet {
   async setScope(ref: string, paths: string[]): Promise<void> {
     if (!paths.length) throw new Error("scope needs at least one path or glob")
     const live = await this.get(ref)
+    if (this.landingTasks.has(live.record.id)) throw new Error("the task is landing; wait for horde_land's answer")
     const moved = await this.observeTip(live)
     if (moved) throw new Error(moved)
     const id = live.record.id
@@ -2002,6 +2075,7 @@ export class Fleet {
   async setDone(ref: string, criteria: string[]): Promise<void> {
     if (!criteria.length) throw new Error("done needs at least one criterion")
     const live = await this.get(ref)
+    if (this.landingTasks.has(live.record.id)) throw new Error("the task is landing; wait for horde_land's answer")
     const moved = await this.observeTip(live)
     if (moved) throw new Error(moved)
     const task = live.record.task
@@ -2428,15 +2502,23 @@ export class Fleet {
     const promptBefore = live.track.lastPromptedSeq
     let wt = live.record.worktree
     let recorded: string | undefined
-    let moved: string | undefined
+    let moved: TipMove | undefined
     if (wt) {
       // The rules come from the tip the orchestrator observed, not the live HEAD (which the worker
-      // can move from its worktree); refuse when the worker moved the target onto its own branch.
+      // can move from its worktree); classify a move so it is noted, never silently accepted.
       recorded = live.record.observedTip ?? (await git(wt.repo, "rev-parse", "HEAD").catch(() => undefined))
       if (recorded) moved = await this.movedTip(wt, recorded)
     }
     if (wt && !moved) wt = await this.followRebase(live, wt)
-    const start = wt ? workStart(wt) : undefined
+    let start = wt ? workStart(wt) : undefined
+    // A move the worker may have made is ambiguous: judge only what it added after the target's new
+    // tip (a rebase onto the user's commits), or after the recorded one when it rewrote the branch.
+    // A target moved onto the worker's own HEAD keeps the recorded base, so its own commits are
+    // still audited; the move itself is only noted (a later caller call asks to confirm it).
+    if (wt && moved) {
+      if (moved.shape === "rewrite") start = recorded ?? start
+      else start = moved.tip === moved.head ? (recorded ?? start) : moved.tip
+    }
     let pass = false
     let text: string
     let checks: GateCheckSummary[] | undefined
@@ -2444,55 +2526,47 @@ export class Fleet {
     let review: ReviewSummary | undefined
     let stuck: SlotBlocked[] = []
     try {
-      if (moved) {
-        // The worker moved the target branch: the rules the gate would read are the worker's own.
-        pass = false
-        text = moved
-      } else {
-        // A worktree's commits are never on the target branch: its rules are horde.json at the tip
-        // the orchestrator observed, including a change the orchestrator committed while the task ran.
-        const directory = live.session?.location.directory ?? live.record.directory
-        const onCheck = (state: GateCheckState) => {
-          if (live.gating?.abort === abort) live.gating.check = state
-        }
-        const judge = () =>
-          runGate(directory, {
-            base: start ?? cfg.base,
-            rulesAt: wt ? recorded : undefined,
-            audit: cfg.audit,
-            // Only an unaudited shared gate may use the human's working config; a worktree gate
-            // judges by the target branch's rules, which the work itself cannot rewrite.
-            settingsFrom: !wt && !cfg.audit ? "working" : "base",
-            checks: cfg.checks,
-            allowed: cfg.allowed,
-            related: cfg.related !== false,
-            stage: "work",
-            env: wt ? { HORDE_TASK: live.record.task?.id ?? live.record.name ?? live.record.id, HORDE_WORKTREE: wt.root } : undefined,
-            baseline: wt && start ? this.baselineFor(wt.repo, start, `${start.slice(0, 8)} where the task started`) : undefined,
-            signal: abort.signal,
-            onCheck,
-            stateDir: verifyStateDir(),
-          })
-        const blockedIn = (v: { checks: CheckResult[]; pass: boolean }) => v.checks.map(slotBlocked).filter((x): x is SlotBlocked => !!x)
-        // Every failing check never started for lack of its slot: nothing about the work was judged.
-        const onlyStuck = (v: { checks: CheckResult[]; pass: boolean }) =>
-          !v.pass && v.checks.some((c) => !c.pass) && v.checks.every((c) => c.pass || !!slotBlocked(c))
-        let v = await judge()
-        if (onlyStuck(v) && !abort.signal.aborted) {
-          // A check that never started because its slot stayed taken is not the worker's failure:
-          // wait once more for the slot (bounded by the check's timeout again), and say nothing to
-          // the worker unless the work itself failed (NEW-03).
-          v = await judge()
-        }
-        pass = v.pass
-        text = v.text
-        checks = v.checks.map(gateCheck)
-        audit = v.audit?.findings
-          .filter((f) => f.severity === "block")
-          .map((f) => ({ category: f.category, ...(f.file ? { file: f.file } : {}), text: f.text }))
-        stuck = onlyStuck(v) ? blockedIn(v) : []
-        if (!pass && stuck.length) text = await slotFailureText(stuck, directory)
+      // A worktree's commits are never on the target branch: its rules are horde.json at the tip
+      // the orchestrator observed, including a change the orchestrator committed while the task ran.
+      const directory = live.session?.location.directory ?? live.record.directory
+      const onCheck = (state: GateCheckState) => {
+        if (live.gating?.abort === abort) live.gating.check = state
       }
+      const judge = () =>
+        runGate(directory, {
+          base: start ?? cfg.base,
+          rulesAt: wt ? recorded : undefined,
+          audit: cfg.audit,
+          // Only an unaudited shared gate may use the human's working config; a worktree gate
+          // judges by the target branch's rules, which the work itself cannot rewrite.
+          settingsFrom: !wt && !cfg.audit ? "working" : "base",
+          checks: cfg.checks,
+          allowed: cfg.allowed,
+          related: cfg.related !== false,
+          stage: "work",
+          env: wt ? { HORDE_TASK: live.record.task?.id ?? live.record.name ?? live.record.id, HORDE_WORKTREE: wt.root } : undefined,
+          baseline: wt && start ? this.baselineFor(wt.repo, start, `${start.slice(0, 8)} where the task started`) : undefined,
+          signal: abort.signal,
+          onCheck,
+          stateDir: verifyStateDir(),
+        })
+      const blockedIn = (v: { checks: CheckResult[]; pass: boolean }) => v.checks.map(slotBlocked).filter((x): x is SlotBlocked => !!x)
+      // Every failing check never started for lack of its slot: nothing about the work was judged.
+      const onlyStuck = (v: { checks: CheckResult[]; pass: boolean }) =>
+        !v.pass && v.checks.some((c) => !c.pass) && v.checks.every((c) => c.pass || !!slotBlocked(c))
+      let v = await judge()
+      if (onlyStuck(v) && !abort.signal.aborted) {
+        // A check that never started because its slot stayed taken is not the worker's failure:
+        // wait once more for the slot (bounded by the check's timeout again), and say nothing to
+        // the worker unless the work itself failed (NEW-03).
+        v = await judge()
+      }
+      pass = v.pass
+      text = v.text
+      checks = v.checks.map(gateCheck)
+      audit = v.audit?.findings.filter((f) => f.severity === "block").map((f) => ({ category: f.category, ...(f.file ? { file: f.file } : {}), text: f.text }))
+      stuck = onlyStuck(v) ? blockedIn(v) : []
+      if (!pass && stuck.length) text = await slotFailureText(stuck, directory)
     } catch (err) {
       stuck = []
       text = `the gate could not run: ${(err as Error).message}`
@@ -2521,12 +2595,14 @@ export class Fleet {
         text = `The work in ${wt.branch} is not committed. Commit all of it with git commit, in a message the repository's commit-msg hook at ${hook} accepts (read the hook for its rules), and never with --no-verify.`
       }
     }
+    // The move is noted, not judged: only a later caller call can confirm it (pendingTip).
+    if (moved) text = `${text}\n(the target's tip moved: ${moved.text})`
     // A new instruction (or dispose, or shutdown) superseded this run: its verdict is about an old task.
     if (this.closed || abort.signal.aborted || this.live.get(id) !== live) return
     if (live.sent || live.sending || live.track.lastPromptedSeq > promptBefore || currentTurn(live.track)?.startSeq !== turn) return
     // A round whose check never started judges nothing about the worker, so it does not count.
     const blocked = !pass && stuck.length > 0
-    const final = blocked || pass || round >= cfg.maxRounds || text.startsWith("the gate could not run") || !!review?.error || !!moved
+    const final = blocked || pass || round >= cfg.maxRounds || text.startsWith("the gate could not run") || !!review?.error
     const storedRound = blocked ? (live.record.gateState?.round ?? 0) : round
     const verdict: StoredVerdict = { turn, pass, final, text, at: Date.now(), checks, review, ...(audit?.length ? { audit } : {}) }
     this.updateRecord(id, { gateState: { round: storedRound, verdict } })
@@ -2584,6 +2660,7 @@ export class Fleet {
       this.publishNews()
     } catch (err) {
       // The agent could not be told: report the failure instead of waiting forever.
+      const text = `${fix.text}\n(could not send the failure back to the agent: ${(err as Error).message})`
       this.updateRecord(id, {
         gateState: {
           round: fix.round,
@@ -2591,11 +2668,13 @@ export class Fleet {
             turn: fix.turn,
             pass: false,
             final: true,
-            text: `${fix.text}\n(could not send the failure back to the agent: ${(err as Error).message})`,
+            text,
             at: Date.now(),
           },
         },
       })
+      this.publishNews()
+      await this.recordGateFailure(live, text)
     } finally {
       release()
       this.wake()
@@ -3420,7 +3499,7 @@ export class Fleet {
     this.live.set(record.id, live)
     // A running turn whose backend died is gone: show it settled rather than RUNNING until a
     // new prompt restarts it (the marker survives in the record; close() writes it on death).
-    if (record.stopReason?.startsWith(GONE_PREFIX)) this.strand(live)
+    if (record.stopReason?.startsWith(GONE_PREFIX) || record.stopReason?.startsWith(RESTART_PREFIX)) this.strand(live)
     return live
   }
 
@@ -3544,7 +3623,8 @@ export class Fleet {
       // backend (or owner process) went away: never blame a session that does not drive it.
       if (foreign.owner && foreign.owner.token !== SELF.token)
         throw new Error(`agent "${ref}" is driven by another MCP session (pid ${foreign.owner.pid}); use that session, or close it first`)
-      if (foreign.stopReason?.startsWith(GONE_PREFIX)) return this.strand(this.live.get(foreign.id) ?? this.adoptRecord(foreign))
+      if (foreign.stopReason?.startsWith(GONE_PREFIX) || foreign.stopReason?.startsWith(RESTART_PREFIX))
+        return this.strand(this.live.get(foreign.id) ?? this.adoptRecord(foreign))
       throw new Error(`agent "${ref}" has no live owner and is not tracked here; call again to claim it, or opencode_spawn a new agent`)
     }
     if (!ref.startsWith("ses_")) throw new Error(`unknown agent "${ref}". Pass a session id (ses_…) or the name given at spawn; opencode_status lists them.`)
@@ -3598,6 +3678,8 @@ export type LandResult =
       why: "conflict" | "checks" | "uncommitted" | "message" | "leftovers" | "land" | "already" | "moved" | "dirty"
       text: string
       checks?: GateCheckSummary[]
+      /** why "uncommitted": git refused because of the checkout's own changes; otherwise the failure is not about them. */
+      blocked?: boolean
       /** why "message": the hook that refused it. */
       hook?: string
       /** why "conflict" or "already": the worker's worktree root, for the by-hand fix the answer suggests. */

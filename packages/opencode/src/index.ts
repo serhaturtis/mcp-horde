@@ -44,7 +44,7 @@ try {
 }
 
 // A hook reads this session's news file; a server that died without cleaning up left one behind.
-const news = loaded ? new News(loaded.config.stateDir) : undefined
+let news = loaded ? new News(loaded.config.stateDir) : undefined
 await news?.clear()
 
 // Every stored record, including ones syncStore/fleet hide because their worktree vanished.
@@ -144,10 +144,13 @@ const getFleet = async (): Promise<Fleet> => {
   const b = await getBackend()
   if (!fleet) {
     const { config, store } = load()
-    // If the first load failed, this one may succeed: clear the stale file before any write.
-    const newsFile = news ?? new News(config.stateDir)
-    if (!news) await newsFile.clear()
-    fleet = Promise.resolve(new Fleet(b, config, store, makeHooks(server, config), newsFile))
+    // The first fleet after a load that failed at startup clears the stale file once; a reconnect
+    // reuses this writer, so keepNews survives (and its writes stay serialised).
+    if (!news) {
+      news = new News(config.stateDir)
+      await news.clear()
+    }
+    fleet = Promise.resolve(new Fleet(b, config, store, makeHooks(server, config), news))
   }
   return fleet
 }

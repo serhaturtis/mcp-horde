@@ -789,7 +789,14 @@ export async function followRebase(wt: Worktree): Promise<Worktree> {
     () => false,
   )
   if (!descendant) return wt
-  return { ...wt, base, baseline: wt.baseline ? await baselineReplay(wt.root, base) : undefined }
+  // The new base has passed the last merged commit: workStart must be the new base, not the stale merge.
+  const passed = wt.merged
+    ? await git(wt.repo, "merge-base", "--is-ancestor", wt.merged, base).then(
+        () => true,
+        () => false,
+      )
+    : false
+  return { ...wt, base, baseline: wt.baseline ? await baselineReplay(wt.root, base) : undefined, ...(passed ? { merged: undefined } : {}) }
 }
 
 /** The replayed carried-over baseline commit after `base`, or none when the worker's rebase dropped it. */
