@@ -297,9 +297,12 @@ export class CursorRuntime implements Runtime {
     session.updatedAt = now
     this.emit("session.execution.started", { sessionID: session.id })
 
-    const args = ["-p", "--output-format", "stream-json", "--force", "--sandbox", "enabled", "--workspace", session.directory, "--trust"]
+    const args = ["-p", "--output-format", "stream-json", "--sandbox", "enabled", "--workspace", session.directory, "--trust"]
     for (const dir of session.writableDirs ?? []) args.push("--add-dir", dir)
+    // --force auto-approves every tool, and ask mode is read-only only without it: the real CLI
+    // still writes files in ask mode when forced (probed 2026-11-01).
     if (session.askMode) args.push("--mode", "ask")
+    else args.push("--force")
     if (session.modelID) args.push("--model", session.modelID)
     if (session.cursorID) args.push("--resume", session.cursorID)
 

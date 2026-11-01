@@ -348,6 +348,7 @@ describe("the cursor runtime: Cursor's agent CLI as a worker", { timeout: 600_00
     await idleMessages(runtime, id)
     const call = await callWith("deny mode put")
     assert.equal(call.mode, "ask")
+    assert.ok(!(call.argv as string[]).includes("--force"), "ask mode is read-only only without --force")
   })
 
   test("a grandchild holding stdout does not keep the turn open", async () => {
