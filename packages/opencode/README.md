@@ -4,6 +4,8 @@ An MCP server that gives any harness (Claude Code, Codex, Cursor, OpenCode itsel
 
 It is built on the server API of **OpenCode 2** (`/api/*`, through `@opencode/client`).
 
+A task whose model id starts with `cursor/` (for example `cursor/gpt-5.3-codex` or `cursor/auto`) runs on Cursor's `cursor-agent` CLI instead, in print mode with `stream-json`, `--force` and its sandbox in the worktree; later turns continue the same chat with `--resume`. Cursor workers keep the same worktree, transcript, gate and landing path, but have no permission prompts, mid-turn steering, revert or compact, and their edits are checked by the gate's audit rather than confined by the runtime. Set `HORDE_CURSOR_BIN` when `cursor-agent` is not on `PATH`; `CURSOR_API_KEY` and `HOME` are passed through for its login.
+
 ## The simple path
 
 Five tools cover delegating coding work, and their answers always name the next call, so an agent needs nothing else:
@@ -169,6 +171,7 @@ The model, effort, profile, directory, policies and limits are chosen by the cal
 | `HORDE_OPENCODE_URL` | none | Attach to a server you run yourself (e.g. one whose TUI you watch). |
 | `OPENCODE_SERVER_PASSWORD` / `OPENCODE_SERVER_USERNAME` | random / `opencode` | Basic auth. OpenCode 2 serves its API only with a password: to attach, use the one your server was started with. Required for non-loopback URLs unless `HORDE_OPENCODE_ALLOW_INSECURE=1`. |
 | `HORDE_OPENCODE_BIN` | `opencode` | Binary used to start `opencode serve`. |
+| `HORDE_CURSOR_BIN` | `cursor-agent` | Binary used for tasks whose model id starts with `cursor/` (Cursor's agent CLI, version 2026.10 or later). |
 | `HORDE_OPENCODE_DIRECTORY` | current directory | Default working directory for agents; relative `directory` arguments resolve against it. |
 | `HORDE_OPENCODE_PERMISSIONS` | `user` | Default permission policy. |
 | `HORDE_OPENCODE_MAX_RUNNING` | `horde.json` `opencode.maxRunning`, else `8` | Maximum number of agents working at once (`0` = unlimited). |

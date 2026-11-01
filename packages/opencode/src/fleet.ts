@@ -34,6 +34,7 @@ import { type Config, inProject, type PermissionPolicy } from "./config.js"
 import { News, type NewsWait, type NewsWork } from "./news.js"
 import { type Detail, inputSummary, renderTranscript } from "./render.js"
 import { notSupported, OpenCodeRuntime, type Runtime, type RuntimeKind, within } from "./runtime.js"
+import { CursorRuntime } from "./runtime-cursor.js"
 import { type AgentRecord, type GateConfig, type Limits, ownerAlive, type ReviewSummary, SELF, type Store } from "./state.js"
 import { buildTrack, type CostEstimator, costSince, currentTurn, emptyTrack, latestTool, type Track, type Turn, turnsSince } from "./tracker.js"
 import {
@@ -553,7 +554,7 @@ export class Fleet {
   private closed = false
   /** A landing waits for the previous landing of its repository; a failure does not block the next. */
   private readonly landing = new Map<string, Promise<unknown>>()
-  /** The runtimes this fleet can drive: OpenCode today, Codex and Cursor once they exist. */
+  /** The runtimes this fleet can drive. */
   private readonly runtimes: Map<RuntimeKind, Runtime>
 
   constructor(
@@ -563,7 +564,10 @@ export class Fleet {
     private readonly hooks: Hooks,
     private readonly news = new News(config.stateDir),
   ) {
-    this.runtimes = new Map([["opencode", new OpenCodeRuntime(backend)]])
+    this.runtimes = new Map<RuntimeKind, Runtime>([
+      ["opencode", new OpenCodeRuntime(backend)],
+      ["cursor", new CursorRuntime(backend, config)],
+    ])
     this.syncStore()
     for (const runtime of this.runtimes.values()) {
       runtime.events.on("event", (e: OpenCodeEvent) => {
@@ -681,7 +685,10 @@ export class Fleet {
   }
 
   private async listModels(runtime: Runtime, dir: string): Promise<ModelInfo[]> {
-    const cached = this.modelCache.get(dir)
+    // Only OpenCode's catalog is slow and worth caching; another runtime reads its ids from
+    // the repository's config, and its catalog must not be confused with OpenCode's for the dir.
+    const cacheable = runtime.kind === "opencode"
+    const cached = cacheable ? this.modelCache.get(dir) : undefined
     if (cached && Date.now() - cached.at < 60_000) return cached.models
     let models: ModelInfo[] = []
     // A directory OpenCode has not opened yet answers with an empty catalog at first.
@@ -690,7 +697,7 @@ export class Fleet {
       if (models.length) break
       await sleep(250)
     }
-    if (models.length) this.modelCache.set(dir, { at: Date.now(), models })
+    if (models.length && cacheable) this.modelCache.set(dir, { at: Date.now(), models })
     return models
   }
 
@@ -1150,10 +1157,10 @@ export class Fleet {
     }
     try {
       if (input.scope && !input.scope.paths.length) throw new Error("scope.paths needs at least one path or glob")
-      // "codex/" and "cursor/" name another runtime; only OpenCode exists after this task.
+      // "codex/" and "cursor/" name another runtime; anything else is OpenCode's "provider/model".
       const named = input.model ? modelRuntime(input.model) : { runtime: "opencode" as const, model: undefined }
       const runtime = this.runtimeFor(named.runtime)
-      const model = named.model ? parseModel(named.model, input.variant) : undefined
+      const model = input.model ? parseModel(input.model, input.variant) : undefined
       if (!model && input.variant) throw new Error("variant requires model (pick one with opencode_models)")
       if (model) await this.validateModel(runtime, model, directory)
       if (input.agent) await this.validateAgent(input.agent, directory)
@@ -1323,11 +1330,12 @@ export class Fleet {
       }
       if (opts.model || opts.variant) {
         const current = session.model ?? live.track.model
-        const model = chosen
-          ? parseModel(chosen.model, opts.variant)
-          : current
-            ? { providerID: current.providerID, id: current.id, variant: opts.variant }
-            : undefined
+        const model =
+          chosen && opts.model
+            ? parseModel(opts.model, opts.variant)
+            : current
+              ? { providerID: current.providerID, id: current.id, variant: opts.variant }
+              : undefined
         if (!model) throw new Error("variant requires model: the agent's model is not known yet; pass model too")
         if (!runtime.switchModel) throw notSupported(runtime, "switching model")
         await this.validateModel(runtime, model, directory)

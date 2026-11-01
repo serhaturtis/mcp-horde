@@ -26,6 +26,8 @@ export interface Config {
   serverMode: ServerMode
   /** Binary used when spawning `opencode serve`. */
   bin: string
+  /** Binary used for tasks whose model id starts with `cursor/` (HORDE_CURSOR_BIN, else cursor-agent). */
+  cursorBin?: string
   /** Default working directory for spawned agents. */
   directory: string
   defaultPermissions: PermissionPolicy
@@ -115,6 +117,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, opts: { cores?:
     allowInsecure: bool(env.HORDE_OPENCODE_ALLOW_INSECURE, "HORDE_OPENCODE_ALLOW_INSECURE"),
     serverMode: mode(env.HORDE_OPENCODE_SERVER),
     bin: env.HORDE_OPENCODE_BIN || "opencode",
+    cursorBin: env.HORDE_CURSOR_BIN || "cursor-agent",
     directory,
     defaultPermissions: policy(env.HORDE_OPENCODE_PERMISSIONS),
     ...maxRunning(env, directory, opts.cores ?? os.cpus().length),

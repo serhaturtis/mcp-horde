@@ -594,7 +594,7 @@ export function serverEnv(
 }
 
 /** The shell environment a session gets: the allowlist without the server's auth. */
-function workerEnvironment(env: Record<string, string | undefined>): Record<string, string> {
+export function workerEnvironment(env: Record<string, string | undefined>): Record<string, string> {
   const out: Record<string, string> = {}
   for (const [name, value] of Object.entries(env)) {
     if (value !== undefined && name !== "OPENCODE_SERVER_PASSWORD" && name !== "OPENCODE_SERVER_USERNAME") out[name] = value
