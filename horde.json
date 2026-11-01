@@ -60,5 +60,8 @@
     "audit": {
       "generated": ["plugins/horde/servers/**"]
     }
+  },
+  "opencode": {
+    "maxRunning": 4
   }
 }
