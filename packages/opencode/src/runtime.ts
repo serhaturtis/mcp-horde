@@ -162,6 +162,8 @@ export interface Runtime {
   sessions(directory: string, opts?: { limit?: number; order?: "asc" | "desc" }): Promise<SessionInfo[]>
   interrupt(id: string): Promise<void>
   remove(id: string): Promise<void>
+  /** Interrupt, drop every queued prompt and keep the transcript readable (a dropped agent must not start another turn). */
+  dispose?(id: string): Promise<void>
   readonly form?: RuntimeForm
   readonly permissions?: RuntimePermissions
   readonly revert?: RuntimeRevert

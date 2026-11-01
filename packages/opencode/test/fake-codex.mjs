@@ -71,7 +71,10 @@ const prompt = positional.length ? positional.join(" ") : await readStdin()
 const threadId = resume || randomUUID()
 const threadFile = path.join(threadsDir, `${threadId}.json`)
 
-fs.appendFileSync(invocations, `${JSON.stringify({ args: argv, prompt, cwd, sandbox, model, addDirs, threadId, pid: process.pid, at: Date.now() })}\n`)
+fs.appendFileSync(
+  invocations,
+  `${JSON.stringify({ args: argv, prompt, cwd, sandbox, model, addDirs, threadId, pid: process.pid, at: Date.now(), envKeys: Object.keys(process.env).sort() })}\n`,
+)
 
 const emit = (value) => process.stdout.write(`${JSON.stringify(value)}\n`)
 

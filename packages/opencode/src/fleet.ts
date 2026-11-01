@@ -1471,6 +1471,9 @@ export class Fleet {
       this.updateRecord(id, { pauseAfterStep: true, stopReason: reason ?? "paused after step" })
       return this.snapshot(id)
     }
+    // A drop forgets the agent: dispose first, so a queued steer cannot start a turn while the
+    // interrupt below waits for the session to settle.
+    if (reason === "dropped") await this.runtimeFor(live).dispose?.(id)
     await this.interruptNow(live, reason ?? "interrupted by the orchestrator")
     await this.waitFor([id], "all", 5_000, { markReported: false })
     return this.snapshot(id)
@@ -1572,6 +1575,8 @@ export class Fleet {
     const name = live.record.name ?? id
     const runtime = this.runtimeFor(live)
     await this.refresh(live).catch(() => undefined)
+    // Dispose first: dropping the queue before any interrupt keeps a queued tell from starting.
+    await runtime.dispose?.(id)
     if (live.state === "running" || live.state === "needs_input") {
       await this.interruptNow(live, "disposed")
       notes.push("interrupted the running turn")

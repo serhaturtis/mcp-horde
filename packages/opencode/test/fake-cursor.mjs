@@ -2,10 +2,18 @@
 // A stand-in for Cursor's agent CLI in print mode. It speaks the stream-json shapes the
 // runtime parses and acts on simple prompt lines: RUN: <cmd>, WRITE: <path>=<content>,
 // SLOW (sleep 20 s first), FAIL (end with is_error), and review prompts get JSON verdicts.
-import { spawnSync } from "node:child_process"
+// The prompt arrives on stdin (as the real CLI reads it), with HOLD_STDOUT leaving a detached
+// grandchild on stdout, SIGKILL_SELF dying by signal, and DUP_TEXT answering in two chunks.
+import { spawn, spawnSync } from "node:child_process"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
+
+const readStdin = async () => {
+  let text = ""
+  for await (const chunk of process.stdin) text += chunk
+  return text
+}
 
 const argv = process.argv.slice(2)
 const flag = (name, fallback) => {
@@ -16,7 +24,9 @@ const workspace = flag("--workspace", process.cwd())
 const resume = flag("--resume")
 const model = flag("--model", "auto")
 const mode = flag("--mode")
-const prompt = argv[argv.length - 1] ?? ""
+const stdin = process.stdin.isTTY ? "" : await readStdin()
+// The runtime writes the prompt to stdin and passes no positional argument.
+const prompt = stdin || (argv[argv.length - 1] ?? "")
 const addDirs = argv.flatMap((arg, i) => (arg === "--add-dir" && argv[i + 1] ? [argv[i + 1]] : []))
 
 const stateDir = process.env.CURSOR_FAKE_STATE || path.join(process.env.XDG_STATE_HOME || os.tmpdir(), "horde-cursor-fake")
@@ -46,6 +56,7 @@ fs.appendFileSync(
     resume: resume ?? null,
     session,
     prompt,
+    envKeys: Object.keys(process.env).sort(),
   })}\n`,
 )
 
@@ -58,6 +69,10 @@ emit({ type: "thinking", subtype: "delta", text: "working" })
 emit({ type: "thinking", subtype: "completed" })
 
 const lines = prompt.split("\n")
+if (/\bSIGKILL_SELF\b/.test(prompt)) {
+  process.kill(process.pid, "SIGKILL")
+  await sleep(10_000)
+}
 if (lines.some((l) => /^\s*SLOW\b/.test(l))) await sleep(20_000)
 
 const json = reviewJson(prompt)
@@ -119,7 +134,15 @@ if (json) {
   text = rest.join("\n").trim()
 }
 if (!text) text = "done"
-emit({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text }] }, model_call_id: `call_${Date.now()}` })
+if (/\bDUP_TEXT\b/.test(prompt)) {
+  // "Done.\nDone." split across two assistant events: a repeated tail is real text, not a duplicate.
+  text = "Done.\nDone."
+  for (const chunk of ["Done.\n", "Done."]) {
+    emit({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: chunk }] }, model_call_id: `call_${Date.now()}` })
+  }
+} else {
+  emit({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text }] }, model_call_id: `call_${Date.now()}` })
+}
 const fail = lines.some((l) => /^\s*FAIL\b/.test(l))
 emit({
   type: "result",
@@ -129,6 +152,10 @@ emit({
   result: fail ? "failed on purpose" : text,
   usage: { inputTokens: 10355, outputTokens: 175, cacheReadTokens: 18560, cacheWriteTokens: 0 },
 })
+if (/\bHOLD_STDOUT\b/.test(prompt)) {
+  // A tool that daemonizes and keeps the inherited stdout open: the runtime must finish at exit.
+  spawn(process.execPath, ["-e", "setTimeout(() => {}, 6000)"], { stdio: ["ignore", "inherit", "inherit"], detached: true }).unref()
+}
 
 /** Verdicts for a review prompt: every criterion cites the first added line of the diff. */
 function reviewJson(prompt) {

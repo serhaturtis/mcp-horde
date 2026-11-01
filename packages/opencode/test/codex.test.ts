@@ -22,6 +22,7 @@ interface Invocation {
   addDirs?: string[]
   threadId: string
   pid: number
+  envKeys?: string[]
 }
 
 const CHECK = `const fs = require("fs")
@@ -215,6 +216,23 @@ describe("the Codex runtime: codex exec --json and exec resume (fake CLI)", { ti
     assert.match(dropped, /^dropped /, dropped)
     await until(async () => !alive(invocation.pid), 10_000)
     assert.ok(!alive(invocation.pid), "horde_drop killed the codex process")
+  })
+
+  test("horde_drop never starts a queued tell", async () => {
+    const started = await h.call("horde_do", {
+      goal: "Hold this codex turn.\nSLOW",
+      done: ["it held"],
+      scope: ["held.txt"],
+    })
+    const id = taskId(started)
+    const first = await until(async () => readInvocations(codexHome).find((i) => i.prompt.includes("Hold this codex turn.")))
+    assert.ok(alive(first.pid))
+    const told = await h.call("horde_tell", { id, message: "A queued codex second turn." })
+    assert.match(told, new RegExp(id))
+    await h.call("horde_drop", { id, reason: "not needed" })
+    await until(async () => !alive(first.pid), 10_000)
+    await new Promise((r) => setTimeout(r, 1_500))
+    assert.ok(!readInvocations(codexHome).some((i) => i.prompt.includes("A queued codex second turn")), "the queued tell never started after horde_drop")
   })
 
   // The bug-hunt findings, against the runtime directly so the event, queue and status shapes
@@ -458,5 +476,72 @@ describe("the Codex runtime: codex exec --json and exec resume (fake CLI)", { ti
     assert.equal(info.tokens.input, 29420)
     assert.equal(info.tokens.output, 151)
     assert.equal(info.tokens.cache.read, 25856)
+  })
+
+  test("inbox lists a queued prompt with its id until its turn starts", async () => {
+    const runtime = newRuntime()
+    const id = await newSession(runtime, "queued inbox")
+    await runtime.prompt(id, "SLOW inbox first put")
+    await invocationWith("SLOW inbox first put")
+    const sent = await runtime.prompt(id, "inbox second put")
+    const queued = await runtime.inbox(id)
+    assert.equal(queued.length, 1)
+    const item = queued[0]!
+    assert.equal(item.type, "user")
+    assert.equal(item.id, sent.id)
+    assert.equal(item.type === "user" ? item.payload.text : "", "inbox second put")
+
+    await runtime.interrupt(id)
+    await idleMessages(runtime, id, 2)
+    assert.deepEqual(await runtime.inbox(id), [])
+  })
+
+  test("a turn with three tool calls opens a new assistant message per step", async () => {
+    const runtime = newRuntime()
+    const id = await newSession(runtime, "live steps split")
+    await runtime.prompt(id, "RUN: sleep 1\nRUN: sleep 1\nRUN: sleep 1\nRUN: sleep 6\nsteps put")
+    const live = await until(
+      async () => {
+        const page = await runtime.messages(id)
+        const assistants = page.messages.filter((m): m is SessionMessageAssistant => m.type === "assistant")
+        return assistants.length >= 3 ? assistants : undefined
+      },
+      15_000,
+      50,
+    )
+    assert.ok(live.length >= 3, "three tool calls produced three assistant messages while running")
+    assert.equal((await runtime.status(id)).state, "running")
+    await runtime.remove(id)
+
+    const second = await newSession(runtime, "finished steps split")
+    await runtime.prompt(second, "RUN: sleep 1\nRUN: sleep 1\nRUN: sleep 1\nfinished steps put")
+    await idleMessages(runtime, second)
+    const all = (await runtime.messages(second)).messages.filter((m): m is SessionMessageAssistant => m.type === "assistant")
+    assert.ok(all.length >= 3)
+    const last = all[all.length - 1]!
+    assert.equal(last.tokens?.input, 29420, "the turn's usage is on its last assistant message")
+  })
+
+  test("a provider key reaches the child only through the worker allowlist", async () => {
+    const saved = process.env.OPENAI_API_KEY
+    process.env.OPENAI_API_KEY = "sk-host-secret"
+    try {
+      const base = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: process.env.HOME ?? tmp }
+      const plain = new CodexRuntime({ info: { workerEnv: base } } as unknown as Backend, fakeBin)
+      const plainID = (await plain.createSession({ directory: repo, title: "no key", env: { CODEX_HOME: codexHome } })).id
+      await plain.prompt(plainID, "key absent put")
+      await idleMessages(plain, plainID)
+      const absent = await invocationWith("key absent put")
+      assert.ok(!absent.envKeys?.includes("OPENAI_API_KEY"), "the host's key was not copied into the child")
+
+      const allowed = new CodexRuntime({ info: { workerEnv: { ...base, OPENAI_API_KEY: "sk-allowed" } } } as unknown as Backend, fakeBin)
+      const allowedID = (await allowed.createSession({ directory: repo, title: "key allowed", env: { CODEX_HOME: codexHome } })).id
+      await allowed.prompt(allowedID, "key allowed put")
+      await idleMessages(allowed, allowedID)
+      assert.ok((await invocationWith("key allowed put")).envKeys?.includes("OPENAI_API_KEY"), "an allowlisted key reaches the child")
+    } finally {
+      if (saved === undefined) delete process.env.OPENAI_API_KEY
+      else process.env.OPENAI_API_KEY = saved
+    }
   })
 })

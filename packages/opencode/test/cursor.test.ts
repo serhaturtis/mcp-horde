@@ -4,6 +4,11 @@ import path from "node:path"
 import { after, before, describe, test } from "node:test"
 import { fileURLToPath } from "node:url"
 import { Board } from "@mcp-horde/board"
+import type { SessionMessageAssistant, SessionMessageIdle } from "@opencode/client"
+import type { Backend } from "../src/backend.js"
+import type { Config } from "../src/config.js"
+import type { CreateSessionInput } from "../src/runtime.js"
+import { CursorRuntime } from "../src/runtime-cursor.js"
 import { connect, git, type Harness, isolatedEnv, type Mock, makeRepo, until } from "./harness.js"
 import { startMockLlm } from "./mock-llm.js"
 
@@ -26,6 +31,7 @@ describe("the cursor runtime: Cursor's agent CLI as a worker", { timeout: 600_00
   let tmp: string
   let cursorState: string
   let boardState: () => string
+  let fakeBin: string
   let idOf: (text: string) => string
   let settle: (id: string) => Promise<string>
   let calls: () => Record<string, unknown>[]
@@ -47,6 +53,7 @@ describe("the cursor runtime: Cursor's agent CLI as a worker", { timeout: 600_00
     const bin = path.join(tmp, "cursor-agent")
     fs.writeFileSync(bin, `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(fakeScript)} "$@"\n`, { mode: 0o755 })
     fs.chmodSync(bin, 0o755)
+    fakeBin = bin
     boardState = () => path.join(tmp, "board-state")
     h = await connect({ ...isolatedEnv(tmp, repo), HORDE_CURSOR_BIN: bin })
     idOf = (text: string) => text.match(/\bt-[0-9a-f]+\b/)![0]
@@ -110,9 +117,10 @@ describe("the cursor runtime: Cursor's agent CLI as a worker", { timeout: 600_00
     assert.match(ready, /checks ✓ test/)
     assert.match(ready, /review: 1 of 1 criteria met \(by cursor\/fake/, ready)
     assert.match(ready, /changed 1 file\(s\) \(\+1 −0\): hello\.txt/)
-    // Status carries the step count and the result's tokens.
+    // Status carries the step count (one assistant message per completed tool plus the answer)
+    // and the result's tokens.
     const status = await h.call("opencode_status", { ids: [id] })
-    assert.match(status, /1 steps · \$\d.* · \d+\.?\d*k? tok/, status)
+    assert.match(status, /3 steps · \$\d.* · \d+\.?\d*k? tok/, status)
 
     // The transcript carries the shell tool's command and output as OpenCode-shaped parts.
     const transcript = await h.call("opencode_output", { id, scope: "all" })
@@ -241,5 +249,241 @@ describe("the cursor runtime: Cursor's agent CLI as a worker", { timeout: 600_00
       "review_task ran in ask mode",
     )
     await h.call("horde_drop", { id })
+  })
+
+  test("horde_drop never starts a queued tell", async () => {
+    const id = idOf(
+      await h.call("horde_do", {
+        goal: "Hold this turn open.\nSLOW",
+        done: ["it held"],
+        scope: ["held.txt"],
+      }),
+    )
+    const first = await until(() => Promise.resolve(calls().find((c) => typeof c.prompt === "string" && c.prompt.includes("Hold this turn open"))), 20_000, 100)
+    assert.equal(typeof first.pid, "number")
+    const told = await h.call("horde_tell", { id, message: "A queued second turn.\nWRITE: never.txt=no" })
+    assert.match(told, new RegExp(id))
+    await h.call("horde_drop", { id, reason: "not needed" })
+    await until(() => Promise.resolve(!alive(first.pid as number)), 10_000, 100)
+    await new Promise((r) => setTimeout(r, 1_500))
+    assert.ok(!calls().some((c) => typeof c.prompt === "string" && c.prompt.includes("A queued second turn")), "the queued tell never started after horde_drop")
+  })
+
+  test("the step limit interrupts a cursor turn before it finishes", async () => {
+    const out = await h.call("opencode_spawn", {
+      prompt: "Steps here.\nRUN: sleep 2\nRUN: sleep 2\nRUN: sleep 2\nlast put",
+      name: "cursor-limit",
+      model: "cursor/fake",
+      directory: repo,
+      permissions: "allow",
+      limits: { max_steps: 2 },
+      wait: true,
+      timeout_seconds: 120,
+    })
+    assert.match(out, /INTERRUPTED/, out)
+    assert.match(out, /reason: step limit reached \(2 steps this turn\)/, out)
+  })
+
+  // The bug-hunt findings, against the runtime directly so messages and the fake CLI's log are
+  // visible. The fake CLI's markers are described at the top of fake-cursor.mjs.
+  const readCalls = (state: string) => {
+    try {
+      return fs
+        .readFileSync(path.join(state, "calls.jsonl"), "utf8")
+        .split("\n")
+        .filter(Boolean)
+        .flatMap((line) => {
+          try {
+            return [JSON.parse(line) as Record<string, unknown>]
+          } catch {
+            return []
+          }
+        })
+    } catch {
+      return []
+    }
+  }
+  const newRuntime = () =>
+    new CursorRuntime(
+      {
+        info: {
+          workerEnv: {
+            PATH: process.env.PATH ?? "/usr/bin:/bin",
+            HOME: process.env.HOME ?? tmp,
+            XDG_STATE_HOME: path.join(tmp, "xdg-state"),
+          },
+        },
+      } as unknown as Backend,
+      { cursorBin: fakeBin } as unknown as Config,
+    )
+  const newSession = async (runtime: CursorRuntime, title: string, extra: Partial<CreateSessionInput> = {}) =>
+    (await runtime.createSession({ directory: repo, title, ...extra })).id
+  const idleMessages = (runtime: CursorRuntime, id: string, count = 1) =>
+    until(async () => {
+      const page = await runtime.messages(id)
+      const found = page.messages.filter((m): m is SessionMessageIdle => m.type === "idle")
+      return found.length >= count ? found : undefined
+    }, 30_000)
+  const lastAssistant = (runtime: CursorRuntime, id: string) =>
+    until(async () => {
+      const page = await runtime.messages(id)
+      return [...page.messages].reverse().find((m): m is SessionMessageAssistant => m.type === "assistant")
+    }, 20_000)
+  const callWith = (text: string) => until(() => Promise.resolve(calls().find((c) => typeof c.prompt === "string" && c.prompt.includes(text))), 20_000, 100)
+
+  test("a turn killed by a signal fails and names the signal", async () => {
+    const runtime = newRuntime()
+    const id = await newSession(runtime, "signal death")
+    await runtime.prompt(id, "SIGKILL_SELF")
+    const done = (await idleMessages(runtime, id))[0]!
+    assert.equal(done.outcome, "failed")
+    assert.match(done.error?.message ?? "", /SIGKILL/)
+    assert.equal((await runtime.status(id)).state, "error")
+  })
+
+  test("permissions deny runs read-only in ask mode", async () => {
+    const runtime = newRuntime()
+    const id = await newSession(runtime, "deny read-only", { permissions: "deny" })
+    await runtime.prompt(id, "deny mode put")
+    await idleMessages(runtime, id)
+    const call = await callWith("deny mode put")
+    assert.equal(call.mode, "ask")
+  })
+
+  test("a grandchild holding stdout does not keep the turn open", async () => {
+    const runtime = newRuntime()
+    const id = await newSession(runtime, "grandchild stdout")
+    const started = Date.now()
+    await runtime.prompt(id, "HOLD_STDOUT")
+    const done = (await idleMessages(runtime, id))[0]!
+    assert.equal(done.outcome, "succeeded")
+    assert.ok(Date.now() - started < 8_000, "the turn finished at the process exit, not the pipe close")
+    assert.equal((await runtime.status(id)).state, "idle")
+  })
+
+  test("CreateSessionInput.env reaches the child and setEnvironment changes it", async () => {
+    const runtime = newRuntime()
+    const first = path.join(tmp, "cursor-env-first")
+    const second = path.join(tmp, "cursor-env-second")
+    const id = await newSession(runtime, "session env", { env: { CURSOR_FAKE_STATE: first } })
+    await runtime.prompt(id, "env first put")
+    await idleMessages(runtime, id)
+    assert.ok(
+      readCalls(first).some((c) => typeof c.prompt === "string" && c.prompt.includes("env first put")),
+      "the session's env reached the first turn",
+    )
+
+    await runtime.setEnvironment(id, { CURSOR_FAKE_STATE: second })
+    await runtime.prompt(id, "env second put")
+    await idleMessages(runtime, id, 2)
+    assert.ok(
+      readCalls(second).some((c) => typeof c.prompt === "string" && c.prompt.includes("env second put")),
+      "setEnvironment reached the next turn",
+    )
+  })
+
+  test("a cursor provider key reaches the child only through the worker allowlist", async () => {
+    const saved = process.env.CURSOR_API_KEY
+    process.env.CURSOR_API_KEY = "cursor-host-secret"
+    try {
+      const runtime = newRuntime()
+      const id = await newSession(runtime, "cursor key absent")
+      await runtime.prompt(id, "cursor key absent put")
+      await idleMessages(runtime, id)
+      const absent = await callWith("cursor key absent put")
+      assert.ok(!(absent.envKeys as string[] | undefined)?.includes("CURSOR_API_KEY"), "the host's key was not copied into the child")
+
+      const allowed = new CursorRuntime(
+        {
+          info: {
+            workerEnv: {
+              PATH: process.env.PATH ?? "/usr/bin:/bin",
+              HOME: process.env.HOME ?? tmp,
+              XDG_STATE_HOME: path.join(tmp, "xdg-state"),
+              CURSOR_API_KEY: "cursor-allowed",
+            },
+          },
+        } as unknown as Backend,
+        { cursorBin: fakeBin } as unknown as Config,
+      )
+      const allowedID = await newSession(allowed, "cursor key allowed")
+      await allowed.prompt(allowedID, "cursor key allowed put")
+      await idleMessages(allowed, allowedID)
+      const present = await callWith("cursor key allowed put")
+      assert.ok((present.envKeys as string[] | undefined)?.includes("CURSOR_API_KEY"), "an allowlisted key reaches the child")
+    } finally {
+      if (saved === undefined) delete process.env.CURSOR_API_KEY
+      else process.env.CURSOR_API_KEY = saved
+    }
+  })
+
+  test("a repeated tail of the answer is kept whole", async () => {
+    const runtime = newRuntime()
+    const id = await newSession(runtime, "repeated text")
+    await runtime.prompt(id, "DUP_TEXT")
+    await idleMessages(runtime, id)
+    const assistant = await lastAssistant(runtime, id)
+    const text = assistant.content.map((p) => (p.type === "text" ? p.text : "")).join("")
+    assert.equal(text, "Done.\nDone.")
+  })
+
+  test("models() tolerates a malformed horde.json", async () => {
+    const directory = fs.mkdtempSync(path.join(tmp, "bad-horde-"))
+    fs.writeFileSync(path.join(directory, "horde.json"), "{ not json")
+    const models = await newRuntime().models(directory)
+    assert.deepEqual(
+      models.map((m) => m.id),
+      ["auto"],
+    )
+  })
+
+  test("a 300 KB prompt and one starting with '-' both reach cursor-agent through stdin", async () => {
+    const runtime = newRuntime()
+    const id = await newSession(runtime, "stdin prompt")
+    const prompt = `-1 more thing\nPAD:${"x".repeat(300_000)}`
+    await runtime.prompt(id, prompt)
+    const done = (await idleMessages(runtime, id))[0]!
+    assert.equal(done.outcome, "succeeded")
+    const call = await callWith("-1 more thing")
+    assert.equal(call.prompt, prompt)
+    const argv = call.argv as string[]
+    assert.ok(!argv.includes(prompt), "the prompt is not in argv")
+    assert.ok(!argv.some((arg) => arg.length > 1_000), "no oversized argv element")
+  })
+
+  test("status follows the process, not a caller's stale active set", async () => {
+    const runtime = newRuntime()
+    const id = await newSession(runtime, "status authority")
+    await runtime.prompt(id, "SLOW status put")
+    await callWith("SLOW status put")
+    assert.equal((await runtime.status(id, new Set())).state, "running")
+    await runtime.remove(id)
+  })
+
+  test("a turn with three tool calls opens a new assistant message per step", async () => {
+    const runtime = newRuntime()
+    const id = await newSession(runtime, "live steps")
+    await runtime.prompt(id, "RUN: sleep 1\nRUN: sleep 1\nRUN: sleep 1\nRUN: sleep 6\nsteps put")
+    const live = await until(
+      async () => {
+        const page = await runtime.messages(id)
+        const assistants = page.messages.filter((m): m is SessionMessageAssistant => m.type === "assistant")
+        return assistants.length >= 3 ? assistants : undefined
+      },
+      15_000,
+      50,
+    )
+    assert.ok(live.length >= 3, "three tool calls produced three assistant messages while running")
+    assert.equal((await runtime.status(id)).state, "running")
+    await runtime.remove(id)
+
+    const second = await newSession(runtime, "finished steps")
+    await runtime.prompt(second, "RUN: sleep 1\nRUN: sleep 1\nRUN: sleep 1\nfinished steps put")
+    await idleMessages(runtime, second)
+    const all = (await runtime.messages(second)).messages.filter((m): m is SessionMessageAssistant => m.type === "assistant")
+    assert.ok(all.length >= 3)
+    const last = all[all.length - 1]!
+    assert.equal(last.tokens?.input, 10355, "the turn's usage is on its last assistant message")
+    assert.equal(last.cost, 0)
   })
 })

@@ -56,13 +56,16 @@ interface TurnState {
   failure?: string
   usage?: CodexUsage
   completed: boolean
-  /** Item id -> index in the assistant message's content. */
-  parts: Map<string, number>
+  /** A completed tool closed the current assistant message: the next content opens a new one. */
+  split: boolean
+  /** Item id -> the part it produced (across every assistant message in the turn). */
+  parts: Map<string, SessionMessageAssistant["content"][number]>
 }
 
 interface Queued {
   id: string
   text: string
+  at: number
 }
 
 interface CodexSession {
@@ -207,8 +210,9 @@ export class CodexRuntime implements Runtime {
   async prompt(id: string, text: string, _opts: PromptOptions = {}): Promise<{ id: string }> {
     const session = this.get(id)
     const messageID = this.messageID()
-    session.queue.push({ id: messageID, text })
-    session.updatedAt = this.now()
+    const at = this.now()
+    session.queue.push({ id: messageID, text, at })
+    session.updatedAt = at
     if (!session.running) this.startNext(session)
     return { id: messageID }
   }
@@ -241,8 +245,16 @@ export class CodexRuntime implements Runtime {
     return { messages, ...(last ? { cursor: `${desc ? "desc" : "asc"}:${last.id}` } : {}) }
   }
 
-  async inbox(_id: string): Promise<SessionInboxInfo[]> {
-    return []
+  async inbox(id: string): Promise<SessionInboxInfo[]> {
+    const session = this.get(id)
+    return session.queue.map((q) => ({
+      id: q.id,
+      sessionID: session.id,
+      time: { created: q.at },
+      type: "user" as const,
+      payload: { text: q.text },
+      delivery: "queue" as const,
+    }))
   }
 
   async status(id: string, active?: Set<string>): Promise<RuntimeStatus> {
@@ -304,6 +316,18 @@ export class CodexRuntime implements Runtime {
     timer.unref()
   }
 
+  /**
+   * Dispose a session: kill its turn, drop everything still queued (a dropped worker must not
+   * start another turn), and keep the transcript readable.
+   */
+  async dispose(id: string): Promise<void> {
+    const session = this.byID.get(id)
+    if (!session) return
+    session.removed = true
+    session.queue = []
+    await this.interrupt(id)
+  }
+
   async switchModel(id: string, model: ModelRef): Promise<void> {
     const session = this.get(id)
     session.model = model
@@ -357,15 +381,8 @@ export class CodexRuntime implements Runtime {
     const first = session.turns.length === 0
     const at = this.now()
     const user: SessionMessageInfo = { id: next.id, type: "user", time: { created: at }, text: next.text }
-    const assistant: SessionMessageAssistant = {
-      id: this.messageID(),
-      type: "assistant",
-      agent: "codex",
-      model: this.modelRef(session),
-      time: { created: this.now() },
-      content: [],
-    }
-    const turn: TurnState = { assistant, interrupted: false, completed: false, parts: new Map() }
+    const assistant = this.newAssistant(session)
+    const turn: TurnState = { assistant, interrupted: false, completed: false, split: false, parts: new Map() }
     session.messages.push(user, assistant)
     session.turns.push(turn)
     session.running = true
@@ -377,7 +394,7 @@ export class CodexRuntime implements Runtime {
     if (session.freshThreadNote) {
       const note = session.freshThreadNote
       session.freshThreadNote = undefined
-      this.note(turn, "thread", note)
+      this.note(session, turn, "thread", note)
     } else if (!first && !session.threadId) {
       // The first turn ended before Codex reported a thread id; starting over would lose the history silently.
       this.fail(session, turn, "cannot resume the Codex thread: the previous turn ended before Codex reported a thread id")
@@ -386,9 +403,39 @@ export class CodexRuntime implements Runtime {
       return
     }
     if (session.model?.variant && !REASONING_EFFORTS.has(session.model.variant)) {
-      this.note(turn, "variant", `Codex does not accept the model variant "${session.model.variant}"; using the default reasoning effort`)
+      this.note(session, turn, "variant", `Codex does not accept the model variant "${session.model.variant}"; using the default reasoning effort`)
     }
     this.run(session, turn, next.text)
+  }
+
+  private newAssistant(session: CodexSession): SessionMessageAssistant {
+    return {
+      id: this.messageID(),
+      type: "assistant",
+      agent: "codex",
+      model: this.modelRef(session),
+      time: { created: this.now() },
+      content: [],
+    }
+  }
+
+  /** The current step: opens a new assistant message after a completed tool closed the last. */
+  private step(session: CodexSession, turn: TurnState): SessionMessageAssistant {
+    if (!turn.split) return turn.assistant
+    turn.split = false
+    const assistant = this.newAssistant(session)
+    session.messages.push(assistant)
+    session.updatedAt = assistant.time.created
+    turn.assistant = assistant
+    return assistant
+  }
+
+  /** Close the step after a completed tool, so the tracker counts it while the turn still runs. */
+  private closeStep(turn: TurnState) {
+    if (turn.split) return
+    turn.assistant.time = { ...turn.assistant.time, completed: this.now() }
+    turn.assistant.finish = "tool-calls"
+    turn.split = true
   }
 
   private run(session: CodexSession, turn: TurnState, text: string) {
@@ -477,11 +524,11 @@ export class CodexRuntime implements Runtime {
     return ["exec", "resume", session.threadId, "--json", "-c", `sandbox_mode="${sandbox}"`, ...roots, ...effort, "--skip-git-repo-check", ...model]
   }
 
-  /** The allowlisted worker environment plus what Codex itself needs. */
+  /** The allowlisted worker environment plus the paths Codex itself needs. */
   private environment(session: CodexSession): Record<string, string> {
     const env: Record<string, string> = { ...(this.backend.info.workerEnv ?? {}) }
+    // CODEX_HOME is a path, not a credential; the CLI's own auth.json is its default login.
     if (process.env.CODEX_HOME) env.CODEX_HOME = process.env.CODEX_HOME
-    if (process.env.OPENAI_API_KEY) env.OPENAI_API_KEY = process.env.OPENAI_API_KEY
     return { ...env, ...session.env }
   }
 
@@ -536,17 +583,18 @@ export class CodexRuntime implements Runtime {
     switch (item.type) {
       case "agent_message": {
         const text = typeof item.text === "string" ? item.text : ""
-        const part = this.part(turn, id, () => ({ type: "text", text: "" }))
+        const part = this.part(session, turn, id, () => ({ type: "text", text: "" }))
         if (part.type === "text") part.text = text
         if (completed && text) {
-          this.emit("session.text.started", { sessionID: session.id, assistantMessageID: turn.assistant.id, ordinal: turn.parts.get(id) ?? 0 })
-          this.emit("session.text.delta", { sessionID: session.id, assistantMessageID: turn.assistant.id, ordinal: turn.parts.get(id) ?? 0, delta: text })
+          const ordinal = turn.assistant.content.indexOf(part)
+          this.emit("session.text.started", { sessionID: session.id, assistantMessageID: turn.assistant.id, ordinal })
+          this.emit("session.text.delta", { sessionID: session.id, assistantMessageID: turn.assistant.id, ordinal, delta: text })
         }
         break
       }
       case "reasoning": {
         const text = typeof item.text === "string" ? item.text : ""
-        const part = this.part(turn, id, () => ({ type: "reasoning", text: "" }))
+        const part = this.part(session, turn, id, () => ({ type: "reasoning", text: "" }))
         if (part.type === "reasoning") part.text = text
         break
       }
@@ -571,10 +619,10 @@ export class CodexRuntime implements Runtime {
           return typeof (c as { path?: unknown }).path === "string" && (c as { path: string }).path !== ""
         })
         if (!changes.length) {
-          this.note(turn, id, "Codex reported a file_change item without a usable path; skipped it")
+          this.note(session, turn, id, "Codex reported a file_change item without a usable path; skipped it")
           break
         }
-        if (changes.length !== raw.length) this.note(turn, id, `Codex reported ${raw.length - changes.length} malformed file change(s); skipped them`)
+        if (changes.length !== raw.length) this.note(session, turn, id, `Codex reported ${raw.length - changes.length} malformed file change(s); skipped them`)
         const paths = changes.map((c) => c.path)
         const input: Record<string, JsonValue> = {
           path: paths[0] ?? "",
@@ -597,24 +645,30 @@ export class CodexRuntime implements Runtime {
       }
       default: {
         if (!completed) return
-        this.part(turn, id, () => ({ type: "text", text: JSON.stringify(item) }))
+        this.part(session, turn, id, () => ({ type: "text", text: JSON.stringify(item) }))
         break
       }
     }
   }
 
-  /** The content part for an item, creating it (and remembering its index) on first use. */
-  private part(turn: TurnState, id: string, make: () => SessionMessageAssistant["content"][number]): SessionMessageAssistant["content"][number] {
-    const at = turn.parts.get(id)
-    if (at !== undefined) return turn.assistant.content[at]!
+  /** The content part for an item, creating it (and opening a new step) on first use. */
+  private part(
+    session: CodexSession,
+    turn: TurnState,
+    id: string,
+    make: () => SessionMessageAssistant["content"][number],
+  ): SessionMessageAssistant["content"][number] {
+    const existing = turn.parts.get(id)
+    if (existing) return existing
+    const assistant = this.step(session, turn)
     const part = make()
-    turn.assistant.content.push(part)
-    turn.parts.set(id, turn.assistant.content.length - 1)
+    assistant.content.push(part)
+    turn.parts.set(id, part)
     return part
   }
 
   private toolPart(session: CodexSession, turn: TurnState, id: string, name: string, state: SessionMessageAssistantTool["state"], completed: boolean) {
-    const part = this.part(turn, id, () => ({ type: "tool" as const, id, name, state, time: { created: this.now() } }))
+    const part = this.part(session, turn, id, () => ({ type: "tool" as const, id, name, state, time: { created: this.now() } }))
     if (part.type !== "tool") return
     part.name = name
     part.state = state
@@ -635,12 +689,13 @@ export class CodexRuntime implements Runtime {
         cost: 0,
         tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
       })
+      this.closeStep(turn)
     }
   }
 
   /** A visible note in the assistant message: the event was unusual but not fatal. */
-  private note(turn: TurnState, id: string, text: string) {
-    const part = this.part(turn, `note:${id}`, () => ({ type: "text" as const, text: "" }))
+  private note(session: CodexSession, turn: TurnState, id: string, text: string) {
+    const part = this.part(session, turn, `note:${id}`, () => ({ type: "text" as const, text: "" }))
     if (part.type === "text") part.text = text
   }
 
@@ -673,7 +728,7 @@ export class CodexRuntime implements Runtime {
     if (outcome === "failed" && !turn.failure) turn.failure = `codex exited with code ${code}`
     // A tool still marked running was cut off with the process.
     if (outcome !== "succeeded") {
-      for (const part of turn.assistant.content) {
+      for (const part of turn.parts.values()) {
         if (part.type !== "tool" || (part.state.status !== "running" && part.state.status !== "streaming")) continue
         part.state = {
           status: "error",

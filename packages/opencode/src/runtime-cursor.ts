@@ -31,11 +31,14 @@ interface Turn {
   resultText: string
   spawnError?: string
   finished: boolean
+  /** A completed tool closed the current assistant message: the next content opens a new one. */
+  split: boolean
 }
 
 interface Queued {
   id: string
   text: string
+  at: number
 }
 
 interface Session {
@@ -48,6 +51,7 @@ interface Session {
   /** The model id passed to `--model` (without the runtime prefix). */
   modelID?: string
   askMode: boolean
+  env?: Record<string, string>
   writableDirs?: string[]
   createdAt: number
   updatedAt: number
@@ -89,18 +93,21 @@ export class CursorRuntime implements Runtime {
     this.bin = config?.cursorBin ?? process.env.HORDE_CURSOR_BIN ?? "cursor-agent"
     const worker = backend.info.workerEnv ?? workerEnvironment(serverEnv({ username: "cursor" }))
     this.baseEnv = { ...worker }
-    // Cursor's CLI needs its login (HOME, inherited from the allowlist) and, when the user
-    // supplies one, its API key. Nothing else of our shell's environment reaches the worker.
+    // Cursor's CLI needs its login (HOME, inherited from the allowlist). A provider key reaches
+    // the child only through the allowlist's HORDE_OPENCODE_PASS_ENV opt-in, like any other.
     if (!this.baseEnv.HOME && process.env.HOME) this.baseEnv.HOME = process.env.HOME
-    if (process.env.CURSOR_API_KEY) this.baseEnv.CURSOR_API_KEY = process.env.CURSOR_API_KEY
     if (!this.baseEnv.PATH && process.env.PATH) this.baseEnv.PATH = process.env.PATH
   }
 
   async models(directory?: string): Promise<ModelInfo[]> {
     const ids = new Set<string>()
-    for (const tier of loadTiers(directory ?? process.cwd())) {
-      const named = /^cursor\/(.+)$/.exec(tier.model)
-      if (named) ids.add(named[1]!)
+    try {
+      for (const tier of loadTiers(directory ?? process.cwd())) {
+        const named = /^cursor\/(.+)$/.exec(tier.model)
+        if (named) ids.add(named[1]!)
+      }
+    } catch {
+      // A malformed horde.json is reported where it is read; the catalog still has its defaults.
     }
     ids.add("auto")
     return [...ids].map((id) => ({
@@ -128,8 +135,10 @@ export class CursorRuntime implements Runtime {
       title: input.title,
       model,
       modelID: model?.id,
-      // The ask path runs with every tool denied; Cursor's read-only mode keeps it to answering.
-      askMode: !!input.rules?.some((r) => r.action === "*" && r.resource === "*" && r.effect === "deny"),
+      // The ask path runs read-only (with every tool denied, or with the deny policy): Cursor's
+      // ask mode keeps it to answering.
+      askMode: input.permissions === "deny" || !!input.rules?.some((r) => r.action === "*" && r.resource === "*" && r.effect === "deny"),
+      ...(input.env ? { env: input.env } : {}),
       ...(input.writableDirs?.length ? { writableDirs: input.writableDirs } : {}),
       createdAt: now,
       updatedAt: now,
@@ -157,7 +166,7 @@ export class CursorRuntime implements Runtime {
     const session = this.require(id)
     const userID = this.newID("msg")
     const body = opts.files?.length ? `${text}\n\n${opts.files.map((f) => `<file uri="${f.uri}"${f.name ? ` name="${f.name}"` : ""} />`).join("\n")}` : text
-    const queued = { id: userID, text: body }
+    const queued = { id: userID, text: body, at: Date.now() }
     // No mid-turn steering: a prompt sent while the process runs starts the next --resume turn.
     if (session.proc) session.queue.push(queued)
     else this.start(session, queued)
@@ -180,12 +189,20 @@ export class CursorRuntime implements Runtime {
   }
 
   async inbox(id: string): Promise<SessionInboxInfo[]> {
-    this.require(id)
-    return []
+    const session = this.require(id)
+    return session.queue.map((q) => ({
+      id: q.id,
+      sessionID: session.id,
+      time: { created: q.at },
+      type: "user" as const,
+      payload: { text: q.text },
+      delivery: "queue" as const,
+    }))
   }
 
   async status(id: string, active?: Set<string>): Promise<RuntimeStatus> {
     const session = this.require(id)
+    // The process state is authoritative; a caller's stale active set must not hide it.
     const running = active ?? (await this.active())
     if (session.running) return { state: "running", session: this.info(session), active: running }
     if (session.lastOutcome === "failed")
@@ -221,6 +238,24 @@ export class CursorRuntime implements Runtime {
     timer.unref()
   }
 
+  /**
+   * Dispose a session: kill its turn, drop everything still queued (a dropped worker must not
+   * start another turn), and keep the transcript readable.
+   */
+  async dispose(id: string): Promise<void> {
+    const session = this.chats.get(id)
+    if (!session) return
+    session.removed = true
+    session.queue = []
+    await this.interrupt(id)
+  }
+
+  async setEnvironment(id: string, env: Record<string, string>): Promise<void> {
+    const session = this.require(id)
+    session.env = { ...session.env, ...env }
+    session.updatedAt = Date.now()
+  }
+
   async remove(id: string): Promise<void> {
     const session = this.chats.get(id)
     if (!session) return
@@ -242,17 +277,7 @@ export class CursorRuntime implements Runtime {
   private start(session: Session, prompt: Queued) {
     const now = this.stamp(session)
     const user: SessionMessageUser = { id: prompt.id, time: { created: now }, text: prompt.text, type: "user" }
-    const assistant: SessionMessageAssistant = {
-      id: this.newID("msg"),
-      time: { created: now },
-      type: "assistant",
-      agent: "cursor",
-      model: this.modelRef(session),
-      content: [],
-      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
-      cost: 0,
-      finish: "stop",
-    }
+    const assistant = this.newAssistant(session, now)
     const turn: Turn = {
       assistant,
       tools: new Map(),
@@ -262,6 +287,7 @@ export class CursorRuntime implements Runtime {
       isError: false,
       resultText: "",
       finished: false,
+      split: false,
     }
     session.messages.push(user, assistant)
     session.running = true
@@ -276,14 +302,13 @@ export class CursorRuntime implements Runtime {
     if (session.askMode) args.push("--mode", "ask")
     if (session.modelID) args.push("--model", session.modelID)
     if (session.cursorID) args.push("--resume", session.cursorID)
-    args.push(prompt.text)
 
     let proc: ChildProcess
     try {
       proc = spawn(this.bin, args, {
         cwd: session.directory,
-        env: this.baseEnv,
-        stdio: ["ignore", "pipe", "pipe"],
+        env: this.environment(session),
+        stdio: ["pipe", "pipe", "pipe"],
         detached: !isWindows,
         windowsHide: true,
       })
@@ -295,8 +320,16 @@ export class CursorRuntime implements Runtime {
     session.proc = proc
     const stderr = { text: "" }
     let pending = ""
+    // The prompt goes through stdin: a large prompt cannot hit argv's E2BIG, and a prompt that
+    // starts with "-" is not parsed as an option.
+    proc.stdin?.on("error", (err) => {
+      if (turn.finished) return
+      if ((err as NodeJS.ErrnoException).code !== "EPIPE") turn.spawnError = err.message
+    })
+    proc.stdin?.end(prompt.text)
     proc.stdout?.setEncoding("utf8")
     proc.stdout?.on("data", (chunk: string) => {
+      if (turn.finished) return
       const lines = (pending + chunk).split("\n")
       pending = lines.pop() ?? ""
       for (const line of lines) this.ingest(session, turn, line)
@@ -309,13 +342,53 @@ export class CursorRuntime implements Runtime {
       turn.spawnError = err.message
       this.finish(session, turn, undefined, stderr.text)
     })
-    proc.once("close", (code, signal) => {
+    // Finish on exit, not close: a grandchild that inherits stdout can keep the pipes open long
+    // after cursor-agent is gone, and the turn must not wait for it.
+    proc.once("exit", (code, signal) => {
       if (pending) this.ingest(session, turn, pending)
-      this.finish(session, turn, code ?? undefined, stderr.text, signal ?? undefined)
+      this.finish(session, turn, code, stderr.text, signal ?? undefined)
+      proc.stdout?.destroy()
+      proc.stderr?.destroy()
     })
   }
 
-  private finish(session: Session, turn: Turn, code?: number, stderr?: string, signal?: string) {
+  private newAssistant(session: Session, at: number): SessionMessageAssistant {
+    return {
+      id: this.newID("msg"),
+      time: { created: at },
+      type: "assistant",
+      agent: "cursor",
+      model: this.modelRef(session),
+      content: [],
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      cost: 0,
+      finish: "stop",
+    }
+  }
+
+  /** The current step: opens a new assistant message after a completed tool closed the last. */
+  private step(session: Session, turn: Turn): SessionMessageAssistant {
+    if (!turn.split) return turn.assistant
+    turn.split = false
+    const at = this.stamp(session)
+    const assistant = this.newAssistant(session, at)
+    session.messages.push(assistant)
+    session.updatedAt = at
+    turn.assistant = assistant
+    turn.parts = assistant.content
+    return assistant
+  }
+
+  /** Close the step after a completed tool, so the tracker counts it while the turn still runs. */
+  private closeStep(session: Session, turn: Turn) {
+    if (turn.split) return
+    const at = this.stamp(session)
+    turn.assistant.time.completed = at
+    turn.assistant.finish = "tool-calls"
+    turn.split = true
+  }
+
+  private finish(session: Session, turn: Turn, code: number | null | undefined, stderr?: string, signal?: string) {
     if (turn.finished) return
     turn.finished = true
     const interrupted = session.interrupted
@@ -325,14 +398,18 @@ export class CursorRuntime implements Runtime {
         ? undefined
         : turn.isError
           ? turn.resultText || "cursor-agent reported an error"
-          : code !== undefined && code !== 0
-            ? turn.resultText || stderr?.trim() || `cursor-agent exited with code ${code}${signal ? ` (${signal})` : ""}`
-            : undefined)
+          : signal
+            ? `cursor-agent was killed by ${signal}`
+            : code !== undefined && code !== 0
+              ? turn.resultText || stderr?.trim() || `cursor-agent exited with code ${code}`
+              : undefined)
     const outcome: "succeeded" | "failed" | "interrupted" = interrupted ? "interrupted" : failure ? "failed" : "succeeded"
     const at = this.stamp(session)
+    // The turn's usage and cost belong to its last assistant message.
     turn.assistant.time.completed = at
     turn.assistant.finish = outcome === "failed" ? "error" : "stop"
-    if (!turn.usage) turn.assistant.tokens = { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }
+    turn.assistant.tokens = turn.usage ?? { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }
+    turn.assistant.cost = 0
     // A tool still marked running was cut off with the process.
     for (const part of turn.tools.values()) {
       if (part.state.status !== "running" && part.state.status !== "streaming") continue
@@ -367,6 +444,7 @@ export class CursorRuntime implements Runtime {
   }
 
   private ingest(session: Session, turn: Turn, line: string) {
+    if (turn.finished) return
     const text = line.trim()
     if (!text) return
     let raw: Record<string, unknown>
@@ -405,25 +483,20 @@ export class CursorRuntime implements Runtime {
         reasoning: 0,
         cache: { read: number(usage?.cacheReadTokens), write: number(usage?.cacheWriteTokens) },
       }
-      turn.assistant.tokens = turn.usage
-      turn.assistant.cost = 0
       turn.isError = raw.is_error === true || raw.subtype === "error"
       const result = typeof raw.result === "string" ? raw.result : ""
       if (result.trim()) {
         turn.resultText = result
-        const joined = turn.parts
-          .filter((p): p is Extract<SessionMessageAssistant["content"][number], { type: "text" }> => p.type === "text")
-          .map((p) => p.text)
-          .join("")
-        if (joined.trim() !== result.trim()) this.addText(session, turn, result)
+        if (result.trim() !== turn.text.trim()) this.addText(session, turn, result)
       }
     }
   }
 
   private addText(session: Session, turn: Turn, text: string) {
     if (!text) return
-    // The result repeats the assistant message's text; do not let the answer appear twice.
-    if (text === turn.text.slice(-text.length) && turn.text) return
+    // Only a repeat of the whole answer is a duplicate; a chunk that repeats a tail is real text.
+    if (turn.text && text === turn.text) return
+    this.step(session, turn)
     turn.text += text
     turn.parts.push({ type: "text", text })
     const ordinal = turn.textOrdinal++
@@ -446,6 +519,7 @@ export class CursorRuntime implements Runtime {
     const at = Date.now()
     let part = turn.tools.get(id)
     if (!part) {
+      this.step(session, turn)
       part = {
         type: "tool",
         id,
@@ -478,6 +552,12 @@ export class CursorRuntime implements Runtime {
       cost: 0,
       tokens: turn.usage ?? { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
     })
+    this.closeStep(session, turn)
+  }
+
+  /** The allowlisted worker environment plus the session's own variables (paths such as HOME stay). */
+  private environment(session: Session): Record<string, string> {
+    return { ...this.baseEnv, ...session.env }
   }
 
   // --------------------------------------------------------------- records
