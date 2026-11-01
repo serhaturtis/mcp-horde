@@ -493,6 +493,38 @@ describe("fleet landing: pure helpers and stranded workers", () => {
     }
   })
 
+  test("message, respond, setScope and setDone refuse while the task is landing", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "horde-landing-guards-"))
+    const store = new Store(path.join(tmp, "state"))
+    const fleet = new Fleet(BACKEND, CONFIG(tmp), store, HOOKS)
+    const id = "ses_landing"
+    store.put({
+      id,
+      server: "local",
+      directory: tmp,
+      policy: "ask",
+      questions: "ask",
+      limits: {},
+      createdAt: 1,
+      reportedSeq: 0,
+      owner: SELF,
+      ownerSeen: Date.now(),
+    })
+    const fleetAny = fleet as unknown as { adoptRecord: (r: AgentRecord) => unknown; landingTasks: Set<string> }
+    fleetAny.adoptRecord(store.get(id)!)
+    fleetAny.landingTasks.add(id)
+    const landing = /the task is landing; wait for horde_land's answer/
+    try {
+      await assert.rejects(fleet.message(id, "hi"), landing)
+      await assert.rejects(fleet.respond(id, "req", {}), landing)
+      await assert.rejects(fleet.setScope(id, ["a.txt"]), landing)
+      await assert.rejects(fleet.setDone(id, ["a.txt exists"]), landing)
+    } finally {
+      await fleet.close({ keepNews: true })
+      fs.rmSync(tmp, { recursive: true, force: true })
+    }
+  })
+
   test("outcome ignores a pass verdict from an earlier turn", async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "horde-landing-outcome-"))
     const snapshot: Snapshot = {
