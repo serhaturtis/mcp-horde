@@ -105,7 +105,19 @@ function gitState(cwd) {
     }
     return changed
   }
-  return { head, root, files }
+  /** The paths a commit or range changed, for a Bash call that committed during the call. */
+  function changedSince(from, to) {
+    try {
+      const dir = root()
+      return git("diff", "--name-only", "-z", from, to)
+        .split("\0")
+        .filter(Boolean)
+        .map((file) => path.resolve(dir, file))
+    } catch {
+      return []
+    }
+  }
+  return { head, root, files, changedSince }
 }
 
 /** The resolved path, through symlinks when the file exists. */
@@ -138,20 +150,26 @@ function postToolUse(input) {
     if (saved.prompt === input.prompt_id) state = saved
   } catch {}
   const git = gitState(input.cwd)
+  const isBash = input.tool_name === "Bash"
   if (!state) {
     // The prompt's first observation: files already changed then are not this prompt's hand edits.
     state = { prompt: input.prompt_id, files: [], fired: false, delegated: false, baseline: git ? git.files() : [], head: git?.head }
   } else {
+    if (!Array.isArray(state.baseline)) state.baseline = git ? git.files() : []
+    // A damaged or older scratchpad file must not turn every PostToolUse into a stack trace.
+    if (!Array.isArray(state.files)) state.files = []
     if (git?.head && git.head !== state.head) {
-      // A commit ended the piece: the next four hand edits start another one, but horde_do stays delegated.
+      // A commit ended the piece: count the files this Bash call changed or committed, then start
+      // the next piece from the new HEAD. horde_do stays delegated across the commit.
+      const committed = isBash && state.head ? git.changedSince(state.head, git.head).filter((f) => !state.files.includes(f)) : []
       state.files = []
       state.fired = false
       state.baseline = git.files()
       state.head = git.head
+      // The committed paths are this call's work, not part of the new baseline.
+      state.files.push(...committed)
     }
-    if (!Array.isArray(state.baseline)) state.baseline = git ? git.files() : []
   }
-  const isBash = input.tool_name === "Bash"
   const changed = isBash && git ? git.files() : []
   const candidates = isBash
     ? changed.filter((f) => !state.baseline.includes(f))

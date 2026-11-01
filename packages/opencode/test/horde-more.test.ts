@@ -207,6 +207,11 @@ describe("the running-agent limit refuses a start without leaving a task on the 
     )
     await lh.call("horde_drop", { id })
   })
+
+  test("an unknown transcript resource returns an error payload instead of throwing", async () => {
+    const res = await lh.client.readResource({ uri: "opencode://agents/no-such-agent/transcript" })
+    assert.match(String((res.contents[0] as { text: string }).text), /^Error: /)
+  })
 })
 
 describe("horde_investigate: read-only workers that answer with a checked report", { timeout: 600_000 }, () => {
@@ -281,6 +286,21 @@ describe("horde_investigate: read-only workers that answer with a checked report
     assert.match(failed, new RegExp(`^${id} FAILED · "Find the bug" \\(the answer never became valid JSON\\)`), failed)
     assert.match(failed, /still prose/, failed)
     assert.doesNotMatch(failed, /REPORT/, failed)
+  })
+
+  test("a malformed tiers value fails before any worker or task starts", async () => {
+    const { repo } = makeRepo(ivmock.url)
+    fs.writeFileSync(path.join(repo, "horde.json"), JSON.stringify({ tiers: "not a list" }))
+    await assert.rejects(iv.call("horde_investigate", { directory: repo, question: "What is here?" }), /"tiers" must be an array/)
+    assert.equal((await Board.open(repo, boardState())).tasks().length, 0, "no task was planned")
+  })
+
+  test("an investigation that stops before answering reports that reason, not invalid JSON", async () => {
+    const id = iid(await iv.call("horde_investigate", { question: "Find the bug.", model: "mock/fail" }))
+    const failed = await iv.call("horde_wait", { ids: [id], timeout_seconds: 120 })
+    assert.match(failed, new RegExp(`^${id} FAILED`), failed)
+    assert.match(failed, /bad request from mock/, failed)
+    assert.doesNotMatch(failed, /never became valid JSON/, failed)
   })
 })
 

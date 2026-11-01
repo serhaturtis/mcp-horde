@@ -23,7 +23,19 @@ import {
   waitedOut,
 } from "../src/fleet.js"
 import { questionAnswers, questionSchema } from "../src/hooks.js"
-import { busyRefusal, gateProgress } from "../src/horde.js"
+import {
+  busyRefusal,
+  changeSummary,
+  checkCitations,
+  countLines,
+  gateProgress,
+  type HordeCommand,
+  plannedCommands,
+  refusalLists,
+  reportPath,
+  shellQuote,
+  trustChange,
+} from "../src/horde.js"
 import { News } from "../src/news.js"
 import { type AgentRecord, Store } from "../src/state.js"
 import { price } from "../src/tools.js"
@@ -1012,5 +1024,118 @@ setInterval(() => {}, 1000)
     } finally {
       cleanup(parent, fakePid)
     }
+  })
+})
+
+describe("horde outcome rendering helpers", () => {
+  const run = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, stdio: "ignore" })
+  const initRepo = (t: { after: (fn: () => void) => void }) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "horde-outcome-"))
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+    run(dir, "init")
+    run(dir, "config", "user.email", "t@t")
+    run(dir, "config", "user.name", "t")
+    fs.writeFileSync(path.join(dir, "base.txt"), "base\n")
+    run(dir, "add", ".")
+    run(dir, "commit", "-qm", "base")
+    return dir
+  }
+
+  test("an untracked file's lines count as added and the line says landing commits it", async (t) => {
+    const dir = initRepo(t)
+    const start = execFileSync("git", ["rev-parse", "HEAD"], { cwd: dir }).toString().trim()
+    fs.writeFileSync(path.join(dir, "hello.txt"), "one\ntwo\n")
+    const changes = await changeSummary(dir, start)
+    assert.match(changes!.line, /^changed 1 file\(s\) \(\+2 −0\): hello\.txt \(new, uncommitted; horde_land commits it\)$/)
+  })
+
+  test("in a commit-msg hook repository the line says landing is refused until the work is committed", async (t) => {
+    const dir = initRepo(t)
+    const start = execFileSync("git", ["rev-parse", "HEAD"], { cwd: dir }).toString().trim()
+    const hook = path.join(dir, ".git", "hooks", "commit-msg")
+    fs.writeFileSync(hook, "#!/bin/sh\nexit 0\n")
+    if (process.platform !== "win32") fs.chmodSync(hook, 0o755)
+    fs.writeFileSync(path.join(dir, "hello.txt"), "one\ntwo\n")
+    const changes = await changeSummary(dir, start)
+    assert.match(changes!.line, /hello\.txt \(new, uncommitted; landing is refused until it is committed\)/)
+  })
+
+  test("a changed multi-line check is named without its command text", () => {
+    const before = ["check opencode (old script\nline two · cwd: . · env: none)", "check old (go test · cwd: . · env: none)"]
+    const after = ["check opencode (new script\nline two · cwd: . · env: none)", "check lint (npm run lint · cwd: . · env: none)"]
+    const change = trustChange(before, after)
+    assert.equal(change, "+ check opencode changed · + check lint added · − check opencode changed · − check old removed")
+    assert.doesNotMatch(change, /script|npm run lint|go test/)
+  })
+
+  test("the checked-by list keeps a multi-line command on one line before truncating", () => {
+    const commands: HordeCommand[] = [
+      { label: "check test", command: "set -e\necho one\necho two\nnpm test", cwd: ".", env: ["FOO"] },
+      { label: "workers.land", command: "npm run build\n", cwd: ".", env: [] },
+    ]
+    const [checked, also] = plannedCommands(commands)
+    assert.equal(
+      checked,
+      "checked by: check test (set -e echo one echo two npm test · cwd: . · env: FOO) · the tests related to the change after each round, every check before landing",
+    )
+    assert.doesNotMatch(checked!, /\n/)
+    assert.match(also!, /also runs: workers\.land \(npm run build · cwd: \. · env: none\)/)
+  })
+
+  test("git -C paths are quoted when they hold shell-significant characters", { skip: process.platform === "win32" ? "POSIX quoting" : false }, () => {
+    assert.equal(shellQuote("/tmp/plain"), "/tmp/plain")
+    assert.equal(shellQuote("/tmp/my repo"), "'/tmp/my repo'")
+    assert.equal(shellQuote("/tmp/it's"), "'/tmp/it'\\''s'")
+    assert.equal(shellQuote("/tmp/a$b"), "'/tmp/a$b'")
+  })
+
+  test("report paths include the repository so equal task ids cannot share a file", async (t) => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "horde-reports-"))
+    t.after(() => fs.rmSync(tmp, { recursive: true, force: true }))
+    const one = path.join(tmp, "one")
+    const two = path.join(tmp, "two")
+    fs.mkdirSync(one)
+    fs.mkdirSync(two)
+    const fleet = { stateDir: path.join(tmp, "state") } as unknown as Fleet
+    const a = await reportPath(fleet, "t-same", one)
+    const b = await reportPath(fleet, "t-same", two)
+    assert.notEqual(a, b)
+    assert.match(a, /[/\\]reports[/\\][^/\\]+[/\\]t-same\.json$/)
+  })
+
+  test("citations are confined to the worktree and a blank line counts as a line", async (t) => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "horde-citations-"))
+    t.after(() => fs.rmSync(tmp, { recursive: true, force: true }))
+    const root = path.join(tmp, "work")
+    fs.mkdirSync(root)
+    fs.writeFileSync(path.join(root, "a.txt"), "one\ntwo\n")
+    fs.writeFileSync(path.join(root, "blank.txt"), "\n")
+    const outside = path.join(tmp, "secret.txt")
+    fs.writeFileSync(outside, "secret\n")
+    fs.symlinkSync(outside, path.join(root, "link.txt"))
+    const wt: Worktree = { path: root, root, branch: "horde/test", base: "0000000", repo: root }
+    assert.equal(countLines(path.join(root, "blank.txt")), 1)
+    const checked = checkCitations(
+      [
+        { title: "absolute", severity: "info", file: "/etc/hostname", line: 1, evidence: "ls", confidence: "high" },
+        { title: "parent", severity: "info", file: "../secret.txt", line: 1, evidence: "ls", confidence: "high" },
+        { title: "symlink", severity: "info", file: "link.txt", line: 1, evidence: "ls", confidence: "high" },
+        { title: "blank", severity: "info", file: "blank.txt", line: 1, evidence: "wc -l", confidence: "high" },
+        { title: "real", severity: "info", file: "a.txt", line: 2, evidence: "cat", confidence: "high" },
+      ],
+      wt,
+    )
+    assert.equal(checked[0]!.cite, "⚠ citation failed: /etc/hostname is outside the worktree")
+    assert.equal(checked[1]!.cite, "⚠ citation failed: ../secret.txt is outside the worktree")
+    assert.equal(checked[2]!.cite, "⚠ citation failed: link.txt is outside the worktree")
+    assert.equal(checked[3]!.cite, "✓ cited")
+    assert.equal(checked[4]!.cite, "✓ cited")
+  })
+
+  test("only edit-tool denials are scope refusals; other permission errors are denied", () => {
+    assert.deepEqual(refusalLists(["edit src/a.ts", "write src/b.ts", "bash rm -rf /", "question *"]), {
+      scope: ["edit src/a.ts", "write src/b.ts"],
+      denied: ["bash rm -rf /", "question *"],
+    })
   })
 })

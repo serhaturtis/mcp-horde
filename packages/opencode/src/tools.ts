@@ -793,9 +793,16 @@ export function registerTools(server: McpServer, ctx: Context) {
     }),
     { description: "Full transcript of an OpenCode agent", mimeType: "text/markdown" },
     async (uri, vars) => {
-      const fleet = await ctx.fleet()
-      const text = await fleet.transcript(String(vars.id), { scope: "all", detail: "summary" })
-      return { contents: [{ uri: uri.href, mimeType: "text/markdown", text }] }
+      try {
+        const fleet = await ctx.fleet()
+        const text = await fleet.transcript(String(vars.id), { scope: "all", detail: "summary" })
+        return { contents: [{ uri: uri.href, mimeType: "text/markdown", text }] }
+      } catch (err) {
+        return {
+          contents: [{ uri: uri.href, mimeType: "text/markdown", text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
+          isError: true,
+        }
+      }
     },
   )
 }

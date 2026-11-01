@@ -8,7 +8,7 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { Board, projectOf } from "@mcp-horde/board"
-import { formatDuration, formatUsd, git, indent, loadTiers, oneLine, truncate, truncateHead, type Workers, writeJson } from "@mcp-horde/core"
+import { formatDuration, formatUsd, git, indent, loadTiers, oneLine, repoKey, truncate, truncateHead, type Workers, writeJson } from "@mcp-horde/core"
 import { type Check, detectChecks, loadSettingsAt } from "@mcp-horde/verify"
 import type { ServerContext } from "@modelcontextprotocol/server"
 import { z } from "zod"
@@ -27,7 +27,7 @@ import {
   type Snapshot,
 } from "./fleet.js"
 import { type AgentRecord, commandSetHash, type ReviewSummary, TrustStore } from "./state.js"
-import { BASELINE_MESSAGE, loadWorkersAt, repoRoot, type Worktree, workStart } from "./worktree.js"
+import { BASELINE_MESSAGE, commitMsgHook, loadWorkersAt, repoRoot, type Worktree, workStart } from "./worktree.js"
 
 // biome-ignore lint/suspicious/noExplicitAny: the registration helper is generic over each tool's schema
 type Tool = (name: string, description: string, shape: z.ZodRawShape, run: (args: any, fleet: Fleet, extra: ServerContext) => Promise<string>) => void
@@ -222,6 +222,8 @@ export function registerHorde(tool: Tool, opts: HordeOptions) {
       // Workers start from HEAD and their gates read HEAD's horde.json, so look there too.
       const checks = await detectChecks(repo, await loadSettingsAt(repo, "HEAD"))
       if (!checks.length) throw new Error(noChecks(repo, (await detectChecks(repo)).length > 0))
+      // Validate the tiers before a worker is spawned: a malformed horde.json must not leave one running.
+      const tiers = loadTiers(repo)
       // The commands a clone's horde.json will run are named in the answer; a change since the
       // last task here (a pull) is announced once, then the new set replaces the record.
       const workers = await loadWorkersAt(root, "HEAD")
@@ -261,7 +263,6 @@ export function registerHorde(tool: Tool, opts: HordeOptions) {
         const text = (await collect(fleet, [snapshot.id], "all", a.timeout_seconds ?? opts.waitSeconds(), extra, opts)).text
         return [[announced, ...plannedCommands(commands)].filter(Boolean).join("\n"), text].filter(Boolean).join("\n\n")
       }
-      const tiers = loadTiers(repo)
       const model = snapshot.model ? formatModel(snapshot.model) : "OpenCode's default model"
       const tier = tiers.length ? ` (tier ${board.task(task.id).tier} of ${tiers.length})` : ""
       const setup = notes.filter((n) => !/^working t-/.test(n)).map((n) => n.replace(/ from the main checkout$/, ""))
@@ -309,6 +310,8 @@ export function registerHorde(tool: Tool, opts: HordeOptions) {
     },
     async (a, fleet, extra) => {
       const repo = fleet.resolveDir(a.directory)
+      // Validate the tiers before a worker is spawned: a malformed horde.json must not leave one running.
+      const tiers = loadTiers(repo)
       const board = await Board.open(repo)
       const { tasks, warnings } = await board.plan([{ title: a.title ?? titleOf(a.question), goal: a.question, acceptance: [], scope: [] }])
       const task = tasks[0]!
@@ -334,7 +337,6 @@ export function registerHorde(tool: Tool, opts: HordeOptions) {
           throw err
         })
       if (a.wait) return (await collect(fleet, [snapshot.id], "all", a.timeout_seconds ?? opts.waitSeconds(), extra, opts)).text
-      const tiers = loadTiers(repo)
       const model = snapshot.model ? formatModel(snapshot.model) : "OpenCode's default model"
       const tier = tiers.length ? ` (tier ${board.task(task.id).tier} of ${tiers.length})` : ""
       const setup = notes.filter((n) => !/^working t-/.test(n)).map((n) => n.replace(/ from the main checkout$/, ""))
@@ -437,7 +439,7 @@ export function registerHorde(tool: Tool, opts: HordeOptions) {
     },
     async (a, fleet, extra) => {
       // A finished investigation has no agent any more (its worktree was discarded); its report file marks it.
-      const report = reportPath(fleet, a.id)
+      const report = await reportPath(fleet, a.id, fleet.resolveDir())
       if (fs.existsSync(report))
         throw new Error(
           `${a.id} is a finished investigation (horde_investigate): it produced a report, never changes, so there is nothing to land. Its report is at ${report}.`,
@@ -497,7 +499,7 @@ export function registerHorde(tool: Tool, opts: HordeOptions) {
 }
 
 /** One command a horde.json will run: what it is, its text, its cwd and the names (not values) of its variables. */
-interface HordeCommand {
+export interface HordeCommand {
   label: string
   command: string
   cwd: string
@@ -529,7 +531,7 @@ function commandSet(root: string, checks: Check[], workers: Workers): HordeComma
 }
 
 function commandPart(c: HordeCommand, maxCommand = 0): string {
-  const command = maxCommand ? truncate(c.command, maxCommand) : c.command
+  const command = maxCommand ? truncate(oneLine(c.command), maxCommand) : c.command
   const env = c.env.length ? c.env.join(", ") : "none"
   return `${command} · cwd: ${c.cwd} · env: ${env}${c.note ? ` · ${c.note}` : ""}`
 }
@@ -540,7 +542,7 @@ function trustLine(c: HordeCommand): string {
 }
 
 /** The first-answer listing: setup and land beside the checks, each with its cwd and env names. */
-function plannedCommands(commands: HordeCommand[]): string[] {
+export function plannedCommands(commands: HordeCommand[]): string[] {
   const checks = commands.filter((c) => c.label.startsWith("check "))
   const list = checks.map((c) => `${c.label} (${commandPart(c, 60)})`).join(", ")
   const others = commands.filter((c) => !c.label.startsWith("check "))
@@ -549,13 +551,26 @@ function plannedCommands(commands: HordeCommand[]): string[] {
   return lines
 }
 
-/** " + workers.land (…) · − check pg (…)" between the recorded and current command sets. */
-function trustChange(before: string[], after: string[]): string {
-  const old = new Set(before)
-  const now = new Set(after)
-  const added = after.filter((c) => !old.has(c)).map((c) => `+ ${c}`)
-  const removed = before.filter((c) => !now.has(c)).map((c) => `− ${c}`)
-  return [...added, ...removed].join(" · ")
+/** The label of a recorded command line ("check pg", "workers.setup"), without its command text. */
+function commandLabel(line: string): string {
+  const at = line.indexOf(" (")
+  return at < 0 ? line : line.slice(0, at)
+}
+
+/** "check pg changed · + check lint added · − workers.land removed" between the recorded and current command sets. */
+export function trustChange(before: string[], after: string[]): string {
+  const old = new Map(before.map((line) => [commandLabel(line), line]))
+  const now = new Map(after.map((line) => [commandLabel(line), line]))
+  const parts: string[] = []
+  for (const [label, line] of now) {
+    if (!old.has(label)) parts.push(`+ ${label} added`)
+    else if (old.get(label) !== line) parts.push(`+ ${label} changed`)
+  }
+  for (const [label, line] of old) {
+    if (!now.has(label)) parts.push(`− ${label} removed`)
+    else if (now.get(label) !== line) parts.push(`− ${label} changed`)
+  }
+  return parts.join(" · ")
 }
 
 function noChecks(repo: string, uncommitted: boolean): string {
@@ -650,7 +665,7 @@ export async function outcome(fleet: Fleet, ref: string, opts: { live?: boolean 
     for (const c of verdict?.checks ?? [])
       if (c.baseline && !c.baseline.pass) lines.push(`  ⚠ ${c.name} fails at ${c.baseline.label} too (not caused by this work)`)
     if (changes) lines.push(`  ${changes.line}`)
-    if (changes && wt) lines.push(`  branch ${wt.branch} · diff: git -C ${wt.root} diff ${workStart(wt).slice(0, 10)}`)
+    if (changes && wt) lines.push(`  branch ${wt.branch} · diff: git -C ${shellQuote(wt.root)} diff ${workStart(wt).slice(0, 10)}`)
     if (workerSaid) lines.push(`  worker: ${truncate(workerSaid, 240)}`)
     for (const c of review?.notMet ?? []) lines.push(`  not met: "${truncate(c.text, 160)}"${c.note ? ` (${truncate(c.note, 160)})` : ""}`)
     for (const c of review?.unclear ?? [])
@@ -682,11 +697,13 @@ export async function outcome(fleet: Fleet, ref: string, opts: { live?: boolean 
             : "finished without a verdict"
   const lines = [say("FAILED", ` (${why})`)]
   if (s.gate?.state === "fail" && verdict?.text) lines.push(indent(truncate(verdict.text, 900), "  "))
-  if (refused.length) lines.push(`  refused outside its scope: ${refused.slice(0, 6).join(", ")}`)
+  const refusals = refusalLists(refused)
+  if (refusals.scope.length) lines.push(`  refused outside its scope: ${refusals.scope.slice(0, 6).join(", ")}`)
+  if (refusals.denied.length) lines.push(`  denied: ${refusals.denied.slice(0, 6).join(", ")}`)
   if (changes) {
     lines.push(`  ${changes.line}`)
     if (changes.excerpt) lines.push(indent(changes.excerpt, "    "))
-    lines.push(`  branch ${wt!.branch} · diff: git -C ${wt!.root} diff ${workStart(wt!).slice(0, 10)}`)
+    lines.push(`  branch ${wt!.branch} · diff: git -C ${shellQuote(wt!.root)} diff ${workStart(wt!).slice(0, 10)}`)
   }
   if (workerSaid) lines.push(`  worker: ${truncate(workerSaid, 240)}`)
   lines.push(`  ${footer}`)
@@ -708,7 +725,7 @@ export async function outcome(fleet: Fleet, ref: string, opts: { live?: boolean 
         ? [`horde_tell {id: "${id}", message: "Run the review again"}`]
         : [`horde_tell {id: "${id}", message: "<a precise hint>"} (its checks run again)`]),
       ...(stronger ? [`horde_tell {id: "${id}", message, model: "${stronger}"}`] : []),
-      ...(refused.length ? [`horde_tell {id: "${id}", scope: [...]} to let it edit more`] : []),
+      ...(refusals.scope.length ? [`horde_tell {id: "${id}", scope: [...]} to let it edit more`] : []),
       ...(scopeBlamed.length ? [`horde_tell {id: "${id}", scope: [...]} to allow ${scopeBlamed.join(", ")}`] : []),
       `horde_drop {id: "${id}"}`,
     ),
@@ -762,7 +779,7 @@ function renderLanding(id: string, r: LandResult): string {
     return [
       `not landed: ${on} of ${total} commits of ${id} are already on ${r.target}; landing the rest would replay those ${on} as empty commits.`,
       indent(r.text, "  "),
-      `If you landed its work yourself, horde_drop {id: "${id}", landed: true}; otherwise merge the rest by hand (git -C ${r.root} …)`,
+      `If you landed its work yourself, horde_drop {id: "${id}", landed: true}; otherwise merge the rest by hand (git -C ${shellQuote(r.root ?? "")} …)`,
     ].join("\n")
   }
   if (r.why === "generated") {
@@ -777,7 +794,7 @@ function renderLanding(id: string, r: LandResult): string {
     return [
       `not landed: ${id}'s commits conflict with ${r.target}${files.length ? ` in ${files.join(", ")}` : ""}. ${r.target} is unchanged.`,
       `→ horde_tell {id: "${id}", message: "Rebase your branch onto ${r.target} and resolve the conflict${files.length ? ` in ${files.join(", ")}` : ""}"} (a fresh gate round, then horde_land again)`,
-      `→ resolve it yourself: git -C ${r.root} rebase ${r.target}, fix${files.length ? ` ${files.join(", ")}` : " the named files"}, git -C ${r.root} rebase --continue, then horde_land {id: "${id}"} again (the land's checks run on the result).${r.baseline ? ` The first commit, "${BASELINE_MESSAGE}", is the carried-over baseline; leave it as it is, it never lands.` : ""}`,
+      `→ resolve it yourself: git -C ${shellQuote(r.root ?? "")} rebase ${r.target}, fix${files.length ? ` ${files.join(", ")}` : " the named files"}, git -C ${shellQuote(r.root ?? "")} rebase --continue, then horde_land {id: "${id}"} again (the land's checks run on the result).${r.baseline ? ` The first commit, "${BASELINE_MESSAGE}", is the carried-over baseline; leave it as it is, it never lands.` : ""}`,
       `→ horde_drop {id: "${id}"}`,
     ].join("\n")
   }
@@ -802,6 +819,15 @@ function checksLine(checks: { name: string; pass: boolean; summary?: string }[])
 /** Files a blocking audit 'scope' finding blamed, from the findings stored with the verdict. */
 function scopeFiles(audit?: GateAuditFinding[]): string[] {
   return [...new Set((audit ?? []).filter((f) => f.category === "scope" && f.file).map((f) => f.file!))]
+}
+
+/** The tools whose OpenCode permission is the scope's edit rule ("Permission denied: edit"). */
+const EDIT_TOOLS = new Set(["edit", "write", "patch", "multiedit", "apply_patch"])
+
+/** Split refused tool calls into scope refusals and other permission denials. */
+export function refusalLists(refused: string[]): { scope: string[]; denied: string[] } {
+  const scope = refused.filter((r) => EDIT_TOOLS.has(r.split(/\s+/)[0] ?? ""))
+  return { scope, denied: refused.filter((r) => !scope.includes(r)) }
 }
 
 /** Files a blocking audit 'binaries' finding blamed, from the findings stored with the verdict. */
@@ -844,8 +870,15 @@ function safeTiers(repo: string) {
   }
 }
 
-/** "changed 3 files (+86 −2): a.ts (new), b.ts, …", and the first changed lines for a failure. */
-async function changeSummary(root: string, start: string, base?: string): Promise<{ line: string; excerpt: string } | undefined> {
+/** Quote a path for a suggested shell command when it holds a shell-significant character. */
+export function shellQuote(p: string): string {
+  if (process.platform === "win32") return /[\s"&|<>^%]/.test(p) ? `"${p.replace(/"/g, '""')}"` : p
+  if (/^[A-Za-z0-9_./:@%+=,-]+$/.test(p)) return p
+  return `'${p.replace(/'/g, "'\\''")}'`
+}
+
+/** "changed 3 files (+86 −2): a.ts (new, uncommitted; horde_land commits it), b.ts, …", and the first changed lines for a failure. */
+export async function changeSummary(root: string, start: string, base?: string): Promise<{ line: string; excerpt: string } | undefined> {
   const numstat = await git(root, "diff", "--numstat", start).catch(() => "")
   const untracked = (await git(root, "ls-files", "--others", "--exclude-standard").catch(() => "")).split("\n").filter(Boolean)
   const files: { file: string; add: number; del: number; isNew?: boolean }[] = numstat
@@ -855,11 +888,13 @@ async function changeSummary(root: string, start: string, base?: string): Promis
       const [add, del, ...rest] = l.split("\t")
       return { file: rest.join("\t"), add: Number(add) || 0, del: Number(del) || 0 }
     })
-  for (const f of untracked) files.push({ file: f, add: 0, del: 0, isNew: true })
+  // An untracked file's content is added, even though git's diff against the start does not see it.
+  for (const f of untracked) files.push({ file: f, add: countFileLines(path.join(root, f)), del: 0, isNew: true })
   if (!files.length) return { line: "changed nothing", excerpt: "" }
   const add = files.reduce((n, f) => n + f.add, 0)
   const del = files.reduce((n, f) => n + f.del, 0)
-  const names = files.slice(0, 6).map((f) => `${f.file}${f.isNew ? " (new)" : ""}`)
+  const landing = (await commitMsgHook(root).catch(() => undefined)) ? "landing is refused until it is committed" : "horde_land commits it"
+  const names = files.slice(0, 6).map((f) => `${f.file}${f.isNew ? ` (new, uncommitted; ${landing})` : ""}`)
   // Deletions of files the checkout only has uncommitted (the carried-over baseline): they are
   // not real deletions, since landing drops them as nothing, so the changed-files line says so.
   // Named by --diff-filter=D rather than the numstat counts, which read "-" for binary files.
@@ -928,37 +963,57 @@ function orderBySeverity(findings: Finding[]): Finding[] {
   return [...findings].sort((a, b) => severityRank(a.severity) - severityRank(b.severity))
 }
 
-/** The report JSON's home: the horde's state directory, so it can be read again. */
-function reportPath(fleet: Fleet, id: string): string {
-  return path.join(fleet.stateDir, "reports", `${id}.json`)
+/** The report JSON's home: the horde's state directory, keyed by repository so ids cannot collide. */
+export async function reportPath(fleet: Fleet, id: string, repo: string): Promise<string> {
+  const root = await repoRoot(repo).catch(() => repo)
+  return path.join(fleet.stateDir, "reports", repoKey(root), `${id}.json`)
 }
 
-function resolveCitation(wt: Worktree, file: string): string | undefined {
+/** Where a citation points inside the worktree, or why it does not. */
+function resolveCitation(wt: Worktree, file: string): { abs?: string; outside?: boolean } {
+  // Absolute paths and ".." segments leave the worktree by definition, even if they land inside it.
+  if (path.isAbsolute(file) || file.split(/[\\/]/).includes("..")) return { outside: true }
+  const root = fs.realpathSync(wt.root)
   for (const base of [wt.path, wt.root]) {
     const abs = path.resolve(base, file)
     try {
-      if (fs.statSync(abs).isFile()) return abs
+      if (!fs.statSync(abs).isFile()) continue
+      const real = fs.realpathSync(abs)
+      const rel = path.relative(root, real)
+      if (rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) return { outside: true }
+      return { abs }
     } catch {
       // try the next base
     }
   }
-  return undefined
+  return {}
 }
 
-function countLines(file: string): number {
-  const text = fs.readFileSync(file, "utf8").replace(/\n$/, "")
-  return text === "" ? 0 : text.split("\n").length
+export function countLines(file: string): number {
+  const lines = fs.readFileSync(file, "utf8").split("\n")
+  if (lines.at(-1) === "") lines.pop()
+  return lines.length
+}
+
+/** A file's line count for the changed-files line; an unreadable file adds none. */
+function countFileLines(file: string): number {
+  try {
+    return countLines(file)
+  } catch {
+    return 0
+  }
 }
 
 /** Check each finding's file:line against the worktree, marking citations that do not hold. */
-function checkCitations(findings: Finding[], wt: Worktree | undefined): Finding[] {
+export function checkCitations(findings: Finding[], wt: Worktree | undefined): Finding[] {
   return findings.map((f) => {
     if (!wt) return f
     if (!f.file) return f.line === undefined ? f : { ...f, cite: "⚠ citation failed: no file to check the line against" }
-    const abs = resolveCitation(wt, f.file)
-    if (!abs) return { ...f, cite: `⚠ citation failed: ${f.file} not found` }
+    const resolved = resolveCitation(wt, f.file)
+    if (resolved.outside) return { ...f, cite: `⚠ citation failed: ${f.file} is outside the worktree` }
+    if (!resolved.abs) return { ...f, cite: `⚠ citation failed: ${f.file} not found` }
     if (f.line === undefined) return f
-    const lines = countLines(abs)
+    const lines = countLines(resolved.abs)
     if (f.line < 1 || f.line > lines) return { ...f, cite: `⚠ citation failed: line ${f.line} past end (${lines} line${lines === 1 ? "" : "s"})` }
     return { ...f, cite: "✓ cited" }
   })
@@ -998,11 +1053,11 @@ async function investigate(fleet: Fleet, ref: string, s: Snapshot, record: Agent
   }
 
   const footer = await footerLine(snap, record, repo, task?.tier)
-  if (result.errors.length || failedReason) {
-    const tail = text || failedReason || ""
+  const reason = failedReason ?? (result.errors.length ? "the answer never became valid JSON" : "")
+  if (reason) {
     return [
-      say("FAILED", " (the answer never became valid JSON)"),
-      tail ? `  answer: ${truncateHead(tail, 500)}` : "",
+      say("FAILED", ` (${reason})`),
+      failedReason ? "" : text ? `  answer: ${truncateHead(text, 500)}` : "",
       `  ${footer}`,
       `→ horde_drop {id: "${id}"} · horde_investigate again with a clearer question`,
     ]
@@ -1012,7 +1067,7 @@ async function investigate(fleet: Fleet, ref: string, s: Snapshot, record: Agent
 
   const answer = result.value as { summary: string; findings: Finding[] }
   const findings = orderBySeverity(checkCitations(answer.findings, wt))
-  const file = reportPath(fleet, id)
+  const file = await reportPath(fleet, id, repo)
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
   writeJson(file, {
     task: id,

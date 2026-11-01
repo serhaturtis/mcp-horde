@@ -183,6 +183,33 @@ describe("PostToolUse", () => {
     assert.ok(!note.includes("a.ts"), "the previous piece's files are not named")
   })
 
+  test("a Bash call that writes and commits counts the files it changed", (t) => {
+    const dir = repo(t)
+    const hook = session(scratch(t))
+    assert.equal(hook(...bash(dir)), undefined, "the baseline starts clean")
+    const files = ["a.ts", "b.ts", "c.ts", "d.ts"]
+    for (const file of files) write(dir, file)
+    commit(dir, "one call")
+    const note = hook(...bash(dir))
+    assert.match(note, /edited 4 files by hand/)
+    for (const file of files) assert.ok(note.includes(file), file)
+  })
+
+  test("a damaged files field is repaired instead of throwing", (t) => {
+    const scratchpad_dir = scratch(t)
+    fs.writeFileSync(
+      path.join(scratchpad_dir, "horde-edits-session-1.json"),
+      JSON.stringify({ prompt: "prompt-1", files: "oops", fired: false, delegated: false, baseline: [] }),
+    )
+    const hook = session(scratchpad_dir)
+    assert.equal(hook(...edit("/repo/a.ts")), undefined)
+    const state = JSON.parse(fs.readFileSync(path.join(scratchpad_dir, "horde-edits-session-1.json"), "utf8"))
+    assert.deepEqual(state.files, ["/repo/a.ts"])
+    assert.equal(hook(...edit("/repo/b.ts")), undefined)
+    assert.equal(hook(...edit("/repo/c.ts")), undefined)
+    assert.match(hook(...edit("/repo/d.ts")), /edited 4 files by hand/)
+  })
+
   test("a horde_do call before the commit keeps the next piece's note silent", (t) => {
     const dir = repo(t)
     const hook = session(scratch(t))
