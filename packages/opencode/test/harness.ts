@@ -202,6 +202,9 @@ export async function until<T>(fn: () => Promise<T | undefined | false>, ms = 30
 export function isolatedEnv(tmp: string, repo: string): Record<string, string> {
   return {
     HORDE_OPENCODE_DIRECTORY: repo,
+    // A chosen limit: the load-aware admission must never refuse a test's spawn because the
+    // machine running the suite is busy (a test that wants another limit sets it after this).
+    HORDE_OPENCODE_MAX_RUNNING: "8",
     HORDE_OPENCODE_STATE_DIR: path.join(tmp, "state"),
     HORDE_OPENCODE_WORKTREE_DIR: path.join(tmp, "worktrees"),
     XDG_DATA_HOME: path.join(tmp, "xdg-data"),
