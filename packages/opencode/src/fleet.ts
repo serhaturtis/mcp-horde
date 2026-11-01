@@ -406,6 +406,23 @@ export async function gateConfig(input: GateInput | undefined, directory: string
   }) as GateConfig
 }
 
+/**
+ * The directories a sandboxed runtime must write besides its worktree: the repository's git
+ * common directory (linked worktrees keep their index, objects and refs there) and the board
+ * state directory the brief's `--state` names.
+ */
+async function worktreeWritableDirs(worktree: Worktree): Promise<string[]> {
+  const common =
+    (await git(worktree.path, "rev-parse", "--path-format=absolute", "--git-common-dir").catch(() => undefined)) ??
+    (await git(worktree.path, "rev-parse", "--git-common-dir")
+      .then((dir) => path.resolve(worktree.path, dir))
+      .catch(() => undefined))
+  const dirs: string[] = []
+  if (common) dirs.push(await fs.realpath(common).catch(() => path.resolve(common)))
+  dirs.push((await Board.open(worktree.repo)).dir)
+  return dirs
+}
+
 /** What the agent is told when its gate fails. The verdict comes last, verbatim. */
 export function gateFeedback(round: number, maxRounds: number, verdict: string): string {
   return [
@@ -1215,6 +1232,7 @@ export class Fleet {
       // A profile is the session's own permission rules, added after the agent's.
       const profile = input.scope ? withScope(input.profile ?? {}, input.scope) : input.profile
       const policy = input.permissions ?? this.config.defaultPermissions
+      const writableDirs = worktree ? await worktreeWritableDirs(worktree) : undefined
       const session = await runtime.createSession({
         directory,
         title: `horde: ${name}`,
@@ -1223,6 +1241,7 @@ export class Fleet {
         ...(input.agent ? { agent: input.agent } : {}),
         permissions: policy,
         ...(profile ? { rules: profileRules(profile) } : {}),
+        ...(writableDirs ? { writableDirs } : {}),
       })
       sessionId = session.id
       const steps = [input.limits?.maxSteps, profile?.steps].filter((n): n is number => !!n)

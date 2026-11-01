@@ -15,6 +15,7 @@ interface Invocation {
   cwd: string
   sandbox: string
   model?: string
+  addDirs?: string[]
   threadId: string
   pid: number
 }
@@ -39,6 +40,20 @@ function readInvocations(codexHome: string): Invocation[] {
 
 function thread(codexHome: string, threadId: string): { threadId: string; prompts: string[]; sandboxes: string[] } {
   return JSON.parse(fs.readFileSync(path.join(codexHome, "fake-codex", "threads", `${threadId}.json`), "utf8"))
+}
+
+function addDirs(args: string[]): string[] {
+  return args.flatMap((arg, i) => (arg === "--add-dir" && args[i + 1] ? [args[i + 1]!] : []))
+}
+
+function writableRoots(args: string[]): string[] {
+  const flag = args.find((arg) => arg.startsWith("sandbox_workspace_write.writable_roots="))
+  if (!flag) return []
+  try {
+    return JSON.parse(flag.slice("sandbox_workspace_write.writable_roots=".length)) as string[]
+  } catch {
+    return []
+  }
 }
 
 function alive(pid: number): boolean {
@@ -138,6 +153,16 @@ describe("the Codex runtime: codex exec --json and exec resume (fake CLI)", { ti
 
     const worker = readInvocations(codexHome).find((i) => i.prompt.includes("Write the second file."))
     assert.ok(worker, "the worker's first turn ran")
+    const boardState = path.join(tmp, "board-state")
+    const firstDirs = addDirs(worker.args)
+    assert.ok(
+      firstDirs.some((dir) => dir.endsWith(".git")),
+      `the first turn grants the git common directory: ${firstDirs.join(", ")}`,
+    )
+    assert.ok(
+      firstDirs.some((dir) => dir.startsWith(boardState)),
+      `the first turn grants the board state directory: ${firstDirs.join(", ")}`,
+    )
     const before = thread(codexHome, worker.threadId)
     assert.equal(before.prompts.length, 1)
 
@@ -155,6 +180,15 @@ describe("the Codex runtime: codex exec --json and exec resume (fake CLI)", { ti
     const resumed = readInvocations(codexHome).filter((i) => i.threadId === worker.threadId)
     assert.equal(resumed.length, 2, "the second turn was an exec resume of the same thread")
     assert.deepEqual(resumed[1]!.args.slice(0, 3), ["exec", "resume", worker.threadId])
+    const resumedDirs = writableRoots(resumed[1]!.args)
+    assert.ok(
+      resumedDirs.some((dir) => dir.endsWith(".git")),
+      `the resumed turn grants the git common directory: ${resumedDirs.join(", ")}`,
+    )
+    assert.ok(
+      resumedDirs.some((dir) => dir.startsWith(boardState)),
+      `the resumed turn grants the board state directory: ${resumedDirs.join(", ")}`,
+    )
 
     assert.match(await h.call("horde_land", { id }), new RegExp(`^landed ${id} on master`))
     assert.equal(fs.readFileSync(path.join(repo, "third.txt"), "utf8").trim(), "ok")

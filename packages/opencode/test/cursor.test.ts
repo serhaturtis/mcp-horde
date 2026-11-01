@@ -130,6 +130,15 @@ describe("the cursor runtime: Cursor's agent CLI as a worker", { timeout: 600_00
     assert.ok(argv.includes("--force"))
     assert.equal(argv[argv.indexOf("--sandbox") + 1], "enabled")
     assert.equal(argv[argv.indexOf("--workspace") + 1], first.workspace)
+    const addDirs = first.addDirs as string[]
+    assert.ok(
+      addDirs.some((dir) => dir.endsWith(".git")),
+      `the first turn grants the git common directory: ${addDirs.join(", ")}`,
+    )
+    assert.ok(
+      addDirs.some((dir) => dir.startsWith(boardState())),
+      `the first turn grants the board state directory: ${addDirs.join(", ")}`,
+    )
     assert.ok(
       log.some((c) => c.mode === "ask" && typeof c.prompt === "string" && c.prompt.includes("# Acceptance criteria")),
       "the review ran in ask mode",
@@ -166,6 +175,15 @@ describe("the cursor runtime: Cursor's agent CLI as a worker", { timeout: 600_00
     assert.ok(second, "the follow-up turn reached the fake CLI")
     assert.equal(second.resume, cursorID)
     assert.equal(second.session, cursorID)
+    const resumedDirs = second.addDirs as string[]
+    assert.ok(
+      resumedDirs.some((dir) => dir.endsWith(".git")),
+      `the resumed turn grants the git common directory: ${resumedDirs.join(", ")}`,
+    )
+    assert.ok(
+      resumedDirs.some((dir) => dir.startsWith(boardState())),
+      `the resumed turn grants the board state directory: ${resumedDirs.join(", ")}`,
+    )
 
     assert.match(await h.call("horde_land", { id }), /^landed t-\w+ on master: 2 commit\(s\)/)
     assert.equal(fs.readFileSync(path.join(repo, "second.txt"), "utf8").trim(), "ok")

@@ -75,6 +75,7 @@ interface CodexSession {
   readOnly: boolean
   rules: CreateSessionInput["rules"]
   env?: Record<string, string>
+  writableDirs?: string[]
   createdAt: number
   updatedAt: number
   messages: SessionMessageInfo[]
@@ -180,6 +181,7 @@ export class CodexRuntime implements Runtime {
       readOnly: input.permissions === "deny",
       rules: input.rules,
       ...(input.env ? { env: input.env } : {}),
+      ...(input.writableDirs?.length ? { writableDirs: input.writableDirs } : {}),
       createdAt: now,
       updatedAt: now,
       messages: [],
@@ -404,9 +406,12 @@ export class CodexRuntime implements Runtime {
   private args(session: CodexSession, text: string): string[] {
     const sandbox = session.readOnly ? "read-only" : "workspace-write"
     const model = session.model ? ["-m", session.model.id] : []
-    if (!session.threadId) return ["exec", "--json", "-C", session.directory, "-s", sandbox, "--skip-git-repo-check", ...model, text]
-    // `codex exec resume` takes no -C or -s: the cwd is set on the process, and -c carries the sandbox.
-    return ["exec", "resume", session.threadId, "--json", "-c", `sandbox_mode="${sandbox}"`, "--skip-git-repo-check", ...model, text]
+    const dirs = session.writableDirs ?? []
+    if (!session.threadId)
+      return ["exec", "--json", "-C", session.directory, "-s", sandbox, "--skip-git-repo-check", ...dirs.flatMap((dir) => ["--add-dir", dir]), ...model, text]
+    // `codex exec resume` takes no -C, -s or --add-dir: the cwd is set on the process, and -c carries the sandbox.
+    const roots = dirs.length ? ["-c", `sandbox_workspace_write.writable_roots=${JSON.stringify(dirs)}`] : []
+    return ["exec", "resume", session.threadId, "--json", "-c", `sandbox_mode="${sandbox}"`, ...roots, "--skip-git-repo-check", ...model, text]
   }
 
   /** The allowlisted worker environment plus what Codex itself needs. */

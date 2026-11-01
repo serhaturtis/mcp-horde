@@ -28,6 +28,7 @@ if (argv[i] === "resume") {
 let cwd = process.cwd()
 let sandbox = "workspace-write"
 let model
+const addDirs = []
 const positional = []
 while (i < argv.length) {
   const a = argv[i++]
@@ -38,6 +39,10 @@ while (i < argv.length) {
   }
   if (a === "-s" || a === "--sandbox") {
     sandbox = argv[i++] ?? sandbox
+    continue
+  }
+  if (a === "--add-dir") {
+    addDirs.push(argv[i++] ?? "")
     continue
   }
   if (a === "-m" || a === "--model") {
@@ -67,7 +72,7 @@ try {
 thread.prompts.push(prompt)
 thread.sandboxes.push(sandbox)
 fs.writeFileSync(threadFile, JSON.stringify(thread, null, 2))
-fs.appendFileSync(invocations, `${JSON.stringify({ args: argv, prompt, cwd, sandbox, model, threadId, pid: process.pid, at: Date.now() })}\n`)
+fs.appendFileSync(invocations, `${JSON.stringify({ args: argv, prompt, cwd, sandbox, model, addDirs, threadId, pid: process.pid, at: Date.now() })}\n`)
 
 const emit = (value) => process.stdout.write(`${JSON.stringify(value)}\n`)
 const usage = {

@@ -4,7 +4,7 @@ An MCP server that gives any harness (Claude Code, Codex, Cursor, OpenCode itsel
 
 It is built on the server API of **OpenCode 2** (`/api/*`, through `@opencode/client`).
 
-A task whose model id starts with `cursor/` (for example `cursor/gpt-5.3-codex` or `cursor/auto`) runs on Cursor's `cursor-agent` CLI instead, in print mode with `stream-json`, `--force` and its sandbox in the worktree; later turns continue the same chat with `--resume`. Cursor workers keep the same worktree, transcript, gate and landing path, but have no permission prompts, mid-turn steering, revert or compact, and their edits are checked by the gate's audit rather than confined by the runtime. Set `HORDE_CURSOR_BIN` when `cursor-agent` is not on `PATH`; `CURSOR_API_KEY` and `HOME` are passed through for its login.
+A task whose model id starts with `cursor/` (for example `cursor/gpt-5.3-codex` or `cursor/auto`) runs on Cursor's `cursor-agent` CLI instead, in print mode with `stream-json`, `--force` and its sandbox in the worktree; later turns continue the same chat with `--resume`. On a worktree spawn it also gets `--add-dir` for the repository's git common directory and the board state directory, so its sandbox can commit and file the board report. Cursor workers keep the same worktree, transcript, gate and landing path, but have no permission prompts, mid-turn steering, revert or compact, and their edits are checked by the gate's audit rather than confined by the runtime. Set `HORDE_CURSOR_BIN` when `cursor-agent` is not on `PATH`; `CURSOR_API_KEY` and `HOME` are passed through for its login.
 
 ## The simple path
 
@@ -33,7 +33,7 @@ horde_land { id: "t-4f1a" }
 
 ### Workers on the Codex CLI
 
-A tier or `model` written `codex/<model>` runs the worker on OpenAI's `codex` CLI instead of OpenCode. Its first turn is `codex exec --json -C <worktree> -s workspace-write --skip-git-repo-check [-m <model>] "<prompt>"`; later turns are `codex exec resume <thread> --json …`, so `horde_tell` continues the same Codex thread. The process gets the same allowlisted environment as an OpenCode worker, plus `CODEX_HOME` and `OPENAI_API_KEY` when they are set, and its stdin is closed. Codex cannot ask for permissions, steer mid-turn, revert or compact; a session created with the `deny` policy (reviews and investigations) runs with `-s read-only`. `horde_drop` stops the process, but the thread stays in your Codex history. Cost comes from the usage Codex reports, priced by `horde.json`:
+A tier or `model` written `codex/<model>` runs the worker on OpenAI's `codex` CLI instead of OpenCode. Its first turn is `codex exec --json -C <worktree> -s workspace-write --skip-git-repo-check [-m <model>] "<prompt>"`; later turns are `codex exec resume <thread> --json …`, so `horde_tell` continues the same Codex thread. On a worktree spawn every turn also grants writes to the repository's git common directory and the board state directory: the first with `--add-dir`, a resume with `-c sandbox_workspace_write.writable_roots=[…]`. The process gets the same allowlisted environment as an OpenCode worker, plus `CODEX_HOME` and `OPENAI_API_KEY` when they are set, and its stdin is closed. Codex cannot ask for permissions, steer mid-turn, revert or compact; a session created with the `deny` policy (reviews and investigations) runs with `-s read-only`. `horde_drop` stops the process, but the thread stays in your Codex history. Cost comes from the usage Codex reports, priced by `horde.json`:
 
 ```json
 {

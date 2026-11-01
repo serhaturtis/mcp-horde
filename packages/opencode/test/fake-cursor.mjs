@@ -17,6 +17,7 @@ const resume = flag("--resume")
 const model = flag("--model", "auto")
 const mode = flag("--mode")
 const prompt = argv[argv.length - 1] ?? ""
+const addDirs = argv.flatMap((arg, i) => (arg === "--add-dir" && argv[i + 1] ? [argv[i + 1]] : []))
 
 const stateDir = process.env.CURSOR_FAKE_STATE || path.join(process.env.XDG_STATE_HOME || os.tmpdir(), "horde-cursor-fake")
 fs.mkdirSync(stateDir, { recursive: true })
@@ -41,6 +42,7 @@ fs.appendFileSync(
     workspace,
     model,
     mode,
+    addDirs,
     resume: resume ?? null,
     session,
     prompt,

@@ -48,6 +48,7 @@ interface Session {
   /** The model id passed to `--model` (without the runtime prefix). */
   modelID?: string
   askMode: boolean
+  writableDirs?: string[]
   createdAt: number
   updatedAt: number
   seq: number
@@ -129,6 +130,7 @@ export class CursorRuntime implements Runtime {
       modelID: model?.id,
       // The ask path runs with every tool denied; Cursor's read-only mode keeps it to answering.
       askMode: !!input.rules?.some((r) => r.action === "*" && r.resource === "*" && r.effect === "deny"),
+      ...(input.writableDirs?.length ? { writableDirs: input.writableDirs } : {}),
       createdAt: now,
       updatedAt: now,
       seq: now,
@@ -270,6 +272,7 @@ export class CursorRuntime implements Runtime {
     this.emit("session.execution.started", { sessionID: session.id })
 
     const args = ["-p", "--output-format", "stream-json", "--force", "--sandbox", "enabled", "--workspace", session.directory, "--trust"]
+    for (const dir of session.writableDirs ?? []) args.push("--add-dir", dir)
     if (session.askMode) args.push("--mode", "ask")
     if (session.modelID) args.push("--model", session.modelID)
     if (session.cursorID) args.push("--resume", session.cursorID)

@@ -63,6 +63,8 @@ export interface CreateSessionInput {
   rules?: SessionRule[]
   /** Environment variables the session's tools should see. */
   env?: Record<string, string>
+  /** Directories outside the session's own that a sandboxed runtime must be able to write. */
+  writableDirs?: string[]
 }
 
 export interface PromptOptions {
