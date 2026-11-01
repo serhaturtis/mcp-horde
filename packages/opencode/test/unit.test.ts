@@ -248,7 +248,7 @@ describe("helpers", () => {
     assert.equal(formatModel({ providerID: "a", id: "b", variant: "max" }), "a/b [max]")
   })
 
-  test("codex/ and cursor/ models select that runtime and are refused until it exists", async () => {
+  test("codex/ and cursor/ models select that runtime; codex is refused until its binary is configured", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "horde-runtime-"))
     const backend = { client: {}, info: { key: "local" }, events: new EventEmitter(), streaming: false, dead: true } as unknown as Backend
     const config: Config = {
@@ -273,15 +273,24 @@ describe("helpers", () => {
       settled: () => {},
     }
     const fleet = new Fleet(backend, config, new Store(dir), hooks)
+    // A process runtime creates its session without touching the stub backend; the (missing) CLI
+    // fails the first turn later, which is not this test's concern.
     try {
-      for (const [spec, kind] of [
-        ["codex/gpt-5", "codex"],
-        ["cursor/composer-1", "cursor"],
-      ] as const) {
-        await assert.rejects(fleet.spawn({ prompt: "hi", directory: dir, model: spec }), new RegExp(`the ${kind} runtime is not available yet`))
-      }
+      // No codexBin in this Config: the codex runtime is not registered.
+      await assert.rejects(fleet.spawn({ prompt: "hi", directory: dir, model: "codex/gpt-5" }), /the codex runtime is not available yet/)
+      const cursor = await fleet.spawn({ prompt: "hi", directory: dir, model: "cursor/auto" })
+      assert.equal(cursor.snapshot.model?.providerID, "cursor")
+      await fleet.dispose(cursor.snapshot.id, { worktree: "discard" }).catch(() => undefined)
     } finally {
       fleet.close()
+    }
+    const withCodex = new Fleet(backend, { ...config, codexBin: "codex" }, new Store(dir), hooks)
+    try {
+      const codex = await withCodex.spawn({ prompt: "hi", directory: dir, model: "codex/gpt-5.3-codex" })
+      assert.equal(codex.snapshot.model?.providerID, "codex")
+      await withCodex.dispose(codex.snapshot.id, { worktree: "discard" }).catch(() => undefined)
+    } finally {
+      withCodex.close()
       fs.rmSync(dir, { recursive: true, force: true })
     }
   })
