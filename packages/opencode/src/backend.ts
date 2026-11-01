@@ -163,6 +163,11 @@ export class Backend {
           const client = connect(known.url, username, known.password)
           const probe = await probeHealth(client)
           if (probe.ok) {
+            // A record from before start times were stored learns its server's now, so a later stop can prove the pid.
+            if (!known.startTime) {
+              const startTime = processStartTime(known.pid)
+              if (startTime) store.setServer({ ...known, startTime })
+            }
             if (known.bin && known.bin !== bin.command) {
               warnings.push(`The shared server runs ${known.bin}, but this process is configured for ${bin.command}. Stop it (opencode_server stop) to switch.`)
             }
@@ -687,7 +692,10 @@ export function serverEnv(
  */
 export function droppedSecretWarning(env: NodeJS.ProcessEnv, username: string, passEnv: string[] = []): string | undefined {
   const kept = serverEnv({ username, passEnv }, env)
-  const names = Object.keys(env).filter((name) => /(_API_KEY|_TOKEN)$/i.test(name) && env[name] !== undefined && !(name in kept))
+  // Claude Code's, the horde's and MCP's own tokens are never a worker's provider key.
+  const names = Object.keys(env).filter(
+    (name) => /(_API_KEY|_TOKEN)$/i.test(name) && !/^(CLAUDE_|HORDE_|MCP_)/i.test(name) && env[name] !== undefined && !(name in kept),
+  )
   if (!names.length) return undefined
   const shown = names.slice(0, 5).join(", ")
   const more = names.length > 5 ? ` and ${names.length - 5} more` : ""
