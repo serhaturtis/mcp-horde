@@ -66,6 +66,17 @@ const csv = (values?: string[]) =>
     .flatMap((v) => v.split(","))
     .map((s) => s.trim())
     .filter(Boolean)
+/** File lists: a whole value that is an existing file may contain commas in its name. */
+const files = (values?: string[]) =>
+  (values ?? []).flatMap((v) => {
+    const whole = v.trim()
+    return whole && fs.existsSync(path.resolve(whole))
+      ? [whole]
+      : whole
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean)
+  })
 const USAGE =
   "usage: horde --state <dir> task|progress|report|finding|findings|recall|lock|unlock …\n       horde status [task id] | watch [--interval <seconds>]  [--repo <dir> | --state <dir>]\n       horde remove [--repo <dir>] [--yes]"
 
@@ -293,8 +304,8 @@ async function main(argv: string[]): Promise<string> {
       if (confidence && !["low", "medium", "high"].includes(confidence)) throw new Error("--confidence must be low, medium or high")
       const t = await board.report(args[0]!, args[1]!, {
         summary,
-        filesChanged: csv(flags.changed),
-        testsAdded: csv(flags.tests),
+        filesChanged: files(flags.changed),
+        testsAdded: files(flags.tests),
         decisions: flags.decision ?? [],
         questions: flags.question ?? [],
         unverifiedClaims: flags.unverified ?? [],

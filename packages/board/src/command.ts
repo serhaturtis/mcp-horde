@@ -24,10 +24,9 @@ export function cliArgv(): string[] {
   return [fwd(process.execPath), "--conditions=source", "--import", `file://${tsx.startsWith("/") ? "" : "/"}${tsx}`, fwd(source)]
 }
 
-// Single quotes protect everything but a quote itself (POSIX shells). cmd.exe knows only double
-// quotes, and a path with a single quote cannot be single-quoted for the trust check (which
-// accepts no backslashes): those stay double-quoted.
-const quote = (w: string) => (/^[\w./:@%+=,-]+$/.test(w) ? w : process.platform === "win32" || w.includes("'") ? `"${w}"` : `'${w}'`)
+// Single quotes protect everything but a quote itself (POSIX shells); an embedded quote becomes
+// the '\'' sequence. cmd.exe knows only double quotes, so Windows keeps those.
+const quote = (w: string) => (/^[\w./:@%+=,-]+$/.test(w) ? w : process.platform === "win32" ? `"${w}"` : `'${w.replace(/'/g, "'\\''")}'`)
 
 /** The command prefix a brief tells the worker to use, for a given board state directory. */
 export function workerCommand(stateDir: string): string {
@@ -36,10 +35,10 @@ export function workerCommand(stateDir: string): string {
 
 /**
  * Split a shell command into words, accepting only what cannot run anything
- * else: plain words, 'single-quoted' strings (anything but a quote) and
- * "double-quoted" strings without $, backticks or backslashes. Anything else
- * (;, &, |, <, >, $, `, \, newlines, globs, braces, unbalanced quotes) returns
- * undefined.
+ * else: plain words, 'single-quoted' strings (anything but a quote, or the
+ * '\'' escape), and "double-quoted" strings without $, backticks or backslashes.
+ * Anything else (;, &, |, <, >, $, `, newlines, globs, braces, unbalanced
+ * quotes) returns undefined.
  */
 export function shellWords(command: string): string[] | undefined {
   const words: string[] = []
@@ -52,7 +51,11 @@ export function shellWords(command: string): string[] | undefined {
     let any = false
     while (i < s.length && s[i] !== " ") {
       const c = s[i]!
-      if (c === "'") {
+      if (c === "\\" && s[i + 1] === "'") {
+        // The POSIX '\'' escape for a quote inside a single-quoted word.
+        word += "'"
+        i += 2
+      } else if (c === "'") {
         const end = s.indexOf("'", i + 1)
         if (end < 0) return undefined
         const body = s.slice(i + 1, end)

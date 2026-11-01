@@ -51,17 +51,37 @@ export function renderBrief(board: Board, t: Task, a: Attempt, budgetTokens = 60
   const cmd = workerCommand(board.dir)
   const id = t.id
   const from = (n: Note) => (n.source ? `from ${n.source.task}` : undefined)
-  const notes = (ns: Note[], title: string, caveat: string, attributed = false) =>
-    ns.length
+  // Note text is data: quote every line and neutralize a heading so it cannot forge a section.
+  const quoteNote = (text: string) =>
+    text
+      .split(/\r?\n/)
+      .map((line) => `> ${line.replace(/^#/, "\\#")}`)
+      .join("\n")
+  const notes = (ns: Note[], title: string, caveat: string, attributed = false, max = 12, more = 0) => {
+    const shown = ns.slice(0, max)
+    const rest = Math.max(more, ns.length - shown.length)
+    const what = title.startsWith("Findings") ? "findings" : "notes"
+    return ns.length
       ? `## ${title}\n${caveat}\n${list(
-          ns.slice(0, 12).map((n) => {
+          shown.map((n) => {
             const where = [...n.paths, ...(attributed ? [from(n) ?? "unattributed"] : [])]
-            return `${n.text}${where.length ? ` (${where.join("; ")})` : ""}`
+            return `${quoteNote(n.text)}${where.length ? ` (${where.join("; ")})` : ""}`
           }),
-        )}`
+        )}${rest ? `\n… ${rest} more ${what} not shown.` : ""}`
       : ""
+  }
   const memory = board.memory({ paths: t.scope, query: `${t.title} ${t.goal}` })
-  const findings = board.findings({ paths: t.scope }).filter((n) => n.source?.task !== id)
+  const allFindings = board.findings().filter((n) => n.source?.task !== id)
+  let findings = allFindings
+  let hiddenFindings = 0
+  if (t.scope.length) findings = board.findings({ paths: t.scope }).filter((n) => n.source?.task !== id)
+  else {
+    // An unscoped task sees facts about no path plus the ten most recent, never the whole board.
+    const recent = allFindings.slice(0, 10)
+    const wanted = new Set([...allFindings.filter((n) => !n.paths.length), ...recent].map((n) => n.id))
+    findings = allFindings.filter((n) => wanted.has(n.id)).sort((a, b) => b.at - a.at)
+    hiddenFindings = allFindings.length - findings.length
+  }
   // Standing house rules are required parts; a missing file or broken horde.json is named, never fatal.
   let briefFiles: string[] = []
   if (repo) {
@@ -141,7 +161,16 @@ export function renderBrief(board: Board, t: Task, a: Attempt, budgetTokens = 60
     { text: goal, required: true },
     ...fixed,
     { text: notes(memory, "Project notes", `${WORKER_TEXT} From earlier tasks; they may be outdated.`) },
-    { text: notes(findings, "Findings from other workers", `${WORKER_TEXT} Shared during this work; check before relying on them.`, true) },
+    {
+      text: notes(
+        findings,
+        "Findings from other workers",
+        `${WORKER_TEXT} Shared during this work; check before relying on them.`,
+        true,
+        Math.max(12, findings.length),
+        hiddenFindings,
+      ),
+    },
   ].filter((s) => s.text)
   // Required parts over a tiny budget are kept whole rather than cut.
   const required = sections.filter((s) => s.required)

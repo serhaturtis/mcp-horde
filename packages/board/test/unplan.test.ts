@@ -45,4 +45,29 @@ describe("unplan", () => {
       [task.id],
     )
   })
+
+  test("a task other tasks depend on is refused and its dependents are named", async () => {
+    const { board } = boardAt()
+    const b = await board
+    const { tasks } = await b.plan([
+      { title: "Base", goal: "Foundation." },
+      { title: "Child", goal: "Uses the base.", deps: ["Base"] },
+    ])
+    const [base, child] = tasks
+    await assert.rejects(b.unplan(base!.id), new RegExp(`${child!.id} "Child"`))
+    assert.equal(b.task(base!.id).id, base!.id)
+    assert.deepEqual(b.task(child!.id).deps, [base!.id])
+  })
+
+  test("starting a task whose dependency vanished says so clearly", async () => {
+    const { board } = boardAt()
+    const b = await board
+    const { tasks } = await b.plan([
+      { title: "Base", goal: "Foundation." },
+      { title: "Child", goal: "Uses the base.", deps: ["Base"] },
+    ])
+    const [base, child] = tasks
+    fs.rmSync(path.join(b.dir, "tasks", `${base!.id}.json`))
+    await assert.rejects(b.assign(child!.id), /depends on .* no longer exists on this board/)
+  })
 })

@@ -51,6 +51,22 @@ test("a --state path that does not exist is refused instead of becoming an empty
   assert.match(sh(`${cliArgv().join(" ")} status --state "${right}"`, tmp()), /1 task: 1 working/)
 })
 
+test("--changed and --tests take repeated flags and keep commas in real file names", async () => {
+  const root = tmp()
+  const board = new Board(path.join(root, "state"))
+  const t = (await board.plan([{ title: "x", goal: "y" }])).tasks[0]!
+  const { attempt } = await board.assign(t.id)
+  fs.writeFileSync(path.join(root, "a,b.ts"), "x\n")
+  fs.writeFileSync(path.join(root, "c.ts"), "x\n")
+  sh(
+    `${workerCommand(board.dir)} report ${t.id} ${attempt.token} --summary "done" --changed "a,b.ts" --changed "c.ts" --tests "test/one.test.ts" --tests "test/two.test.ts,test/three.test.ts"`,
+    root,
+  )
+  const r = board.task(t.id).reports.at(-1)!
+  assert.deepEqual(r.filesChanged, ["a,b.ts", "c.ts"])
+  assert.deepEqual(r.testsAdded, ["test/one.test.ts", "test/two.test.ts", "test/three.test.ts"])
+})
+
 test("status and remove refuse a directory with no board instead of creating one", async () => {
   const root = tmp()
   const state = path.join(root, "state")

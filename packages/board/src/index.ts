@@ -147,8 +147,25 @@ tool(
     cost: z.number().min(0).optional(),
   },
   async (a, board, repo) => {
+    // Read the tiers before the mutation: a malformed horde.json must not leave a failed
+    // task behind a thrown formatting error.
+    let tiers: ReturnType<typeof loadTiers> = []
+    let warning = ""
+    try {
+      tiers = loadTiers(repo)
+    } catch (err) {
+      warning = err instanceof Error ? err.message : String(err)
+    }
     const t = await board.fail(a.id, { reason: a.reason, escalate: a.escalate, retry: a.retry, cost: a.cost })
-    return `${t.id} is ${t.status}${t.status === "open" ? `, now at ${tierLabel(t.tier, loadTiers(repo))}` : ""}.`
+    let text = `${t.id} is ${t.status}`
+    if (t.status === "open") {
+      try {
+        text += `, now at ${tierLabel(t.tier, tiers)}`
+      } catch (err) {
+        if (!warning) warning = err instanceof Error ? err.message : String(err)
+      }
+    }
+    return `${text}${warning ? ` (warning: ${warning})` : ""}.`
   },
 )
 

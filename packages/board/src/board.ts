@@ -114,8 +114,12 @@ export interface PlanInput {
 
 export const LEASE_MS = 30 * 60_000
 const MAX_NOTE = 500
+const MAX_NOTES = 500
 const MAX_REPORT = 2000
+const MAX_REPORTS = 20
 const MAX_ITEM = 300
+const MAX_EVENTS_BYTES = 1_000_000
+const MAX_ID_TRIES = 20
 
 /** Words and punctuation that say "no file" rather than naming one. */
 const NO_CLAIM = new Set(["none", "n/a", "na", "nothing", "nil", "null", "-", ".", "...", "(none)"])
@@ -128,8 +132,12 @@ const placeholder = (p: string) => {
 /** Whether a report entry names a path at all: a placeholder, a bare word or a command is no claim. */
 export function claimsPath(p: string): boolean {
   const s = p.trim().toLowerCase()
-  if (placeholder(s) || /\s/.test(s)) return false
-  return s.includes("/") || /\.[a-z]{1,5}$/.test(s)
+  if (placeholder(s)) return false
+  // A path may contain spaces, but a spaced sentence or a command with flags is not one:
+  // "test/my new.test.ts" is a claim, "npm test -w @mcp-horde/opencode" is not.
+  if (!/\s/.test(s)) return s.includes("/") || /\.[a-z0-9]{1,5}$/.test(s)
+  if (/[!?,;:]|\.\s/.test(s) || /\s-{1,2}[\w]/.test(s)) return false
+  return s.includes("/") || /\.[a-z0-9]{1,5}$/.test(s)
 }
 
 // ------------------------------------------------------------------ project
@@ -208,7 +216,15 @@ export class Board {
   }
 
   private event(type: string, data: Record<string, unknown>) {
-    fs.appendFileSync(path.join(this.dir, "events.jsonl"), `${JSON.stringify({ at: Date.now(), type, ...data })}\n`, { mode: 0o600 })
+    const file = path.join(this.dir, "events.jsonl")
+    fs.appendFileSync(file, `${JSON.stringify({ at: Date.now(), type, ...data })}\n`, { mode: 0o600 })
+    // Watch reads only the tail, so keep the file bounded: the newest half of the events.
+    if (fs.statSync(file).size > MAX_EVENTS_BYTES) {
+      const text = fs.readFileSync(file, "utf8")
+      const keep = text.slice(Math.floor(text.length / 2))
+      const start = keep.indexOf("\n")
+      fs.writeFileSync(file, start >= 0 ? keep.slice(start + 1) : keep, { mode: 0o600 })
+    }
   }
 
   // -------------------------------------------------------------- reads
@@ -219,6 +235,7 @@ export class Board {
     return t
   }
 
+  // Done tasks stay as their history; archiving them is a separate feature.
   tasks(): Task[] {
     return fs
       .readdirSync(this.tasksDir)
@@ -254,6 +271,24 @@ export class Board {
     return [...byId.values()].filter((n) => !n.forgotten)
   }
 
+  /**
+   * A store keeps its newest notes. Forgotten tombstones go first, then the oldest notes;
+   * archiving done tasks is a separate feature.
+   */
+  private trimNotes(file: string) {
+    const p = path.join(this.dir, file)
+    if (!fs.existsSync(p)) return
+    const lines = fs
+      .readFileSync(p, "utf8")
+      .split("\n")
+      .filter((l) => l.trim())
+    if (lines.length <= MAX_NOTES) return
+    const keep = this.readNotes(file)
+      .sort((a, b) => a.at - b.at)
+      .slice(-MAX_NOTES)
+    fs.writeFileSync(p, keep.map((n) => `${JSON.stringify(n)}\n`).join(""), { mode: 0o600 })
+  }
+
   findings(filter: { tags?: string[]; paths?: string[] } = {}): Note[] {
     return rank(this.readNotes("findings.jsonl"), filter)
   }
@@ -263,10 +298,16 @@ export class Board {
   }
 
   locks(now = Date.now()): Lock[] {
-    return fs
-      .readdirSync(this.locksDir)
-      .map((f) => readJson<Lock>(path.join(this.locksDir, f)))
-      .filter((l): l is Lock => !!l && l.expires > now)
+    const live: Lock[] = []
+    for (const f of fs.readdirSync(this.locksDir)) {
+      const file = path.join(this.locksDir, f)
+      const l = readJson<Lock>(file)
+      if (!l) continue
+      if (l.expires > now) live.push(l)
+      // An expired lease is gone; listing is where dead lock files get swept.
+      else fs.rmSync(file, { force: true })
+    }
+    return live
   }
 
   // -------------------------------------------------------------- orchestrator
@@ -336,6 +377,9 @@ export class Board {
     return this.mutate(() => {
       const t = this.task(id)
       if (t.attempts.length) throw new Error(`${id} has attempts; a started task is history, so fail or drop it instead`)
+      const dependents = this.tasks().filter((x) => x.deps.includes(id))
+      if (dependents.length)
+        throw new Error(`${id} is a dependency of ${dependents.map((x) => `${x.id} "${x.title}"`).join(", ")}; remove the dependency first`)
       fs.rmSync(this.taskFile(id), { force: true })
       this.releaseLocks(id)
       this.event("unplan", { task: id })
@@ -343,9 +387,15 @@ export class Board {
   }
 
   private newId(existing: Task[]): string {
+    const free = (id: string) => !existing.some((t) => t.id === id) && !fs.existsSync(this.taskFile(id))
+    // Four hex characters fill up on a long-lived board; then switch to six.
+    for (let i = 0; i < MAX_ID_TRIES; i++) {
+      const id = `t-${randomBytes(2).toString("hex")}`
+      if (free(id)) return id
+    }
     for (;;) {
-      const id = `t-${randomBytes(3).toString("hex").slice(0, 4)}`
-      if (!existing.some((t) => t.id === id) && !fs.existsSync(this.taskFile(id))) return id
+      const id = `t-${randomBytes(3).toString("hex")}`
+      if (free(id)) return id
     }
   }
 
@@ -365,7 +415,11 @@ export class Board {
     return this.update(id, (t) => {
       if (t.status === "done") throw new Error(`${id} is already done`)
       if (t.status === "blocked") throw new Error(`${id} is blocked${t.blockedOn ? ` on ${t.blockedOn}` : ""}; unblock it first`)
-      const deps = t.deps.filter((d) => this.task(d).status !== "done")
+      const all = new Map(this.tasks().map((x) => [x.id, x]))
+      const missing = t.deps.filter((d) => !all.has(d))
+      if (missing.length)
+        throw new Error(`${id} depends on ${missing.join(", ")}, which no longer exists on this board; remove the dependency before starting it`)
+      const deps = t.deps.filter((d) => all.get(d)!.status !== "done")
       if (deps.length) throw new Error(`${id} waits for ${deps.join(", ")}`)
       // The previous worker can no longer report or renew; its locks would only block the new one.
       this.endAttempt(t, "abandoned")
@@ -507,6 +561,7 @@ export class Board {
       t.cost = totalCost(t)
       if (opts.escalate) t.tier++
       t.status = opts.retry === false ? "failed" : "open"
+      t.blockedOn = undefined
       this.releaseLocks(id)
       this.event("fail", { task: id, reason: opts.reason, escalate: !!opts.escalate })
     })
@@ -545,14 +600,15 @@ export class Board {
 
   forget(id: string): Promise<void> {
     return this.mutate(() => {
+      let found = false
+      // An id may exist in both stores (e.g. notes written before ids were namespaced).
       for (const file of ["memory.jsonl", "findings.jsonl"]) {
-        if (this.readNotes(file).some((n) => n.id === id)) {
-          fs.appendFileSync(path.join(this.dir, file), `${JSON.stringify({ id, forgotten: true })}\n`)
-          this.event("forget", { id })
-          return
-        }
+        if (!this.readNotes(file).some((n) => n.id === id)) continue
+        found = true
+        fs.appendFileSync(path.join(this.dir, file), `${JSON.stringify({ id, forgotten: true })}\n`)
+        this.event("forget", { id, store: file.startsWith("memory") ? "memory" : "findings" })
       }
-      throw new Error(`no note ${id}`)
+      if (!found) throw new Error(`no note ${id}`)
     })
   }
 
@@ -586,6 +642,8 @@ export class Board {
     return this.update(id, (t) => {
       const a = this.worker(t, token)
       a.seenAt = Date.now()
+      // The worker is working again: the previous round's gate failure is history.
+      this.clearFailure(a)
       if (progress) a.progress = progress.slice(0, MAX_NOTE)
       if (t.status === "claimed" || t.status === "failed") t.status = "working"
       this.renewLocks(id, a)
@@ -629,6 +687,8 @@ export class Board {
         biggest.cut(Math.floor(biggest.length() / 2))
       }
       t.reports.push(report)
+      // A task keeps its latest reports; older rounds stay in the event log.
+      if (t.reports.length > MAX_REPORTS) t.reports = t.reports.slice(-MAX_REPORTS)
       a.seenAt = report.at
       this.clearFailure(a)
       this.renewLocks(id, a)
@@ -656,12 +716,13 @@ export class Board {
     if (!body) return Promise.reject(new Error("a note needs text"))
     return this.mutate(() => {
       if (sourceOf) opts = { ...opts, source: sourceOf() }
-      // The same fact twice is one note.
-      const id = `n-${createHash("sha256").update(body.toLowerCase()).digest("hex").slice(0, 8)}`
+      // The same fact twice is one note; the store is part of the id so memory and findings differ.
+      const id = `n-${createHash("sha256").update(`${file}\0${body.toLowerCase()}`).digest("hex").slice(0, 8)}`
       const existing = this.readNotes(file).find((n) => n.id === id)
       if (existing) return existing
       const note: Note = { id, text: body, tags: clean(opts.tags), paths: clean(opts.paths), source: opts.source, confidence: opts.confidence, at: Date.now() }
       fs.appendFileSync(path.join(this.dir, file), `${JSON.stringify(note)}\n`, { mode: 0o600 })
+      this.trimNotes(file)
       this.event(file.startsWith("memory") ? "remember" : "finding", { id, source: opts.source })
       return note
     })
@@ -676,7 +737,7 @@ export class Board {
     return this.mutate(() => {
       const t = this.task(id)
       const a = this.worker(t, token)
-      const want = clean(paths).map(normalize)
+      const want = [...new Set(clean(paths).map(normalize))]
       if (!want.length) throw new Error("lock needs at least one path")
       // Locks are repository-relative and specific: "**", absolute paths or ".." would lock
       // everything, or nothing that another worktree's lock could ever overlap.
@@ -759,11 +820,21 @@ function clean(list?: string[]): string[] {
 }
 
 function normalize(p: string): string {
-  return p
-    .replace(/\\/g, "/")
-    .replace(/^\.\//, "")
-    .replace(/\/+$/, "")
-    .replace(/\/\*\*$/, "")
+  const win = process.platform === "win32"
+  const s = p.replace(/\\/g, "/")
+  const rooted = s.startsWith("/")
+  const out: string[] = []
+  for (const seg of s.split("/")) {
+    if (!seg || seg === ".") continue
+    if (seg === "..") {
+      // Resolve within the path; a leading ".." stays so a lock outside the root is still refused.
+      if (out.length && out.at(-1) !== "..") out.pop()
+      else if (!rooted) out.push("..")
+    } else out.push(win ? seg.toLowerCase() : seg)
+  }
+  const joined = `${rooted ? "/" : ""}${out.join("/")}`
+  // A trailing glob is its directory for overlap purposes ("src/**" and "src/" are the same).
+  return joined.endsWith("/**") ? joined.slice(0, -3) : joined
 }
 
 /** Two scope entries overlap when one is the other or contains it (globs are treated as their directory). */
@@ -809,15 +880,15 @@ function findCycle(all: Task[]): string[] | undefined {
 
 /** Notes that overlap the tags, paths or words asked for come first, then the newest. */
 function rank(notes: Note[], f: { tags?: string[]; paths?: string[]; query?: string }): Note[] {
-  const words = (f.query ?? "")
-    .toLowerCase()
-    .split(/\W+/)
-    .filter((w) => w.length > 2)
+  // Unicode letters and digits are words; \W would drop a non-Latin query and match everything.
+  const words = (f.query ?? "").toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []
+  const hasQuery = f.query !== undefined
   const score = (n: Note) =>
     (f.tags ?? []).filter((t) => n.tags.includes(t)).length * 3 +
     (f.paths ?? []).filter((p) => n.paths.some((q) => overlaps(p, q))).length * 3 +
     words.filter((w) => n.text.toLowerCase().includes(w) || n.tags.includes(w)).length
-  const filtering = (f.tags?.length ?? 0) + (f.paths?.length ?? 0) + words.length > 0
+  // A query with no usable token filters everything out, rather than silently returning all notes.
+  const filtering = (f.tags?.length ?? 0) + (f.paths?.length ?? 0) > 0 || hasQuery
   return notes
     .map((n) => ({ n, s: score(n) }))
     .filter((x) => !filtering || x.s > 0)
