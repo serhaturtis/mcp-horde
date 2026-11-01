@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto"
 import fs from "node:fs/promises"
 import path from "node:path"
 import { git, gitRaw, globMatcher, isTestPath, splitZ } from "@mcp-horde/core"
@@ -97,9 +98,62 @@ export function unquoteC(p: string): string {
   return Buffer.from(bytes).toString("utf8")
 }
 
+/** Languages whose line comment starts with `#`; everything else here uses the C-like slash comments. */
+const HASH_COMMENT = /\.(py|pyw|rb|sh|bash|zsh|ksh|fish)$/
+
+/**
+ * Comments removed, strings kept: a comment marker inside quotes is text. Block comment state
+ * carries across lines so a commented-out assertion neither pads nor hides a count.
+ */
+function stripComments(lines: string[], file: string): string[] {
+  const hash = HASH_COMMENT.test(file)
+  const out: string[] = []
+  let block = false
+  for (const line of lines) {
+    let text = ""
+    let quote = ""
+    for (let i = 0; i < line.length; i++) {
+      const c = line[i]!
+      if (block) {
+        if (c === "*" && line[i + 1] === "/") {
+          block = false
+          i++
+        }
+        continue
+      }
+      if (quote) {
+        text += c
+        if (c === "\\" && i + 1 < line.length) text += line[++i]
+        else if (c === quote) quote = ""
+        continue
+      }
+      if (c === '"' || c === "'" || c === "`") {
+        quote = c
+        text += c
+        continue
+      }
+      if (hash) {
+        if (c === "#") break
+        text += c
+        continue
+      }
+      if (c === "/" && line[i + 1] === "/") break
+      if (c === "/" && line[i + 1] === "*") {
+        block = true
+        i++
+        continue
+      }
+      text += c
+    }
+    out.push(text)
+  }
+  return out
+}
+
 /** Assertions in the common test frameworks (counted per occurrence, not per line). */
-const ASSERTION = /\b(assert\w*|expect|should|assertEquals|assertThat|require\.\w+|t\.(Error|Fatal)\w*)\s*[.(!]/g
-const assertions = (lines: string[]) => lines.reduce((n, l) => n + (l.match(ASSERTION)?.length ?? 0), 0)
+// Python's bare `assert x == 1` has no punctuation after the keyword, so it needs its own branch.
+const ASSERTION = /\b(assert\w*|expect|should|assertEquals|assertThat|require\.\w+|t\.(Error|Fatal)\w*)\s*[.(!]|\bassert\s+/g
+const assertions = (lines: string[], file: string) => stripComments(lines, file).reduce((n, l) => n + (l.match(ASSERTION)?.length ?? 0), 0)
 
 /** Test definitions per runner; a rename removes one and adds one, so only the net count matters. */
 const TEST_DEF = [
@@ -110,7 +164,7 @@ const TEST_DEF = [
   /^\s*@Test\b/,
   /^\s*\[(?:Test|Fact)\b/,
 ]
-const testDefs = (lines: string[]) => lines.reduce((n, l) => n + (TEST_DEF.some((re) => re.test(l)) ? 1 : 0), 0)
+const testDefs = (lines: string[], file: string) => stripComments(lines, file).reduce((n, l) => n + (TEST_DEF.some((re) => re.test(l)) ? 1 : 0), 0)
 
 /** Test-runner calls, never ordinary words: `(?<![.\w$])` keeps `model.fit(` or `outfit(` from matching. */
 const SKIP_MARKERS: [RegExp, string][] = [
@@ -164,16 +218,19 @@ function randomLooking(v: string): boolean {
   return bits >= 3
 }
 
-function secretIn(text: string): string | undefined {
+function secretMatch(text: string): { what: string; value: string } | undefined {
   for (const [re, what] of SECRETS) {
     const m = text.match(re)
     if (!m) continue
     // The generic assignment rule needs a value that is neither a placeholder nor a word.
     if (what === "a hard-coded credential" && (PLACEHOLDER.test(m[3] ?? "") || !randomLooking(m[3] ?? ""))) continue
-    return what
+    return { what, value: what === "a hard-coded credential" ? (m[3] ?? "") : m[0] }
   }
   return undefined
 }
+
+/** A short fingerprint of a secret value: history dedupe must tell two keys of one kind apart. */
+const fingerprint = (value: string) => createHash("sha256").update(value).digest("hex").slice(0, 16)
 
 const LOCKFILES =
   /(^|\/)(package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?|Cargo\.lock|poetry\.lock|uv\.lock|Pipfile\.lock|go\.sum|composer\.lock|Gemfile\.lock)$/
@@ -323,7 +380,7 @@ async function changes(root: string, base: string): Promise<Change[]> {
     )
   }
   // Untracked files are additions too (a worker that never ran `git add`).
-  for (const p of splitZ(await gitRaw(root, [...Q, "ls-files", "--others", "--exclude-standard", "-z"]))) {
+  const addUntracked = async (p: string) => {
     const c: Change = { path: p, status: "?", added: [], removed: [], binary: false }
     const full = path.join(root, p)
     const st = await fs.stat(full).catch(() => undefined)
@@ -338,18 +395,46 @@ async function changes(root: string, base: string): Promise<Change[]> {
     }
     byPath.set(p, c)
   }
+  const standard = splitZ(await gitRaw(root, [...Q, "ls-files", "--others", "--exclude-standard", "-z"]))
+  for (const p of standard) await addUntracked(p)
+  // .git/info/exclude is editable by the work, unlike the user's global excludes: a file it alone
+  // hides is audited as untracked. Comparing the two listings leaves only info/global hits.
+  const hidden = splitZ(await gitRaw(root, [...Q, "ls-files", "--others", "--exclude-per-directory=.gitignore", "-z"]))
+  const listed = new Set(standard)
+  for (const p of hidden) {
+    if (listed.has(p)) continue
+    const source = await gitRaw(root, ["check-ignore", "-v", "--", p]).catch(() => "")
+    if (!/(^|[/\\])\.git[/\\]info[/\\]exclude:\d+:/.test(source)) continue
+    await addUntracked(p)
+  }
   return [...byPath.values()]
 }
 
 /** Tracked files an index bit hides from `git diff` and `git status` (so from the change list above). */
 async function hiddenFiles(root: string): Promise<{ path: string; skip: boolean }[]> {
   const out: { path: string; skip: boolean }[] = []
+  // The index blob each path would commit, so an unchanged or sparse-checkout-missing file is quiet.
+  const blobs = new Map<string, string>()
+  for (const entry of splitZ(await gitRaw(root, [...Q, "ls-files", "-s", "-z"]))) {
+    const tab = entry.indexOf("\t")
+    if (tab < 0) continue
+    const [mode, sha] = entry.slice(0, tab).split(" ")
+    if (mode && sha) blobs.set(entry.slice(tab + 1), sha)
+  }
   // `-v` prefixes each entry with one tag character then a space: `S` is skip-worktree, any
   // lowercase tag marks assume-unchanged. A file with both reads `s`; either hides it.
   for (const entry of splitZ(await gitRaw(root, [...Q, "ls-files", "-v", "-z"]))) {
     const tag = entry[0] ?? ""
-    if (tag === "S") out.push({ path: entry.slice(2), skip: true })
-    else if (/[a-z]/.test(tag)) out.push({ path: entry.slice(2), skip: false })
+    const skip = tag === "S"
+    if (!skip && !/[a-z]/.test(tag)) continue
+    const file = entry.slice(2)
+    if (!(await isFile(root, file))) continue
+    const blob = blobs.get(file)
+    if (!blob) continue
+    // Filters apply here too, so this hash is comparable with the index's object id.
+    const disk = await git(root, "hash-object", "--", file).catch(() => "")
+    if (!disk || disk === blob) continue
+    out.push({ path: file, skip })
   }
   return out
 }
@@ -359,6 +444,7 @@ interface HistoricalSecret {
   file: string
   line: number
   what: string
+  fingerprint: string
 }
 
 /** Secret-looking lines added in any commit since base, even when a later commit removed them. */
@@ -416,11 +502,14 @@ async function secretHistory(root: string, base: string): Promise<HistoricalSecr
     }
     if (!inHunk || !file) continue
     if (line.startsWith("+")) {
-      const what = secretIn(line.slice(1))
-      const key = `${sha}\0${file}\0${what}`
-      if (what && !seen.has(key)) {
-        seen.add(key)
-        out.push({ commit: short, file, line: lineNo, what })
+      const hit = secretMatch(line.slice(1))
+      if (hit) {
+        const fp = fingerprint(hit.value)
+        const key = `${sha}\0${file}\0${hit.what}\0${fp}`
+        if (!seen.has(key)) {
+          seen.add(key)
+          out.push({ commit: short, file, line: lineNo, what: hit.what, fingerprint: fp })
+        }
       }
       lineNo++
     } else if (line.startsWith(" ")) lineNo++
@@ -554,20 +643,109 @@ async function checkDirs(root: string, base: string, directory: string): Promise
   return dirs
 }
 
+/** A shell line split at operators outside quotes, so a quoted `sh -c "a; b"` stays one segment. */
+function shellSegments(line: string): string[] {
+  const out: string[] = []
+  let cur = ""
+  let quote = ""
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i]!
+    if (quote) {
+      cur += c
+      if (c === "\\" && i + 1 < line.length) cur += line[++i]
+      else if (c === quote) quote = ""
+      continue
+    }
+    if (c === "'" || c === '"' || c === "`") {
+      quote = c
+      cur += c
+      continue
+    }
+    if (c === "\\" && i + 1 < line.length) {
+      cur += c + line[++i]
+      continue
+    }
+    if ((c === "&" && line[i + 1] === "&") || (c === "|" && line[i + 1] === "|")) {
+      out.push(cur)
+      cur = ""
+      i++
+      continue
+    }
+    if (c === ";" || c === "|" || c === "\n") {
+      out.push(cur)
+      cur = ""
+      continue
+    }
+    cur += c
+  }
+  out.push(cur)
+  return out.map((s) => s.trim()).filter(Boolean)
+}
+
+/** Shell words with matching quotes removed; `$NAME` and `$(…)` are left as written, to be skipped. */
+function shellWords(segment: string): string[] {
+  const out: string[] = []
+  let cur = ""
+  let quote = ""
+  let has = false
+  for (let i = 0; i < segment.length; i++) {
+    const c = segment[i]!
+    if (quote) {
+      if (c === "\\" && i + 1 < segment.length) {
+        cur += segment[++i]
+        has = true
+        continue
+      }
+      if (c === quote) {
+        quote = ""
+        continue
+      }
+      cur += c
+      has = true
+      continue
+    }
+    if (c === "'" || c === '"' || c === "`") {
+      quote = c
+      has = true
+      continue
+    }
+    if (c === "\\" && i + 1 < segment.length) {
+      cur += segment[++i]
+      has = true
+      continue
+    }
+    if (/\s/.test(c)) {
+      if (has) {
+        out.push(cur)
+        cur = ""
+        has = false
+      }
+      continue
+    }
+    cur += c
+    has = true
+  }
+  if (has) out.push(cur)
+  return out
+}
+
 /**
- * The scripts a check command names, plus one level of scripts those name in turn: rewriting any
- * of them changes what the gate runs. A token that does not resolve to an existing non-test file
- * (a flag, a program on PATH, a test file) is ignored, so the resolution is cheap and deterministic.
+ * The scripts a check command names, and the scripts those name up to three levels down:
+ * rewriting any of them changes what the gate runs. A token that does not resolve to an existing
+ * file is ignored, so a flag or a program on PATH is cheap to skip. Variables and `$(…)` cannot be
+ * resolved statically and stay out of the graph.
  */
 async function checkScriptPaths(root: string, checks: { command: string; cwd: string }[]): Promise<Set<string>> {
   const out = new Set<string>()
   const inside = (rel: string) => !rel.startsWith("..") && !path.isAbsolute(rel)
   const relOf = (abs: string) => path.relative(root, abs).split(path.sep).join("/")
-  // A token naming an existing non-test file, resolved at `cwd` first, then the repository root.
+  // A token naming an existing file, resolved at `cwd` first, then the repository root. A script
+  // named directly is executed even when it lives under a test directory.
   const scriptAt = async (cwd: string, tok: string) => {
+    if (!tok || tok.includes("$")) return undefined
     for (const abs of [path.resolve(cwd, tok), path.resolve(root, tok)]) {
       const rel = relOf(abs)
-      if (!inside(rel) || isTestPath(rel)) continue
+      if (!inside(rel)) continue
       if (await isFile(root, rel)) return rel
     }
     return undefined
@@ -575,40 +753,83 @@ async function checkScriptPaths(root: string, checks: { command: string; cwd: st
   // Only what a command executes: the program of each shell segment when it is a file in the
   // repository (./ci.sh, scripts/run.sh), or the file an interpreter runs (sh x.sh, python t.py).
   // A data file a check merely reads (grep ok out.txt, test -f built.js) is the work, not a rule.
-  const refs = async (cwd: string, text: string) => {
+  const refs = async (cwd: string, text: string, depth = 8): Promise<Set<string>> => {
     const found = new Set<string>()
+    if (depth <= 0) return found
     for (const line of text.split("\n")) {
-      for (const segment of line.split(/&&|\|\||;|\|/)) {
-        const toks = segment.trim().split(/\s+/).filter(Boolean)
+      // `cd sub && sh run.sh` runs the script from sub, so later segments resolve there.
+      let dir = cwd
+      for (const segment of shellSegments(line)) {
+        const toks = shellWords(segment)
         while (toks.length && (toks[0] === "env" || toks[0] === "exec" || /^[A-Za-z_][A-Za-z0-9_]*=/.test(toks[0]!))) toks.shift()
         if (!toks.length) continue
         const program = path.posix.basename(toks[0]!.replace(/\\/g, "/"))
-        const own = await scriptAt(cwd, toks[0]!)
+        if (program === "cd") {
+          const target = toks.slice(1).find((t) => !t.startsWith("-"))
+          if (target) dir = path.resolve(dir, target)
+          continue
+        }
+        const own = await scriptAt(dir, toks[0]!)
         if (own) found.add(own)
+        // make -C dir and make -f file name the manifest the check runs.
+        const manifests = MANIFESTS[program]
+        if (manifests) {
+          const dirs = [dir]
+          for (let i = 1; i < toks.length; i++) {
+            const t = toks[i]!
+            if (t === "-C" && toks[i + 1]) dirs.push(path.resolve(dir, toks[++i]!))
+            else if (t.startsWith("-C") && t.length > 2) dirs.push(path.resolve(dir, t.slice(2)))
+            else if (t === "-f" && toks[i + 1]) {
+              const rel = await scriptAt(dir, toks[++i]!)
+              if (rel) found.add(rel)
+            } else if (t.startsWith("-f") && t.length > 2) {
+              const rel = await scriptAt(dir, t.slice(2))
+              if (rel) found.add(rel)
+            }
+          }
+          for (const d of dirs)
+            for (const name of manifests) {
+              const rel = await scriptAt(d, name)
+              if (rel) found.add(rel)
+            }
+        }
         if (!INTERPRETERS.has(program)) continue
+        // sh -c "..." and bash -c '...' run the quoted text: follow it as a command line.
+        const cArg = toks.findIndex((t, i) => i > 0 && (t === "-c" || t === "-e"))
+        if (cArg > 0 && toks[cArg + 1]) {
+          for (const rel of await refs(dir, toks[cArg + 1]!, depth - 1)) found.add(rel)
+          continue
+        }
+        if (toks.includes("-m")) continue // python -m module runs no repository file
+        // node --test's arguments are test files to run, not scripts it executes.
+        if (["node", "nodejs", "bun", "deno"].includes(program) && toks.includes("--test")) continue
         // The first argument that is not a flag (python -m module and the like run no file).
         const arg = toks.slice(1).find((t) => !t.startsWith("-"))
-        if (!arg || toks[1] === "-m" || toks[1] === "-c" || toks[1] === "-e") continue
-        const rel = await scriptAt(cwd, arg)
+        if (!arg || arg.includes("$")) continue
+        const rel = await scriptAt(dir, arg)
         if (rel) found.add(rel)
       }
     }
     return found
   }
-  const program = (cmd: string) => path.posix.basename((cmd.trim().match(/^\S+/) ?? [""])[0]!.replace(/\\/g, "/"))
   const level0 = new Set<string>()
-  for (const check of checks) {
-    for (const rel of await refs(check.cwd, check.command)) level0.add(rel)
-    for (const name of MANIFESTS[program(check.command)] ?? []) {
-      const rel = await scriptAt(check.cwd, name)
-      if (rel) level0.add(rel)
-    }
-  }
+  for (const check of checks) for (const rel of await refs(check.cwd, check.command)) level0.add(rel)
+  const seen = new Set(level0)
   for (const rel of level0) out.add(rel)
-  // One level down: scripts the command's own scripts and manifests name.
-  for (const rel of [...level0]) {
-    const text = await fs.readFile(path.join(root, rel), "utf8").catch(() => "")
-    for (const child of await refs(path.dirname(path.join(root, rel)), text)) out.add(child)
+  // Three levels down: the scripts a check's own scripts and manifests name in turn.
+  let frontier = new Set(level0)
+  for (let depth = 1; depth <= 3 && frontier.size; depth++) {
+    const next = new Set<string>()
+    for (const rel of frontier) {
+      const text = await fs.readFile(path.join(root, rel), "utf8").catch(() => "")
+      for (const child of await refs(path.dirname(path.join(root, rel)), text)) {
+        if (seen.has(child)) continue
+        seen.add(child)
+        out.add(child)
+        next.add(child)
+      }
+    }
+    frontier = next
   }
   return out
 }
@@ -667,6 +888,23 @@ async function ruleChanges(
   }
   const viteSuppressed = async (p: string) => /^vite\.config\..+$/.test(path.posix.basename(p)) && (await vitestAt(path.posix.dirname(p)))
   const local = new Set([...dirs].map((d) => path.relative(root, d).split(path.sep).join("/") || "."))
+  // A runner config is a rule at the repository root or in a project directory (next to a manifest).
+  const runnerConfigAt = async (file: string) => {
+    if (!RUNNER_CONFIG.test(file)) return false
+    const dir = path.posix.dirname(file)
+    if (dir === ".") return true
+    for (const name of ["package.json", "pyproject.toml", "Cargo.toml", "go.mod"]) {
+      const at = path.posix.join(dir, name)
+      if (await isFile(root, at)) return true
+      if (
+        await git(root, "cat-file", "-e", `${base}:${at}`)
+          .then(() => true)
+          .catch(() => false)
+      )
+        return true
+    }
+    return false
+  }
   const checkPaths = await checkScriptPaths(root, checks)
   for (const c of all) {
     const file = c.path
@@ -686,7 +924,7 @@ async function ruleChanges(
       )
       if (changed.length) out.push({ file, what: `package.json scripts ${changed.join(", ")}` })
       if (differs(a.jest, b.jest)) out.push({ file, what: "package.json jest" })
-    } else if (RUNNER_CONFIG.test(file) || (c.from && RUNNER_CONFIG.test(c.from))) {
+    } else if ((await runnerConfigAt(file)) || (c.from && (await runnerConfigAt(c.from)))) {
       out.push({ file, what: path.posix.basename(RUNNER_CONFIG.test(file) ? file : c.from!) })
     } else if (/(^|\/)conftest\.py$/.test(file) || (c.from && /(^|\/)conftest\.py$/.test(c.from))) {
       out.push({ file, what: "conftest.py" })
@@ -710,7 +948,7 @@ async function ruleChanges(
   return out
 }
 
-async function packageJsonDeps(root: string, base: string, file: string) {
+async function packageJsonDeps(root: string, base: string, file: string, beforeFile = file) {
   const parse = (text: string | undefined) => {
     if (!text) return new Map<string, string>()
     try {
@@ -724,7 +962,7 @@ async function packageJsonDeps(root: string, base: string, file: string) {
       return new Map<string, string>()
     }
   }
-  const before = parse(await git(root, "show", `${base}:${file}`).catch(() => undefined))
+  const before = parse(await git(root, "show", `${base}:${beforeFile}`).catch(() => undefined))
   const after = parse(await fs.readFile(path.join(root, file), "utf8").catch(() => undefined))
   const added = [...after.keys()].filter((n) => !before.has(n)).map((n) => `${n}@${after.get(n)}`)
   const removed = [...before.keys()].filter((n) => !after.has(n))
@@ -771,6 +1009,12 @@ export async function audit(directory: string, opts: AuditOptions): Promise<Audi
     known.add(h.path)
   }
 
+  // A later commit lands the index, not this working tree: name a path whose two versions differ.
+  const staged = new Set(splitZ(await gitRaw(root, [...Q, "diff", "--cached", "--no-ext-diff", "-M", "--name-only", "-z", base])))
+  const unstaged = splitZ(await gitRaw(root, [...Q, "diff", "--no-ext-diff", "-M", "--name-only", "-z"]))
+  for (const p of unstaged)
+    if (staged.has(p)) add("git", { file: p, text: "has staged content that differs from the working tree; a commit would land the staged version" }, true)
+
   const scopes = [opts.allowed ?? [], ...(opts.scopes ?? [])].filter((s) => s.length).map((s) => globMatcher(s))
   if (scopes.length) {
     const inScope = (p: string) => scopes.every((m) => m(p))
@@ -785,55 +1029,66 @@ export async function audit(directory: string, opts: AuditOptions): Promise<Audi
   }
 
   const generated = globMatcher(opts.generated ?? [])
+  const currentSecretKeys = new Set<string>()
   for (const c of all) {
     if (opts.generated?.length && generated(c.path)) continue
     const test = isTestPath(c.path)
+    const runnable = isRunnableTest(c.path)
     // Rust unit tests live inline in src/*.rs, so every changed .rs file is scanned.
     const rust = /\.rs$/.test(c.path)
-    if (c.status === "D" && (test || isRunnableTest(c.path))) add("tests", { file: c.path, text: "deletes a test file" })
+    if (c.status === "D" && runnable) add("tests", { file: c.path, text: "deletes a test file" })
     // x.test.ts → x.test.ts.bak stays in a test directory but no runner picks it up any more.
-    if (c.from && ((isTestPath(c.from) && !test) || (isRunnableTest(c.from) && !isRunnableTest(c.path))))
-      add("tests", { file: c.from, text: `moves a test file out of the test suite (to ${c.path})` })
+    if (c.from && isRunnableTest(c.from) && !runnable) add("tests", { file: c.from, text: `moves a test file out of the test suite (to ${c.path})` })
+    const cleanAdded = c.added.length
+      ? stripComments(
+          c.added.map((a) => a.text),
+          c.path,
+        )
+      : []
     // A root conftest.py is not under tests/, but its pytest hooks still skip tests.
     if (test || rust || /(^|\/)conftest\.py$/.test(c.path)) {
-      for (const a of c.added) {
-        const hit = SKIP_MARKERS.find(([re]) => re.test(a.text))
-        if (hit) add("tests", { file: c.path, line: a.line, text: hit[1] })
+      for (const [i, text] of cleanAdded.entries()) {
+        const hit = SKIP_MARKERS.find(([re]) => re.test(text))
+        if (hit) add("tests", { file: c.path, line: c.added[i]!.line, text: hit[1] })
       }
     }
-    if ((test || rust) && c.status !== "D") {
-      const removed = testDefs(c.removed) - testDefs(c.added.map((a) => a.text))
+    if ((runnable || rust) && c.status !== "D") {
+      const removed = testDefs(c.removed, c.from ?? c.path) - testDefs(cleanAdded, c.path)
       if (removed > 0) add("tests", { file: c.path, text: `removes ${removed} test${removed === 1 ? "" : "s"}` })
     }
     // A test file that exits its process at the top level stops the runner early, possibly
     // before it prints a count. Anchored at the line start, so a string in a fixture does not match.
-    if (test || isRunnableTest(c.path)) {
+    if (test || runnable) {
       for (const a of c.added) {
         if (/^\s*(?:process\.exit|os\._exit|sys\.exit)\(/.test(a.text)) add("tests", { file: c.path, line: a.line, text: "exits the test process early" })
       }
     }
-    if (test && c.status !== "D") {
-      // A test that keeps its name but loses its assertions still "passes": losing every one, or
-      // more than half of them, is a neutered test (block); a smaller loss only warns.
+    const snapPath = /\.snap$|__snapshots__\//.test(c.path)
+    const checkAssertions = (runnable || rust) && c.status !== "D"
+    if (checkAssertions || (snapPath && c.status !== "D" && c.removed.length > 0)) {
       const beforeText = await gitRaw(root, ["show", `${base}:${c.from ?? c.path}`]).catch(() => "")
-      const afterText = await fs.readFile(path.join(root, c.path), "utf8").catch(() => "")
       const beforeLines = beforeText ? beforeText.split("\n") : []
-      const afterLines = afterText ? afterText.split("\n") : []
-      const before = assertions(beforeLines)
-      const after = assertions(afterLines)
-      const lost = before - after
-      if (lost > 0) {
-        const emptied = after === 0
-        const majority = !emptied && lost * 2 > before
-        const text = emptied
-          ? `removes all ${before} assertion${before === 1 ? "" : "s"}`
-          : majority
-            ? `removes ${lost} of ${before} assertions (more than half)`
-            : `removes ${lost} assertion${lost === 1 ? "" : "s"}`
-        add("tests", { file: c.path, text }, !(emptied || majority))
+      if (checkAssertions) {
+        // A test that keeps its name but loses its assertions still "passes": losing every one, or
+        // more than half of them, is a neutered test (block); a smaller loss only warns.
+        const afterText = await fs.readFile(path.join(root, c.path), "utf8").catch(() => "")
+        const afterLines = afterText ? afterText.split("\n") : []
+        const before = assertions(beforeLines, c.from ?? c.path)
+        const after = assertions(afterLines, c.path)
+        const lost = before - after
+        if (lost > 0) {
+          const emptied = after === 0
+          const majority = !emptied && lost * 2 > before
+          const text = emptied
+            ? `removes all ${before} assertion${before === 1 ? "" : "s"}`
+            : majority
+              ? `removes ${lost} of ${before} assertions (more than half)`
+              : `removes ${lost} assertion${lost === 1 ? "" : "s"}`
+          add("tests", { file: c.path, text }, !(emptied || majority))
+        }
       }
-      // A snapshot whose lines are mostly gone, or wholly replaced, is a rewrite (block); a smaller one warns.
-      if (/\.snap$|__snapshots__\//.test(c.path) && c.removed.length > 0) {
+      // A snapshot anywhere whose lines are mostly gone, or wholly replaced, is a rewrite (block).
+      if (snapPath && c.removed.length > 0) {
         const beforeCount = beforeLines.length - (beforeLines[beforeLines.length - 1] === "" ? 1 : 0)
         const removed = c.removed.length
         const replaced = removed >= beforeCount
@@ -849,12 +1104,15 @@ export async function audit(directory: string, opts: AuditOptions): Promise<Audi
     for (const a of c.added) {
       const sup = SUPPRESSIONS.find(([re]) => re.test(a.text))
       if (sup) add("suppressions", { file: c.path, line: a.line, text: sup[1] })
-      const secret = secretIn(a.text)
-      // Name the kind of secret, never the value.
-      if (secret) add("secrets", { file: c.path, line: a.line, text: `adds what looks like ${secret}` })
+      const secret = secretMatch(a.text)
+      // Name the kind of secret, never the value; the fingerprint only feeds history dedupe.
+      if (secret) {
+        add("secrets", { file: c.path, line: a.line, text: `adds what looks like ${secret.what}` })
+        currentSecretKeys.add(`${c.path}\0${secret.what}\0${fingerprint(secret.value)}`)
+      }
     }
     if (c.status !== "D") {
-      if (c.binary) add("binaries", { file: c.path, text: "adds or changes a binary file" })
+      if (c.binary && !LOCKFILES.test(c.path)) add("binaries", { file: c.path, text: "adds or changes a binary file" })
       // Size: new files, or files this change made big; lockfiles are big by nature.
       const st = LOCKFILES.test(c.path) ? undefined : await fs.stat(path.join(root, c.path)).catch(() => undefined)
       if (st?.isFile() && st.size > BIG_FILE) {
@@ -864,7 +1122,7 @@ export async function audit(directory: string, opts: AuditOptions): Promise<Audi
     }
     // Dependencies.
     if (/(^|\/)package\.json$/.test(c.path) && c.status !== "D") {
-      const d = await packageJsonDeps(root, base, c.path)
+      const d = await packageJsonDeps(root, base, c.path, c.from ?? c.path)
       if (d.added.length) add("dependencies", { file: c.path, text: `adds ${d.added.join(", ")}` })
       if (d.removed.length) add("dependencies", { file: c.path, text: `removes ${d.removed.join(", ")}` })
       if (d.changed.length) add("dependencies", { file: c.path, text: `changes ${d.changed.join(", ")}` })
@@ -893,9 +1151,8 @@ export async function audit(directory: string, opts: AuditOptions): Promise<Audi
 
   // A secret committed and then deleted still leaked: scan the commits, not only the net diff.
   if (severityOf("secrets")) {
-    const current = findings.filter((f) => f.category === "secrets")
     for (const h of await secretHistory(root, base)) {
-      if (current.some((f) => f.file === h.file && f.text.includes(h.what))) continue
+      if (currentSecretKeys.has(`${h.file}\0${h.what}\0${h.fingerprint}`)) continue
       add("secrets", { file: h.file, line: h.line, text: `adds what looks like ${h.what} in commit ${h.commit}` })
     }
   }
