@@ -363,7 +363,8 @@ if (!fs.existsSync("b.txt")) {
     )
     const failed = await settle(id)
     assert.match(failed, new RegExp(`^${id} FAILED`), failed)
-    assert.doesNotMatch(failed, /outside the allowed scope/, "the verdict text was trimmed before its audit lines")
+    // The audit lines come before the check output, so a long failure can no longer push them out.
+    assert.match(failed, /outside the allowed scope/, failed)
     assert.match(failed, /scope: \[\.\.\.\]\} to allow b\.txt/, failed)
     await h.call("horde_drop", { id })
   })

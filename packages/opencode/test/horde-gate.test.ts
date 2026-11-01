@@ -359,7 +359,8 @@ describe("the simple path: horde_do, horde_wait, horde_land (real opencode, mock
     git(r, "add", "horde.json")
     git(r, "commit", "-qm", "change commands")
     const second = await h.call("horde_do", { directory: r, goal: "Write r.txt.\nRUN: echo ok > r.txt && git add r.txt && git commit -qm r", scope: ["r.txt"] })
-    assert.match(second, /horde\.json's commands changed since you last ran a task here: .*\+ workers\.land .*− check test /, second)
+    assert.match(second, /horde\.json's commands changed since you last ran a task here: check test changed · workers\.land changed/, second)
+    assert.doesNotMatch(second, /commands changed since[^\n]*node -e/, "the announcement names the checks, never their command text")
     await h.call("horde_drop", { id: idOf(second) })
 
     const third = await h.call("horde_do", { directory: r, goal: "Write s.txt.\nRUN: echo ok > s.txt && git add s.txt && git commit -qm s", scope: ["s.txt"] })
