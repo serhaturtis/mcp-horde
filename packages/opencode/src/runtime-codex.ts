@@ -84,6 +84,9 @@ interface CodexSession {
   proc?: ChildProcess
   running: boolean
   interrupted: boolean
+  removed: boolean
+  /** A note for the next turn: its thread was rejected and it starts a fresh conversation. */
+  freshThreadNote?: string
   error?: string
   outcome?: "succeeded" | "failed" | "interrupted"
   tokens: { input: number; output: number; reasoning: number; cacheRead: number; cacheWrite: number }
@@ -91,6 +94,8 @@ interface CodexSession {
 }
 
 const ZERO_TOKENS = { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 }
+/** The reasoning efforts Codex accepts in `model_reasoning_effort`. */
+const REASONING_EFFORTS = new Set(["low", "medium", "high", "xhigh"])
 
 function num(v: unknown): number {
   return typeof v === "number" && Number.isFinite(v) ? v : 0
@@ -173,11 +178,12 @@ export class CodexRuntime implements Runtime {
   async createSession(input: CreateSessionInput): Promise<SessionInfo> {
     const id = `codex-${randomBytes(4).toString("hex")}`
     const now = this.now()
+    const model = input.model && input.variant && !input.model.variant ? { ...input.model, variant: input.variant } : input.model
     const session: CodexSession = {
       id,
       directory: input.directory,
       title: input.title,
-      ...(input.model ? { model: input.model } : {}),
+      ...(model ? { model } : {}),
       readOnly: input.permissions === "deny",
       rules: input.rules,
       ...(input.env ? { env: input.env } : {}),
@@ -189,6 +195,7 @@ export class CodexRuntime implements Runtime {
       queue: [],
       running: false,
       interrupted: false,
+      removed: false,
       tokens: { ...ZERO_TOKENS },
       cost: 0,
     }
@@ -240,8 +247,9 @@ export class CodexRuntime implements Runtime {
 
   async status(id: string, active?: Set<string>): Promise<RuntimeStatus> {
     const session = this.get(id)
+    // The process state is authoritative; a caller's stale active set must not hide it.
     const running = active ?? (await this.active())
-    if (running.has(id)) return { state: "running", session: this.sessionInfo(session), active: running }
+    if (session.running) return { state: "running", session: this.sessionInfo(session), active: running }
     if (session.outcome === "failed")
       return { state: "error", error: session.error ?? "the last turn failed", session: this.sessionInfo(session), active: running }
     return { state: "idle", session: this.sessionInfo(session), active: running }
@@ -270,7 +278,7 @@ export class CodexRuntime implements Runtime {
     const turn = session.turns[session.turns.length - 1]
     if (turn && !turn.completed) turn.interrupted = true
     session.interrupted = true
-    session.queue.length = 0
+    // Keep the queue: a tell sent behind the running turn starts once the killed turn closes.
     const proc = session.proc
     if (!proc?.pid || proc.exitCode !== null || proc.signalCode !== null) return
     this.signal(proc, "SIGTERM")
@@ -284,8 +292,16 @@ export class CodexRuntime implements Runtime {
   async remove(id: string): Promise<void> {
     const session = this.byID.get(id)
     if (!session) return
-    if (session.proc) this.signal(session.proc, "SIGTERM")
+    session.removed = true
+    session.queue = []
     this.byID.delete(id)
+    const proc = session.proc
+    if (!proc?.pid) return
+    this.signal(proc, "SIGTERM")
+    const timer = setTimeout(() => {
+      if (proc.exitCode === null && proc.signalCode === null) this.signal(proc, "SIGKILL")
+    }, 5_000)
+    timer.unref()
   }
 
   async switchModel(id: string, model: ModelRef): Promise<void> {
@@ -301,7 +317,9 @@ export class CodexRuntime implements Runtime {
   }
 
   private modelRef(session: CodexSession): ModelRef {
-    return session.model ? { providerID: "codex", id: session.model.id } : { providerID: "codex", id: "default" }
+    return session.model
+      ? { providerID: "codex", id: session.model.id, ...(session.model.variant ? { variant: session.model.variant } : {}) }
+      : { providerID: "codex", id: "default" }
   }
 
   private sessionInfo(session: CodexSession): SessionInfo {
@@ -327,11 +345,16 @@ export class CodexRuntime implements Runtime {
 
   /** Start the next queued prompt in its own `codex exec` (first turn) or `codex exec resume`. */
   private startNext(session: CodexSession) {
+    if (session.removed) {
+      session.running = false
+      return
+    }
     const next = session.queue.shift()
     if (!next) {
       session.running = false
       return
     }
+    const first = session.turns.length === 0
     const at = this.now()
     const user: SessionMessageInfo = { id: next.id, type: "user", time: { created: at }, text: next.text }
     const assistant: SessionMessageAssistant = {
@@ -350,18 +373,32 @@ export class CodexRuntime implements Runtime {
     session.outcome = undefined
     session.error = undefined
     session.interrupted = false
-    this.emit("session.created", { sessionID: session.id, title: session.title, model: assistant.model })
+    // `session.created` belongs to createSession: a later turn is not a new session.
+    if (session.freshThreadNote) {
+      const note = session.freshThreadNote
+      session.freshThreadNote = undefined
+      this.note(turn, "thread", note)
+    } else if (!first && !session.threadId) {
+      // The first turn ended before Codex reported a thread id; starting over would lose the history silently.
+      this.fail(session, turn, "cannot resume the Codex thread: the previous turn ended before Codex reported a thread id")
+      session.freshThreadNote = "the previous Codex turn ended before it reported a thread id; this turn started a new conversation"
+      this.finish(session, turn, undefined)
+      return
+    }
+    if (session.model?.variant && !REASONING_EFFORTS.has(session.model.variant)) {
+      this.note(turn, "variant", `Codex does not accept the model variant "${session.model.variant}"; using the default reasoning effort`)
+    }
     this.run(session, turn, next.text)
   }
 
   private run(session: CodexSession, turn: TurnState, text: string) {
-    const args = this.args(session, text)
+    const args = this.args(session)
     let proc: ChildProcess
     try {
       proc = spawn(this.bin, args, {
         cwd: session.directory,
         env: this.environment(session),
-        stdio: ["ignore", "pipe", "pipe"],
+        stdio: ["pipe", "pipe", "pipe"],
         detached: process.platform !== "win32",
         windowsHide: true,
       })
@@ -373,6 +410,13 @@ export class CodexRuntime implements Runtime {
     session.proc = proc
     let out = ""
     let err = ""
+    // Codex reads the instructions from stdin when no prompt argument is given: this avoids
+    // argv's E2BIG limit and keeps a prompt that starts with "-" from being parsed as an option.
+    proc.stdin?.on("error", (e) => {
+      if (turn.completed) return
+      if ((e as NodeJS.ErrnoException).code !== "EPIPE") this.fail(session, turn, e.message)
+    })
+    proc.stdin?.end(text)
     proc.stdout?.setEncoding("utf8")
     proc.stderr?.setEncoding("utf8")
     proc.stdout?.on("data", (chunk: string) => {
@@ -382,7 +426,13 @@ export class CodexRuntime implements Runtime {
         if (nl < 0) break
         const line = out.slice(0, nl).trim()
         out = out.slice(nl + 1)
-        if (line) this.record(session, turn, line)
+        if (!line) continue
+        try {
+          this.record(session, turn, line)
+        } catch (e) {
+          // A malformed protocol line may fail this turn, but never escapes the stream handler.
+          this.fail(session, turn, `codex sent a malformed event: ${(e as Error).message}`)
+        }
       }
     })
     proc.stderr?.on("data", (chunk: string) => {
@@ -403,15 +453,28 @@ export class CodexRuntime implements Runtime {
     })
   }
 
-  private args(session: CodexSession, text: string): string[] {
+  private args(session: CodexSession): string[] {
     const sandbox = session.readOnly ? "read-only" : "workspace-write"
     const model = session.model ? ["-m", session.model.id] : []
+    const variant = session.model?.variant
+    const effort = variant && REASONING_EFFORTS.has(variant) ? ["-c", `model_reasoning_effort="${variant}"`] : []
     const dirs = session.writableDirs ?? []
     if (!session.threadId)
-      return ["exec", "--json", "-C", session.directory, "-s", sandbox, "--skip-git-repo-check", ...dirs.flatMap((dir) => ["--add-dir", dir]), ...model, text]
+      return [
+        "exec",
+        "--json",
+        "-C",
+        session.directory,
+        "-s",
+        sandbox,
+        "--skip-git-repo-check",
+        ...dirs.flatMap((dir) => ["--add-dir", dir]),
+        ...effort,
+        ...model,
+      ]
     // `codex exec resume` takes no -C, -s or --add-dir: the cwd is set on the process, and -c carries the sandbox.
     const roots = dirs.length ? ["-c", `sandbox_workspace_write.writable_roots=${JSON.stringify(dirs)}`] : []
-    return ["exec", "resume", session.threadId, "--json", "-c", `sandbox_mode="${sandbox}"`, ...roots, "--skip-git-repo-check", ...model, text]
+    return ["exec", "resume", session.threadId, "--json", "-c", `sandbox_mode="${sandbox}"`, ...roots, ...effort, "--skip-git-repo-check", ...model]
   }
 
   /** The allowlisted worker environment plus what Codex itself needs. */
@@ -430,9 +493,13 @@ export class CodexRuntime implements Runtime {
       // Not a protocol line (Codex can print a banner): ignore it rather than fail the turn.
       return
     }
+    if (!event || typeof event !== "object" || Array.isArray(event)) return
     switch (event.type) {
       case "thread.started":
-        if (typeof event.thread_id === "string") session.threadId = event.thread_id
+        if (typeof event.thread_id === "string") {
+          session.threadId = event.thread_id
+          session.freshThreadNote = undefined
+        }
         break
       case "turn.started":
         break
@@ -445,6 +512,10 @@ export class CodexRuntime implements Runtime {
       case "turn.completed":
         turn.usage = event.usage
         break
+      case "turn.failed": {
+        this.fail(session, turn, messageText(event) ?? "codex reported a failed turn")
+        break
+      }
       case "error": {
         const message = messageText(event)
         if (message) this.fail(session, turn, message)
@@ -456,8 +527,12 @@ export class CodexRuntime implements Runtime {
   }
 
   private item(session: CodexSession, turn: TurnState, item: CodexItem | undefined, completed: boolean) {
-    if (!item) return
+    if (!item || typeof item !== "object" || Array.isArray(item)) return
     const id = typeof item.id === "string" ? item.id : `item_${turn.parts.size}`
+    if (item.type === "error" || item.error !== undefined) {
+      this.fail(session, turn, messageText(item as CodexEvent) ?? "codex reported an error item")
+      return
+    }
     switch (item.type) {
       case "agent_message": {
         const text = typeof item.text === "string" ? item.text : ""
@@ -490,11 +565,20 @@ export class CodexRuntime implements Runtime {
         break
       }
       case "file_change": {
-        const changes = Array.isArray(item.changes) ? item.changes : []
-        const paths = changes.map((c) => (typeof c.path === "string" ? c.path : "")).filter(Boolean)
+        const raw = Array.isArray(item.changes) ? item.changes : []
+        const changes = raw.filter((c): c is { path: string; kind?: string } => {
+          if (!c || typeof c !== "object" || Array.isArray(c)) return false
+          return typeof (c as { path?: unknown }).path === "string" && (c as { path: string }).path !== ""
+        })
+        if (!changes.length) {
+          this.note(turn, id, "Codex reported a file_change item without a usable path; skipped it")
+          break
+        }
+        if (changes.length !== raw.length) this.note(turn, id, `Codex reported ${raw.length - changes.length} malformed file change(s); skipped them`)
+        const paths = changes.map((c) => c.path)
         const input: Record<string, JsonValue> = {
           path: paths[0] ?? "",
-          changes: changes.map((c) => ({ path: typeof c.path === "string" ? c.path : "", kind: typeof c.kind === "string" ? c.kind : "update" })),
+          changes: changes.map((c) => ({ path: c.path, kind: typeof c.kind === "string" ? c.kind : "update" })),
         }
         const content: [ToolContent, ...ToolContent[]] = [{ type: "text", text: paths.join("\n") }]
         const state: SessionMessageAssistantTool["state"] = completed ? { status: "completed", input, content } : { status: "running", input, metadata: {} }
@@ -554,9 +638,22 @@ export class CodexRuntime implements Runtime {
     }
   }
 
+  /** A visible note in the assistant message: the event was unusual but not fatal. */
+  private note(turn: TurnState, id: string, text: string) {
+    const part = this.part(turn, `note:${id}`, () => ({ type: "text" as const, text: "" }))
+    if (part.type === "text") part.text = text
+  }
+
   private fail(session: CodexSession, turn: TurnState, message: string) {
     turn.failure = message
     session.error = message
+    // A deleted or moved CODEX_HOME makes `exec resume` reject the stored thread: forget it so the
+    // next prompt can start fresh instead of failing forever. Its history is already unreachable.
+    if (session.threadId && /(?:no rollout found for thread|thread\/resume failed|unknown thread|thread .*not found)/i.test(message)) {
+      const lost = session.threadId
+      session.threadId = undefined
+      session.freshThreadNote = `the previous Codex thread (${lost}) was no longer available; this turn started a new one`
+    }
   }
 
   /** The process is gone: close the assistant step, add the idle marker, and start the next queued turn. */
@@ -574,6 +671,18 @@ export class CodexRuntime implements Runtime {
     }
     const outcome = turn.interrupted ? "interrupted" : turn.failure ? "failed" : code === 0 || code === null || code === undefined ? "succeeded" : "failed"
     if (outcome === "failed" && !turn.failure) turn.failure = `codex exited with code ${code}`
+    // A tool still marked running was cut off with the process.
+    if (outcome !== "succeeded") {
+      for (const part of turn.assistant.content) {
+        if (part.type !== "tool" || (part.state.status !== "running" && part.state.status !== "streaming")) continue
+        part.state = {
+          status: "error",
+          input: part.state.status === "running" ? part.state.input : {},
+          error: { type: "codex", message: outcome === "interrupted" ? "interrupted" : "the turn ended before the tool finished" },
+        }
+        part.time = { ...part.time, completed: ended }
+      }
+    }
     const cost = this.cost(session, tokens)
     turn.assistant.time = { ...turn.assistant.time, completed: ended }
     turn.assistant.tokens = {
@@ -607,7 +716,7 @@ export class CodexRuntime implements Runtime {
       tokens: { input: tokens.input, output: tokens.output, reasoning: tokens.reasoning, cache: { read: tokens.cacheRead, write: tokens.cacheWrite } },
     })
     session.running = false
-    if (session.queue.length && !session.interrupted) this.startNext(session)
+    if (session.queue.length && !session.removed) this.startNext(session)
   }
 
   private cost(session: CodexSession, tokens: { input: number; output: number; reasoning: number; cacheRead: number; cacheWrite: number }): number {
@@ -621,9 +730,15 @@ export class CodexRuntime implements Runtime {
     const price = prices[key]
     if (!price) return 0
     const cached = price.cachedInput ?? price.input
-    return (
-      (tokens.input * price.input + (tokens.output + tokens.reasoning) * price.output + tokens.cacheRead * cached + tokens.cacheWrite * price.input) / 1_000_000
-    )
+    // Codex reports Responses API usage: input_tokens is gross of cached and cache-write tokens, and
+    // output_tokens already includes reasoning_output_tokens. The codex-cli 0.166.0 binary confirms
+    // it by exporting token_usage.non_cached_input_tokens separately from cached_input_tokens and
+    // carries a `last_usage_includes_reasoning` flag (see `strings $(command -v codex)`); the
+    // app-server protocol's TokenUsageBreakdown in `codex app-server generate-json-schema` names the
+    // same fields. Price only the uncached remainder as input, and do not add reasoning on top of
+    // output, or cached input and reasoning are charged twice.
+    const netInput = Math.max(tokens.input - tokens.cacheRead - tokens.cacheWrite, 0)
+    return (netInput * price.input + tokens.output * price.output + tokens.cacheRead * cached + tokens.cacheWrite * price.input) / 1_000_000
   }
 
   private signal(proc: ChildProcess, signal: NodeJS.Signals) {

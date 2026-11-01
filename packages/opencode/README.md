@@ -33,7 +33,7 @@ horde_land { id: "t-4f1a" }
 
 ### Workers on the Codex CLI
 
-A tier or `model` written `codex/<model>` runs the worker on OpenAI's `codex` CLI instead of OpenCode. Its first turn is `codex exec --json -C <worktree> -s workspace-write --skip-git-repo-check [-m <model>] "<prompt>"`; later turns are `codex exec resume <thread> --json …`, so `horde_tell` continues the same Codex thread. On a worktree spawn every turn also grants writes to the repository's git common directory and the board state directory: the first with `--add-dir`, a resume with `-c sandbox_workspace_write.writable_roots=[…]`. The process gets the same allowlisted environment as an OpenCode worker, plus `CODEX_HOME` and `OPENAI_API_KEY` when they are set, and its stdin is closed. Codex cannot ask for permissions, steer mid-turn, revert or compact; a session created with the `deny` policy (reviews and investigations) runs with `-s read-only`. `horde_drop` stops the process, but the thread stays in your Codex history. Cost comes from the usage Codex reports, priced by `horde.json`:
+A tier or `model` written `codex/<model>` runs the worker on OpenAI's `codex` CLI instead of OpenCode. Its first turn is `codex exec --json -C <worktree> -s workspace-write --skip-git-repo-check [-c model_reasoning_effort="<variant>"] [-m <model>]`, with the prompt written to stdin and stdin then closed (so a prompt over the argv limit, or one starting with `-`, is safe); later turns are `codex exec resume <thread> --json …`, so `horde_tell` continues the same Codex thread. An accepted variant is `low`, `medium`, `high` or `xhigh`; any other variant is ignored with a note. On a worktree spawn every turn also grants writes to the repository's git common directory and the board state directory: the first with `--add-dir`, a resume with `-c sandbox_workspace_write.writable_roots=[…]`. The process gets the same allowlisted environment as an OpenCode worker, plus `CODEX_HOME` and `OPENAI_API_KEY` when they are set. Codex cannot ask for permissions, steer mid-turn, revert or compact; a session created with the `deny` policy (reviews and investigations) runs with `-s read-only`. A rejected or missing thread id fails that turn with its error and lets the next prompt start a fresh thread with a note in the transcript. `horde_drop` stops the process, but the thread stays in your Codex history. Cost comes from the usage Codex reports, priced by `horde.json`:
 
 ```json
 {
@@ -42,7 +42,7 @@ A tier or `model` written `codex/<model>` runs the worker on OpenAI's `codex` CL
 }
 ```
 
-`input`, `output` and the optional `cachedInput` are USD per million tokens; reasoning tokens are billed as output and cache writes at the input price. Without a matching price the cost is 0.
+`input`, `output` and the optional `cachedInput` are USD per million tokens. Codex's `input_tokens` already includes cached tokens, so only the uncached remainder is charged at `input`, cache reads at `cachedInput`, and cache writes at the input price; reasoning tokens are already part of `output`. Without a matching price the cost is 0.
 
 Everything below is the finer control underneath: agents without a task, worktree or checks, steering mid-step, multi-task plans on the board, transcripts and the rest.
 
