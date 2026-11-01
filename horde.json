@@ -20,7 +20,7 @@
         "kind": "test"
       },
       "core": {
-        "command": "node --conditions=source --import tsx --import ../../scripts/test-env.mjs --test test/core.test.ts",
+        "command": "node --conditions=source --import tsx --import ../../scripts/test-env.mjs --test test/core.test.ts test/process.test.ts",
         "cwd": "packages/core",
         "kind": "test"
       },
@@ -30,7 +30,7 @@
         "kind": "test"
       },
       "verify": {
-        "command": "node --conditions=source --import tsx --import ../../scripts/test-env.mjs --test --test-concurrency=1 test/extract.test.ts test/verify.test.ts",
+        "command": "node --conditions=source --import tsx --import ../../scripts/test-env.mjs --test --test-concurrency=1 test/extract.test.ts test/verify.test.ts test/audit-more.test.ts test/gate-more.test.ts",
         "cwd": "packages/verify",
         "kind": "test"
       },
@@ -50,7 +50,7 @@
         "kind": "test"
       },
       "opencode": {
-        "command": "node --conditions=source --import tsx --import ../../scripts/test-env.mjs --test --test-concurrency=$(node ../../scripts/test-concurrency.mjs) test/unit.test.ts test/horde-gate.test.ts test/fleet-fixes.test.ts test/horde.test.ts test/horde-tell.test.ts test/fleet-worktrees.test.ts test/fleet-gates.test.ts test/fleet-reviews.test.ts test/horde-more.test.ts test/core.test.ts test/modes.test.ts test/flow.test.ts test/dist.test.ts test/plugin.test.ts test/support-fixes.test.ts test/codex.test.ts test/cursor.test.ts",
+        "command": "node --conditions=source --import tsx --import ../../scripts/test-env.mjs --test --test-concurrency=$(node ../../scripts/test-concurrency.mjs) test/unit.test.ts test/horde-gate.test.ts test/fleet-fixes.test.ts test/horde.test.ts test/horde-tell.test.ts test/fleet-worktrees.test.ts test/fleet-gates.test.ts test/fleet-reviews.test.ts test/horde-more.test.ts test/core.test.ts test/modes.test.ts test/flow.test.ts test/dist.test.ts test/plugin.test.ts test/support-fixes.test.ts test/codex.test.ts test/cursor.test.ts test/fleet-landing.test.ts test/backend.test.ts",
         "cwd": "packages/opencode",
         "kind": "test",
         "slots": 1,
